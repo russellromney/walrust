@@ -87,7 +87,7 @@ dist/
 *.tsbuildinfo
 
 # Test database files
-/tmp/walsync-test-*.db
+/tmp/walrust-test-*.db
 /tmp/restored-*.db
 
 # Logs

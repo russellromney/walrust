@@ -1,6 +1,6 @@
-# Walsync Release Guide
+# Walrust Release Guide
 
-This document explains how to release walsync to both Crates.io (Rust) and PyPI (Python).
+This document explains how to release walrust to both Crates.io (Rust) and PyPI (Python).
 
 ## Pre-Release Checklist
 
@@ -25,8 +25,8 @@ cargo publish
 ### Verify Installation
 
 ```bash
-cargo install walsync --version 0.X.Y
-walsync --version
+cargo install walrust --version 0.X.Y
+walrust --version
 ```
 
 ## Release to PyPI (Python)
@@ -70,18 +70,18 @@ twine upload dist/*
 
 ```bash
 # Test from PyPI
-pip install walsync --upgrade
-python -c "from walsync import WalSync; print('OK')"
+pip install walrust --upgrade
+python -c "from walrust import Walrust; print('OK')"
 
 # Test CLI
-pip install walsync[cli]
-walsync --version
+pip install walrust[cli]
+walrust --version
 ```
 
 ## Release Contents
 
 ### Crates.io Release
-- ✅ Binary: `walsync` CLI
+- ✅ Binary: `walrust` CLI
 - ✅ Library: Rust crate
 
 ### PyPI Release
@@ -94,17 +94,17 @@ walsync --version
 
 ```toml
 [package]
-name = "walsync"
+name = "walrust"
 version = "0.2.0"
 
 # For CLI releases
 [[bin]]
-name = "walsync"
+name = "walrust"
 path = "src/main.rs"
 
 # For library
 [lib]
-name = "walsync"
+name = "walrust"
 crate-type = ["cdylib", "rlib"]
 ```
 
@@ -112,7 +112,7 @@ crate-type = ["cdylib", "rlib"]
 
 ```toml
 [project]
-name = "walsync"
+name = "walrust"
 version = "0.2.0"
 
 [build-system]
@@ -180,7 +180,7 @@ The GitHub Actions workflow automatically builds:
 | macOS | Intel (x86_64) | 3.8-3.12 |
 | macOS | Apple Silicon (aarch64) | 3.8-3.12 |
 
-Users can install with: `pip install walsync`
+Users can install with: `pip install walrust`
 
 ## Troubleshooting
 
@@ -215,7 +215,7 @@ git push --tags
 
 ## Support Versions
 
-Walsync supports:
+Walrust supports:
 - **Rust**: Edition 2021+
 - **Python**: 3.8+
 - **Platforms**: Linux, macOS, Windows (via WSL)
@@ -234,9 +234,9 @@ After release, update:
 - ✅ Point-in-time restore by TXID or timestamp
 - ✅ GFS retention policies (grandfather/father/son compaction)
 - ✅ Config file support (TOML) with per-database overrides
-- ✅ Poll-based read replicas (`walsync replicate`)
-- ✅ `walsync explain` - Preview configuration without running
-- ✅ `walsync verify` - Verify LTX integrity in S3
+- ✅ Poll-based read replicas (`walrust replicate`)
+- ✅ `walrust explain` - Preview configuration without running
+- ✅ `walrust verify` - Verify LTX integrity in S3
 - ✅ Prometheus metrics dashboard
 - ✅ Multi-database support (single process)
 - ✅ Python bindings

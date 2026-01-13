@@ -1,4 +1,4 @@
-//! Python bindings for walsync
+//! Python bindings for walrust
 
 use pyo3::prelude::*;
 use pyo3::exceptions::PyRuntimeError;
@@ -8,9 +8,9 @@ use tokio::runtime::Runtime;
 
 use crate::sync;
 
-/// Python wrapper for walsync operations
+/// Python wrapper for walrust operations
 #[pyclass]
-pub struct WalSync {
+pub struct Walrust {
     runtime: Arc<Runtime>,
     bucket: String,
     endpoint: Option<String>,
@@ -29,8 +29,8 @@ pub struct DatabaseInfo {
 }
 
 #[pymethods]
-impl WalSync {
-    /// Create a new WalSync instance
+impl Walrust {
+    /// Create a new Walrust instance
     /// 
     /// Args:
     ///     bucket: S3 bucket (e.g., "s3://my-bucket/prefix" or "my-bucket")
@@ -41,7 +41,7 @@ impl WalSync {
         let runtime = Runtime::new()
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to create runtime: {}", e)))?;
         
-        Ok(WalSync {
+        Ok(Walrust {
             runtime: Arc::new(runtime),
             bucket: bucket.to_string(),
             endpoint: endpoint.map(|s| s.to_string()),
@@ -183,8 +183,8 @@ fn list_databases(bucket: &str, endpoint: Option<&str>) -> PyResult<Vec<String>>
 
 /// Python module
 #[pymodule]
-fn walsync(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<WalSync>()?;
+fn walrust(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<Walrust>()?;
     m.add_class::<DatabaseInfo>()?;
     m.add_function(wrap_pyfunction!(snapshot, m)?)?;
     m.add_function(wrap_pyfunction!(restore, m)?)?;

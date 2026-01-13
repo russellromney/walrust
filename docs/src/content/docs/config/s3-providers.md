@@ -1,9 +1,9 @@
 ---
 title: S3 Providers
-description: Configure walsync with different S3-compatible storage providers
+description: Configure walrust with different S3-compatible storage providers
 ---
 
-Walsync works with any S3-compatible storage. Here's how to configure popular providers.
+Walrust works with any S3-compatible storage. Here's how to configure popular providers.
 
 ## Tigris (Fly.io)
 
@@ -11,7 +11,7 @@ Tigris is an S3-compatible object store from Fly.io with global distribution and
 
 ```bash
 # Create a bucket
-fly storage create my-walsync-bucket
+fly storage create my-walrust-bucket
 
 # Credentials are shown after creation
 export AWS_ACCESS_KEY_ID=tid_xxxxxxxxxxxxx
@@ -49,8 +49,8 @@ export AWS_REGION=us-east-1
         "s3:ListBucket"
       ],
       "Resource": [
-        "arn:aws:s3:::my-walsync-bucket",
-        "arn:aws:s3:::my-walsync-bucket/*"
+        "arn:aws:s3:::my-walrust-bucket",
+        "arn:aws:s3:::my-walrust-bucket/*"
       ]
     }
   ]
@@ -101,8 +101,8 @@ services:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
 
-  walsync:
-    image: walsync
+  walrust:
+    image: walrust
     command: watch /data/app.db --bucket my-bucket
     environment:
       AWS_ACCESS_KEY_ID: minioadmin
@@ -150,7 +150,7 @@ Verify your S3 connection:
 
 ```bash
 # List databases (should work with valid credentials)
-walsync list --bucket my-bucket
+walrust list --bucket my-bucket
 
 # Or test with AWS CLI
 aws s3 ls s3://my-bucket --endpoint-url $AWS_ENDPOINT_URL_S3

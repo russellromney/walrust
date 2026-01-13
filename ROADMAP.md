@@ -1,4 +1,4 @@
-# walsync Roadmap
+# walrust Roadmap
 
 ## Vision
 
@@ -33,34 +33,34 @@ What's next:
 
 ### Core Commands
 ```bash
-walsync watch <db>... [--config file]   # Watch and sync
-walsync snapshot <db>                    # Immediate snapshot
-walsync restore <name> -o <output>       # Restore database
-walsync list                             # List backups
-walsync compact <name> -b <bucket>       # Clean up old snapshots
-walsync replicate <source> --local <db>  # Poll-based read replica
-walsync explain [--config file]          # Show config summary (dry-run)
-walsync verify <name> -b <bucket>        # Verify LTX integrity in S3
+walrust watch <db>... [--config file]   # Watch and sync
+walrust snapshot <db>                    # Immediate snapshot
+walrust restore <name> -o <output>       # Restore database
+walrust list                             # List backups
+walrust compact <name> -b <bucket>       # Clean up old snapshots
+walrust replicate <source> --local <db>  # Poll-based read replica
+walrust explain [--config file]          # Show config summary (dry-run)
+walrust verify <name> -b <bucket>        # Verify LTX integrity in S3
 ```
 
 **Compaction Usage:**
 ```bash
 # Dry-run (default) - show what would be deleted
-walsync compact mydb -b s3://my-bucket
+walrust compact mydb -b s3://my-bucket
 
 # Custom retention policy
-walsync compact mydb -b s3://my-bucket --hourly 48 --daily 14
+walrust compact mydb -b s3://my-bucket --hourly 48 --daily 14
 
 # Actually execute compaction
-walsync compact mydb -b s3://my-bucket --force
+walrust compact mydb -b s3://my-bucket --force
 
 # Auto-compact in watch mode (after each snapshot)
-walsync watch mydb.db -b s3://my-bucket \
+walrust watch mydb.db -b s3://my-bucket \
   --compact-after-snapshot \
   --retain-hourly 24
 
 # Periodic compaction (every hour)
-walsync watch mydb.db -b s3://my-bucket \
+walrust watch mydb.db -b s3://my-bucket \
   --compact-interval 3600
 ```
 
@@ -160,7 +160,7 @@ snapshot_interval = 1800  # Per-DB override (seconds)
    - [x] Create `src/retention.rs` module with GFS categorization logic
    - [x] Implement retention policy: 24 hourly, 7 daily, 12 weekly, 12 monthly
    - [x] Add S3 delete functions to `src/s3.rs`
-   - [x] Add `walsync compact` command with dry-run default
+   - [x] Add `walrust compact` command with dry-run default
    - [x] Add auto-compact flags to `watch` command
    - [x] Write comprehensive unit and integration tests
 
@@ -199,7 +199,7 @@ snapshot_interval = 1800  # Per-DB override (seconds)
 
 ### Read Replicas (Poll-based) ✅ COMPLETE
 ```bash
-walsync replicate s3://bucket/mydb --local replica.db --interval 5s
+walrust replicate s3://bucket/mydb --local replica.db --interval 5s
 ```
 - ✅ Polls S3 for new LTX files at configurable interval
 - ✅ Auto-bootstraps from latest snapshot if local db doesn't exist
@@ -211,18 +211,18 @@ walsync replicate s3://bucket/mydb --local replica.db --interval 5s
 ### Read Replicas (Push-based) - Future
 ```bash
 # Primary
-walsync watch mydb.db --push-to http://replica:8080
+walrust watch mydb.db --push-to http://replica:8080
 
 # Replica
-walsync serve --port 8080 --db replica.db
+walrust serve --port 8080 --db replica.db
 ```
 - Lower latency than polling
 - Requires network connectivity
 
 ### Additional Commands
 ```bash
-walsync verify <name> -b s3://...       # ✅ Verify LTX checksums + TXID continuity
-walsync explain [--config file]         # ✅ Show config summary without running
+walrust verify <name> -b s3://...       # ✅ Verify LTX checksums + TXID continuity
+walrust explain [--config file]         # ✅ Show config summary without running
 ```
 
 ---
@@ -278,17 +278,17 @@ s3://bucket/prefix/
   - [x] 105 total tests (all passing)
 - [x] **Snapshot Compaction & Retention**
   - [x] GFS rotation (hourly/daily/weekly/monthly tiers)
-  - [x] `walsync compact` command with dry-run default
+  - [x] `walrust compact` command with dry-run default
   - [x] Auto-compaction in watch mode (--compact-after-snapshot, --compact-interval)
   - [x] Batch S3 delete operations
 - [x] **Poll-based Read Replicas**
-  - [x] `walsync replicate` command with configurable poll interval
+  - [x] `walrust replicate` command with configurable poll interval
   - [x] Auto-bootstrap from latest snapshot
   - [x] In-place incremental LTX apply
   - [x] TXID tracking with resume capability
 - [x] **Operational Commands**
-  - [x] `walsync explain` - Show config summary without running
-  - [x] `walsync verify` - Verify LTX integrity (checksums, TXID continuity, --fix)
+  - [x] `walrust explain` - Show config summary without running
+  - [x] `walrust verify` - Verify LTX integrity (checksums, TXID continuity, --fix)
 - [x] WAL sync to S3/Tigris as incremental LTX files
 - [x] SHA256 checksums in S3 metadata
 - [x] Multi-database support (single process)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Real-world performance benchmarks for walsync
+Real-world performance benchmarks for walrust
 
 Measures what users care about:
 1. Sync latency (commit → Tigris)
@@ -9,7 +9,7 @@ Measures what users care about:
 4. Network failure recovery
 
 Requirements:
-- walsync binary (cargo build --release)
+- walrust binary (cargo build --release)
 - Tigris credentials in .env
 - pip install psutil boto3
 
@@ -133,13 +133,13 @@ def benchmark_sync_latency(
     db_size_kb: int = 100,
 ) -> SyncLatencyResult:
     """
-    Measure latency for walsync snapshot operations.
+    Measure latency for walrust snapshot operations.
 
     Strategy:
     1. Create test database with data
     2. For each test:
        - Write new data
-       - Run walsync snapshot command
+       - Run walrust snapshot command
        - Measure time for snapshot to complete
     3. Return p50/p95/p99/max
 
@@ -163,7 +163,7 @@ def benchmark_sync_latency(
             conn.execute("INSERT INTO data (value, ts) VALUES (?, ?)", (chunk, time.time()))
         conn.commit()
 
-        walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
+        walrust_bin = Path(__file__).parent.parent / "target" / "release" / "walrust"
         env = os.environ.copy()
 
         latencies = []
@@ -175,7 +175,7 @@ def benchmark_sync_latency(
             conn.commit()
 
             # Measure snapshot time
-            cmd = [str(walsync_bin), "snapshot", str(db_path), "-b", bucket]
+            cmd = [str(walrust_bin), "snapshot", str(db_path), "-b", bucket]
             if endpoint:
                 cmd += ["--endpoint", endpoint]
 
@@ -223,7 +223,7 @@ def benchmark_restore(
     print(f"\nBenchmarking restore performance (sizes: {db_sizes_mb}MB)...")
     results = []
 
-    walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
+    walrust_bin = Path(__file__).parent.parent / "target" / "release" / "walrust"
 
     with tempfile.TemporaryDirectory() as tmpdir:
         tmpdir = Path(tmpdir)
@@ -253,7 +253,7 @@ def benchmark_restore(
             actual_size_mb = db_path.stat().st_size / (1024 * 1024)
 
             # Snapshot to S3
-            cmd = [str(walsync_bin), "snapshot", str(db_path), "-b", bucket]
+            cmd = [str(walrust_bin), "snapshot", str(db_path), "-b", bucket]
             if endpoint:
                 cmd += ["--endpoint", endpoint]
 
@@ -266,7 +266,7 @@ def benchmark_restore(
             # Measure restore time
             restore_path = tmpdir / f"restored_{size_mb}mb.db"
 
-            cmd = [str(walsync_bin), "restore", f"test_{size_mb}mb", "-o", str(restore_path), "-b", bucket]
+            cmd = [str(walrust_bin), "restore", f"test_{size_mb}mb", "-o", str(restore_path), "-b", bucket]
             if endpoint:
                 cmd += ["--endpoint", endpoint]
 
@@ -304,7 +304,7 @@ def benchmark_multi_db_throughput(
 
     Strategy:
     1. Create N databases
-    2. Start walsync watching all of them
+    2. Start walrust watching all of them
     3. Spawn threads that write to each DB at target rate
     4. Measure sync lag, CPU, memory
     """
@@ -324,9 +324,9 @@ def benchmark_multi_db_throughput(
             conn.close()
             databases.append(db_path)
 
-        # Start walsync
-        walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
-        cmd = [str(walsync_bin), "watch"] + [str(db) for db in databases] + ["-b", bucket]
+        # Start walrust
+        walrust_bin = Path(__file__).parent.parent / "target" / "release" / "walrust"
+        cmd = [str(walrust_bin), "watch"] + [str(db) for db in databases] + ["-b", bucket]
         if endpoint:
             cmd += ["--endpoint", endpoint]
 
@@ -357,16 +357,16 @@ def benchmark_multi_db_throughput(
         for t in threads:
             t.start()
 
-        # Monitor walsync process
+        # Monitor walrust process
         time.sleep(1)
-        walsync_proc = psutil.Process(proc.pid)
+        walrust_proc = psutil.Process(proc.pid)
 
         mem_samples = []
         cpu_samples = []
 
         for _ in range(duration_sec):
-            mem_samples.append(walsync_proc.memory_info().rss / (1024 * 1024))
-            cpu_samples.append(walsync_proc.cpu_percent(interval=1))
+            mem_samples.append(walrust_proc.memory_info().rss / (1024 * 1024))
+            cpu_samples.append(walrust_proc.cpu_percent(interval=1))
 
         # Stop writers
         stop_flag.set()
@@ -394,11 +394,11 @@ def benchmark_network_recovery(
     Measure recovery time after simulated network outage.
 
     Strategy:
-    1. Start walsync + database
+    1. Start walrust + database
     2. Write continuously, record count
-    3. Stop walsync (simulating network failure)
+    3. Stop walrust (simulating network failure)
     4. Continue writing for N seconds
-    5. Restart walsync
+    5. Restart walrust
     6. Measure time until WAL segment count stabilizes
     """
     print(f"\nBenchmarking network recovery ({outage_duration_sec}s outage)...")
@@ -415,9 +415,9 @@ def benchmark_network_recovery(
 
         chunk = b"x" * 1024
 
-        # Start walsync
-        walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
-        cmd = [str(walsync_bin), "watch", str(db_path), "-b", bucket]
+        # Start walrust
+        walrust_bin = Path(__file__).parent.parent / "target" / "release" / "walrust"
+        cmd = [str(walrust_bin), "watch", str(db_path), "-b", bucket]
         if endpoint:
             cmd += ["--endpoint", endpoint]
 
@@ -427,7 +427,7 @@ def benchmark_network_recovery(
 
         if proc.poll() is not None:
             _, stderr = proc.communicate()
-            print(f"  Warning: walsync exited early: {stderr.decode()[:200]}")
+            print(f"  Warning: walrust exited early: {stderr.decode()[:200]}")
             conn.close()
             return NetworkRecoveryResult(outage_duration_sec=outage_duration_sec)
 
@@ -437,8 +437,8 @@ def benchmark_network_recovery(
             conn.commit()
         time.sleep(2)  # Let it sync
 
-        # Stop walsync (simulating outage)
-        print(f"  Stopping walsync to simulate outage...")
+        # Stop walrust (simulating outage)
+        print(f"  Stopping walrust to simulate outage...")
         proc.terminate()
         proc.wait()
 
@@ -454,8 +454,8 @@ def benchmark_network_recovery(
 
         conn.close()
 
-        # Restart walsync
-        print(f"  Restarting walsync (wrote {writes_during_outage} rows during outage)...")
+        # Restart walrust
+        print(f"  Restarting walrust (wrote {writes_during_outage} rows during outage)...")
         catchup_start = time.time()
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
 
@@ -471,7 +471,7 @@ def benchmark_network_recovery(
             outage_duration_sec=outage_duration_sec,
             catchup_time_ms=catchup_time,
             writes_during_outage=writes_during_outage,
-            writes_lost=0,  # Walsync should recover all writes
+            writes_lost=0,  # Walrust should recover all writes
         )
 
 
@@ -484,10 +484,10 @@ def benchmark_write_throughput(
     Measure maximum sustainable write throughput.
 
     Strategy:
-    1. Start walsync
+    1. Start walrust
     2. Write as fast as possible for N seconds
     3. Measure commits/sec achieved
-    4. Measure if walsync keeps up (WAL file size doesn't grow unbounded)
+    4. Measure if walrust keeps up (WAL file size doesn't grow unbounded)
     """
     print(f"\nBenchmarking write throughput ({duration_sec}s)...")
 
@@ -504,9 +504,9 @@ def benchmark_write_throughput(
 
         chunk = b"x" * 512  # Smaller chunks for faster commits
 
-        # Start walsync
-        walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
-        cmd = [str(walsync_bin), "watch", str(db_path), "-b", bucket]
+        # Start walrust
+        walrust_bin = Path(__file__).parent.parent / "target" / "release" / "walrust"
+        cmd = [str(walrust_bin), "watch", str(db_path), "-b", bucket]
         if endpoint:
             cmd += ["--endpoint", endpoint]
 
@@ -516,7 +516,7 @@ def benchmark_write_throughput(
 
         if proc.poll() is not None:
             _, stderr = proc.communicate()
-            print(f"  Warning: walsync exited early: {stderr.decode()[:200]}")
+            print(f"  Warning: walrust exited early: {stderr.decode()[:200]}")
             conn.close()
             return WriteThroughputResult()
 
@@ -559,7 +559,7 @@ def benchmark_checkpoint_impact(
     Measure sync latency impact during SQLite checkpoint.
 
     Strategy:
-    1. Start walsync
+    1. Start walrust
     2. Write data to grow WAL
     3. Measure normal sync latency
     4. Trigger checkpoint
@@ -580,9 +580,9 @@ def benchmark_checkpoint_impact(
 
         chunk = b"x" * 1024
 
-        # Start walsync
-        walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
-        cmd = [str(walsync_bin), "watch", str(db_path), "-b", bucket]
+        # Start walrust
+        walrust_bin = Path(__file__).parent.parent / "target" / "release" / "walrust"
+        cmd = [str(walrust_bin), "watch", str(db_path), "-b", bucket]
         if endpoint:
             cmd += ["--endpoint", endpoint]
 
@@ -592,7 +592,7 @@ def benchmark_checkpoint_impact(
 
         if proc.poll() is not None:
             _, stderr = proc.communicate()
-            print(f"  Warning: walsync exited early: {stderr.decode()[:200]}")
+            print(f"  Warning: walrust exited early: {stderr.decode()[:200]}")
             conn.close()
             return CheckpointImpactResult()
 
@@ -644,7 +644,7 @@ def benchmark_checkpoint_impact(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Real-world performance benchmarks for walsync",
+        description="Real-world performance benchmarks for walrust",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
@@ -655,7 +655,7 @@ def main():
     parser.add_argument(
         "--bucket",
         type=str,
-        default=os.environ.get("WALSYNC_TEST_BUCKET", "s3://walsync-bench"),
+        default=os.environ.get("WALSYNC_TEST_BUCKET", "s3://walrust-bench"),
         help="S3 bucket for testing",
     )
     parser.add_argument(

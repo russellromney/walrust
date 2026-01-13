@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="logo.svg" alt="Walsync" width="200">
+  <img src="logo.svg" alt="Walrust" width="200">
 </p>
 
-# walsync
+# walrust
 
 **Lightweight SQLite replication to S3/Tigris in Rust.**
 
@@ -14,20 +14,20 @@ Like Litestream but with an emphasis on memory footprint and easy of configurati
 
 ### CLI (Rust)
 ```bash
-cargo install walsync
+cargo install walrust
 ```
 
 ### Python Package
 ```bash
-pip install walsync
+pip install walrust
 ```
 
 Then use from Python:
 ```python
-from walsync import WalSync
+from walrust import Walrust
 
 # Create instance
-ws = WalSync("s3://my-bucket", endpoint="https://fly.storage.tigris.dev")
+ws = Walrust("s3://my-bucket", endpoint="https://fly.storage.tigris.dev")
 
 # Snapshot a database
 ws.snapshot("/path/to/app.db")
@@ -43,33 +43,33 @@ ws.restore("app", "/path/to/restored.db")
 
 ```bash
 # Watch databases and sync to S3
-walsync watch db1.db db2.db -b s3://my-bucket/backups
+walrust watch db1.db db2.db -b s3://my-bucket/backups
 
 # With Tigris endpoint
-walsync watch app.db -b s3://my-bucket --endpoint https://fly.storage.tigris.dev
+walrust watch app.db -b s3://my-bucket --endpoint https://fly.storage.tigris.dev
 
 # With auto-compaction after each snapshot
-walsync watch app.db -b s3://my-bucket --compact-after-snapshot
+walrust watch app.db -b s3://my-bucket --compact-after-snapshot
 
 # Take immediate snapshot
-walsync snapshot app.db -b s3://my-bucket
+walrust snapshot app.db -b s3://my-bucket
 
 # List backed up databases
-walsync list -b s3://my-bucket
+walrust list -b s3://my-bucket
 
 # Restore database
-walsync restore mydb -o restored.db -b s3://my-bucket
+walrust restore mydb -o restored.db -b s3://my-bucket
 
 # Clean up old snapshots (dry-run)
-walsync compact mydb -b s3://my-bucket
+walrust compact mydb -b s3://my-bucket
 
 # Actually delete old snapshots
-walsync compact mydb -b s3://my-bucket --force
+walrust compact mydb -b s3://my-bucket --force
 ```
 
 ## Acknowledgments
 
-Walsync wouldn't exist without [Litestream](https://litestream.io) and the work of [Ben Johnson](https://github.com/benbjohnson). Litestream was the first place I saw WAL-based SQLite replication to cloud storage, and walsync uses the same [LTX file format](https://github.com/superfly/ltx) for efficient compaction and replication.
+Walrust wouldn't exist without [Litestream](https://litestream.io) and the work of [Ben Johnson](https://github.com/benbjohnson). Litestream was the first place I saw WAL-based SQLite replication to cloud storage, and walrust uses the same [LTX file format](https://github.com/superfly/ltx) for efficient compaction and replication.
 
 ## How It Works
 
@@ -87,12 +87,12 @@ app.db-wal  ────────────────►   /app/00000002-
 
 ## Commands
 
-### `walsync watch`
+### `walrust watch`
 
 Watch databases and continuously sync WAL changes.
 
 ```bash
-walsync watch <DATABASES>... -b <BUCKET> [OPTIONS]
+walrust watch <DATABASES>... -b <BUCKET> [OPTIONS]
 
 Options:
   --snapshot-interval <SECS>    Snapshot interval (default: 3600)
@@ -105,31 +105,31 @@ Options:
   --retain-monthly <N>          Monthly snapshots to keep (default: 12)
 ```
 
-### `walsync snapshot`
+### `walrust snapshot`
 
 Take an immediate snapshot.
 
 ```bash
-walsync snapshot <DATABASE> -b <BUCKET>
+walrust snapshot <DATABASE> -b <BUCKET>
 ```
 
-### `walsync restore`
+### `walrust restore`
 
 Restore a database from S3.
 
 ```bash
-walsync restore <NAME> -o <OUTPUT> -b <BUCKET>
+walrust restore <NAME> -o <OUTPUT> -b <BUCKET>
 
 Options:
   --point-in-time <ISO8601>  Restore to specific time
 ```
 
-### `walsync compact`
+### `walrust compact`
 
 Clean up old snapshots using retention policy (GFS rotation).
 
 ```bash
-walsync compact <NAME> -b <BUCKET> [OPTIONS]
+walrust compact <NAME> -b <BUCKET> [OPTIONS]
 
 Options:
   --hourly <N>    Hourly snapshots to keep (default: 24)
@@ -142,39 +142,39 @@ Options:
 **Example:**
 ```bash
 # Preview what would be deleted
-walsync compact mydb -b s3://my-bucket
+walrust compact mydb -b s3://my-bucket
 
 # Actually delete old snapshots
-walsync compact mydb -b s3://my-bucket --force
+walrust compact mydb -b s3://my-bucket --force
 
 # Keep more hourly snapshots
-walsync compact mydb -b s3://my-bucket --hourly 48 --force
+walrust compact mydb -b s3://my-bucket --hourly 48 --force
 ```
 
-### `walsync list`
+### `walrust list`
 
 List backed up databases.
 
 ```bash
-walsync list -b <BUCKET>
+walrust list -b <BUCKET>
 ```
 
-### `walsync explain`
+### `walrust explain`
 
 Show what the current configuration will do without running.
 
 ```bash
-walsync explain [--config <CONFIG>]
+walrust explain [--config <CONFIG>]
 ```
 
 Displays: S3 settings, snapshot triggers, compaction settings, retention policy, and resolved database paths.
 
-### `walsync verify`
+### `walrust verify`
 
 Verify integrity of LTX files in S3.
 
 ```bash
-walsync verify <NAME> -b <BUCKET> [OPTIONS]
+walrust verify <NAME> -b <BUCKET> [OPTIONS]
 
 Options:
   --endpoint <URL>  S3 endpoint
@@ -218,7 +218,7 @@ Every snapshot includes an SHA256 checksum stored in S3 object metadata (`x-amz-
 
 ### Snapshot Compaction
 
-Walsync uses Grandfather/Father/Son (GFS) rotation to manage snapshot retention:
+Walrust uses Grandfather/Father/Son (GFS) rotation to manage snapshot retention:
 
 | Tier | Default | Description |
 |------|---------|-------------|
@@ -235,15 +235,15 @@ Walsync uses Grandfather/Father/Son (GFS) rotation to manage snapshot retention:
 **Auto-compaction modes:**
 ```bash
 # After each snapshot
-walsync watch app.db -b s3://bucket --compact-after-snapshot
+walrust watch app.db -b s3://bucket --compact-after-snapshot
 
 # On interval (every hour)
-walsync watch app.db -b s3://bucket --compact-interval 3600
+walrust watch app.db -b s3://bucket --compact-interval 3600
 ```
 
 ### Multi-Database Scalability
 
-| Databases | Litestream | Walsync | Savings |
+| Databases | Litestream | Walrust | Savings |
 |-----------|-----------|---------|---------|
 | 1 | 33 MB (1 process) | 12 MB (1 process) | **21 MB** |
 | 5 | 152 MB (5 processes) | 14 MB (1 process) | **138 MB** |
@@ -252,7 +252,7 @@ walsync watch app.db -b s3://bucket --compact-interval 3600
 
 *Measured on macOS with 100KB test databases. See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full results.*
 
-Single walsync process handles multiple databases with shared S3 connection pooling.
+Single walrust process handles multiple databases with shared S3 connection pooling.
 
 ## Testing
 
@@ -271,7 +271,7 @@ Perfect for backing up tenant SQLite databases:
 
 ```bash
 # In your tenement deployment
-walsync watch \
+walrust watch \
   /var/lib/ourfam/romneys/app.db \
   /var/lib/ourfam/smiths/app.db \
   /var/lib/ourfam/jones/app.db \
@@ -283,7 +283,7 @@ All databases sync with single process, saving ~275MB memory vs Litestream for 1
 
 ## Documentation
 
-- [Docs Site](https://walsync.dev) - Full documentation
+- [Docs Site](https://walrust.dev) - Full documentation
 - [ROADMAP.md](ROADMAP.md) - Planned features and direction
 - [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) - Performance benchmark results
 - [TESTING.md](TESTING.md) - Comprehensive testing guide

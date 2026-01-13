@@ -1,4 +1,4 @@
-//! Prometheus metrics server for walsync
+//! Prometheus metrics server for walrust
 
 use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::get, Router};
 use prometheus::{Encoder, GaugeVec, IntCounterVec, IntGaugeVec, Opts, Registry, TextEncoder};
@@ -40,14 +40,14 @@ impl MetricsState {
         let registry = Registry::new();
 
         let last_sync = GaugeVec::new(
-            Opts::new("walsync_last_sync_timestamp", "Unix timestamp of last sync"),
+            Opts::new("walrust_last_sync_timestamp", "Unix timestamp of last sync"),
             &["database"],
         )
         .unwrap();
         registry.register(Box::new(last_sync.clone())).unwrap();
 
         let wal_size = IntGaugeVec::new(
-            Opts::new("walsync_wal_size_bytes", "Current WAL file size in bytes"),
+            Opts::new("walrust_wal_size_bytes", "Current WAL file size in bytes"),
             &["database"],
         )
         .unwrap();
@@ -55,7 +55,7 @@ impl MetricsState {
 
         let next_snapshot = GaugeVec::new(
             Opts::new(
-                "walsync_next_snapshot_timestamp",
+                "walrust_next_snapshot_timestamp",
                 "Estimated next snapshot time",
             ),
             &["database"],
@@ -64,28 +64,28 @@ impl MetricsState {
         registry.register(Box::new(next_snapshot.clone())).unwrap();
 
         let error_count = IntCounterVec::new(
-            Opts::new("walsync_error_count_total", "Total sync/upload errors"),
+            Opts::new("walrust_error_count_total", "Total sync/upload errors"),
             &["database"],
         )
         .unwrap();
         registry.register(Box::new(error_count.clone())).unwrap();
 
         let snapshot_count = IntCounterVec::new(
-            Opts::new("walsync_snapshot_count_total", "Total snapshots taken"),
+            Opts::new("walrust_snapshot_count_total", "Total snapshots taken"),
             &["database"],
         )
         .unwrap();
         registry.register(Box::new(snapshot_count.clone())).unwrap();
 
         let current_txid = IntGaugeVec::new(
-            Opts::new("walsync_current_txid", "Current transaction ID"),
+            Opts::new("walrust_current_txid", "Current transaction ID"),
             &["database"],
         )
         .unwrap();
         registry.register(Box::new(current_txid.clone())).unwrap();
 
         let databases_total =
-            prometheus::IntGauge::new("walsync_databases_total", "Number of watched databases")
+            prometheus::IntGauge::new("walrust_databases_total", "Number of watched databases")
                 .unwrap();
         registry
             .register(Box::new(databases_total.clone()))
@@ -184,7 +184,7 @@ async fn metrics(State(state): State<Arc<MetricsState>>) -> impl IntoResponse {
     }
 
     let uptime_line = format!(
-        "\n# HELP walsync_uptime_seconds Process uptime in seconds\n# TYPE walsync_uptime_seconds gauge\nwalsync_uptime_seconds {}\n",
+        "\n# HELP walrust_uptime_seconds Process uptime in seconds\n# TYPE walrust_uptime_seconds gauge\nwalrust_uptime_seconds {}\n",
         state.uptime_seconds()
     );
     buffer.extend_from_slice(uptime_line.as_bytes());
@@ -265,12 +265,12 @@ mod tests {
         let body_str = String::from_utf8(body.to_vec()).unwrap();
 
         // Verify metrics are present
-        assert!(body_str.contains("walsync_last_sync_timestamp"));
-        assert!(body_str.contains("walsync_wal_size_bytes"));
-        assert!(body_str.contains("walsync_snapshot_count_total"));
-        assert!(body_str.contains("walsync_error_count_total"));
-        assert!(body_str.contains("walsync_uptime_seconds"));
-        assert!(body_str.contains("walsync_databases_total"));
+        assert!(body_str.contains("walrust_last_sync_timestamp"));
+        assert!(body_str.contains("walrust_wal_size_bytes"));
+        assert!(body_str.contains("walrust_snapshot_count_total"));
+        assert!(body_str.contains("walrust_error_count_total"));
+        assert!(body_str.contains("walrust_uptime_seconds"));
+        assert!(body_str.contains("walrust_databases_total"));
         assert!(body_str.contains("testdb"));
     }
 
@@ -289,8 +289,8 @@ mod tests {
         encoder.encode(&families, &mut buf).unwrap();
         let output = String::from_utf8(buf).unwrap();
 
-        assert!(output.contains("walsync_snapshot_count_total{database=\"db1\"} 2"));
-        assert!(output.contains("walsync_error_count_total{database=\"db1\"} 1"));
+        assert!(output.contains("walrust_snapshot_count_total{database=\"db1\"} 2"));
+        assert!(output.contains("walrust_error_count_total{database=\"db1\"} 1"));
     }
 
     #[tokio::test]

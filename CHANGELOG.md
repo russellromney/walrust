@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to walsync will be documented in this file.
+All notable changes to walrust will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -16,21 +16,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - By timestamp: `--point-in-time 2024-01-15T10:30:00Z`
 - **GFS Retention Policies**: Grandfather/Father/Son compaction
   - Configurable hourly/daily/weekly/monthly tiers
-  - `walsync compact` command with dry-run default
+  - `walrust compact` command with dry-run default
   - Auto-compaction via `--compact-after-snapshot` and `--compact-interval`
 - **Config File Support**: TOML configuration for multi-database deployments
   - Per-database settings overrides (interval, retention, prefix)
   - Wildcard path expansion (`/data/*.db`)
-  - `walsync.toml` auto-discovery in current directory
-- **Poll-based Read Replicas**: `walsync replicate` command
+  - `walrust.toml` auto-discovery in current directory
+- **Poll-based Read Replicas**: `walrust replicate` command
   - Auto-bootstrap from latest snapshot
   - TXID-based tracking with resume capability
   - Configurable poll interval
-- **`walsync explain` Command**: Preview configuration without executing
+- **`walrust explain` Command**: Preview configuration without executing
   - Shows resolved database paths
   - Displays per-database overrides
   - Calculates total snapshots retained
-- **`walsync verify` Command**: Verify LTX integrity in S3
+- **`walrust verify` Command**: Verify LTX integrity in S3
   - Checks file existence, checksums, TXID continuity
   - `--fix` flag to remove orphaned manifest entries
 - **Prometheus Metrics Dashboard**: Built-in observability
@@ -68,9 +68,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Initial release
 - Basic WAL sync to S3/Tigris
 - Simple snapshot/restore commands
-- `walsync watch` for continuous sync
-- `walsync list` to show databases in S3
+- `walrust watch` for continuous sync
+- `walrust list` to show databases in S3
 
-[0.3.0]: https://github.com/russellromney/walsync/compare/v0.2.0...v0.3.0
-[0.2.0]: https://github.com/russellromney/walsync/compare/v0.1.0...v0.2.0
-[0.1.0]: https://github.com/russellromney/walsync/releases/tag/v0.1.0
+[0.3.0]: https://github.com/russellromney/walrust/compare/v0.2.0...v0.3.0
+[0.2.0]: https://github.com/russellromney/walrust/compare/v0.1.0...v0.2.0
+[0.1.0]: https://github.com/russellromney/walrust/releases/tag/v0.1.0

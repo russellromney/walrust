@@ -1,21 +1,21 @@
 [package]
-name = "walsync"
+name = "walrust"
 version = "0.3.0"
 edition = "2021"
 description = "Lightweight SQLite WAL sync to S3/Tigris"
 authors = ["Russell Romney <russellromney@gmail.com>"]
 license = "Apache-2.0"
-repository = "https://github.com/russellromney/walsync"
-homepage = "https://github.com/russellromney/walsync"
+repository = "https://github.com/russellromney/walrust"
+homepage = "https://github.com/russellromney/walrust"
 keywords = ["sqlite", "wal", "s3", "backup", "sync"]
 categories = ["database", "command-line-utilities"]
 
 [lib]
-name = "walsync"
+name = "walrust"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "walsync"
+name = "walrust"
 path = "src/main.rs"
 
 [features]

@@ -36,7 +36,7 @@ test-verbose:
 bench:
 	cargo bench
 
-# Run comparison benchmark (walsync vs litestream)
+# Run comparison benchmark (walrust vs litestream)
 bench-compare: release
 	uv run bench/compare.py
 
@@ -116,7 +116,7 @@ help:
 	@echo ""
 	@echo "  Benchmark:"
 	@echo "    make bench          - Run micro-benchmarks (cargo bench)"
-	@echo "    make bench-compare  - Compare walsync vs litestream (memory/CPU)"
+	@echo "    make bench-compare  - Compare walrust vs litestream (memory/CPU)"
 	@echo "    make bench-realworld - Real-world benchmarks (sync latency, restore, multi-DB)"
 	@echo ""
 	@echo "  Code Quality:"

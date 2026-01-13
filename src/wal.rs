@@ -208,7 +208,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_header_empty_file() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
         tokio::fs::write(&path, &[]).await.unwrap();
 
         let result = read_header(&path).await.unwrap();
@@ -219,7 +219,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_header_too_small() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
         // Write less than 32 bytes
         tokio::fs::write(&path, &[0u8; 20]).await.unwrap();
 
@@ -231,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_header_invalid_magic() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
         // Write 32 bytes with invalid magic
         tokio::fs::write(&path, &[0u8; 32]).await.unwrap();
 
@@ -244,7 +244,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_header_valid_magic_big_endian() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
 
         // Create valid WAL header with magic 0x377F0682 (big-endian checksum)
         let mut header = [0u8; 32];
@@ -264,7 +264,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_header_valid_magic_little_endian() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
 
         // Create valid WAL header with magic 0x377F0683 (little-endian checksum)
         let mut header = [0u8; 32];
@@ -289,7 +289,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_wal_size_existing() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
         let data = vec![0u8; 1024];
         tokio::fs::write(&path, &data).await.unwrap();
 
@@ -308,7 +308,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_wal_existing() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
         let expected = vec![1u8, 2, 3, 4, 5];
         tokio::fs::write(&path, &expected).await.unwrap();
 
@@ -320,7 +320,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_frames_from_no_frames() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
 
         // Create valid WAL header only (no frames)
         let mut header = [0u8; 32];
@@ -339,7 +339,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_frames_from_with_frames() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
 
         let page_size: u32 = 4096;
         let frame_size = FRAME_HEADER_SIZE as usize + page_size as usize;
@@ -366,7 +366,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_frames_from_with_offset() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
 
         let page_size: u32 = 4096;
         let frame_size = FRAME_HEADER_SIZE as usize + page_size as usize;
@@ -391,7 +391,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_frames_partial_frame_ignored() {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
 
         let page_size: u32 = 4096;
         let frame_size = FRAME_HEADER_SIZE as usize + page_size as usize;

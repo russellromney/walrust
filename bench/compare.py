@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-Benchmark: walsync vs litestream
+Benchmark: walrust vs litestream
 
 Compares memory usage and CPU for single and multiple databases.
 
 Requirements:
-- walsync binary (cargo build --release)
+- walrust binary (cargo build --release)
 - litestream binary (brew install litestream or download)
 - psutil (pip install psutil)
 
 Usage:
     python bench/compare.py                     # Run all benchmarks
     python bench/compare.py --dbs 1,5,10       # Specific database counts
-    python bench/compare.py --walsync-only     # Only benchmark walsync
+    python bench/compare.py --walrust-only     # Only benchmark walrust
     python bench/compare.py --litestream-only  # Only benchmark litestream
     python bench/compare.py --duration 10      # Measure for 10 seconds
     python bench/compare.py --db-size 1000     # 1MB test databases
@@ -102,20 +102,20 @@ def measure_process_stats(pids: list[int], duration_secs: float = 5.0) -> tuple[
     return peak_memory, avg_memory, avg_cpu
 
 
-def benchmark_walsync(
+def benchmark_walrust(
     databases: list[Path],
     bucket: str,
     endpoint: Optional[str] = None,
     duration: float = 5.0,
 ) -> BenchmarkResult:
-    """Benchmark walsync with multiple databases (single process)."""
-    walsync_bin = Path(__file__).parent.parent / "target" / "release" / "walsync"
+    """Benchmark walrust with multiple databases (single process)."""
+    walrust_bin = Path(__file__).parent.parent / "target" / "release" / "walrust"
 
-    if not walsync_bin.exists():
-        print("Building walsync...")
-        subprocess.run(["cargo", "build", "--release"], cwd=walsync_bin.parent.parent, check=True)
+    if not walrust_bin.exists():
+        print("Building walrust...")
+        subprocess.run(["cargo", "build", "--release"], cwd=walrust_bin.parent.parent, check=True)
 
-    cmd = [str(walsync_bin), "watch"] + [str(db) for db in databases] + ["-b", bucket]
+    cmd = [str(walrust_bin), "watch"] + [str(db) for db in databases] + ["-b", bucket]
     if endpoint:
         cmd += ["--endpoint", endpoint]
 
@@ -132,9 +132,9 @@ def benchmark_walsync(
     # Check if process is still running
     if proc.poll() is not None:
         _, stderr = proc.communicate()
-        print(f"    Warning: walsync exited early: {stderr.decode()[:200]}")
+        print(f"    Warning: walrust exited early: {stderr.decode()[:200]}")
         return BenchmarkResult(
-            name="walsync",
+            name="walrust",
             num_databases=len(databases),
             num_processes=1,
             peak_memory_mb=0,
@@ -150,7 +150,7 @@ def benchmark_walsync(
     proc.wait()
 
     return BenchmarkResult(
-        name="walsync",
+        name="walrust",
         num_databases=len(databases),
         num_processes=1,
         peak_memory_mb=peak_mem,
@@ -231,7 +231,7 @@ def run_comparison(
     endpoint: Optional[str] = None,
     db_size_kb: int = 100,
     duration: float = 5.0,
-    walsync_only: bool = False,
+    walrust_only: bool = False,
     litestream_only: bool = False,
     quiet: bool = False,
 ) -> list[dict]:
@@ -257,15 +257,15 @@ def run_comparison(
 
             result = {"num_databases": count}
 
-            # Benchmark walsync
+            # Benchmark walrust
             if not litestream_only:
                 if not quiet:
-                    print("Benchmarking walsync...")
-                walsync_result = benchmark_walsync(databases, bucket, endpoint, duration)
-                result["walsync"] = asdict(walsync_result)
+                    print("Benchmarking walrust...")
+                walrust_result = benchmark_walrust(databases, bucket, endpoint, duration)
+                result["walrust"] = asdict(walrust_result)
 
             # Benchmark litestream
-            if not walsync_only:
+            if not walrust_only:
                 if not quiet:
                     print("Benchmarking litestream...")
                 litestream_result = benchmark_litestream(databases, bucket, duration)
@@ -274,13 +274,13 @@ def run_comparison(
             results.append(result)
 
             # Print comparison
-            if not quiet and not litestream_only and not walsync_only:
+            if not quiet and not litestream_only and not walrust_only:
                 print(f"\nResults for {count} database(s):")
-                print(f"  {'':20} {'walsync':>12} {'litestream':>12} {'savings':>12}")
-                print(f"  {'Processes':20} {walsync_result.num_processes:>12} {litestream_result.num_processes:>12}")
-                print(f"  {'Peak Memory (MB)':20} {walsync_result.peak_memory_mb:>12.1f} {litestream_result.peak_memory_mb:>12.1f} {litestream_result.peak_memory_mb - walsync_result.peak_memory_mb:>12.1f}")
-                print(f"  {'Avg Memory (MB)':20} {walsync_result.avg_memory_mb:>12.1f} {litestream_result.avg_memory_mb:>12.1f} {litestream_result.avg_memory_mb - walsync_result.avg_memory_mb:>12.1f}")
-                print(f"  {'CPU %':20} {walsync_result.cpu_percent:>12.1f} {litestream_result.cpu_percent:>12.1f}")
+                print(f"  {'':20} {'walrust':>12} {'litestream':>12} {'savings':>12}")
+                print(f"  {'Processes':20} {walrust_result.num_processes:>12} {litestream_result.num_processes:>12}")
+                print(f"  {'Peak Memory (MB)':20} {walrust_result.peak_memory_mb:>12.1f} {litestream_result.peak_memory_mb:>12.1f} {litestream_result.peak_memory_mb - walrust_result.peak_memory_mb:>12.1f}")
+                print(f"  {'Avg Memory (MB)':20} {walrust_result.avg_memory_mb:>12.1f} {litestream_result.avg_memory_mb:>12.1f} {litestream_result.avg_memory_mb - walrust_result.avg_memory_mb:>12.1f}")
+                print(f"  {'CPU %':20} {walrust_result.cpu_percent:>12.1f} {litestream_result.cpu_percent:>12.1f}")
 
     return results
 
@@ -309,18 +309,18 @@ def cleanup_s3_prefix(bucket: str, prefix: str, endpoint: Optional[str] = None) 
 
 def print_summary(results: list[dict]) -> None:
     """Print a summary table of all results."""
-    if not results or "walsync" not in results[0] or "litestream" not in results[0]:
+    if not results or "walrust" not in results[0] or "litestream" not in results[0]:
         return
 
     print("\n" + "=" * 80)
-    print("SUMMARY: walsync vs litestream")
+    print("SUMMARY: walrust vs litestream")
     print("=" * 80)
-    print(f"\n{'DBs':>4} | {'walsync':^30} | {'litestream':^30} | {'Memory Saved':>12}")
+    print(f"\n{'DBs':>4} | {'walrust':^30} | {'litestream':^30} | {'Memory Saved':>12}")
     print(f"{'':>4} | {'Procs':>6} {'Peak MB':>10} {'Avg MB':>10} | {'Procs':>6} {'Peak MB':>10} {'Avg MB':>10} |")
     print("-" * 80)
 
     for r in results:
-        w = r["walsync"]
+        w = r["walrust"]
         l = r["litestream"]
         savings = l["avg_memory_mb"] - w["avg_memory_mb"]
         print(f"{r['num_databases']:>4} | {w['num_processes']:>6} {w['peak_memory_mb']:>10.1f} {w['avg_memory_mb']:>10.1f} | {l['num_processes']:>6} {l['peak_memory_mb']:>10.1f} {l['avg_memory_mb']:>10.1f} | {savings:>10.1f} MB")
@@ -330,13 +330,13 @@ def print_summary(results: list[dict]) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark walsync vs litestream",
+        description="Benchmark walrust vs litestream",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   %(prog)s                          # Run full comparison with 1,5,10,20 databases
   %(prog)s --dbs 1,5               # Only test with 1 and 5 databases
-  %(prog)s --walsync-only          # Only benchmark walsync
+  %(prog)s --walrust-only          # Only benchmark walrust
   %(prog)s --duration 10           # Measure for 10 seconds per test
   %(prog)s --db-size 1000          # Use 1MB test databases
   %(prog)s --json                  # Output results as JSON
@@ -349,9 +349,9 @@ Examples:
         help="Comma-separated list of database counts to test (default: 1,5,10,20)",
     )
     parser.add_argument(
-        "--walsync-only",
+        "--walrust-only",
         action="store_true",
-        help="Only benchmark walsync",
+        help="Only benchmark walrust",
     )
     parser.add_argument(
         "--litestream-only",
@@ -373,8 +373,8 @@ Examples:
     parser.add_argument(
         "--bucket",
         type=str,
-        default=os.environ.get("WALSYNC_TEST_BUCKET", "s3://walsync-bench"),
-        help="S3 bucket for testing (default: $WALSYNC_TEST_BUCKET or s3://walsync-bench)",
+        default=os.environ.get("WALSYNC_TEST_BUCKET", "s3://walrust-bench"),
+        help="S3 bucket for testing (default: $WALSYNC_TEST_BUCKET or s3://walrust-bench)",
     )
     parser.add_argument(
         "--endpoint",
@@ -394,7 +394,7 @@ Examples:
     db_counts = [int(x.strip()) for x in args.dbs.split(",")]
 
     if not args.json:
-        print("Walsync vs Litestream Benchmark")
+        print("Walrust vs Litestream Benchmark")
         print(f"Bucket: {args.bucket}")
         print(f"Endpoint: {args.endpoint or 'default'}")
         print(f"Database counts: {db_counts}")
@@ -408,7 +408,7 @@ Examples:
         endpoint=args.endpoint,
         db_size_kb=args.db_size,
         duration=args.duration,
-        walsync_only=args.walsync_only,
+        walrust_only=args.walrust_only,
         litestream_only=args.litestream_only,
         quiet=args.json,
     )

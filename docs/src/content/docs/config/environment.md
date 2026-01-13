@@ -1,9 +1,9 @@
 ---
 title: Environment Variables
-description: Configure walsync with environment variables
+description: Configure walrust with environment variables
 ---
 
-Walsync reads configuration from environment variables and CLI options.
+Walrust reads configuration from environment variables and CLI options.
 
 ## Required Variables
 
@@ -18,7 +18,7 @@ Walsync reads configuration from environment variables and CLI options.
 |----------|-------------|---------|
 | `AWS_ENDPOINT_URL_S3` | Custom S3 endpoint for Tigris, R2, MinIO, etc. | AWS S3 |
 | `AWS_REGION` | AWS region | `auto` |
-| `RUST_LOG` | Log level and filtering | `walsync=info` |
+| `RUST_LOG` | Log level and filtering | `walrust=info` |
 
 ## Setting Variables
 
@@ -77,8 +77,8 @@ CLI options override environment variables:
 ```bash
 # Uses environment variable
 export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
-walsync list --bucket my-bucket
+walrust list --bucket my-bucket
 
 # CLI option overrides environment
-walsync list --bucket my-bucket --endpoint http://localhost:9000
+walrust list --bucket my-bucket --endpoint http://localhost:9000
 ```

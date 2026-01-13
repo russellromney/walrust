@@ -1,4 +1,4 @@
-# Walsync Benchmark Results
+# Walrust Benchmark Results
 
 Run date: 2026-01-13
 
@@ -56,8 +56,8 @@ Run date: 2026-01-13
 | Avg commit latency | 0.04 ms |
 
 **Key findings:**
-- Walsync imposes virtually no overhead on SQLite commit performance
-- Can sustain >25,000 commits/sec with walsync watching
+- Walrust imposes virtually no overhead on SQLite commit performance
+- Can sustain >25,000 commits/sec with walrust watching
 
 ### Checkpoint Impact
 
@@ -82,7 +82,7 @@ Run date: 2026-01-13
 
 **Key findings:**
 - All writes made during outage are preserved in WAL
-- Walsync syncs pending WAL immediately on restart
+- Walrust syncs pending WAL immediately on restart
 - No data loss during network interruptions
 
 ## Micro-Benchmarks (CPU)
@@ -106,7 +106,7 @@ From `cargo bench`:
 
 ### Memory Usage (Measured)
 
-| DBs | Litestream | Walsync | Savings |
+| DBs | Litestream | Walrust | Savings |
 |-----|-----------|---------|---------|
 | 1   | 33 MB     | 12 MB   | **21 MB** |
 | 5   | 152 MB    | 14 MB   | **138 MB** |
@@ -115,16 +115,16 @@ From `cargo bench`:
 
 *Measured on macOS with 100KB test databases, 5 second measurement window, valid S3 credentials*
 
-**Key observation:** Walsync memory stays constant (~12 MB) regardless of database count. Litestream scales linearly (~30 MB per process).
+**Key observation:** Walrust memory stays constant (~12 MB) regardless of database count. Litestream scales linearly (~30 MB per process).
 
 ### Process Model
 
 - **Litestream**: 1 process per database
-- **Walsync**: 1 process for N databases
+- **Walrust**: 1 process for N databases
 
 ### When to Use Each
 
-**Use Walsync when:**
+**Use Walrust when:**
 - Multiple databases (5+)
 - Resource-constrained environments
 - Memory is a concern

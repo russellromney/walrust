@@ -1,9 +1,9 @@
 ---
 title: Logging
-description: Configure walsync logging and log levels
+description: Configure walrust logging and log levels
 ---
 
-Walsync uses the standard Rust `RUST_LOG` environment variable for log configuration.
+Walrust uses the standard Rust `RUST_LOG` environment variable for log configuration.
 
 ## Log Levels
 
@@ -19,16 +19,16 @@ Walsync uses the standard Rust `RUST_LOG` environment variable for log configura
 
 ```bash
 # Default: info level
-export RUST_LOG=walsync=info
+export RUST_LOG=walrust=info
 
 # Debug logging
-export RUST_LOG=walsync=debug
+export RUST_LOG=walrust=debug
 
 # Trace logging (very verbose)
-export RUST_LOG=walsync=trace
+export RUST_LOG=walrust=trace
 
 # Errors only
-export RUST_LOG=walsync=error
+export RUST_LOG=walrust=error
 ```
 
 ## Advanced Filtering
@@ -36,11 +36,11 @@ export RUST_LOG=walsync=error
 Include AWS SDK logs for debugging S3 issues:
 
 ```bash
-# Debug walsync + AWS config
-export RUST_LOG=walsync=debug,aws_config=debug
+# Debug walrust + AWS config
+export RUST_LOG=walrust=debug,aws_config=debug
 
 # Debug all AWS SDK components
-export RUST_LOG=walsync=debug,aws_sdk_s3=debug,aws_config=debug
+export RUST_LOG=walrust=debug,aws_sdk_s3=debug,aws_config=debug
 
 # Trace everything (very verbose)
 export RUST_LOG=trace
@@ -51,21 +51,21 @@ export RUST_LOG=trace
 ### Info Level (Default)
 
 ```
-2024-01-15T10:30:00Z INFO walsync: Watching 3 database(s)
-2024-01-15T10:30:05Z INFO walsync: app.db: WAL sync (4 frames, 16KB)
-2024-01-15T11:30:00Z INFO walsync: app.db: Scheduled snapshot complete
+2024-01-15T10:30:00Z INFO walrust: Watching 3 database(s)
+2024-01-15T10:30:05Z INFO walrust: app.db: WAL sync (4 frames, 16KB)
+2024-01-15T11:30:00Z INFO walrust: app.db: Scheduled snapshot complete
 ```
 
 ### Debug Level
 
 ```
-2024-01-15T10:30:00Z INFO walsync: Watching 3 database(s)
-2024-01-15T10:30:00Z DEBUG walsync: Connecting to S3 endpoint: https://fly.storage.tigris.dev
-2024-01-15T10:30:01Z DEBUG walsync: S3 connection established
-2024-01-15T10:30:05Z DEBUG walsync: app.db: Detected WAL change, reading frames
-2024-01-15T10:30:05Z DEBUG walsync: app.db: Read 4 frames (16384 bytes)
-2024-01-15T10:30:05Z DEBUG walsync: app.db: Computing SHA256 checksum
-2024-01-15T10:30:05Z INFO walsync: app.db: WAL sync (4 frames, 16KB)
+2024-01-15T10:30:00Z INFO walrust: Watching 3 database(s)
+2024-01-15T10:30:00Z DEBUG walrust: Connecting to S3 endpoint: https://fly.storage.tigris.dev
+2024-01-15T10:30:01Z DEBUG walrust: S3 connection established
+2024-01-15T10:30:05Z DEBUG walrust: app.db: Detected WAL change, reading frames
+2024-01-15T10:30:05Z DEBUG walrust: app.db: Read 4 frames (16384 bytes)
+2024-01-15T10:30:05Z DEBUG walrust: app.db: Computing SHA256 checksum
+2024-01-15T10:30:05Z INFO walrust: app.db: WAL sync (4 frames, 16KB)
 ```
 
 ## Production Logging
@@ -74,39 +74,39 @@ export RUST_LOG=trace
 
 ```ini
 [Service]
-Environment=RUST_LOG=walsync=info
+Environment=RUST_LOG=walrust=info
 ```
 
 View logs:
 ```bash
-sudo journalctl -u walsync -f
+sudo journalctl -u walrust -f
 ```
 
 ### Docker
 
 ```yaml
 environment:
-  RUST_LOG: walsync=info
+  RUST_LOG: walrust=info
 ```
 
 View logs:
 ```bash
-docker logs -f walsync
+docker logs -f walrust
 ```
 
 ## Troubleshooting with Logs
 
 **S3 connection issues:**
 ```bash
-RUST_LOG=walsync=debug,aws_config=debug walsync list --bucket my-bucket
+RUST_LOG=walrust=debug,aws_config=debug walrust list --bucket my-bucket
 ```
 
 **Permission errors:**
 ```bash
-RUST_LOG=walsync=debug,aws_sdk_s3=debug walsync snapshot mydb.db --bucket my-bucket
+RUST_LOG=walrust=debug,aws_sdk_s3=debug walrust snapshot mydb.db --bucket my-bucket
 ```
 
 **WAL sync issues:**
 ```bash
-RUST_LOG=walsync=trace walsync watch mydb.db --bucket my-bucket
+RUST_LOG=walrust=trace walrust watch mydb.db --bucket my-bucket
 ```

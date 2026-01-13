@@ -1,6 +1,6 @@
-//! Configuration file support for walsync.
+//! Configuration file support for walrust.
 //!
-//! Loads walsync.toml from current directory with CLI override support.
+//! Loads walrust.toml from current directory with CLI override support.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -169,7 +169,7 @@ impl Config {
     /// Load config from file, or return None if not found.
     ///
     /// If `path` is Some, load from that path.
-    /// If `path` is None, check for ./walsync.toml in current directory.
+    /// If `path` is None, check for ./walrust.toml in current directory.
     /// Returns Ok(None) if no config file exists (backward compat).
     pub fn load(path: Option<&Path>) -> Result<Option<Self>> {
         let config_path = match path {
@@ -181,8 +181,8 @@ impl Config {
                 p.to_path_buf()
             }
             None => {
-                // Check for ./walsync.toml in current directory
-                let default_path = PathBuf::from("./walsync.toml");
+                // Check for ./walrust.toml in current directory
+                let default_path = PathBuf::from("./walrust.toml");
                 if !default_path.exists() {
                     return Ok(None);
                 }

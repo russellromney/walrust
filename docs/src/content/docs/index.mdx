@@ -1,35 +1,42 @@
 ---
 title: Quick Start
-description: Get started with walsync in 5 minutes
+description: Get started with walrust in 5 minutes
 ---
 
 Lightweight SQLite WAL sync to S3 in Rust.
 
-## Why Walsync?
+## Why Walrust?
 
-Walsync is built for **control**, **efficiency**, and **Rust-native integration**.
+Walrust is built for **curiosity**, **control**, **efficiency**, and **Rust-native integration**.
+
+### Curiosity
+
+I built walrust because I was interested in it, and because I was doing silly things with millions of databases on a single server. Think a SaaS platform where every customer gets their own SQLite database - I needed the lowest memory overhead possible and the fastest sync possible (see [redlite](https://github.com/russellromney/redlite)).
 
 ### Control
 
-You own the code. No black box, no surprises. If you need a custom feature or fix, you can implement it. Walsync is designed to be hackable and transparent.
+I wanted something I could configure and add features to as needed. When you own the code, you can tweak behavior, add features specific to your use case, and understand exactly what's happening under the hood.
+
+### Hubris
+
+I enjoy building my own tools.
 
 ### Memory Efficiency
 
-Walsync's Rust implementation has a smaller memory footprint:
+Walrust's Rust implementation has a smaller memory footprint:
 
 **Measured overhead:**
-- **walsync:** ~12 MB baseline
+- **walrust:** ~12 MB baseline
 - **Litestream:** ~33 MB baseline
 
 For resource-constrained environments (small VMs, containers, edge deployments), this difference matters.
 
 ### Rust-Native
 
-Walsync integrates naturally into Rust projects:
+Walrust integrates naturally into Rust projects:
 - Native async/await with tokio
 - No CGO dependencies
 - Smaller binary size (~8 MB)
-- LTX format compatible with Litestream
 
 ---
 
@@ -38,19 +45,19 @@ Walsync integrates naturally into Rust projects:
 ### CLI (Rust)
 
 ```bash
-cargo install walsync
+cargo install walrust
 ```
 
 ### Python
 
 ```bash
-pip install walsync
+pip install walrust
 ```
 
 ### Verify
 
 ```bash
-walsync --version
+walrust --version
 ```
 
 ## Set Up Credentials
@@ -70,7 +77,7 @@ See [S3 Providers](/config/s3-providers/) for AWS, R2, MinIO, and other provider
 Back up your database to S3:
 
 ```bash
-walsync snapshot myapp.db --bucket my-backups
+walrust snapshot myapp.db --bucket my-backups
 ```
 
 Output:
@@ -85,7 +92,7 @@ Snapshotting myapp.db to s3://my-backups/myapp.db/...
 Continuously sync WAL changes:
 
 ```bash
-walsync watch myapp.db --bucket my-backups
+walrust watch myapp.db --bucket my-backups
 ```
 
 This watches for database changes and syncs them to S3. Run this as a background service in production.
@@ -95,7 +102,7 @@ This watches for database changes and syncs them to S3. Run this as a background
 Restore a database from backup:
 
 ```bash
-walsync restore myapp.db --bucket my-backups -o restored.db
+walrust restore myapp.db --bucket my-backups -o restored.db
 ```
 
 Output:
@@ -111,7 +118,7 @@ Restoring myapp.db from s3://my-backups/...
 Sync multiple databases with a single process:
 
 ```bash
-walsync watch app.db users.db analytics.db --bucket my-backups
+walrust watch app.db users.db analytics.db --bucket my-backups
 ```
 
 ## Create a Read Replica
@@ -119,7 +126,7 @@ walsync watch app.db users.db analytics.db --bucket my-backups
 Run a local read replica that polls S3 for changes:
 
 ```bash
-walsync replicate s3://my-backups/myapp.db --local replica.db --interval 5s
+walrust replicate s3://my-backups/myapp.db --local replica.db --interval 5s
 ```
 
 Output:
@@ -136,7 +143,7 @@ The replica auto-bootstraps from the latest snapshot if it doesn't exist, then a
 
 ## Next Steps
 
-- [Why Not Litestream?](/start/why-not-litestream/) - Detailed comparison
+- [Why Walrust?](/start/why-walrust/) - Multi-tenant SQLite use case
 - [CLI Reference](/guide/cli/) - Full command documentation (including `replicate`)
 - [Configuration](/config/environment/) - Environment variables and options
 - [Deployment](/config/deployment/) - systemd, Docker, Kubernetes guides

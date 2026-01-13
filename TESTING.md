@@ -1,8 +1,8 @@
-# Walsync Testing Guide
+# Walrust Testing Guide
 
 ## Overview
 
-Walsync has a comprehensive test suite covering unit tests, integration tests, and WAL file format validation. All tests require Rust and Cargo to run.
+Walrust has a comprehensive test suite covering unit tests, integration tests, and WAL file format validation. All tests require Rust and Cargo to run.
 
 ## Test Structure
 
@@ -43,7 +43,7 @@ Located in `src/s3.rs` and `src/sync.rs` - require Tigris credentials and test b
 ### Prerequisites
 1. **Rust** - [Install from rustup.rs](https://rustup.rs/)
 2. **Tigris Credentials** - Already configured in `ourfam/.env`
-3. **Test Bucket** - Already created at `walsync-test`
+3. **Test Bucket** - Already created at `walrust-test`
 
 ### Environment Variables
 
@@ -54,14 +54,14 @@ AWS_ACCESS_KEY_ID=tid_WAotOpFUJKEuxOtLKfWrwFLreutdY_xLvifqaIOUcHkxrbwDaP
 AWS_SECRET_ACCESS_KEY=tsec_KvsiU-34raykBGv0lmbGI_QqXomvj8+iTiav6mQhdkqHeKv+aIsfP2dxIDstwcPbmnVpo+
 AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
 AWS_REGION=auto
-WALSYNC_TEST_BUCKET=walsync-test
-RUST_LOG=walsync=debug
+WALRUST_TEST_BUCKET=walrust-test
+RUST_LOG=walrust=debug
 ```
 
 ## Running Tests
 
 ### Quick Start
-Run all tests from the walsync directory:
+Run all tests from the walrust directory:
 
 ```bash
 ./run_tests.sh
@@ -142,7 +142,7 @@ These are better tested in E2E scenarios or manual testing.
 
 ## Data Integrity Verification
 
-**Walsync guarantees exact database reconstruction** (like Litestream):
+**Walrust guarantees exact database reconstruction** (like Litestream):
 
 ### Integrity Checks
 - ✅ **Byte-for-byte verification** - Original and restored databases are identical
@@ -184,9 +184,9 @@ Tests included:
 
 ### Common Issues
 
-**"WALSYNC_TEST_BUCKET not set"**
+**"WALRUST_TEST_BUCKET not set"**
 - Ensure you're running via `./run_tests.sh`
-- Or manually set: `export WALSYNC_TEST_BUCKET=walsync-test`
+- Or manually set: `export WALRUST_TEST_BUCKET=walrust-test`
 
 **"Invalid credentials" or "Unauthorized"**
 - Verify Tigris credentials in `ourfam/.env`
@@ -229,7 +229,7 @@ fn test_new_feature() {
 #[tokio::test]
 #[ignore]  // Mark as integration test
 async fn test_integration_new_feature() {
-    let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+    let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
     let endpoint = get_test_endpoint();
 
     let result = some_async_function(&bucket, endpoint.as_deref()).await;
@@ -249,15 +249,15 @@ async fn test_integration_new_feature() {
 To run tests in CI, add to your workflow:
 
 ```yaml
-- name: Run walsync tests
+- name: Run walrust tests
   env:
     AWS_ACCESS_KEY_ID: ${{ secrets.TIGRIS_ACCESS_KEY }}
     AWS_SECRET_ACCESS_KEY: ${{ secrets.TIGRIS_SECRET_KEY }}
     AWS_ENDPOINT_URL_S3: https://fly.storage.tigris.dev
     AWS_REGION: auto
-    WALSYNC_TEST_BUCKET: walsync-test
+    WALRUST_TEST_BUCKET: walrust-test
   run: |
-    cd walsync
+    cd walrust
     cargo test --lib -- --include-ignored
 ```
 
@@ -269,16 +269,16 @@ For testing the `watch()` function in practice:
 # Create a test database
 sqlite3 /tmp/test.db "CREATE TABLE test (id INTEGER PRIMARY KEY);"
 
-# Run walsync watch
-./target/release/walsync watch /tmp/test.db \
-  -b s3://walsync-test/manual-test \
+# Run walrust watch
+./target/release/walrust watch /tmp/test.db \
+  -b s3://walrust-test/manual-test \
   --endpoint https://fly.storage.tigris.dev
 
 # In another terminal, modify the database
 sqlite3 /tmp/test.db "INSERT INTO test VALUES (1);"
 
 # Verify uploads to S3
-aws s3 ls s3://walsync-test/manual-test/ --recursive
+aws s3 ls s3://walrust-test/manual-test/ --recursive
 ```
 
 ## Cleanup
@@ -287,10 +287,10 @@ Test artifacts are automatically cleaned up by tests. To manually clean up:
 
 ```bash
 # Remove test database files
-rm -f /tmp/walsync-test-*.db /tmp/restored-*.db
+rm -f /tmp/walrust-test-*.db /tmp/restored-*.db
 
 # Remove test objects from S3 (optional - they won't interfere)
-aws s3 rm s3://walsync-test/ --recursive --endpoint-url https://fly.storage.tigris.dev
+aws s3 rm s3://walrust-test/ --recursive --endpoint-url https://fly.storage.tigris.dev
 ```
 
 ## References

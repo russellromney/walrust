@@ -347,10 +347,10 @@ mod tests {
     }
 
     // Integration tests - run with: cargo test -- --ignored
-    // Requires: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3, WALSYNC_TEST_BUCKET
+    // Requires: AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_ENDPOINT_URL_S3, WALRUST_TEST_BUCKET
 
     fn get_test_bucket() -> Option<String> {
-        std::env::var("WALSYNC_TEST_BUCKET").ok()
+        std::env::var("WALRUST_TEST_BUCKET").ok()
     }
 
     fn get_test_endpoint() -> Option<String> {
@@ -360,13 +360,13 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_integration_upload_download_bytes() {
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
 
         let client = create_client(endpoint.as_deref()).await.unwrap();
 
-        let test_key = format!("walsync-test/{}.txt", uuid::Uuid::new_v4());
-        let test_data = b"Hello from walsync integration test!".to_vec();
+        let test_key = format!("walrust-test/{}.txt", uuid::Uuid::new_v4());
+        let test_data = b"Hello from walrust integration test!".to_vec();
 
         // Upload
         upload_bytes(&client, &bucket, &test_key, test_data.clone())
@@ -390,12 +390,12 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_integration_list_objects() {
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
 
         let client = create_client(endpoint.as_deref()).await.unwrap();
 
-        let prefix = format!("walsync-test-list/{}/", uuid::Uuid::new_v4());
+        let prefix = format!("walrust-test-list/{}/", uuid::Uuid::new_v4());
 
         // Upload a few test objects
         for i in 0..3 {
@@ -424,12 +424,12 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_integration_exists() {
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
 
         let client = create_client(endpoint.as_deref()).await.unwrap();
 
-        let test_key = format!("walsync-test/{}.txt", uuid::Uuid::new_v4());
+        let test_key = format!("walrust-test/{}.txt", uuid::Uuid::new_v4());
 
         // Should not exist
         let exists_before = exists(&client, &bucket, &test_key).await.unwrap();

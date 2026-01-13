@@ -3,7 +3,7 @@ requires = ["maturin>=1.4,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "walsync"
+name = "walrust"
 version = "0.3.0"
 description = "Lightweight SQLite WAL sync to S3/Tigris - Production-grade database backup with explicit data integrity verification"
 readme = "README.md"
@@ -31,10 +31,10 @@ classifiers = [
 keywords = ["sqlite", "wal", "s3", "backup", "sync", "tigris", "database"]
 
 [project.urls]
-Homepage = "https://github.com/russellromney/walsync"
-Repository = "https://github.com/russellromney/walsync"
-Documentation = "https://github.com/russellromney/walsync#readme"
-"Issue Tracker" = "https://github.com/russellromney/walsync/issues"
+Homepage = "https://github.com/russellromney/walrust"
+Repository = "https://github.com/russellromney/walrust"
+Documentation = "https://github.com/russellromney/walrust#readme"
+"Issue Tracker" = "https://github.com/russellromney/walrust/issues"
 
 [tool.maturin]
 features = ["python"]

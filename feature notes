@@ -1,0 +1,297 @@
+for walsync watch, we need to make it clear the differences between syncing pages (configurable interval, not clear how to do that right now) and snapshots (full upload of the datbase file at a given page). 
+
+like you should be able to either use the config or the CLI to do: 
+- watch this.db, that.db, and other.db and check every 1 second
+- snapshot each one every hour, and keep one snapshot per day for 30 days
+- clean up old snapshots every hour
+- send to this s3 bucket
+- use this config file
+
+what other thigns could we do here?
+Good question - let me think through a comprehensive CLI/config design for walsync watch.
+
+Core concepts to clarify:
+
+WAL sync - Incremental sync of WAL changes (fast, frequent)
+Snapshots - Full database upload (slower, less frequent)
+Retention - How long to keep old snapshots/WAL segments
+Cleanup - When to delete expired data
+Proposed config structure:
+
+
+# walsync.toml
+
+[storage]
+bucket = "s3://my-bucket/backups"
+endpoint = "https://fly.storage.tigris.dev"
+region = "auto"
+
+[sync]
+interval = "1s"              # How often to check for WAL changes
+batch_size = 100             # Max WAL frames per upload
+
+[snapshots]
+interval = "1h"              # How often to take snapshots
+on_startup = true            # Take snapshot when watch starts
+
+[retention]
+snapshots = "30d"            # Keep snapshots for 30 days
+wal = "7d"                   # Keep WAL segments for 7 days
+# Or more granular:
+# hourly = 24                # Keep 24 hourly snapshots
+# daily = 30                 # Keep 30 daily snapshots  
+# weekly = 12                # Keep 12 weekly snapshots
+
+[cleanup]
+interval = "1h"              # How often to run cleanup
+dry_run = false              # Preview deletions without executing
+
+[[databases]]
+path = "/data/this.db"
+prefix = "this"
+
+[[databases]]
+path = "/data/that.db"
+prefix = "that"
+
+[[databases]]
+path = "/data/other.db"
+prefix = "other"
+snapshot_interval = "30m"    # Override per-database
+CLI equivalent:
+
+
+walsync watch this.db that.db other.db \
+  --bucket s3://my-bucket \
+  --sync-interval 1s \
+  --snapshot-interval 1h \
+  --retention 30d \
+  --cleanup-interval 1h \
+  --config walsync.toml
+Other features to consider:
+
+Feature	Description
+Compression	--compress zstd - Compress snapshots/WAL before upload
+Bandwidth limit	--max-bandwidth 10MB/s - Throttle uploads
+Concurrent uploads	--max-concurrent 4 - Parallel upload limit
+Health endpoint	--health-port 8080 - HTTP health check for k8s/nomad
+Metrics	--metrics-port 9090 - Prometheus metrics endpoint
+Webhooks	--webhook-url https://... - Notify on snapshot/error
+Encryption	--encrypt-key $KEY - Client-side encryption
+Verify schedule	--verify-interval 24h - Periodic integrity checks
+Graceful shutdown	Handle SIGTERM, complete in-progress uploads
+Resume state	Track progress in local state file
+Snapshot trigger	SIGUSR1 triggers immediate snapshot
+Tiered retention example:
+
+
+[retention]
+# Grandfather-father-son backup rotation
+hourly_snapshots = 24    # Keep last 24 hours
+daily_snapshots = 7      # Keep last 7 days (1 per day)
+weekly_snapshots = 4     # Keep last 4 weeks (1 per week)
+monthly_snapshots = 12   # Keep last 12 months (1 per month)
+Status/monitoring commands:
+
+
+# Show current sync status
+walsync status --config walsync.toml
+
+# List all snapshots with retention info
+walsync list --bucket s3://my-bucket --show-retention
+
+# Preview what cleanup would delete
+walsync cleanup --bucket s3://my-bucket --dry-run
+
+# Force immediate snapshot
+walsync snapshot this.db --bucket s3://my-bucket
+
+# Verify all backups
+walsync verify --bucket s3://my-bucket
+Which of these would you want to prioritize? I can update the docs to reflect the planned CLI/config design.
+
+or every N changes or 10s, which ever comes first, or something
+Right - trigger-based sync is smarter than pure intervals. Options:
+
+Sync triggers (any of):
+
+
+[sync]
+# Trigger sync when ANY condition is met:
+max_changes = 100        # After N WAL frames
+max_interval = "10s"     # After N seconds
+max_bytes = "1MB"        # After N bytes accumulated
+on_checkpoint = true     # When SQLite checkpoints the WAL
+Snapshot triggers (any of):
+
+
+[snapshots]
+# Trigger snapshot when ANY condition is met:
+interval = "1h"          # Every hour
+on_wal_size = "100MB"    # When WAL exceeds size
+on_changes = 10000       # After N total changes
+on_idle = "5m"           # After 5 min of no writes
+on_startup = true        # When watch starts
+on_shutdown = true       # Graceful shutdown snapshot
+Combined example:
+
+
+[sync]
+max_changes = 100
+max_interval = "10s"
+# → Sync after 100 changes OR 10 seconds, whichever first
+
+[snapshots]
+interval = "1h"
+on_idle = "5m"
+# → Snapshot every hour OR after 5 min idle, whichever first
+CLI:
+
+
+walsync watch app.db \
+  --sync-changes 100 \
+  --sync-interval 10s \
+  --snapshot-interval 1h \
+  --snapshot-on-idle 5m
+Other trigger ideas:
+
+Trigger	Use case
+on_signal	SIGUSR1 forces immediate snapshot
+on_cron	Cron expression (0 * * * *)
+on_file	Touch a file to trigger
+on_http	POST to health endpoint triggers snapshot
+min_interval	Debounce - don't sync more often than X
+The "whichever comes first" pattern with max_changes + max_interval is probably the sweet spot for WAL sync. Want me to update the docs with this design?
+
+compression:
+we should let sqlite handle compression, right? or, for the less techncial user, perhaps it makes more sense to include it. same with encryption. but "encryption at rest" would require the db to also be encrypted. 
+
+bandwidth - great idea but who would use it? it would lead to queuing issues. i say we don't do it. just make the goddamn thing work as fasat as possible. 
+
+concurrent upload: same. why do this? the uploads will work. and if they fail we retry it (or not? hmmm)
+
+health endpoint: yes
+
+metrics: god tier idea. discuss
+
+webhooks: who would use this? why?
+
+verify schedule: discuss. i lean no
+
+graceful shutdown: we could do this. is it necessary? how does it currently work? 
+
+resume state: what is this? already leaning no haha. discuss
+
+snapshot trigger: why? 
+
+tiered retention - excellent idea. cloud storage is cheap af. data duplication worreis is just not that important. gives super easy point in time restore. need to have config so people don't do stupid stuff
+
+let'd discuss monitoring commands. why do this? 
+
+other stuff: 
+* page cleanup - if you're doing snapshots and don't need point in time restore, we should be able to clean up pages. 
+* multiple configs: a single config should only 
+* wildcard sync. 
+* how to handle overwrites? say the same db name already exists at the bucket. what do you do? how to prevent? 
+* snapshot/sync triggers: yes these are great. and we should do a trigger hierarchy command that shows the user when walsync will be triggered - time, pages, commits, wasize, idle, startup, etc. 
+* idk about triggers. 
+* debounce w/min_interval - this is a good idea. simplifies the mental model. same with max_interval (max you can wait to check is ...)
+
+overall i lean toward making this very simple. so a lot of the commands might not make it into alpha. 
+
+one thing i want is a little built in dashbaord that can target a :PORT/metrics to observe walsync as it runs.
+Great feedback. Let me address the key ones:
+
+Metrics + Dashboard - This is the killer feature. Built-in web UI at :PORT:
+
+
+┌─────────────────────────────────────────────────────────┐
+│  walsync dashboard                    ● Running  3 DBs  │
+├─────────────────────────────────────────────────────────┤
+│  Database      Last Sync    WAL Size   Next Snapshot    │
+│  ─────────────────────────────────────────────────────  │
+│  app.db        2s ago       1.2 MB     in 47m           │
+│  users.db      5s ago       340 KB     in 47m           │
+│  analytics.db  12s ago      4.8 MB     in 47m           │
+├─────────────────────────────────────────────────────────┤
+│  Total synced: 847 MB │ Snapshots: 12 │ Errors: 0       │
+└─────────────────────────────────────────────────────────┘
+Plus /metrics endpoint for Prometheus scraping.
+
+Overwrites - Three options:
+
+Error - Refuse if prefix exists, require --force or --continue
+Continue - Pick up from existing state (most useful)
+Namespace - Auto-suffix like app-20240115 (confusing)
+I lean toward continue by default with --fresh to start clean.
+
+Page cleanup - Yes. Two modes:
+
+
+[retention]
+mode = "snapshot"   # Delete WAL older than oldest snapshot (no PITR)
+# or
+mode = "pitr"       # Keep WAL for point-in-time restore window
+pitr_window = "7d"  # How far back you can restore
+Wildcard sync - Essential for multi-tenant:
+
+
+walsync watch "/data/tenants/*.db" --bucket s3://backups
+Trigger hierarchy command - Love it:
+
+
+$ walsync explain --config walsync.toml
+
+Sync triggers (whichever first):
+  • 100 changes
+  • 10s elapsed
+  
+Snapshot triggers (whichever first):
+  • Every 1h
+  • 5m idle
+  
+Current state:
+  • app.db: 34 changes, 6s since sync → sync in 4s
+  • users.db: 2 changes, 8s since sync → sync in 2s
+Graceful shutdown - Currently just dies. Should:
+
+Complete in-progress uploads (with 5s timeout)
+Optionally take final snapshot (--snapshot-on-shutdown)
+Write state file for resume (or not - keep it simple)
+Simple alpha scope:
+
+
+✓ watch / snapshot / restore / list
+✓ Multi-database
+✓ SHA256 verification
+✓ Tiered retention
+✓ min_interval / max_interval triggers
+✓ Dashboard at :PORT
+✓ Wildcard paths
+✓ --continue / --fresh for overwrites
+
+✗ Compression (use SQLite)
+✗ Encryption (use SQLite)  
+✗ Bandwidth limits
+✗ Webhooks
+✗ Verify schedule
+Want me to update the docs with this refined scope?
+
+metrics/dashboard: 
+we should track for each db since the beginning, using simple aggregation in memory that updates a super simple stats file every once in a while. or use a sled db. or its own sqlite file (it knows not to sync it, unless configured? hmmm)
+
+overwriting - go read https://litestream.io/how-it-works/. it usees random ids. how does that work? how does it know what the id is? it seem odd. 
+
+page cleanup - see https://litestream.io/how-it-works/#snapshots--generations, litestream automatically does this. we want stronger support for point in time restore though. so def have defaults, but also make it easily configurable. 
+
+wildcard sync - yes. litestream does this now, you can sync multiple databases. lol. so our main benefit now is just, lower memory footprint. maybe faster. 
+
+trigger hierarchy command: yes, explain is a good command
+
+graceful sghutdown. no. anything that fails can be restored again on startup. steelman why i'm wrong
+
+more things: 
+- we should do read replicas, it's a good idea. not raft consensus, just read replicas. litestream-vfs does this. it basically polls s3 for changs. we could do this optionally through http to the original walsync process. or do webhooks. let's dicuss
+- compaction: keep point in time, but at grandfather/father/son intrevals. so you don't have to keep as many snapshots. 
+- the shadow wal - this appears to be something
+- checkpointing - litestream avoids interrupting checkpointing by keeping a read-only connection open on wal. then nobody can checkpoint. checkpointing stops writes, which we don't want to do. https://litestream.io/how-it-works/ see shadow wal here. should we do something like this? i don't want to build a worse litestream, though i'm okay with a less-full-featrued litestresam

@@ -36,19 +36,16 @@ starlight-toc {
   background: var(--sl-color-bg-sidebar);
 }
 
-/* Fix content width and padding for proper text wrapping */
-.main-frame {
-  padding-inline: 1rem;
+/* Navbar border for better separation in light mode */
+header.header {
+  border-bottom: 1px solid var(--sl-color-hairline);
 }
 
-@media (min-width: 50rem) {
-  .main-frame {
-    padding-inline: 2rem;
-  }
+/* Code block styling to match warm theme */
+:root[data-theme='light'] .expressive-code {
+  --ec-frm-frameBoxShdCssVal: 0 1px 3px rgba(0, 0, 0, 0.08);
 }
 
-/* Ensure main content has proper max-width */
-.sl-container {
-  max-width: 82rem;
-  margin-inline: auto;
+:root[data-theme='light'] .expressive-code .frame {
+  border: 1px solid var(--sl-color-hairline);
 }

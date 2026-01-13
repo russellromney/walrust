@@ -58,7 +58,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: pypi
-      url: https://pypi.org/project/walsync/
+      url: https://pypi.org/project/walrust/
     permissions:
       id-token: write
     steps:

@@ -3,23 +3,26 @@ import { defineConfig } from 'astro/config';
 import starlight from '@astrojs/starlight';
 
 export default defineConfig({
-  site: 'https://walsync.dev',
+  site: 'https://walrust.dev',
   integrations: [
     starlight({
-      title: 'Walsync',
+      title: 'Walrust',
+      expressiveCode: {
+        themes: ['rose-pine', 'rose-pine-dawn'],
+      },
       logo: {
         src: './src/assets/logo.svg',
       },
       components: {
         ThemeSelect: './src/components/ThemeSelect.astro',
       },
-      social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/russellromney/walsync' }],
+      social: [{ icon: 'github', label: 'GitHub', href: 'https://github.com/russellromney/walrust' }],
       sidebar: [
         {
           label: 'Getting Started',
           items: [
             { label: 'Quick Start', link: '/' },
-            { label: 'Why Not Litestream?', link: '/start/why-not-litestream/' },
+            { label: 'Why Walrust?', link: '/start/why-walrust/' },
           ],
         },
         { label: 'Guides', autogenerate: { directory: 'guide' } },
@@ -32,7 +35,7 @@ export default defineConfig({
             { label: 'Deployment', link: '/config/deployment/' },
           ],
         },
-        { label: 'Concepts', autogenerate: { directory: 'concepts' } },
+        { label: 'How It Works', autogenerate: { directory: 'how-it-works' } },
       ],
       customCss: ['./src/styles/custom.css'],
     }),

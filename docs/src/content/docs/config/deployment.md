@@ -1,18 +1,18 @@
 ---
 title: Deployment
-description: Deploy walsync in production environments
+description: Deploy walrust in production environments
 ---
 
 Production deployment guides for different platforms.
 
 ## systemd (Linux)
 
-The recommended way to run walsync on Linux servers.
+The recommended way to run walrust on Linux servers.
 
 ```ini
-# /etc/systemd/system/walsync.service
+# /etc/systemd/system/walrust.service
 [Unit]
-Description=Walsync SQLite Backup
+Description=Walrust SQLite Backup
 After=network.target
 
 [Service]
@@ -25,10 +25,10 @@ WorkingDirectory=/var/lib/app
 Environment=AWS_ACCESS_KEY_ID=tid_xxxxx
 Environment=AWS_SECRET_ACCESS_KEY=tsec_xxxxx
 Environment=AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
-Environment=RUST_LOG=walsync=info
+Environment=RUST_LOG=walrust=info
 
 # Command
-ExecStart=/usr/local/bin/walsync watch \
+ExecStart=/usr/local/bin/walrust watch \
   /var/lib/app/data.db \
   --bucket my-backups \
   --snapshot-interval 1800
@@ -51,20 +51,20 @@ WantedBy=multi-user.target
 
 ```bash
 sudo systemctl daemon-reload
-sudo systemctl enable walsync
-sudo systemctl start walsync
+sudo systemctl enable walrust
+sudo systemctl start walrust
 ```
 
 **View logs:**
 
 ```bash
-sudo journalctl -u walsync -f
+sudo journalctl -u walrust -f
 ```
 
 **Check status:**
 
 ```bash
-sudo systemctl status walsync
+sudo systemctl status walrust
 ```
 
 ## Docker
@@ -74,13 +74,13 @@ sudo systemctl status walsync
 ```dockerfile
 FROM rust:1.75-slim as builder
 WORKDIR /app
-RUN cargo install walsync
+RUN cargo install walrust
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
-COPY --from=builder /usr/local/cargo/bin/walsync /usr/local/bin/
+COPY --from=builder /usr/local/cargo/bin/walrust /usr/local/bin/
 
-ENTRYPOINT ["walsync"]
+ENTRYPOINT ["walrust"]
 ```
 
 ### Docker Compose
@@ -93,14 +93,14 @@ services:
     volumes:
       - app-data:/data
 
-  walsync:
-    image: walsync
+  walrust:
+    image: walrust
     command: watch /data/app.db --bucket my-backups
     environment:
       AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
       AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
       AWS_ENDPOINT_URL_S3: https://fly.storage.tigris.dev
-      RUST_LOG: walsync=info
+      RUST_LOG: walrust=info
     volumes:
       - app-data:/data:ro
     depends_on:
@@ -115,7 +115,7 @@ volumes:
 
 ```bash
 docker-compose up -d
-docker-compose logs -f walsync
+docker-compose logs -f walrust
 ```
 
 ## Fly.io
@@ -127,7 +127,7 @@ app = "myapp"
 
 [env]
   AWS_ENDPOINT_URL_S3 = "https://fly.storage.tigris.dev"
-  RUST_LOG = "walsync=info"
+  RUST_LOG = "walrust=info"
 
 [[mounts]]
   source = "data"
@@ -135,7 +135,7 @@ app = "myapp"
 
 [processes]
   app = "myapp"
-  walsync = "walsync watch /data/app.db --bucket my-backups"
+  walrust = "walrust watch /data/app.db --bucket my-backups"
 ```
 
 ### Set secrets
@@ -145,10 +145,10 @@ fly secrets set AWS_ACCESS_KEY_ID=tid_xxxxx
 fly secrets set AWS_SECRET_ACCESS_KEY=tsec_xxxxx
 ```
 
-### Scale the walsync process
+### Scale the walrust process
 
 ```bash
-fly scale count walsync=1
+fly scale count walrust=1
 ```
 
 ## Kubernetes
@@ -159,20 +159,20 @@ fly scale count walsync=1
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: walsync
+  name: walrust
 spec:
   replicas: 1
   selector:
     matchLabels:
-      app: walsync
+      app: walrust
   template:
     metadata:
       labels:
-        app: walsync
+        app: walrust
     spec:
       containers:
-      - name: walsync
-        image: walsync:latest
+      - name: walrust
+        image: walrust:latest
         args:
           - watch
           - /data/app.db
@@ -182,17 +182,17 @@ spec:
         - name: AWS_ACCESS_KEY_ID
           valueFrom:
             secretKeyRef:
-              name: walsync-secrets
+              name: walrust-secrets
               key: aws-access-key-id
         - name: AWS_SECRET_ACCESS_KEY
           valueFrom:
             secretKeyRef:
-              name: walsync-secrets
+              name: walrust-secrets
               key: aws-secret-access-key
         - name: AWS_ENDPOINT_URL_S3
           value: https://fly.storage.tigris.dev
         - name: RUST_LOG
-          value: walsync=info
+          value: walrust=info
         volumeMounts:
         - name: data
           mountPath: /data
@@ -209,7 +209,7 @@ spec:
 apiVersion: v1
 kind: Secret
 metadata:
-  name: walsync-secrets
+  name: walrust-secrets
 type: Opaque
 stringData:
   aws-access-key-id: tid_xxxxx
@@ -219,14 +219,14 @@ stringData:
 ### Apply
 
 ```bash
-kubectl apply -f walsync-secret.yaml
-kubectl apply -f walsync-deployment.yaml
-kubectl logs -f deployment/walsync
+kubectl apply -f walrust-secret.yaml
+kubectl apply -f walrust-deployment.yaml
+kubectl logs -f deployment/walrust
 ```
 
 ## Sidecar Pattern
 
-Run walsync as a sidecar container alongside your application:
+Run walrust as a sidecar container alongside your application:
 
 ```yaml
 apiVersion: v1
@@ -241,19 +241,19 @@ spec:
     - name: data
       mountPath: /data
 
-  - name: walsync
-    image: walsync
+  - name: walrust
+    image: walrust
     args: ["watch", "/data/app.db", "--bucket", "my-backups"]
     env:
     - name: AWS_ACCESS_KEY_ID
       valueFrom:
         secretKeyRef:
-          name: walsync-secrets
+          name: walrust-secrets
           key: aws-access-key-id
     - name: AWS_SECRET_ACCESS_KEY
       valueFrom:
         secretKeyRef:
-          name: walsync-secrets
+          name: walrust-secrets
           key: aws-secret-access-key
     - name: AWS_ENDPOINT_URL_S3
       value: https://fly.storage.tigris.dev
@@ -269,12 +269,12 @@ spec:
 
 ## Health Checks
 
-Walsync exposes a Prometheus metrics endpoint at `http://127.0.0.1:16767/metrics` (configurable via `--metrics-port`, disable with `--no-metrics`).
+Walrust exposes a Prometheus metrics endpoint at `http://127.0.0.1:16767/metrics` (configurable via `--metrics-port`, disable with `--no-metrics`).
 
 **Monitoring options:**
 
 1. **Metrics endpoint:** Scrape `/metrics` for Prometheus metrics (localhost only)
-2. **Process status:** Check if the walsync process is running
+2. **Process status:** Check if the walrust process is running
 3. **S3 objects:** Check for recent WAL uploads
 4. **Logs:** Monitor for errors in logs
 
@@ -282,8 +282,8 @@ Example health check script:
 
 ```bash
 #!/bin/bash
-# Check if walsync process is running
-pgrep -x walsync > /dev/null || exit 1
+# Check if walrust process is running
+pgrep -x walrust > /dev/null || exit 1
 
 # Check for recent S3 activity (last 5 minutes)
 LAST_MODIFIED=$(aws s3 ls s3://my-backups/app.db/ \

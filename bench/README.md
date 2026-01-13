@@ -1,6 +1,6 @@
-# Walsync Benchmarks
+# Walrust Benchmarks
 
-Performance benchmarks for walsync covering micro-benchmarks, comparison with litestream, and real-world scenarios.
+Performance benchmarks for walrust covering micro-benchmarks, comparison with litestream, and real-world scenarios.
 
 ## Quick Start
 
@@ -8,7 +8,7 @@ Performance benchmarks for walsync covering micro-benchmarks, comparison with li
 # Micro-benchmarks (WAL parsing, SHA256)
 make bench
 
-# Compare walsync vs litestream (memory/CPU)
+# Compare walrust vs litestream (memory/CPU)
 make bench-compare
 
 # Real-world benchmarks (sync latency, restore performance)
@@ -29,9 +29,9 @@ Run with: `make bench` or `cargo bench`
 
 ### 2. Comparison Benchmarks (`compare.py`)
 
-Memory and CPU usage comparison between walsync and litestream:
+Memory and CPU usage comparison between walrust and litestream:
 
-| Scenario | Metric | Litestream | Walsync | Savings |
+| Scenario | Metric | Litestream | Walrust | Savings |
 |----------|--------|------------|---------|---------|
 | 1 DB | Memory | 33MB | 12MB | **21MB** |
 | 5 DBs | Memory | 152MB (5 processes) | 14MB | **138MB** |
@@ -46,8 +46,8 @@ python bench/compare.py
 # Specific database counts
 python bench/compare.py --dbs 1,5,10
 
-# Only walsync (skip litestream)
-python bench/compare.py --walsync-only
+# Only walrust (skip litestream)
+python bench/compare.py --walrust-only
 
 # Longer measurement (default: 5s)
 python bench/compare.py --duration 10
@@ -75,7 +75,7 @@ Time to restore databases of various sizes from S3.
 Measures: download time, restore time, throughput (MB/s).
 
 #### c) Multi-DB Throughput
-Concurrent writes to N databases, measuring walsync's ability to keep up.
+Concurrent writes to N databases, measuring walrust's ability to keep up.
 
 Measures: writes/sec sustained, sync lag, CPU%, memory.
 
@@ -85,7 +85,7 @@ Recovery time after simulated network outage.
 Measures: catchup time, writes lost (should be 0).
 
 #### e) Write Throughput
-Maximum sustainable commits per second with walsync watching.
+Maximum sustainable commits per second with walrust watching.
 
 Measures: max commits/sec, average latency.
 
@@ -123,7 +123,7 @@ python bench/realworld.py --json
 export AWS_ACCESS_KEY_ID=...
 export AWS_SECRET_ACCESS_KEY=...
 export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
-export WALSYNC_TEST_BUCKET=s3://walsync-bench
+export WALSYNC_TEST_BUCKET=s3://walrust-bench
 
 # Or use direnv/.envrc
 ```
@@ -144,7 +144,7 @@ Add to GitHub Actions:
     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
     AWS_ENDPOINT_URL_S3: ${{ secrets.AWS_ENDPOINT_URL_S3 }}
-    WALSYNC_TEST_BUCKET: s3://walsync-bench
+    WALSYNC_TEST_BUCKET: s3://walrust-bench
   run: python bench/realworld.py --json > bench-results.json
 
 - name: Upload benchmark results

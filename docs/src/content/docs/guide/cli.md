@@ -6,7 +6,7 @@ description: Complete CLI reference with options and examples
 ## Overview
 
 ```bash
-walsync <COMMAND>
+walrust <COMMAND>
 
 Commands:
   snapshot   Take an immediate snapshot
@@ -26,7 +26,7 @@ These options apply to all commands:
 
 | Option | Description |
 |--------|-------------|
-| `--config <PATH>` | Path to config file (default: `./walsync.toml` if exists) |
+| `--config <PATH>` | Path to config file (default: `./walrust.toml` if exists) |
 | `--version` | Print version |
 | `-h, --help` | Print help |
 
@@ -37,7 +37,7 @@ These options apply to all commands:
 Take a one-time snapshot of a database to S3.
 
 ```bash
-walsync snapshot [OPTIONS] --bucket <BUCKET> <DATABASE>
+walrust snapshot [OPTIONS] --bucket <BUCKET> <DATABASE>
 ```
 
 ### Arguments
@@ -58,16 +58,16 @@ walsync snapshot [OPTIONS] --bucket <BUCKET> <DATABASE>
 
 ```bash
 # Snapshot to AWS S3
-walsync snapshot myapp.db --bucket my-backups
+walrust snapshot myapp.db --bucket my-backups
 
 # Snapshot to Tigris
-walsync snapshot myapp.db \
+walrust snapshot myapp.db \
   --bucket my-backups \
   --endpoint https://fly.storage.tigris.dev
 
 # Using environment variable for endpoint
 export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
-walsync snapshot myapp.db --bucket my-backups
+walrust snapshot myapp.db --bucket my-backups
 ```
 
 ### Output
@@ -85,7 +85,7 @@ Snapshotting myapp.db to s3://my-backups/myapp.db/...
 Continuously watch one or more databases and sync WAL changes to S3.
 
 ```bash
-walsync watch [OPTIONS] --bucket <BUCKET> <DATABASES>...
+walrust watch [OPTIONS] --bucket <BUCKET> <DATABASES>...
 ```
 
 ### Arguments
@@ -119,28 +119,28 @@ walsync watch [OPTIONS] --bucket <BUCKET> <DATABASES>...
 
 ```bash
 # Watch a single database
-walsync watch myapp.db --bucket my-backups
+walrust watch myapp.db --bucket my-backups
 
 # Watch multiple databases (single process!)
-walsync watch app.db users.db analytics.db --bucket my-backups
+walrust watch app.db users.db analytics.db --bucket my-backups
 
 # Custom snapshot interval (every 30 minutes)
-walsync watch myapp.db \
+walrust watch myapp.db \
   --bucket my-backups \
   --snapshot-interval 1800
 
 # Watch with Tigris endpoint
-walsync watch myapp.db \
+walrust watch myapp.db \
   --bucket my-backups \
   --endpoint https://fly.storage.tigris.dev
 
 # Auto-compact after each snapshot
-walsync watch myapp.db \
+walrust watch myapp.db \
   --bucket my-backups \
   --compact-after-snapshot
 
 # Periodic compaction every hour
-walsync watch myapp.db \
+walrust watch myapp.db \
   --bucket my-backups \
   --compact-interval 3600 \
   --retain-hourly 48
@@ -161,12 +161,12 @@ Watching 3 database(s)...
 
 ### Running as a Service
 
-For production, run walsync as a systemd service:
+For production, run walrust as a systemd service:
 
 ```ini
-# /etc/systemd/system/walsync.service
+# /etc/systemd/system/walrust.service
 [Unit]
-Description=Walsync SQLite backup
+Description=Walrust SQLite backup
 After=network.target
 
 [Service]
@@ -175,7 +175,7 @@ User=app
 Environment=AWS_ACCESS_KEY_ID=your-key
 Environment=AWS_SECRET_ACCESS_KEY=your-secret
 Environment=AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
-ExecStart=/usr/local/bin/walsync watch \
+ExecStart=/usr/local/bin/walrust watch \
   /var/lib/app/data.db \
   --bucket my-backups
 Restart=always
@@ -192,7 +192,7 @@ WantedBy=multi-user.target
 Restore a database from S3 backup.
 
 ```bash
-walsync restore [OPTIONS] --output <OUTPUT> --bucket <BUCKET> <NAME>
+walrust restore [OPTIONS] --output <OUTPUT> --bucket <BUCKET> <NAME>
 ```
 
 ### Arguments
@@ -215,18 +215,18 @@ walsync restore [OPTIONS] --output <OUTPUT> --bucket <BUCKET> <NAME>
 
 ```bash
 # Basic restore
-walsync restore myapp.db \
+walrust restore myapp.db \
   --bucket my-backups \
   --output restored.db
 
 # Restore to specific point in time
-walsync restore myapp.db \
+walrust restore myapp.db \
   --bucket my-backups \
   --output restored.db \
   --point-in-time "2024-01-15T10:30:00Z"
 
 # Restore from Tigris
-walsync restore myapp.db \
+walrust restore myapp.db \
   --bucket my-backups \
   --output restored.db \
   --endpoint https://fly.storage.tigris.dev
@@ -249,7 +249,7 @@ Restoring myapp.db from s3://my-backups/...
 Clean up old snapshots using retention policy (Grandfather/Father/Son rotation).
 
 ```bash
-walsync compact [OPTIONS] --bucket <BUCKET> <NAME>
+walrust compact [OPTIONS] --bucket <BUCKET> <NAME>
 ```
 
 ### Arguments
@@ -273,7 +273,7 @@ walsync compact [OPTIONS] --bucket <BUCKET> <NAME>
 
 ### Retention Policy
 
-Walsync uses Grandfather/Father/Son (GFS) rotation:
+Walrust uses Grandfather/Father/Son (GFS) rotation:
 
 | Tier | Default | Description |
 |------|---------|-------------|
@@ -291,19 +291,19 @@ Walsync uses Grandfather/Father/Son (GFS) rotation:
 
 ```bash
 # Dry-run: preview what would be deleted
-walsync compact myapp.db --bucket my-backups
+walrust compact myapp.db --bucket my-backups
 
 # Actually delete old snapshots
-walsync compact myapp.db --bucket my-backups --force
+walrust compact myapp.db --bucket my-backups --force
 
 # Keep more hourly snapshots
-walsync compact myapp.db \
+walrust compact myapp.db \
   --bucket my-backups \
   --hourly 48 \
   --force
 
 # Aggressive retention (fewer snapshots)
-walsync compact myapp.db \
+walrust compact myapp.db \
   --bucket my-backups \
   --hourly 6 \
   --daily 3 \
@@ -338,7 +338,7 @@ Dry-run mode: no files deleted. Use --force to actually delete.
 Run as a read replica, polling S3 for new LTX files and applying them locally.
 
 ```bash
-walsync replicate [OPTIONS] --local <LOCAL> <SOURCE>
+walrust replicate [OPTIONS] --local <LOCAL> <SOURCE>
 ```
 
 ### Arguments
@@ -367,20 +367,20 @@ walsync replicate [OPTIONS] --local <LOCAL> <SOURCE>
 
 ```bash
 # Basic read replica with 5-second polling
-walsync replicate s3://my-bucket/mydb --local replica.db --interval 5s
+walrust replicate s3://my-bucket/mydb --local replica.db --interval 5s
 
 # Replica with custom endpoint (Tigris)
-walsync replicate s3://my-bucket/mydb \
+walrust replicate s3://my-bucket/mydb \
   --local /var/lib/app/replica.db \
   --interval 30s \
   --endpoint https://fly.storage.tigris.dev
 
 # Using environment variable for endpoint
 export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
-walsync replicate s3://my-bucket/prefix/mydb --local replica.db
+walrust replicate s3://my-bucket/prefix/mydb --local replica.db
 
 # Fast polling for near-real-time replication
-walsync replicate s3://my-bucket/mydb --local replica.db --interval 1s
+walrust replicate s3://my-bucket/mydb --local replica.db --interval 1s
 ```
 
 ### Output
@@ -397,7 +397,7 @@ Bootstrapped from snapshot: 1024 pages, TXID 100
 
 ### State File
 
-Walsync stores replica progress in a `.db-replica-state` file alongside the database:
+Walrust stores replica progress in a `.db-replica-state` file alongside the database:
 
 ```json
 {
@@ -422,7 +422,7 @@ This allows the replica to resume from where it left off after restart.
 List databases and snapshots stored in S3.
 
 ```bash
-walsync list [OPTIONS] --bucket <BUCKET>
+walrust list [OPTIONS] --bucket <BUCKET>
 ```
 
 ### Options
@@ -437,10 +437,10 @@ walsync list [OPTIONS] --bucket <BUCKET>
 
 ```bash
 # List all databases
-walsync list --bucket my-backups
+walrust list --bucket my-backups
 
 # List with Tigris endpoint
-walsync list \
+walrust list \
   --bucket my-backups \
   --endpoint https://fly.storage.tigris.dev
 ```
@@ -465,17 +465,17 @@ Databases in s3://my-backups/:
 
 ## explain
 
-Show what the current configuration will do without actually running walsync.
+Show what the current configuration will do without actually running walrust.
 
 ```bash
-walsync explain [--config <CONFIG>]
+walrust explain [--config <CONFIG>]
 ```
 
 ### Options
 
 | Option | Description |
 |--------|-------------|
-| `--config <CONFIG>` | Path to config file (default: ./walsync.toml) |
+| `--config <CONFIG>` | Path to config file (default: ./walrust.toml) |
 | `-h, --help` | Print help |
 
 ### Output
@@ -490,11 +490,11 @@ The explain command displays:
 ### Examples
 
 ```bash
-# Explain default config (./walsync.toml)
-walsync explain
+# Explain default config (./walrust.toml)
+walrust explain
 
 # Explain specific config file
-walsync explain --config /etc/walsync/production.toml
+walrust explain --config /etc/walrust/production.toml
 ```
 
 ### Output Example
@@ -540,7 +540,7 @@ Summary:
 Verify integrity of all LTX files stored in S3 for a database.
 
 ```bash
-walsync verify [OPTIONS] --bucket <BUCKET> <NAME>
+walrust verify [OPTIONS] --bucket <BUCKET> <NAME>
 ```
 
 ### Arguments
@@ -570,15 +570,15 @@ walsync verify [OPTIONS] --bucket <BUCKET> <NAME>
 
 ```bash
 # Verify a database (read-only check)
-walsync verify myapp.db --bucket my-backups
+walrust verify myapp.db --bucket my-backups
 
 # Verify with Tigris endpoint
-walsync verify myapp.db \
+walrust verify myapp.db \
   --bucket my-backups \
   --endpoint https://fly.storage.tigris.dev
 
 # Fix orphaned manifest entries
-walsync verify myapp.db --bucket my-backups --fix
+walrust verify myapp.db --bucket my-backups --fix
 ```
 
 ### Output
@@ -618,7 +618,7 @@ Note: 1 non-orphan issues found. These may require manual intervention:
 
 ## Environment Variables
 
-Walsync reads these environment variables:
+Walrust reads these environment variables:
 
 | Variable | Description |
 |----------|-------------|

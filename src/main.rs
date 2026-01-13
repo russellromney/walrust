@@ -14,14 +14,14 @@ use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser)]
-#[command(name = "walsync")]
+#[command(name = "walrust")]
 #[command(version)]
 #[command(about = "Lightweight SQLite WAL sync to S3/Tigris with data integrity verification")]
-#[command(long_about = "Walsync provides production-grade SQLite database backup and replication \
+#[command(long_about = "Walrust provides production-grade SQLite database backup and replication \
 to S3-compatible storage. Features include point-in-time recovery, GFS retention policies, \
 Litestream-compatible LTX format, and multi-database support in a single process.")]
 struct Cli {
-    /// Config file path (checks ./walsync.toml if not specified)
+    /// Config file path (checks ./walrust.toml if not specified)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
 
@@ -421,7 +421,7 @@ fn parse_duration(s: &str) -> Result<Duration> {
 async fn main() -> Result<()> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "walsync=info".into()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "walrust=info".into()),
         ))
         .with(tracing_subscriber::fmt::layer())
         .init();

@@ -233,17 +233,17 @@ pub async fn watch(
 
     if compact_after_snapshot {
         tracing::info!(
-            "walsync running (snapshot interval: {}s, compact after snapshot: enabled)",
+            "walrust running (snapshot interval: {}s, compact after snapshot: enabled)",
             snapshot_interval.as_secs()
         );
     } else if compact_interval > 0 {
         tracing::info!(
-            "walsync running (snapshot interval: {}s, compact interval: {}s)",
+            "walrust running (snapshot interval: {}s, compact interval: {}s)",
             snapshot_interval.as_secs(),
             compact_interval
         );
     } else {
-        tracing::info!("walsync running (snapshot interval: {}s)", snapshot_interval.as_secs());
+        tracing::info!("walrust running (snapshot interval: {}s)", snapshot_interval.as_secs());
     }
 
     loop {
@@ -543,7 +543,7 @@ pub async fn watch_with_config(
 
     if triggers_enabled {
         tracing::info!(
-            "walsync running (snapshot interval: {}s, max_changes: {}, max_interval: {}s, on_idle: {}s)",
+            "walrust running (snapshot interval: {}s, max_changes: {}, max_interval: {}s, on_idle: {}s)",
             global_sync.snapshot_interval,
             global_sync.max_changes,
             global_sync.max_interval,
@@ -551,7 +551,7 @@ pub async fn watch_with_config(
         );
     } else {
         tracing::info!(
-            "walsync running (snapshot interval: {}s)",
+            "walrust running (snapshot interval: {}s)",
             global_sync.snapshot_interval
         );
     }
@@ -1828,11 +1828,11 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
         None => {
             println!("No configuration file found.");
             println!();
-            println!("walsync looks for ./walsync.toml in the current directory,");
+            println!("walrust looks for ./walrust.toml in the current directory,");
             println!("or you can specify a config file with --config <path>.");
             println!();
             println!("Without a config file, you must provide all options via CLI:");
-            println!("  walsync watch <database> --bucket <bucket> [options]");
+            println!("  walrust watch <database> --bucket <bucket> [options]");
             return Ok(());
         }
         Some(cfg) => {
@@ -1958,7 +1958,7 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
             if cfg.sync.compact_after_snapshot || cfg.sync.compact_interval > 0 {
                 println!("  Automatic compaction: enabled");
             } else {
-                println!("  Automatic compaction: disabled (run 'walsync compact' manually)");
+                println!("  Automatic compaction: disabled (run 'walrust compact' manually)");
             }
         }
     }
@@ -2171,7 +2171,7 @@ mod tests {
     use std::path::PathBuf;
 
     fn get_test_bucket() -> Option<String> {
-        std::env::var("WALSYNC_TEST_BUCKET").ok()
+        std::env::var("WALRUST_TEST_BUCKET").ok()
     }
 
     fn get_test_endpoint() -> Option<String> {
@@ -2180,7 +2180,7 @@ mod tests {
 
     /// Helper to create a test database with valid SQLite structure
     async fn create_test_db(name: &str) -> PathBuf {
-        let path = PathBuf::from(format!("/tmp/walsync-test-{}.db", name));
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db", name));
         let page_size = 4096u32;
 
         // Create a minimal valid SQLite database (1 page)
@@ -2235,7 +2235,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_integration_snapshot() {
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("snapshot-test-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;
@@ -2251,7 +2251,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_integration_list_empty_bucket() {
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
 
         // This should not panic even if bucket is empty or only has test files
@@ -2262,7 +2262,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_integration_list_with_database() {
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("list-test-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;
@@ -2282,7 +2282,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_integration_restore_nonexistent() {
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let output = PathBuf::from(format!("/tmp/restored-{}.db", uuid::Uuid::new_v4()));
 
@@ -2298,7 +2298,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_integration_snapshot_and_restore() {
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("snapshot-restore-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;
@@ -2343,7 +2343,7 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_integration_sync_wal_workflow() {
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("wal-sync-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;
@@ -2367,9 +2367,9 @@ mod tests {
         assert_eq!(bucket1, "my-bucket");
         assert_eq!(prefix1, "");
 
-        let (bucket2, prefix2) = crate::s3::parse_bucket("s3://my-bucket/walsync/");
+        let (bucket2, prefix2) = crate::s3::parse_bucket("s3://my-bucket/walrust/");
         assert_eq!(bucket2, "my-bucket");
-        assert_eq!(prefix2, "walsync/");
+        assert_eq!(prefix2, "walrust/");
 
         let (bucket3, prefix3) = crate::s3::parse_bucket("my-bucket/path/to/prefix");
         assert_eq!(bucket3, "my-bucket");
@@ -2380,10 +2380,10 @@ mod tests {
     #[ignore]
     async fn test_integration_snapshot_and_restore_with_data() {
         // Test that snapshot/restore preserves exact data content (like Litestream)
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("snapshot-restore-data-{}", uuid::Uuid::new_v4());
-        let db_path = PathBuf::from(format!("/tmp/walsync-test-{}.db", test_name));
+        let db_path = PathBuf::from(format!("/tmp/walrust-test-{}.db", test_name));
         let db_name = db_path.file_stem().unwrap().to_str().unwrap();
         let restored_path = PathBuf::from(format!("/tmp/restored-{}.db", uuid::Uuid::new_v4()));
 
@@ -2458,8 +2458,8 @@ mod tests {
     #[tokio::test]
     #[ignore]
     async fn test_integration_multi_database_snapshot() {
-        // Test walsync advantage: single process handles multiple databases
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        // Test walrust advantage: single process handles multiple databases
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
 
         const NUM_DBS: usize = 5;
@@ -2474,7 +2474,7 @@ mod tests {
             db_paths.push(db_path);
         }
 
-        // Snapshot all databases (this is where walsync shines - single process)
+        // Snapshot all databases (this is where walrust shines - single process)
         for db_path in &db_paths {
             let result = snapshot(db_path, &bucket, endpoint.as_deref()).await;
             assert!(result.is_ok(), "All snapshots should succeed");
@@ -2494,7 +2494,7 @@ mod tests {
     #[ignore]
     async fn test_integration_checksum_verification() {
         // Test that checksums are stored and verified
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("checksum-test-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;
@@ -2528,7 +2528,7 @@ mod tests {
     #[ignore]
     async fn test_integration_manifest_updates() {
         // Test that manifest is properly created and updated across snapshots
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("manifest-test-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;
@@ -2561,7 +2561,7 @@ mod tests {
     #[ignore]
     async fn test_integration_point_in_time_restore_by_txid() {
         // Test point-in-time restore using TXID
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("pit-txid-test-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;
@@ -2593,7 +2593,7 @@ mod tests {
     #[ignore]
     async fn test_integration_ltx_file_naming() {
         // Test that LTX files are created with correct naming convention
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("ltx-naming-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;
@@ -2616,7 +2616,7 @@ mod tests {
         // Test with a database that has SQLite-like structure
         use tempfile::tempdir;
 
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let dir = tempdir().unwrap();
         let db_path = dir.path().join(format!("sqlite-like-{}.db", uuid::Uuid::new_v4()));
@@ -2667,20 +2667,20 @@ mod tests {
 
     #[test]
     fn test_performance_multi_database_advantage() {
-        // This test documents the theoretical advantage of walsync vs Litestream
+        // This test documents the theoretical advantage of walrust vs Litestream
         // Litestream: N databases = N processes = N overhead
-        // Walsync: N databases = 1 process = 1 overhead
+        // Walrust: N databases = 1 process = 1 overhead
 
         let database_counts = vec![1, 5, 10, 100];
 
-        println!("\n=== Performance Advantage: Walsync vs Litestream ===\n");
-        println!("Databases | Litestream Processes | Walsync Processes | Memory Saved (est)");
+        println!("\n=== Performance Advantage: Walrust vs Litestream ===\n");
+        println!("Databases | Litestream Processes | Walrust Processes | Memory Saved (est)");
         println!("----------|---------------------|-------------------|------------------");
 
         for count in database_counts {
             let litestream_processes = count;
-            let walsync_processes = 1;
-            let processes_saved = litestream_processes - walsync_processes;
+            let walrust_processes = 1;
+            let processes_saved = litestream_processes - walrust_processes;
 
             // Rough estimate: ~50MB per Litestream process
             let memory_per_process = 50;
@@ -2688,7 +2688,7 @@ mod tests {
 
             println!(
                 "{:9} | {:21} | {:17} | {:>14} MB",
-                count, litestream_processes, walsync_processes, memory_saved_mb
+                count, litestream_processes, walrust_processes, memory_saved_mb
             );
         }
 
@@ -3765,7 +3765,7 @@ mod tests {
     async fn test_integration_compaction() {
         use crate::retention::RetentionPolicy;
 
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("compact-test-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;
@@ -4347,7 +4347,7 @@ mod tests {
     #[ignore]
     async fn test_integration_verify_valid_database() {
         // Test verify on a database with valid LTX files
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("verify-valid-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;
@@ -4369,7 +4369,7 @@ mod tests {
     #[ignore]
     async fn test_integration_verify_nonexistent_database() {
         // Test verify on a database that doesn't exist
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
 
         // Verify a nonexistent database should fail gracefully
@@ -4382,7 +4382,7 @@ mod tests {
     #[ignore]
     async fn test_integration_verify_multiple_snapshots() {
         // Test verify on a database with multiple snapshots
-        let bucket = get_test_bucket().expect("WALSYNC_TEST_BUCKET not set");
+        let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
         let test_name = format!("verify-multi-{}", uuid::Uuid::new_v4());
         let db_path = create_test_db(&test_name).await;

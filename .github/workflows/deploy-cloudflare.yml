@@ -36,7 +36,7 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy dist --project-name=walsync
+          command: pages deploy dist --project-name=walrust
           workingDirectory: docs
 
   verify:
@@ -46,5 +46,5 @@ jobs:
       - name: Verify deployment
         run: |
           echo "✓ Deployment to Cloudflare Pages initiated"
-          echo "Site URL: https://walsync.dev"
+          echo "Site URL: https://walrust.dev"
           echo "Monitor at: https://dash.cloudflare.com/"
