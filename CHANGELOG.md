@@ -17,6 +17,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Non-blocking PASSIVE checkpoints for efficiency
   - Blocking TRUNCATE checkpoints for emergency safety brake
 - **WAL Sync Batching**: `wal_sync_interval` to batch WAL changes (default: 1s) instead of syncing on every write
+- **DST Framework Roadmap**: Comprehensive battle testing plan for v1.0 (see [ROADMAP.md](./ROADMAP.md))
+  - Phase 1: Basic crash/network failure testing
+  - Phase 2: S3 fault injection and WAL edge cases
+  - Phase 3: Property-based chaos testing (10K+ iterations)
+  - Success criteria: Zero data loss under any failure scenario
+- **Documentation**:
+  - [CONFIG_VERIFICATION.md](./CONFIG_VERIFICATION.md) - Production readiness assessment
+  - [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) - Detailed plan for missing features
+  - [BATTLE_TESTING.md](./BATTLE_TESTING.md) - DST architecture and test scenarios
+
+### Known Issues
+- **Missing Production Features** (see [CONFIG_VERIFICATION.md](./CONFIG_VERIFICATION.md)):
+  - ❌ `monitor_interval` - File watcher debouncing for high-write workloads (~2-3 hours to implement)
+  - ❌ `validation_interval` - Automated backup integrity verification (~4-6 hours to implement)
+  - **Impact**: v0.3 is NOT production-ready without these features
+  - **Timeline**: ~10 hours total implementation work for v0.4
 
 ## [0.3.0] - 2026-01-13
 

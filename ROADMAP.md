@@ -309,9 +309,243 @@ s3://bucket/prefix/
 
 ---
 
+---
+
+## Battle Testing & DST Framework (Path to v1.0)
+
+**Goal**: Prove walrust won't lose data under ANY failure scenario before v1.0 release.
+
+### Why Battle Testing is Critical
+
+Traditional testing catches ~5% of real bugs in backup systems. Production has:
+- Network delays/partitions during S3 uploads
+- Crashes mid-WAL-sync with partial writes
+- S3 eventual consistency (object appears, disappears, reappears)
+- SQLite checkpoint happening mid-backup
+- Concurrent writes while backup is reading WAL
+- Clock drift, disk full, process SIGKILL
+
+**Battle testing finds these bugs in milliseconds on a laptop that would take months in production.**
+
+### DST Implementation Phases
+
+See [BATTLE_TESTING.md](./BATTLE_TESTING.md) for detailed DST architecture and test scenarios.
+
+#### Phase 1: Basic DST Framework (Week 1)
+
+**Create `tests/dst/` test suite:**
+
+```bash
+tests/dst/
+  framework/
+    simulator.rs       # FailureSimulator trait
+    oracle.rs          # Reference DB + invariant checking
+    scenarios.rs       # Test scenario builders
+  cases/
+    basic.rs           # Core crash/network tests
+    advanced.rs        # Multi-DB, cascading failures
+    stress.rs          # Long-running chaos tests
+  Cargo.toml           # Test dependencies
+```
+
+**Core Components:**
+
+1. **Failure Simulators**
+   - [ ] NetworkFailure: timeout, connection refused, 503 errors
+   - [ ] ProcessCrash: SIGKILL at strategic points
+   - [ ] DiskFull: ENOSPC during writes
+   - [ ] ClockSkew: NTP drift simulation
+
+2. **Reference Oracle**
+   - [ ] ReferenceDatabase: Ground truth SQLite operations
+   - [ ] OperationLog: Record all mutations
+   - [ ] Invariant checkers (TXID monotonicity, checksum chain, etc.)
+
+3. **First DST Tests**
+   - [ ] test_crash_during_wal_sync()
+   - [ ] test_crash_during_snapshot()
+   - [ ] test_network_timeout_recovery()
+   - [ ] test_disk_full_graceful_degradation()
+
+**Success Criteria:**
+- All basic crash scenarios pass
+- No data loss detected by oracle
+- Restore matches reference DB byte-for-byte
+
+#### Phase 2: Advanced Failure Scenarios (Week 2)
+
+**S3 Fault Injection:**
+
+1. **S3 Failure Modes**
+   - [ ] test_partial_upload_recovery() - Upload fails mid-stream
+   - [ ] test_s3_eventual_consistency() - Object appears then disappears
+   - [ ] test_s3_500_transient_errors() - Retry logic verification
+   - [ ] test_silent_data_corruption() - Checksum mismatch detection
+
+2. **WAL Edge Cases**
+   - [ ] test_checkpoint_during_sync() - Race condition handling
+   - [ ] test_wal_truncate_threshold_reached() - Emergency TRUNCATE checkpoint
+   - [ ] test_manifest_corruption_recovery() - Rebuild from S3 scan
+   - [ ] test_concurrent_writes_during_backup() - Snapshot consistency
+
+3. **Multi-Database Stress**
+   - [ ] test_100_databases_simultaneous_writes()
+   - [ ] test_cascading_failures() - One DB failure doesn't affect others
+   - [ ] test_resource_exhaustion() - Memory/file descriptor limits
+
+**Success Criteria:**
+- All S3 fault scenarios handled gracefully
+- Checksum mismatches always detected
+- Multi-DB isolation verified
+
+#### Phase 3: Continuous Chaos Testing (Week 3)
+
+**Property-Based Testing with `proptest`:**
+
+1. **Core Properties**
+   - [ ] Property: Every committed transaction is recoverable from S3
+   - [ ] Property: Point-in-time restore gives exact state at timestamp T
+   - [ ] Property: WAL batching never loses frames
+   - [ ] Property: Snapshot is atomic (no partial state)
+   - [ ] Property: GFS compaction preserves recoverability
+
+2. **Chaos Engineering Loop**
+   - [ ] Run DST suite with random failure injection
+   - [ ] 10,000+ iterations per property test
+   - [ ] Measure MTBF (mean time between failures)
+   - [ ] Collect failure seeds for regression testing
+
+3. **Performance Under Failure**
+   - [ ] Measure crash recovery time
+   - [ ] Verify no memory leaks during repeated crashes
+   - [ ] Check CPU usage during S3 retry storms
+   - [ ] Monitor file descriptor leaks
+
+**Success Criteria:**
+- 10,000+ seeds pass all property tests
+- Zero data loss in chaos tests
+- No resource leaks detected
+- Recovery time < 5 seconds for typical workloads
+
+### Critical Invariants to Verify
+
+All DST tests must verify these invariants hold after recovery:
+
+1. **TXID Monotonicity** - No gaps, no duplicates
+2. **Checksum Chain Integrity** - pre_apply → post_apply chain valid
+3. **Manifest Consistency** - All listed files exist in S3
+4. **WAL Frame Count** - Matches S3 LTX frame count
+5. **Transaction Atomicity** - No partial transactions (all-or-nothing)
+6. **Binary Preservation** - Restored DB byte-identical to source
+
+### Test Scenarios Matrix
+
+| Scenario | Failure Type | Expected Behavior |
+|----------|--------------|-------------------|
+| Crash during WAL sync | SIGKILL mid-upload | No partial LTX files in S3 |
+| S3 500 errors | Transient failures | Retry succeeds, no data loss |
+| WAL checkpoint race | SQLite resets WAL while reading | Detect and re-snapshot |
+| Eventual consistency | Object appears then disappears | Handle gracefully with retries |
+| Clock skew | System clock jumps backward | Snapshot intervals still work |
+| Concurrent snapshots | Two snapshots triggered simultaneously | Only one runs (mutex) |
+| Restore corruption | Downloaded LTX is corrupted | Detect via checksum, fail safely |
+| Disk full | ENOSPC during snapshot | Log error, continue WAL sync |
+| Network partition | S3 unreachable for hours | Buffer WAL, resume when network returns |
+| Manifest corruption | manifest.json is invalid | Rebuild from S3 object listing |
+
+### Integration with CI/CD
+
+**GitHub Actions:**
+
+```yaml
+# .github/workflows/battle-test.yml
+name: Battle Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 4 * * *'  # 4 AM UTC daily
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Smoke tests (basic crash scenarios)
+        run: cargo test --test dst_basic
+
+  properties:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Property tests (quick - 100 cases)
+        run: cargo test --test dst_properties
+
+      - name: Property tests (extended - 10K cases)
+        if: github.event_name == 'schedule'
+        run: PROPTEST_CASES=10000 cargo test --test dst_properties
+
+  chaos:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Chaos tests (fault injection)
+        run: cargo test --test dst_chaos
+
+  soak:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+    timeout-minutes: 120
+    steps:
+      - name: 2-hour soak test
+        run: cargo test --test dst_soak -- --ignored
+```
+
+### Success Criteria for v1.0 Release
+
+Before declaring walrust production-ready:
+
+- [ ] **10,000+ seeds pass** all property tests (zero failures)
+- [ ] **Zero data loss** in chaos tests (crashes, S3 faults, network partitions)
+- [ ] **Litestream compatibility** verified (restore Litestream backups)
+- [ ] **100+ database scale** tested without issues
+- [ ] **1000 writes/sec/db** sustained (with WAL batching)
+- [ ] **24h soak test** passes with no memory leaks
+- [ ] **CI runs nightly** for 2+ weeks with zero failures
+- [ ] **All critical invariants** verified in every test
+- [ ] **Recovery time** < 5 seconds for typical workloads
+- [ ] **Documentation** includes failure recovery guide
+
+### Timeline Estimate
+
+- **Phase 1 (Basic DST Framework)**: 1 week
+- **Phase 2 (Advanced Scenarios)**: 1 week
+- **Phase 3 (Continuous Chaos)**: 1 week
+- **CI Integration & Hardening**: 2 weeks nightly runs
+- **Total**: ~5 weeks to production-ready v1.0
+
+### Dependencies
+
+**New Crates for DST:**
+- `proptest` - Property-based testing
+- `tempfile` - Temporary test databases
+- `rusqlite` - Direct SQLite access for oracle
+- `rand` - Seeded RNG for reproducibility
+
+**Implementation Files:**
+- `tests/dst/framework/simulator.rs` - Failure injection
+- `tests/dst/framework/oracle.rs` - Reference DB + invariants
+- `tests/dst/cases/basic.rs` - Core crash/network tests
+- `tests/dst/cases/advanced.rs` - S3/WAL edge cases
+- `tests/dst/cases/stress.rs` - Multi-DB, long-running tests
+
+---
+
 ## References
 
 - [Litestream Revamped](https://fly.io/blog/litestream-revamped/) - LTX format, multi-DB
 - [Litestream v0.5.0](https://fly.io/blog/litestream-v050-is-here/) - Compaction levels
 - [litetx crate](https://docs.rs/litetx/) - Rust LTX implementation
 - [Litestream How It Works](https://litestream.io/how-it-works/) - WAL mechanics
+- [sled simulation guide](https://sled.rs/simulation.html) - DST architecture inspiration
+- [TigerBeetle VOPR](https://github.com/tigerbeetle/tigerbeetle/blob/main/docs/internals/vopr.md) - Deterministic simulation testing
+- [Jepsen](https://jepsen.io) - Distributed systems testing methodology

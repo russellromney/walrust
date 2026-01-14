@@ -8,7 +8,7 @@
 
 Like Litestream but with an emphasis on memory footprint and easy of configuration. 
 
-> This is alpha software. Do not use in production. 
+> **Alpha Status:** Core functionality complete, but missing production-critical features (`monitor_interval`, `validation_interval`). See [CONFIG_VERIFICATION.md](./CONFIG_VERIFICATION.md) for details. ETA for production readiness: ~10 hours of implementation work. 
 
 ## Installation
 
