@@ -13,6 +13,7 @@ use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::ltx;
 use crate::retention::{self, RetentionPolicy, SnapshotEntry};
 use crate::s3::{self, create_client, parse_bucket};
+use crate::storage::StorageBackend;
 use crate::wal;
 
 /// State for a single watched database
@@ -2508,6 +2509,370 @@ async fn run_checkpoint(db_path: &Path, mode: CheckpointMode) -> Result<()> {
         Ok(())
     })
     .await?
+}
+
+// ============================================================================
+// StorageBackend-aware functions for testability
+// ============================================================================
+
+/// Module exposing sync operations that use StorageBackend trait
+/// for deterministic simulation testing (DST).
+///
+/// These functions are identical to the internal sync functions but
+/// accept a `&dyn StorageBackend` instead of `&Client` + bucket,
+/// enabling fault injection and deterministic testing.
+pub mod testable {
+    use super::*;
+    use crate::storage::StorageBackend;
+
+    /// State for a single database being synced (public version for testing)
+    #[derive(Debug, Clone)]
+    pub struct SyncState {
+        /// Database name
+        pub name: String,
+        /// Path to main db file
+        pub db_path: PathBuf,
+        /// Path to WAL file
+        pub wal_path: PathBuf,
+        /// Current WAL sync position
+        pub wal_offset: u64,
+        /// WAL generation (increments on checkpoint)
+        pub wal_generation: u64,
+        /// Current transaction ID
+        pub current_txid: u64,
+        /// Last snapshot time
+        pub last_snapshot: Option<chrono::DateTime<Utc>>,
+        /// Current database checksum
+        pub db_checksum: Option<u64>,
+    }
+
+    impl SyncState {
+        /// Create new sync state for a database
+        pub fn new(db_path: PathBuf) -> Result<Self> {
+            let name = db_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| anyhow!("Invalid database path"))?
+                .to_string();
+            let wal_path = db_path.with_extension("db-wal");
+            Ok(Self {
+                name,
+                db_path,
+                wal_path,
+                wal_offset: 0,
+                wal_generation: 0,
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+            })
+        }
+
+        /// Initialize checksum from database file
+        pub fn init_checksum(&mut self) -> Result<()> {
+            match ltx::compute_checksum_from_file(&self.db_path) {
+                Ok(cs) => {
+                    self.db_checksum = Some(cs.into_inner());
+                    Ok(())
+                }
+                Err(e) => Err(anyhow!("Failed to compute checksum: {}", e)),
+            }
+        }
+    }
+
+    /// Load manifest from storage
+    pub async fn load_manifest(
+        storage: &dyn StorageBackend,
+        prefix: &str,
+        db_name: &str,
+    ) -> Result<Manifest> {
+        let manifest_key = format!("{}{}/manifest.json", prefix, db_name);
+        match storage.download_bytes(&manifest_key).await {
+            Ok(data) => Ok(serde_json::from_slice(&data)?),
+            Err(_) => Ok(Manifest {
+                name: db_name.to_string(),
+                ..Default::default()
+            }),
+        }
+    }
+
+    /// Save manifest to storage
+    pub async fn save_manifest(
+        storage: &dyn StorageBackend,
+        prefix: &str,
+        manifest: &Manifest,
+    ) -> Result<()> {
+        let manifest_key = format!("{}{}/manifest.json", prefix, manifest.name);
+        storage
+            .upload_bytes(&manifest_key, serde_json::to_vec_pretty(manifest)?)
+            .await
+    }
+
+    /// Save legacy state.json for backwards compatibility
+    pub async fn save_state(
+        storage: &dyn StorageBackend,
+        prefix: &str,
+        state: &SyncState,
+    ) -> Result<()> {
+        let state_key = format!("{}{}/state.json", prefix, state.name);
+        let state_json = serde_json::json!({
+            "wal_offset": state.wal_offset,
+            "wal_generation": state.wal_generation,
+            "current_txid": state.current_txid,
+            "last_snapshot": state.last_snapshot,
+        });
+        storage
+            .upload_bytes(&state_key, serde_json::to_vec(&state_json)?)
+            .await
+    }
+
+    /// Sync WAL changes to storage as incremental LTX files
+    ///
+    /// This is the core sync function that:
+    /// 1. Reads new WAL frames since last sync
+    /// 2. Deduplicates pages (keeps latest version)
+    /// 3. Encodes as LTX with checksum chaining
+    /// 4. Uploads to storage
+    /// 5. Updates manifest
+    ///
+    /// Returns the number of frames synced.
+    pub async fn sync_wal(
+        storage: &dyn StorageBackend,
+        prefix: &str,
+        state: &mut SyncState,
+    ) -> Result<u64> {
+        use litetx::Checksum;
+
+        let header = match wal::read_header(&state.wal_path).await? {
+            Some(h) => h,
+            None => return Ok(0), // No WAL file
+        };
+
+        // Check if WAL was reset (checkpoint happened)
+        let current_size = wal::get_wal_size(&state.wal_path).await?;
+        if current_size < state.wal_offset {
+            tracing::info!("{}: WAL checkpoint detected, resetting offset", state.name);
+            state.wal_offset = 0;
+            state.wal_generation += 1;
+
+            // Recompute checksum from current database state
+            match ltx::compute_checksum_from_file(&state.db_path) {
+                Ok(cs) => {
+                    state.db_checksum = Some(cs.into_inner());
+                }
+                Err(e) => {
+                    tracing::warn!("{}: Could not recompute checksum: {}", state.name, e);
+                }
+            }
+        }
+
+        // Read WAL frames as parsed pages
+        let (frames, new_offset, max_db_size) =
+            wal::read_frames_as_pages(&state.wal_path, header.page_size, state.wal_offset).await?;
+
+        if frames.is_empty() {
+            return Ok(0);
+        }
+
+        // Deduplicate pages
+        let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+        for frame in &frames {
+            page_map.insert(frame.page_number, frame.data.clone());
+        }
+
+        let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
+        let frame_count = frames.len();
+
+        // Get pre_apply_checksum
+        let pre_checksum = match state.db_checksum {
+            Some(cs) => Checksum::new(cs),
+            None => ltx::compute_checksum_from_file(&state.db_path)?,
+        };
+
+        // Calculate TXIDs
+        let min_txid = state.current_txid + 1;
+        let max_txid = min_txid + pages.len() as u64 - 1;
+        let commit_page = if max_db_size > 0 {
+            max_db_size
+        } else {
+            let db_size = std::fs::metadata(&state.db_path)?.len();
+            (db_size / header.page_size as u64) as u32
+        };
+
+        // Encode as incremental LTX
+        let mut ltx_buffer = Vec::new();
+        let post_checksum = ltx::encode_wal_changes(
+            &mut ltx_buffer,
+            &pages,
+            header.page_size,
+            min_txid,
+            max_txid,
+            commit_page,
+            Some(pre_checksum),
+        )?;
+
+        let ltx_size = ltx_buffer.len() as u64;
+        let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
+        let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+
+        // Upload LTX file
+        let timestamp = Utc::now();
+        storage.upload_bytes(&ltx_key, ltx_buffer).await?;
+
+        tracing::info!(
+            "{}: Synced {} WAL frames as incremental LTX {} ({} bytes)",
+            state.name,
+            frame_count,
+            ltx_filename,
+            ltx_size
+        );
+
+        // Update manifest
+        let mut manifest = load_manifest(storage, prefix, &state.name).await?;
+        manifest.current_txid = max_txid;
+        manifest.last_checksum = Some(post_checksum.into_inner());
+        manifest.files.push(LtxEntry {
+            filename: ltx_filename,
+            min_txid,
+            max_txid,
+            size: ltx_size,
+            created_at: timestamp.to_rfc3339(),
+            is_snapshot: false,
+        });
+        save_manifest(storage, prefix, &manifest).await?;
+
+        // Update state
+        state.wal_offset = new_offset;
+        state.current_txid = max_txid;
+        state.db_checksum = Some(post_checksum.into_inner());
+
+        // Save legacy state
+        save_state(storage, prefix, state).await?;
+
+        Ok(frame_count as u64)
+    }
+
+    /// Take a full database snapshot as LTX
+    pub async fn take_snapshot(
+        storage: &dyn StorageBackend,
+        prefix: &str,
+        state: &mut SyncState,
+    ) -> Result<()> {
+        let timestamp = Utc::now();
+
+        // Get page size from database header
+        let page_size = get_page_size(&state.db_path).await?;
+
+        // Increment TXID for this snapshot
+        let new_txid = state.current_txid + 1;
+
+        // LTX filename: {min_txid:08}-{max_txid:08}.ltx
+        let ltx_filename = format!("{:08}-{:08}.ltx", 1, new_txid);
+        let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+
+        // Encode database as LTX
+        let mut ltx_buffer = Vec::new();
+        ltx::encode_snapshot(&mut ltx_buffer, &state.db_path, page_size, new_txid)?;
+
+        let ltx_size = ltx_buffer.len() as u64;
+
+        // Upload LTX file
+        storage.upload_bytes(&ltx_key, ltx_buffer).await?;
+
+        // Compute checksum
+        let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
+
+        tracing::info!(
+            "{}: LTX snapshot uploaded ({} bytes, TXID: {})",
+            state.name,
+            ltx_size,
+            new_txid
+        );
+
+        // Update manifest
+        let mut manifest = load_manifest(storage, prefix, &state.name).await?;
+        manifest.current_txid = new_txid;
+        manifest.page_size = page_size;
+        manifest.last_checksum = Some(db_checksum.into_inner());
+        manifest.files.push(LtxEntry {
+            filename: ltx_filename,
+            min_txid: 1,
+            max_txid: new_txid,
+            size: ltx_size,
+            created_at: timestamp.to_rfc3339(),
+            is_snapshot: true,
+        });
+        save_manifest(storage, prefix, &manifest).await?;
+
+        // Update state
+        state.current_txid = new_txid;
+        state.last_snapshot = Some(timestamp);
+        state.db_checksum = Some(db_checksum.into_inner());
+
+        // Save legacy state
+        save_state(storage, prefix, state).await?;
+
+        Ok(())
+    }
+
+    /// Restore a database from storage using LTX files
+    pub async fn restore(
+        storage: &dyn StorageBackend,
+        prefix: &str,
+        db_name: &str,
+        output: &Path,
+        point_in_time: Option<&str>,
+    ) -> Result<()> {
+        use std::io::Cursor;
+
+        // Load manifest
+        let manifest = load_manifest(storage, prefix, db_name).await?;
+        if manifest.files.is_empty() {
+            return Err(anyhow!("No LTX files found for database '{}'", db_name));
+        }
+
+        // Sort by TXID
+        let mut files: Vec<_> = manifest.files.iter().collect();
+        files.sort_by_key(|f| f.max_txid);
+
+        // Find latest snapshot
+        let snapshot = files
+            .iter()
+            .rev()
+            .find(|f| f.is_snapshot)
+            .ok_or_else(|| anyhow!("No snapshot found"))?;
+
+        // Download and decode snapshot
+        let snapshot_key = format!("{}{}/{}", prefix, db_name, snapshot.filename);
+        let snapshot_data = storage.download_bytes(&snapshot_key).await?;
+        let cursor = Cursor::new(snapshot_data);
+        ltx::decode_to_db(cursor, output)?;
+
+        tracing::info!("Restored snapshot {} to {}", snapshot.filename, output.display());
+
+        // Apply incrementals if needed
+        let target_txid = if let Some(pit) = point_in_time {
+            // Parse point-in-time (implement as needed)
+            manifest.current_txid // For now, restore to latest
+        } else {
+            manifest.current_txid
+        };
+
+        // Find incrementals to apply
+        let incrementals: Vec<_> = files
+            .iter()
+            .filter(|f| !f.is_snapshot && f.min_txid > snapshot.max_txid && f.max_txid <= target_txid)
+            .collect();
+
+        for inc in incrementals {
+            let inc_key = format!("{}{}/{}", prefix, db_name, inc.filename);
+            let inc_data = storage.download_bytes(&inc_key).await?;
+            let cursor = Cursor::new(inc_data);
+            ltx::apply_ltx_to_db(cursor, output)?;
+            tracing::info!("Applied incremental {}", inc.filename);
+        }
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]

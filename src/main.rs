@@ -1,12 +1,16 @@
 mod config;
 mod dashboard;
+mod errors;
 mod ltx;
 mod retention;
 mod s3;
+mod storage;
 mod sync;
 mod wal;
 
 use anyhow::{anyhow, Result};
+use errors::{classify_error, ExitStatus};
+use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use config::{Config, ResolvedDbConfig, RetentionConfig, SyncConfig};
 use std::path::PathBuf;
@@ -464,8 +468,18 @@ fn parse_duration(s: &str) -> Result<Duration> {
     }
 }
 
+/// Main entry point with structured exit codes
+///
+/// Exit codes:
+/// - 0: Success
+/// - 1: General/unknown error
+/// - 2: Configuration error (invalid config file, missing CLI args)
+/// - 3: Database error (file not found, WAL corruption, SQLite issues)
+/// - 4: S3 error (network, authentication, bucket access)
+/// - 5: Integrity error (checksum mismatch, LTX verification failed)
+/// - 6: Restore error (no snapshot found, PITR unavailable)
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> ExitCode {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "walrust=info".into()),
@@ -473,6 +487,18 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    match run().await {
+        Ok(()) => ExitCode::from(ExitStatus::Success),
+        Err(err) => {
+            let status = classify_error(&err);
+            tracing::error!("{:#}", err);
+            ExitCode::from(status)
+        }
+    }
+}
+
+/// Run the CLI commands
+async fn run() -> Result<()> {
     let cli = Cli::parse();
 
     // Load config file (optional)

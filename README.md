@@ -8,7 +8,7 @@
 
 Like Litestream but with an emphasis on memory footprint and easy of configuration. 
 
-> **v0.1.4:** Adds `monitor_interval` for debouncing and `validation_interval` for automated backup verification. 
+> **v0.1.5:** Adds `StorageBackend` trait for testability and DST framework (`walrust-dst`) with fault injection testing. 22 chaos/property tests passing. 
 
 ## Installation
 
@@ -196,6 +196,31 @@ Options:
 ```
 
 Checks: file existence, header validity, checksums, TXID continuity.
+
+## Exit Codes
+
+Walrust uses structured exit codes for scripting and automation:
+
+| Code | Name | Description |
+|------|------|-------------|
+| 0 | Success | Operation completed successfully |
+| 1 | General | Unknown or uncategorized error |
+| 2 | Config | Configuration error (invalid config file, missing CLI args) |
+| 3 | Database | Database error (file not found, WAL corruption, SQLite issues) |
+| 4 | S3 | S3 error (network, authentication, bucket access) |
+| 5 | Integrity | Integrity error (checksum mismatch, LTX verification failed) |
+| 6 | Restore | Restore error (no snapshot found, PITR unavailable) |
+
+**Example usage in scripts:**
+```bash
+walrust verify mydb -b s3://bucket
+case $? in
+  0) echo "Verification passed" ;;
+  5) echo "Integrity error - backup may be corrupted" ;;
+  4) echo "S3 error - check credentials/connectivity" ;;
+  *) echo "Other error: $?" ;;
+esac
+```
 
 ## Environment Variables
 

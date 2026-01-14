@@ -1,0 +1,51 @@
+[package]
+name = "walrust-dst"
+version = "0.1.0"
+edition = "2021"
+description = "Deterministic Simulation Testing for Walrust"
+authors = ["Russell Romney <russellromney@gmail.com>"]
+license = "Apache-2.0"
+
+[[bin]]
+name = "walrust-dst"
+path = "src/main.rs"
+
+[dependencies]
+# Walrust (path dependency for testing)
+walrust = { path = ".." }
+
+# Property-based testing
+proptest = "1.4"
+
+# SQLite for test databases
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# AWS SDK for S3 testing
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+
+# Async trait support (must match walrust's version)
+async-trait = "0.1"
+
+# Utilities
+anyhow = "1"
+rand = "0.8"
+tempfile = "3"
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }

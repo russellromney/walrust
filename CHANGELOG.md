@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **StorageBackend Trait**: Abstraction for S3 operations enabling testability
+  - `StorageBackend` trait in `src/storage.rs` with `S3Backend` implementation
+  - `walrust::testable` module exposing `sync_wal`, `take_snapshot`, `restore` for DST
+  - Enables fault injection testing without MadSim complexity
+- **DST Framework (walrust-dst)**: Deterministic Simulation Testing for chaos testing
+  - `MockStorageBackend` with configurable fault injection (RandomError, Latency, PartialWrite, SilentCorruption, EventualConsistency)
+  - Property-based tests (7 properties, 100+ cases each)
+  - Real chaos tests calling actual walrust sync functions
+  - 22 tests passing
+- **Structured Exit Codes**: Specific exit codes for different error categories
+  - 0: Success
+  - 1: General/unknown error
+  - 2: Configuration error (invalid config, missing CLI args)
+  - 3: Database error (file not found, WAL corruption)
+  - 4: S3 error (network, auth, bucket access)
+  - 5: Integrity error (checksum mismatch, LTX verification failed)
+  - 6: Restore error (no snapshot found, PITR unavailable)
+  - Enables scripted error handling and monitoring integration
+
 ## [0.1.4] - 2026-01-14
 
 ### Added

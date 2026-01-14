@@ -7,8 +7,15 @@ pub mod dashboard;
 pub mod ltx;
 pub mod retention;
 pub mod s3;
+pub mod storage;
 pub mod sync;
 pub mod wal;
+
+// Re-export storage types for convenience
+pub use storage::{S3Backend, StorageBackend};
+
+// Re-export testable sync module for DST
+pub use sync::testable;
 
 #[cfg(feature = "python")]
 mod python;
