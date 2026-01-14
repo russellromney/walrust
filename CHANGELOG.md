@@ -5,6 +5,19 @@ All notable changes to walrust will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **WAL Checkpoint Controls**: Production-grade WAL management to prevent unbounded growth
+  - `checkpoint_interval`: Periodic PASSIVE checkpoint (default: 60s)
+  - `min_checkpoint_page_count`: Only checkpoint if WAL ≥ N pages (default: 1000, ~4MB)
+  - `wal_truncate_threshold_pages`: Emergency TRUNCATE checkpoint threshold (default: 121359, ~500MB)
+  - Configurable via CLI flags (`--checkpoint-interval`, `--min-checkpoint-pages`, `--wal-truncate-threshold`)
+  - Configurable per-database in `walrust.toml`
+  - Non-blocking PASSIVE checkpoints for efficiency
+  - Blocking TRUNCATE checkpoints for emergency safety brake
+- **WAL Sync Batching**: `wal_sync_interval` to batch WAL changes (default: 1s) instead of syncing on every write
+
 ## [0.3.0] - 2026-01-13
 
 ### Added

@@ -44,6 +44,11 @@ enum Commands {
         #[arg(long)]
         snapshot_interval: Option<u64>,
 
+        /// WAL sync interval in seconds (default: 1)
+        /// Batches WAL changes instead of syncing immediately on each write
+        #[arg(long)]
+        wal_sync_interval: Option<u64>,
+
         /// S3 endpoint URL (for Tigris/MinIO/etc)
         #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
         endpoint: Option<String>,
@@ -71,6 +76,20 @@ enum Commands {
         /// Compaction interval in seconds (0 = disabled)
         #[arg(long)]
         compact_interval: Option<u64>,
+
+        /// Checkpoint interval in seconds (default: 60)
+        /// Runs PASSIVE checkpoint periodically to prevent unbounded WAL growth
+        #[arg(long)]
+        checkpoint_interval: Option<u64>,
+
+        /// Minimum pages before checkpoint (default: 1000, ~4MB)
+        #[arg(long)]
+        min_checkpoint_pages: Option<u64>,
+
+        /// Emergency WAL truncate threshold in pages (default: 121359, ~500MB)
+        /// Set to 0 to disable emergency checkpoints
+        #[arg(long)]
+        wal_truncate_threshold: Option<u64>,
 
         /// Number of hourly snapshots to retain
         #[arg(long)]
@@ -229,6 +248,7 @@ struct WatchArgs {
     databases: Vec<PathBuf>,
     bucket: Option<String>,
     snapshot_interval: Option<u64>,
+    wal_sync_interval: Option<u64>,
     endpoint: Option<String>,
     max_changes: Option<u64>,
     max_interval: Option<u64>,
@@ -236,6 +256,9 @@ struct WatchArgs {
     on_startup: Option<bool>,
     compact_after_snapshot: bool,
     compact_interval: Option<u64>,
+    checkpoint_interval: Option<u64>,
+    min_checkpoint_pages: Option<u64>,
+    wal_truncate_threshold: Option<u64>,
     retain_hourly: Option<usize>,
     retain_daily: Option<usize>,
     retain_weekly: Option<usize>,
@@ -318,12 +341,16 @@ fn resolve_watch_config(
             // Build config from CLI with defaults
             let sync = SyncConfig {
                 snapshot_interval: cli.snapshot_interval.unwrap_or(3600),
+                wal_sync_interval: cli.wal_sync_interval.unwrap_or(1),
                 max_changes: cli.max_changes.unwrap_or(0),
                 max_interval: cli.max_interval.unwrap_or(0),
                 on_idle: cli.on_idle.unwrap_or(0),
                 on_startup: cli.on_startup.unwrap_or(true),
                 compact_after_snapshot: cli.compact_after_snapshot,
                 compact_interval: cli.compact_interval.unwrap_or(0),
+                checkpoint_interval: cli.checkpoint_interval.unwrap_or(60),
+                min_checkpoint_page_count: cli.min_checkpoint_pages.unwrap_or(1000),
+                wal_truncate_threshold_pages: cli.wal_truncate_threshold.unwrap_or(121359),
             };
 
             let retention = RetentionConfig {
@@ -363,12 +390,16 @@ fn resolve_watch_config(
 fn merge_cli_sync_overrides(base: &SyncConfig, cli: &WatchArgs) -> SyncConfig {
     SyncConfig {
         snapshot_interval: cli.snapshot_interval.unwrap_or(base.snapshot_interval),
+        wal_sync_interval: cli.wal_sync_interval.unwrap_or(base.wal_sync_interval),
         max_changes: cli.max_changes.unwrap_or(base.max_changes),
         max_interval: cli.max_interval.unwrap_or(base.max_interval),
         on_idle: cli.on_idle.unwrap_or(base.on_idle),
         on_startup: cli.on_startup.unwrap_or(base.on_startup),
         compact_after_snapshot: cli.compact_after_snapshot || base.compact_after_snapshot,
         compact_interval: cli.compact_interval.unwrap_or(base.compact_interval),
+        checkpoint_interval: cli.checkpoint_interval.unwrap_or(base.checkpoint_interval),
+        min_checkpoint_page_count: cli.min_checkpoint_pages.unwrap_or(base.min_checkpoint_page_count),
+        wal_truncate_threshold_pages: cli.wal_truncate_threshold.unwrap_or(base.wal_truncate_threshold_pages),
     }
 }
 
@@ -436,6 +467,7 @@ async fn main() -> Result<()> {
             databases,
             bucket,
             snapshot_interval,
+            wal_sync_interval,
             endpoint,
             max_changes,
             max_interval,
@@ -443,6 +475,9 @@ async fn main() -> Result<()> {
             on_startup,
             compact_after_snapshot,
             compact_interval,
+            checkpoint_interval,
+            min_checkpoint_pages,
+            wal_truncate_threshold,
             retain_hourly,
             retain_daily,
             retain_weekly,
@@ -454,6 +489,7 @@ async fn main() -> Result<()> {
                 databases,
                 bucket,
                 snapshot_interval,
+                wal_sync_interval,
                 endpoint,
                 max_changes,
                 max_interval,
@@ -461,6 +497,9 @@ async fn main() -> Result<()> {
                 on_startup,
                 compact_after_snapshot,
                 compact_interval,
+                checkpoint_interval,
+                min_checkpoint_pages,
+                wal_truncate_threshold,
                 retain_hourly,
                 retain_daily,
                 retain_weekly,

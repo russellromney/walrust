@@ -53,6 +53,9 @@ sha2 = "0.10"
 # LTX format (Litestream-compatible)
 litetx = "0.1"
 
+# SQLite for checkpointing
+rusqlite = { version = "0.32", features = ["bundled"] }
+
 # Dashboard + metrics
 axum = "0.7"
 prometheus = "0.13"

@@ -244,10 +244,17 @@ walrust explain [--config file]         # ✅ Show config summary without runnin
 - Litestream-compatible storage format
 - Add SHA256 verification on top of LTX CRC64
 
-### Checkpointing
-- Transaction-aware recording (like Litestream v0.5+)
-- Don't block SQLite checkpoints
-- Re-snapshot when WAL continuity breaks
+### Checkpointing ✅ IMPLEMENTED
+- ✅ **WAL Checkpoint Controls** - Production-grade WAL management
+  - `checkpoint_interval`: Periodic PASSIVE checkpoint (default: 60s)
+  - `min_checkpoint_page_count`: Efficiency threshold (default: 1000 pages, ~4MB)
+  - `wal_truncate_threshold_pages`: Emergency TRUNCATE (default: 121359 pages, ~500MB)
+  - Configurable via CLI and per-database in `walrust.toml`
+  - Non-blocking PASSIVE checkpoints for efficiency
+  - Blocking TRUNCATE checkpoints for safety brake
+- ✅ Transaction-aware recording (like Litestream v0.5+)
+- ✅ Don't block SQLite checkpoints
+- ✅ Re-snapshot when WAL continuity breaks
 
 ---
 

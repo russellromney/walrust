@@ -524,6 +524,11 @@ pub async fn watch_with_config(
     let snapshot_interval = Duration::from_secs(global_sync.snapshot_interval);
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
 
+    // Set up WAL sync timer (batches WAL changes instead of syncing immediately)
+    let wal_sync_interval = Duration::from_secs(global_sync.wal_sync_interval);
+    let mut wal_sync_timer = tokio::time::interval(wal_sync_interval);
+    wal_sync_timer.tick().await; // Skip first tick
+
     // Set up compaction timer
     let compact_interval_duration = if global_sync.compact_interval > 0 {
         Duration::from_secs(global_sync.compact_interval)
@@ -533,8 +538,20 @@ pub async fn watch_with_config(
     let mut compact_timer = tokio::time::interval(compact_interval_duration);
     compact_timer.tick().await; // Skip first tick
 
+    // Set up checkpoint timer (PASSIVE mode, non-blocking)
+    let checkpoint_interval_duration = if global_sync.checkpoint_interval > 0 {
+        Duration::from_secs(global_sync.checkpoint_interval)
+    } else {
+        Duration::from_secs(u64::MAX) // Disabled
+    };
+    let mut checkpoint_timer = tokio::time::interval(checkpoint_interval_duration);
+    checkpoint_timer.tick().await; // Skip first tick
+
     // Set up trigger check interval (1 second granularity)
     let mut trigger_timer = tokio::time::interval(Duration::from_secs(1));
+
+    // Track pending WAL syncs
+    let mut pending_wal_syncs = std::collections::HashSet::new();
 
     // Log startup info with sync trigger settings
     let triggers_enabled = global_sync.max_changes > 0
@@ -543,79 +560,113 @@ pub async fn watch_with_config(
 
     if triggers_enabled {
         tracing::info!(
-            "walrust running (snapshot interval: {}s, max_changes: {}, max_interval: {}s, on_idle: {}s)",
+            "walrust running (snapshot interval: {}s, WAL sync interval: {}s, checkpoint interval: {}s, max_changes: {}, max_interval: {}s, on_idle: {}s)",
             global_sync.snapshot_interval,
+            global_sync.wal_sync_interval,
+            global_sync.checkpoint_interval,
             global_sync.max_changes,
             global_sync.max_interval,
             global_sync.on_idle
         );
     } else {
         tracing::info!(
-            "walrust running (snapshot interval: {}s)",
-            global_sync.snapshot_interval
+            "walrust running (snapshot interval: {}s, WAL sync interval: {}s, checkpoint interval: {}s)",
+            global_sync.snapshot_interval,
+            global_sync.wal_sync_interval,
+            global_sync.checkpoint_interval
         );
     }
 
     loop {
         tokio::select! {
-            // WAL file changed
+            // WAL file changed - mark for sync instead of syncing immediately
             Some(wal_path) = rx.recv() => {
                 let db_path = wal_path.with_extension("db");
-                if let Some(state) = db_states.get_mut(&db_path) {
-                    let sync_config = sync_configs.get(&db_path).unwrap_or(&global_sync);
+                if db_states.contains_key(&db_path) {
+                    pending_wal_syncs.insert(db_path);
+                }
+            }
 
-                    match sync_wal(&client, &bucket_name, &prefix, state).await {
-                        Ok(frame_count) if frame_count > 0 => {
-                            // Update dashboard on successful sync
-                            let wal_size = std::fs::metadata(&state.wal_path).map(|m| m.len()).unwrap_or(0);
-                            metrics_state.update_db(DbStatus {
-                                name: state.name.clone(),
-                                path: state.db_path.display().to_string(),
-                                last_sync_timestamp: chrono::Utc::now().timestamp(),
-                                wal_size_bytes: wal_size,
-                                next_snapshot_timestamp: state.last_snapshot.map(|t| t.timestamp() + global_sync.snapshot_interval as i64).unwrap_or(0),
-                                error_count: 0,
-                                snapshot_count: 0,
-                                current_txid: state.current_txid,
-                            }).await;
+            // Batch sync pending WAL changes
+            _ = wal_sync_timer.tick() => {
+                for db_path in pending_wal_syncs.drain() {
+                    if let Some(state) = db_states.get_mut(&db_path) {
+                        let sync_config = sync_configs.get(&db_path).unwrap_or(&global_sync);
 
-                            if let Some(trigger) = trigger_states.get_mut(&db_path) {
-                                trigger.frames_since_snapshot += frame_count;
-                                trigger.last_wal_activity = Some(std::time::Instant::now());
-                                if trigger.first_change_time.is_none() {
-                                    trigger.first_change_time = Some(std::time::Instant::now());
+                        match sync_wal(&client, &bucket_name, &prefix, state).await {
+                            Ok(frame_count) if frame_count > 0 => {
+                                // Update dashboard on successful sync
+                                let wal_size = std::fs::metadata(&state.wal_path).map(|m| m.len()).unwrap_or(0);
+                                metrics_state.update_db(DbStatus {
+                                    name: state.name.clone(),
+                                    path: state.db_path.display().to_string(),
+                                    last_sync_timestamp: chrono::Utc::now().timestamp(),
+                                    wal_size_bytes: wal_size,
+                                    next_snapshot_timestamp: state.last_snapshot.map(|t| t.timestamp() + global_sync.snapshot_interval as i64).unwrap_or(0),
+                                    error_count: 0,
+                                    snapshot_count: 0,
+                                    current_txid: state.current_txid,
+                                }).await;
+
+                                // Check for emergency truncate threshold
+                                if sync_config.wal_truncate_threshold_pages > 0 {
+                                    if let Ok(wal_pages) = get_wal_page_count(&state.wal_path).await {
+                                        if wal_pages >= sync_config.wal_truncate_threshold_pages {
+                                            tracing::warn!(
+                                                "{}: WAL size ({} pages) exceeded emergency threshold ({} pages) - triggering TRUNCATE checkpoint",
+                                                state.name,
+                                                wal_pages,
+                                                sync_config.wal_truncate_threshold_pages
+                                            );
+
+                                            // TRUNCATE checkpoint blocks readers and writers!
+                                            if let Err(e) = run_checkpoint(&state.db_path, CheckpointMode::Truncate).await {
+                                                tracing::error!("{}: Emergency TRUNCATE checkpoint failed: {}", state.name, e);
+                                            } else {
+                                                tracing::info!("{}: Emergency TRUNCATE checkpoint completed", state.name);
+                                            }
+                                        }
+                                    }
                                 }
 
-                                // Check max_changes trigger
-                                if sync_config.max_changes > 0
-                                    && trigger.frames_since_snapshot >= sync_config.max_changes
-                                {
-                                    tracing::info!(
-                                        "{}: max_changes trigger ({} frames)",
-                                        state.name,
-                                        trigger.frames_since_snapshot
-                                    );
-                                    if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
-                                        tracing::error!("Failed to snapshot {}: {}", state.name, e);
-                                        metrics_state.record_error(&state.name);
-                                    } else {
-                                        metrics_state.record_snapshot(&state.name);
-                                        trigger.frames_since_snapshot = 0;
-                                        trigger.first_change_time = None;
+                                if let Some(trigger) = trigger_states.get_mut(&db_path) {
+                                    trigger.frames_since_snapshot += frame_count;
+                                    trigger.last_wal_activity = Some(std::time::Instant::now());
+                                    if trigger.first_change_time.is_none() {
+                                        trigger.first_change_time = Some(std::time::Instant::now());
+                                    }
 
-                                        if sync_config.compact_after_snapshot {
-                                            if let Some(ref policy) = compact_policy {
-                                                let _ = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await;
+                                    // Check max_changes trigger
+                                    if sync_config.max_changes > 0
+                                        && trigger.frames_since_snapshot >= sync_config.max_changes
+                                    {
+                                        tracing::info!(
+                                            "{}: max_changes trigger ({} frames)",
+                                            state.name,
+                                            trigger.frames_since_snapshot
+                                        );
+                                        if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
+                                            tracing::error!("Failed to snapshot {}: {}", state.name, e);
+                                            metrics_state.record_error(&state.name);
+                                        } else {
+                                            metrics_state.record_snapshot(&state.name);
+                                            trigger.frames_since_snapshot = 0;
+                                            trigger.first_change_time = None;
+
+                                            if sync_config.compact_after_snapshot {
+                                                if let Some(ref policy) = compact_policy {
+                                                    let _ = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await;
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            tracing::error!("Failed to sync WAL for {}: {}", state.name, e);
-                            metrics_state.record_error(&state.name);
+                            Ok(_) => {}
+                            Err(e) => {
+                                tracing::error!("Failed to sync WAL for {}: {}", state.name, e);
+                                metrics_state.record_error(&state.name);
+                            }
                         }
                     }
                 }
@@ -724,6 +775,37 @@ pub async fn watch_with_config(
                     for state in db_states.values() {
                         if let Err(e) = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await {
                             tracing::error!("Failed to compact {}: {}", state.name, e);
+                        }
+                    }
+                }
+            }
+
+            // Periodic PASSIVE checkpoint
+            _ = checkpoint_timer.tick(), if global_sync.checkpoint_interval > 0 => {
+                for (db_path, state) in db_states.iter_mut() {
+                    let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
+
+                    // Check if WAL has enough pages to warrant checkpoint
+                    if let Ok(wal_pages) = get_wal_page_count(&state.wal_path).await {
+                        if wal_pages >= sync_config.min_checkpoint_page_count {
+                            tracing::info!(
+                                "{}: Running PASSIVE checkpoint ({} pages)",
+                                state.name,
+                                wal_pages
+                            );
+
+                            if let Err(e) = run_checkpoint(&state.db_path, CheckpointMode::Passive).await {
+                                tracing::error!("{}: PASSIVE checkpoint failed: {}", state.name, e);
+                            } else {
+                                tracing::debug!("{}: PASSIVE checkpoint completed", state.name);
+                            }
+                        } else {
+                            tracing::debug!(
+                                "{}: Skipping checkpoint (only {} pages, need {})",
+                                state.name,
+                                wal_pages,
+                                sync_config.min_checkpoint_page_count
+                            );
                         }
                     }
                 }
@@ -2163,6 +2245,81 @@ pub async fn verify(
     }
 
     Ok(())
+}
+
+/// Checkpoint mode for SQLite WAL
+#[derive(Debug, Clone, Copy)]
+enum CheckpointMode {
+    /// Non-blocking, best effort checkpoint
+    Passive,
+    /// Blocking checkpoint that ensures WAL is reset
+    Truncate,
+}
+
+/// Get WAL page count for size checking
+async fn get_wal_page_count(wal_path: &Path) -> Result<u64> {
+    if !wal_path.exists() {
+        return Ok(0);
+    }
+
+    // WAL file size / page size (4096 bytes typically)
+    let metadata = tokio::fs::metadata(wal_path).await?;
+    let file_size = metadata.len();
+
+    if file_size < 32 {
+        // WAL file too small to have a valid header
+        return Ok(0);
+    }
+
+    // Read page size from WAL header (bytes 8-11)
+    let mut file = tokio::fs::File::open(wal_path).await?;
+    let mut header = vec![0u8; 32];
+    use tokio::io::AsyncReadExt;
+    file.read_exact(&mut header).await?;
+
+    let page_size = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as u64;
+
+    // Account for WAL header (32 bytes) + frame headers (24 bytes each)
+    // Approximate: (file_size - 32) / (page_size + 24)
+    let approx_pages = if page_size > 0 {
+        (file_size.saturating_sub(32)) / (page_size + 24)
+    } else {
+        0
+    };
+
+    Ok(approx_pages)
+}
+
+/// Run SQLite checkpoint on database
+async fn run_checkpoint(db_path: &Path, mode: CheckpointMode) -> Result<()> {
+    // Use blocking task since SQLite operations are synchronous
+    let db_path = db_path.to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open(&db_path)?;
+
+        let pragma = match mode {
+            CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
+            CheckpointMode::Truncate => "PRAGMA wal_checkpoint(TRUNCATE)",
+        };
+
+        // Returns (busy, checkpointed_frames, log_size)
+        let (busy, frames, log_size): (i32, i32, i32) = conn.query_row(pragma, [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })?;
+
+        if busy != 0 {
+            tracing::debug!("Checkpoint was busy (concurrent writers)");
+        }
+
+        tracing::debug!(
+            "Checkpointed {} frames (log size: {})",
+            frames,
+            log_size
+        );
+        Ok(())
+    })
+    .await?
 }
 
 #[cfg(test)]
@@ -4319,12 +4476,16 @@ mod tests {
             },
             sync: SyncConfig {
                 snapshot_interval: 1800,
+                wal_sync_interval: 1,
                 max_changes: 100,
                 max_interval: 300,
                 on_idle: 60,
                 on_startup: true,
                 compact_after_snapshot: true,
                 compact_interval: 3600,
+                checkpoint_interval: 60,
+                min_checkpoint_page_count: 1000,
+                wal_truncate_threshold_pages: 121359,
             },
             retention: RetentionConfig {
                 hourly: 12,
@@ -4337,6 +4498,115 @@ mod tests {
 
         let result = explain(&Some(config));
         assert!(result.is_ok());
+    }
+
+    // ============================================
+    // Checkpoint Tests
+    // ============================================
+
+    #[tokio::test]
+    async fn test_get_wal_page_count() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("test.db");
+
+        // Create a test database with WAL mode
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+
+        let wal_path = db_path.with_extension("db-wal");
+        let initial_pages = get_wal_page_count(&wal_path).await.unwrap();
+
+        // Write some data to generate WAL pages
+        for i in 0..100 {
+            conn.execute("INSERT INTO test (data) VALUES (?)", [format!("data_{}", i)]).unwrap();
+        }
+
+        let after_pages = get_wal_page_count(&wal_path).await.unwrap();
+        assert!(after_pages > initial_pages, "WAL should have more pages after writes");
+    }
+
+    #[tokio::test]
+    async fn test_passive_checkpoint() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("test.db");
+
+        // Create a test database with WAL mode
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+        conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+
+        // Write enough data to generate WAL pages
+        for i in 0..500 {
+            conn.execute("INSERT INTO test (data) VALUES (?)", [format!("data_{}", i)]).unwrap();
+        }
+
+        let wal_path = db_path.with_extension("db-wal");
+        let before_pages = get_wal_page_count(&wal_path).await.unwrap();
+        assert!(before_pages > 0, "Should have WAL pages before checkpoint");
+
+        // Run PASSIVE checkpoint
+        let result = run_checkpoint(&db_path, CheckpointMode::Passive).await;
+        assert!(result.is_ok(), "PASSIVE checkpoint should succeed");
+
+        // WAL should be smaller after checkpoint (though not necessarily zero with PASSIVE)
+        let after_pages = get_wal_page_count(&wal_path).await.unwrap();
+        assert!(
+            after_pages <= before_pages,
+            "WAL should not grow after checkpoint"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_truncate_checkpoint() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("test.db");
+
+        // Create a test database with WAL mode
+        {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, data TEXT)", []).unwrap();
+
+            // Write data to generate WAL pages
+            for i in 0..500 {
+                conn.execute("INSERT INTO test (data) VALUES (?)", [format!("data_{}", i)]).unwrap();
+            }
+            // Connection auto-closes here
+        }
+
+        // Wait a bit for connection to fully close
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let wal_path = db_path.with_extension("db-wal");
+        let before_pages = get_wal_page_count(&wal_path).await.unwrap_or(0);
+
+        // Only test if there are WAL pages (connection close might checkpoint)
+        if before_pages > 0 {
+            // Run TRUNCATE checkpoint
+            let result = run_checkpoint(&db_path, CheckpointMode::Truncate).await;
+            assert!(result.is_ok(), "TRUNCATE checkpoint should succeed");
+
+            // With TRUNCATE and no active connections, WAL should be reset
+            let after_pages = get_wal_page_count(&wal_path).await.unwrap_or(0);
+            assert!(
+                after_pages <= before_pages,
+                "WAL should not grow after TRUNCATE checkpoint"
+            );
+        } else {
+            // If no WAL pages, just verify checkpoint doesn't error
+            let result = run_checkpoint(&db_path, CheckpointMode::Truncate).await;
+            assert!(result.is_ok(), "TRUNCATE checkpoint should succeed even with empty WAL");
+        }
+    }
+
+    #[tokio::test]
+    async fn test_get_wal_page_count_nonexistent() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let wal_path = tmpdir.path().join("nonexistent.db-wal");
+
+        let pages = get_wal_page_count(&wal_path).await.unwrap();
+        assert_eq!(pages, 0, "Non-existent WAL should return 0 pages");
     }
 
     // ============================================

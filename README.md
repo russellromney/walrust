@@ -95,14 +95,24 @@ Watch databases and continuously sync WAL changes.
 walrust watch <DATABASES>... -b <BUCKET> [OPTIONS]
 
 Options:
-  --snapshot-interval <SECS>    Snapshot interval (default: 3600)
-  --endpoint <URL>              S3 endpoint (for Tigris/MinIO)
-  --compact-after-snapshot      Run compaction after each snapshot
-  --compact-interval <SECS>     Compaction interval in seconds (0 = disabled)
-  --retain-hourly <N>           Hourly snapshots to keep (default: 24)
-  --retain-daily <N>            Daily snapshots to keep (default: 7)
-  --retain-weekly <N>           Weekly snapshots to keep (default: 12)
-  --retain-monthly <N>          Monthly snapshots to keep (default: 12)
+  --snapshot-interval <SECS>       Snapshot interval (default: 3600)
+  --wal-sync-interval <SECS>       WAL sync batching interval (default: 1)
+  --endpoint <URL>                 S3 endpoint (for Tigris/MinIO)
+
+  # Checkpointing (prevent unbounded WAL growth)
+  --checkpoint-interval <SECS>     Checkpoint interval (default: 60)
+  --min-checkpoint-pages <N>       Min pages before checkpoint (default: 1000, ~4MB)
+  --wal-truncate-threshold <N>     Emergency truncate threshold (default: 121359, ~500MB)
+
+  # Compaction
+  --compact-after-snapshot         Run compaction after each snapshot
+  --compact-interval <SECS>        Compaction interval in seconds (0 = disabled)
+
+  # Retention
+  --retain-hourly <N>              Hourly snapshots to keep (default: 24)
+  --retain-daily <N>               Daily snapshots to keep (default: 7)
+  --retain-weekly <N>              Weekly snapshots to keep (default: 12)
+  --retain-monthly <N>             Monthly snapshots to keep (default: 12)
 ```
 
 ### `walrust snapshot`
@@ -189,6 +199,52 @@ Checks: file existence, header validity, checksums, TXID continuity.
 - `AWS_SECRET_ACCESS_KEY` - AWS/Tigris secret key
 - `AWS_ENDPOINT_URL_S3` - S3 endpoint (for Tigris/MinIO)
 - `AWS_REGION` - AWS region (default: us-east-1)
+
+## Configuration File
+
+Create `walrust.toml` in your project directory:
+
+```toml
+[s3]
+bucket = "s3://my-bucket/backups"
+endpoint = "https://fly.storage.tigris.dev"
+
+[sync]
+snapshot_interval = 3600        # Snapshot every hour
+wal_sync_interval = 1           # Batch WAL syncs every 1 second
+checkpoint_interval = 60        # Checkpoint every 60 seconds
+min_checkpoint_page_count = 1000  # Only checkpoint if WAL >= 1000 pages (~4MB)
+wal_truncate_threshold_pages = 121359  # Emergency truncate at 500MB
+
+max_changes = 1000              # Snapshot after 1000 WAL frames
+max_interval = 300              # Snapshot after 5 min of changes
+on_idle = 60                    # Snapshot after 60 sec of no activity
+
+compact_after_snapshot = true
+compact_interval = 3600
+
+[retention]
+hourly = 24
+daily = 7
+weekly = 12
+monthly = 12
+
+[[databases]]
+path = "/data/app.db"
+prefix = "production"
+
+[[databases]]
+path = "/data/analytics.db"
+checkpoint_interval = 30        # Override: checkpoint more frequently
+wal_truncate_threshold_pages = 50000  # Override: lower emergency threshold
+```
+
+Then run:
+```bash
+walrust watch  # Auto-discovers walrust.toml
+# or
+walrust watch --config custom.toml
+```
 
 ## S3 Layout (LTX Format)
 

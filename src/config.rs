@@ -46,6 +46,11 @@ pub struct SyncConfig {
     #[serde(default = "default_snapshot_interval")]
     pub snapshot_interval: u64,
 
+    /// WAL sync interval in seconds (default: 1)
+    /// Batches WAL changes instead of syncing immediately on each write
+    #[serde(default = "default_wal_sync_interval")]
+    pub wal_sync_interval: u64,
+
     /// Take snapshot after N WAL frames (0 = disabled)
     #[serde(default)]
     pub max_changes: u64,
@@ -69,18 +74,37 @@ pub struct SyncConfig {
     /// Compaction interval in seconds (0 = disabled)
     #[serde(default)]
     pub compact_interval: u64,
+
+    /// Checkpoint interval in seconds (default: 60)
+    /// Runs PRAGMA wal_checkpoint(PASSIVE) on interval
+    #[serde(default = "default_checkpoint_interval")]
+    pub checkpoint_interval: u64,
+
+    /// Minimum page count before running checkpoint (default: 1000)
+    /// Only checkpoint if WAL has this many pages (~4MB)
+    #[serde(default = "default_min_checkpoint_pages")]
+    pub min_checkpoint_page_count: u64,
+
+    /// Emergency WAL size threshold in pages (default: 121359 = ~500MB)
+    /// Triggers blocking TRUNCATE checkpoint. Set to 0 to disable.
+    #[serde(default = "default_truncate_threshold")]
+    pub wal_truncate_threshold_pages: u64,
 }
 
 impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             snapshot_interval: 3600,
+            wal_sync_interval: 1,
             max_changes: 0,
             max_interval: 0,
             on_idle: 0,
             on_startup: true,
             compact_after_snapshot: false,
             compact_interval: 0,
+            checkpoint_interval: 60,
+            min_checkpoint_page_count: 1000,
+            wal_truncate_threshold_pages: 121359,
         }
     }
 }
@@ -88,8 +112,20 @@ impl Default for SyncConfig {
 fn default_snapshot_interval() -> u64 {
     3600
 }
+fn default_wal_sync_interval() -> u64 {
+    1
+}
 fn default_on_startup() -> bool {
     true
+}
+fn default_checkpoint_interval() -> u64 {
+    60
+}
+fn default_min_checkpoint_pages() -> u64 {
+    1000
+}
+fn default_truncate_threshold() -> u64 {
+    121359
 }
 
 /// Retention policy configuration
@@ -143,6 +179,9 @@ pub struct DatabaseConfig {
     /// Override snapshot interval for this database
     pub snapshot_interval: Option<u64>,
 
+    /// Override WAL sync interval for this database
+    pub wal_sync_interval: Option<u64>,
+
     /// Override max_changes for this database
     pub max_changes: Option<u64>,
 
@@ -151,6 +190,15 @@ pub struct DatabaseConfig {
 
     /// Override on_idle for this database
     pub on_idle: Option<u64>,
+
+    /// Override checkpoint_interval for this database
+    pub checkpoint_interval: Option<u64>,
+
+    /// Override min_checkpoint_page_count for this database
+    pub min_checkpoint_page_count: Option<u64>,
+
+    /// Override wal_truncate_threshold_pages for this database
+    pub wal_truncate_threshold_pages: Option<u64>,
 
     /// Override retention policy for this database
     pub retention: Option<RetentionConfig>,
@@ -294,6 +342,9 @@ impl Config {
         if let Some(interval) = db.snapshot_interval {
             sync.snapshot_interval = interval;
         }
+        if let Some(interval) = db.wal_sync_interval {
+            sync.wal_sync_interval = interval;
+        }
         if let Some(v) = db.max_changes {
             sync.max_changes = v;
         }
@@ -302,6 +353,15 @@ impl Config {
         }
         if let Some(v) = db.on_idle {
             sync.on_idle = v;
+        }
+        if let Some(v) = db.checkpoint_interval {
+            sync.checkpoint_interval = v;
+        }
+        if let Some(v) = db.min_checkpoint_page_count {
+            sync.min_checkpoint_page_count = v;
+        }
+        if let Some(v) = db.wal_truncate_threshold_pages {
+            sync.wal_truncate_threshold_pages = v;
         }
 
         sync
