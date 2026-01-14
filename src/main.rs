@@ -91,6 +91,16 @@ enum Commands {
         #[arg(long)]
         wal_truncate_threshold: Option<u64>,
 
+        /// File watcher check interval in seconds (default: 1)
+        /// Debounces trigger checks to reduce CPU on high-write workloads
+        #[arg(long)]
+        monitor_interval: Option<u64>,
+
+        /// Backup validation interval in seconds (0 = disabled)
+        /// Periodically verifies backup integrity by checking LTX checksums
+        #[arg(long)]
+        validation_interval: Option<u64>,
+
         /// Number of hourly snapshots to retain
         #[arg(long)]
         retain_hourly: Option<usize>,
@@ -259,6 +269,8 @@ struct WatchArgs {
     checkpoint_interval: Option<u64>,
     min_checkpoint_pages: Option<u64>,
     wal_truncate_threshold: Option<u64>,
+    monitor_interval: Option<u64>,
+    validation_interval: Option<u64>,
     retain_hourly: Option<usize>,
     retain_daily: Option<usize>,
     retain_weekly: Option<usize>,
@@ -351,6 +363,8 @@ fn resolve_watch_config(
                 checkpoint_interval: cli.checkpoint_interval.unwrap_or(60),
                 min_checkpoint_page_count: cli.min_checkpoint_pages.unwrap_or(1000),
                 wal_truncate_threshold_pages: cli.wal_truncate_threshold.unwrap_or(121359),
+                monitor_interval: cli.monitor_interval.unwrap_or(1),
+                validation_interval: cli.validation_interval.unwrap_or(0),
             };
 
             let retention = RetentionConfig {
@@ -400,6 +414,8 @@ fn merge_cli_sync_overrides(base: &SyncConfig, cli: &WatchArgs) -> SyncConfig {
         checkpoint_interval: cli.checkpoint_interval.unwrap_or(base.checkpoint_interval),
         min_checkpoint_page_count: cli.min_checkpoint_pages.unwrap_or(base.min_checkpoint_page_count),
         wal_truncate_threshold_pages: cli.wal_truncate_threshold.unwrap_or(base.wal_truncate_threshold_pages),
+        monitor_interval: cli.monitor_interval.unwrap_or(base.monitor_interval),
+        validation_interval: cli.validation_interval.unwrap_or(base.validation_interval),
     }
 }
 
@@ -478,6 +494,8 @@ async fn main() -> Result<()> {
             checkpoint_interval,
             min_checkpoint_pages,
             wal_truncate_threshold,
+            monitor_interval,
+            validation_interval,
             retain_hourly,
             retain_daily,
             retain_weekly,
@@ -500,6 +518,8 @@ async fn main() -> Result<()> {
                 checkpoint_interval,
                 min_checkpoint_pages,
                 wal_truncate_threshold,
+                monitor_interval,
+                validation_interval,
                 retain_hourly,
                 retain_daily,
                 retain_weekly,

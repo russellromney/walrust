@@ -33,6 +33,9 @@ pub struct MetricsState {
     pub snapshot_count: IntCounterVec,
     pub current_txid: IntGaugeVec,
     pub databases_total: prometheus::IntGauge,
+    pub validation_success: IntCounterVec,
+    pub validation_failure: IntCounterVec,
+    pub last_validation_timestamp: GaugeVec,
 }
 
 impl MetricsState {
@@ -91,6 +94,30 @@ impl MetricsState {
             .register(Box::new(databases_total.clone()))
             .unwrap();
 
+        let validation_success = IntCounterVec::new(
+            Opts::new("walrust_validation_success_total", "Successful backup validations"),
+            &["database"],
+        )
+        .unwrap();
+        registry.register(Box::new(validation_success.clone())).unwrap();
+
+        let validation_failure = IntCounterVec::new(
+            Opts::new("walrust_validation_failure_total", "Failed backup validations"),
+            &["database"],
+        )
+        .unwrap();
+        registry.register(Box::new(validation_failure.clone())).unwrap();
+
+        let last_validation_timestamp = GaugeVec::new(
+            Opts::new(
+                "walrust_last_validation_timestamp",
+                "Unix timestamp of last validation",
+            ),
+            &["database"],
+        )
+        .unwrap();
+        registry.register(Box::new(last_validation_timestamp.clone())).unwrap();
+
         Self {
             start_time: Instant::now(),
             databases: RwLock::new(HashMap::new()),
@@ -102,6 +129,9 @@ impl MetricsState {
             snapshot_count,
             current_txid,
             databases_total,
+            validation_success,
+            validation_failure,
+            last_validation_timestamp,
         }
     }
 
@@ -131,6 +161,20 @@ impl MetricsState {
 
     pub fn record_snapshot(&self, db_name: &str) {
         self.snapshot_count.with_label_values(&[db_name]).inc();
+    }
+
+    pub fn record_validation_success(&self, db_name: &str) {
+        self.validation_success.with_label_values(&[db_name]).inc();
+        self.last_validation_timestamp
+            .with_label_values(&[db_name])
+            .set(chrono::Utc::now().timestamp() as f64);
+    }
+
+    pub fn record_validation_failure(&self, db_name: &str) {
+        self.validation_failure.with_label_values(&[db_name]).inc();
+        self.last_validation_timestamp
+            .with_label_values(&[db_name])
+            .set(chrono::Utc::now().timestamp() as f64);
     }
 
     pub fn uptime_seconds(&self) -> u64 {

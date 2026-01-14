@@ -547,8 +547,18 @@ pub async fn watch_with_config(
     let mut checkpoint_timer = tokio::time::interval(checkpoint_interval_duration);
     checkpoint_timer.tick().await; // Skip first tick
 
-    // Set up trigger check interval (1 second granularity)
-    let mut trigger_timer = tokio::time::interval(Duration::from_secs(1));
+    // Set up trigger check interval (configurable via monitor_interval)
+    let monitor_interval_duration = Duration::from_secs(global_sync.monitor_interval);
+    let mut trigger_timer = tokio::time::interval(monitor_interval_duration);
+
+    // Set up validation timer (periodic backup integrity check)
+    let validation_interval_duration = if global_sync.validation_interval > 0 {
+        Duration::from_secs(global_sync.validation_interval)
+    } else {
+        Duration::from_secs(u64::MAX) // Disabled
+    };
+    let mut validation_timer = tokio::time::interval(validation_interval_duration);
+    validation_timer.tick().await; // Skip first tick
 
     // Track pending WAL syncs
     let mut pending_wal_syncs = std::collections::HashSet::new();
@@ -558,22 +568,32 @@ pub async fn watch_with_config(
         || global_sync.max_interval > 0
         || global_sync.on_idle > 0;
 
+    let validation_info = if global_sync.validation_interval > 0 {
+        format!(", validation: {}s", global_sync.validation_interval)
+    } else {
+        String::new()
+    };
+
     if triggers_enabled {
         tracing::info!(
-            "walrust running (snapshot interval: {}s, WAL sync interval: {}s, checkpoint interval: {}s, max_changes: {}, max_interval: {}s, on_idle: {}s)",
+            "walrust running (snapshot: {}s, WAL sync: {}s, checkpoint: {}s, monitor: {}s, max_changes: {}, max_interval: {}s, on_idle: {}s{})",
             global_sync.snapshot_interval,
             global_sync.wal_sync_interval,
             global_sync.checkpoint_interval,
+            global_sync.monitor_interval,
             global_sync.max_changes,
             global_sync.max_interval,
-            global_sync.on_idle
+            global_sync.on_idle,
+            validation_info
         );
     } else {
         tracing::info!(
-            "walrust running (snapshot interval: {}s, WAL sync interval: {}s, checkpoint interval: {}s)",
+            "walrust running (snapshot: {}s, WAL sync: {}s, checkpoint: {}s, monitor: {}s{})",
             global_sync.snapshot_interval,
             global_sync.wal_sync_interval,
-            global_sync.checkpoint_interval
+            global_sync.checkpoint_interval,
+            global_sync.monitor_interval,
+            validation_info
         );
     }
 
@@ -806,6 +826,43 @@ pub async fn watch_with_config(
                                 wal_pages,
                                 sync_config.min_checkpoint_page_count
                             );
+                        }
+                    }
+                }
+            }
+
+            // Periodic backup validation
+            _ = validation_timer.tick(), if global_sync.validation_interval > 0 => {
+                for (_db_path, state) in db_states.iter() {
+                    let db_name = &state.name;
+
+                    tracing::debug!("{}: Running periodic backup validation", db_name);
+
+                    match validate_backup_integrity(&client, &bucket_name, &prefix, db_name).await {
+                        Ok(result) => {
+                            if result.is_valid {
+                                tracing::info!(
+                                    "{}: Validation passed ({} files, {:.2} MB)",
+                                    db_name,
+                                    result.verified_count,
+                                    result.verified_size_bytes as f64 / (1024.0 * 1024.0)
+                                );
+                                metrics_state.record_validation_success(db_name);
+                            } else {
+                                tracing::error!(
+                                    "{}: Validation failed with {} issues",
+                                    db_name,
+                                    result.issues.len()
+                                );
+                                for issue in &result.issues {
+                                    tracing::error!("  {}: {}", issue.filename, issue.issue);
+                                }
+                                metrics_state.record_validation_failure(db_name);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("{}: Validation error: {}", db_name, e);
+                            metrics_state.record_validation_failure(db_name);
                         }
                     }
                 }
@@ -2049,11 +2106,142 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
 }
 
 /// Verification issue found during verify
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct VerifyIssue {
     pub filename: String,
     pub issue: String,
     pub is_orphan: bool,
+}
+
+/// Result of backup validation
+#[derive(Debug)]
+pub struct ValidationResult {
+    pub verified_count: usize,
+    pub total_files: usize,
+    pub issues: Vec<VerifyIssue>,
+    pub verified_size_bytes: u64,
+    pub is_valid: bool,
+}
+
+/// Validate backup integrity for a database (non-blocking, for periodic validation)
+async fn validate_backup_integrity(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    db_name: &str,
+) -> Result<ValidationResult> {
+    // Load manifest
+    let manifest = load_manifest(client, bucket, prefix, db_name).await?;
+
+    if manifest.files.is_empty() {
+        return Ok(ValidationResult {
+            verified_count: 0,
+            total_files: 0,
+            issues: Vec::new(),
+            verified_size_bytes: 0,
+            is_valid: true,
+        });
+    }
+
+    let mut issues: Vec<VerifyIssue> = Vec::new();
+    let mut verified_count = 0;
+    let mut total_size: u64 = 0;
+
+    // Check each LTX file
+    for entry in &manifest.files {
+        let ltx_key = format!("{}{}/{}", prefix, db_name, entry.filename);
+
+        match s3::exists(client, bucket, &ltx_key).await {
+            Ok(true) => {
+                // File exists, download and verify
+                match s3::download_bytes(client, bucket, &ltx_key).await {
+                    Ok(data) => {
+                        let cursor = std::io::Cursor::new(&data);
+                        match ltx::verify_ltx(cursor) {
+                            Ok(header) => {
+                                let header_min = header.min_txid.into_inner();
+                                let header_max = header.max_txid.into_inner();
+
+                                if header_min != entry.min_txid || header_max != entry.max_txid {
+                                    issues.push(VerifyIssue {
+                                        filename: entry.filename.clone(),
+                                        issue: format!(
+                                            "TXID mismatch: manifest {}-{}, header {}-{}",
+                                            entry.min_txid, entry.max_txid,
+                                            header_min, header_max
+                                        ),
+                                        is_orphan: false,
+                                    });
+                                } else {
+                                    verified_count += 1;
+                                    total_size += data.len() as u64;
+                                }
+                            }
+                            Err(e) => {
+                                issues.push(VerifyIssue {
+                                    filename: entry.filename.clone(),
+                                    issue: format!("Checksum failed: {}", e),
+                                    is_orphan: false,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        issues.push(VerifyIssue {
+                            filename: entry.filename.clone(),
+                            issue: format!("Download failed: {}", e),
+                            is_orphan: false,
+                        });
+                    }
+                }
+            }
+            Ok(false) => {
+                issues.push(VerifyIssue {
+                    filename: entry.filename.clone(),
+                    issue: "File missing from S3".to_string(),
+                    is_orphan: true,
+                });
+            }
+            Err(e) => {
+                issues.push(VerifyIssue {
+                    filename: entry.filename.clone(),
+                    issue: format!("S3 check failed: {}", e),
+                    is_orphan: false,
+                });
+            }
+        }
+    }
+
+    // Check TXID continuity
+    let mut sorted_files: Vec<_> = manifest.files.iter().collect();
+    sorted_files.sort_by_key(|f| f.min_txid);
+
+    let mut expected_next_txid: Option<u64> = None;
+    for entry in &sorted_files {
+        if let Some(expected) = expected_next_txid {
+            // For incrementals, check for gaps
+            if !entry.is_snapshot && entry.min_txid != expected && entry.min_txid > expected {
+                issues.push(VerifyIssue {
+                    filename: entry.filename.clone(),
+                    issue: format!(
+                        "TXID gap: expected {}, got {} (missing {}-{})",
+                        expected, entry.min_txid,
+                        expected, entry.min_txid - 1
+                    ),
+                    is_orphan: false,
+                });
+            }
+        }
+        expected_next_txid = Some(entry.max_txid + 1);
+    }
+
+    Ok(ValidationResult {
+        verified_count,
+        total_files: manifest.files.len(),
+        issues: issues.clone(),
+        verified_size_bytes: total_size,
+        is_valid: issues.is_empty(),
+    })
 }
 
 /// Verify integrity of all LTX files in S3 for a database
@@ -4486,6 +4674,8 @@ mod tests {
                 checkpoint_interval: 60,
                 min_checkpoint_page_count: 1000,
                 wal_truncate_threshold_pages: 121359,
+                monitor_interval: 1,
+                validation_interval: 0,
             },
             retention: RetentionConfig {
                 hourly: 12,

@@ -7,7 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-01-14
+
 ### Added
+- **Monitor Interval** (`monitor_interval`): Configurable file watcher debouncing
+  - Reduces CPU usage on high-write workloads
+  - Default: 1 second (check for changes every second)
+  - Higher values reduce CPU but increase sync latency
+  - Configurable via CLI (`--monitor-interval`) and config file
+  - Per-database override support
+- **Validation Interval** (`validation_interval`): Automated backup integrity verification
+  - Periodic verification of LTX checksums and TXID continuity
+  - Default: 0 (disabled)
+  - Recommended: 86400 (daily) for production
+  - Prometheus metrics: `walrust_validation_success_total`, `walrust_validation_failure_total`, `walrust_last_validation_timestamp`
+  - Configurable via CLI (`--validation-interval`) and config file
+  - Per-database override support
 - **WAL Checkpoint Controls**: Production-grade WAL management to prevent unbounded growth
   - `checkpoint_interval`: Periodic PASSIVE checkpoint (default: 60s)
   - `min_checkpoint_page_count`: Only checkpoint if WAL ≥ N pages (default: 1000, ~4MB)
@@ -27,12 +42,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) - Detailed plan for missing features
   - [BATTLE_TESTING.md](./BATTLE_TESTING.md) - DST architecture and test scenarios
 
-### Known Issues
-- **Missing Production Features** (see [CONFIG_VERIFICATION.md](./CONFIG_VERIFICATION.md)):
-  - ❌ `monitor_interval` - File watcher debouncing for high-write workloads (~2-3 hours to implement)
-  - ❌ `validation_interval` - Automated backup integrity verification (~4-6 hours to implement)
-  - **Impact**: v0.3 is NOT production-ready without these features
-  - **Timeline**: ~10 hours total implementation work for v0.4
+### Fixed
+- All production-critical config options now implemented (was blocking v0.3 production readiness)
 
 ## [0.3.0] - 2026-01-13
 

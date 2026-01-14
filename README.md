@@ -8,7 +8,7 @@
 
 Like Litestream but with an emphasis on memory footprint and easy of configuration. 
 
-> **Alpha Status:** Core functionality complete, but missing production-critical features (`monitor_interval`, `validation_interval`). See [CONFIG_VERIFICATION.md](./CONFIG_VERIFICATION.md) for details. ETA for production readiness: ~10 hours of implementation work. 
+> **v0.1.4:** Adds `monitor_interval` for debouncing and `validation_interval` for automated backup verification. 
 
 ## Installation
 
@@ -103,6 +103,10 @@ Options:
   --checkpoint-interval <SECS>     Checkpoint interval (default: 60)
   --min-checkpoint-pages <N>       Min pages before checkpoint (default: 1000, ~4MB)
   --wal-truncate-threshold <N>     Emergency truncate threshold (default: 121359, ~500MB)
+
+  # Monitoring & Validation
+  --monitor-interval <SECS>        File watcher check interval (default: 1)
+  --validation-interval <SECS>     Backup validation interval (default: 0, disabled)
 
   # Compaction
   --compact-after-snapshot         Run compaction after each snapshot
@@ -215,6 +219,8 @@ wal_sync_interval = 1           # Batch WAL syncs every 1 second
 checkpoint_interval = 60        # Checkpoint every 60 seconds
 min_checkpoint_page_count = 1000  # Only checkpoint if WAL >= 1000 pages (~4MB)
 wal_truncate_threshold_pages = 121359  # Emergency truncate at 500MB
+monitor_interval = 1            # File watcher check interval (debounce)
+validation_interval = 86400     # Backup validation every 24 hours (0 = disabled)
 
 max_changes = 1000              # Snapshot after 1000 WAL frames
 max_interval = 300              # Snapshot after 5 min of changes
@@ -237,6 +243,8 @@ prefix = "production"
 path = "/data/analytics.db"
 checkpoint_interval = 30        # Override: checkpoint more frequently
 wal_truncate_threshold_pages = 50000  # Override: lower emergency threshold
+monitor_interval = 5            # Override: debounce every 5 seconds
+validation_interval = 3600      # Override: validate hourly for this DB
 ```
 
 Then run:
@@ -312,7 +320,7 @@ Single walrust process handles multiple databases with shared S3 connection pool
 
 ## Testing
 
-105 tests covering:
+132 tests covering:
 - ✅ Byte-for-byte data integrity (snapshot → restore → verify)
 - ✅ SHA256 checksum storage and verification
 - ✅ Multi-database concurrent snapshots

@@ -10,22 +10,26 @@ Litestream-compatible SQLite sync in Rust. Optimized for multi-tenant deployment
 - Built-in dashboard + Prometheus metrics
 - Opinionated defaults (grandfather/father/son retention)
 
-## v0.3 Highlights (Current Alpha)
+## v0.1.4 Highlights (Current)
+
+- ✅ **Monitor Interval** (`monitor_interval`) - File watcher debouncing to reduce CPU usage
+- ✅ **Validation Interval** (`validation_interval`) - Automated periodic backup integrity verification
+- ✅ **Validation Metrics** - Prometheus metrics for backup validation
+- ✅ **132 tests** - Comprehensive test coverage including 20 integration tests on Tigris
+
+## v0.1.3 Highlights (Previous)
 
 **Major Achievement:** Full LTX format integration with Litestream compatibility
 
-What works now:
 - ✅ **Snapshots as LTX files** - Compressed, checksummed, Litestream-compatible
 - ✅ **Point-in-time restore** - By TXID or timestamp with manifest tracking
 - ✅ **Binary preservation** - Byte-for-byte identical restore verified
-- ✅ **Real S3 testing** - 105 tests including 23 integration tests on Tigris
 - ✅ **Multi-database** - Single process handles multiple SQLite databases
-
-What's next:
 - ✅ **Compaction & retention** - GFS rotation with configurable retention
 - ✅ **Config file support** for multi-DB deployments
 - ✅ **Smart sync triggers** (reduce snapshot frequency)
 - ✅ **Dashboard & metrics** for observability
+- ✅ **WAL Checkpoint Controls** - Production-grade WAL management
 
 ---
 
@@ -276,13 +280,25 @@ s3://bucket/prefix/
 
 ## Current Status
 
-### v0.3 (Current - Alpha)
+### v0.1.4 (Current)
+- [x] **Monitor Interval** - File watcher debouncing for high-write workloads
+  - [x] Configurable via CLI (`--monitor-interval`) and config file
+  - [x] Per-database override support
+  - [x] Default: 1 second
+- [x] **Validation Interval** - Automated backup integrity verification
+  - [x] Periodic LTX checksum and TXID continuity verification
+  - [x] Prometheus metrics: `walrust_validation_success_total`, `walrust_validation_failure_total`, `walrust_last_validation_timestamp`
+  - [x] Configurable via CLI (`--validation-interval`) and config file
+  - [x] Per-database override support
+  - [x] Default: 0 (disabled), recommended: 86400 (daily) for production
+- [x] 132 total tests (all passing)
+
+### v0.1.3 (Previous)
 - [x] **LTX Format Integration**
   - [x] Snapshots stored as LTX files (Litestream-compatible)
   - [x] manifest.json tracking with TXID sequencing
   - [x] Point-in-time restore by TXID or timestamp
   - [x] Binary data preservation with extensive test coverage
-  - [x] 105 total tests (all passing)
 - [x] **Snapshot Compaction & Retention**
   - [x] GFS rotation (hourly/daily/weekly/monthly tiers)
   - [x] `walrust compact` command with dry-run default
