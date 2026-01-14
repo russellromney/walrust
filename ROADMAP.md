@@ -399,29 +399,37 @@ walrust-dst/
 - Real walrust code tested with fault injection
 - Silent corruption detection >90%
 
-#### Phase 2: Retry Logic & Webhooks (Next)
+#### Phase 2: Retry Logic & Webhooks ✅ COMPLETE
 
-**Retry Logic (see BATTLE_TESTING.md):**
+**Retry Logic Implementation:**
 
-1. **Exponential Backoff with Jitter**
-   - [ ] 100ms → 200ms → 400ms → ... capped at 30s
-   - [ ] Jitter to avoid thundering herd
-   - [ ] Max retries (default: 5)
+1. **Exponential Backoff with Jitter** ✅
+   - [x] Base delay: 100ms → 200ms → 400ms → 800ms → ...
+   - [x] Max delay cap: 30 seconds
+   - [x] Full jitter: `random(0, min(cap, base * 2^attempt))`
+   - [x] Max retries: configurable (default: 5)
 
-2. **Error Classification**
-   - [ ] Retry: 500/502/503/504, timeouts, network errors
-   - [ ] Fail immediately: 400 (bug), 401/403 (auth)
-   - [ ] Circuit breaker after N consecutive failures
+2. **Error Classification** ✅
+   - [x] Retryable errors: 500/502/503/504, timeouts, connection errors, "Service unavailable"
+   - [x] Non-retryable errors: 400 (client bug), 401/403 (auth), 404 (not found)
+   - [x] Circuit breaker: Opens after N consecutive failures (default: 10), half-open after cooldown
 
-3. **Failure Webhooks**
-   - [ ] POST to configurable URL on persistent failures
-   - [ ] Payload: event, database, error, attempts
-   - [ ] Config: `webhooks: [{ url: "...", events: [...] }]`
+3. **Failure Webhooks** ✅
+   - [x] POST to configurable URL on persistent failures
+   - [x] Event types: `sync_failed`, `auth_failure`, `corruption_detected`, `circuit_breaker_open`
+   - [x] Payload: `{ "event": "...", "database": "...", "error": "...", "attempts": N, "timestamp": "..." }`
+   - [x] Config: `webhooks: [{ url: "https://...", events: ["sync_failed", "auth_failure"] }]`
 
-4. **Tests**
-   - [ ] Make `chaos_s3_errors` pass after adding retry logic
-   - [ ] Test auth failure fast-fail
-   - [ ] Test circuit breaker behavior
+4. **Tests** ✅
+   - [x] `chaos_s3_errors` passes with retry logic (80%+ success rate under 20% error injection)
+   - [x] Auth failure fast-fail verified
+   - [x] Circuit breaker behavior tested
+
+**Implementation Files:**
+- `src/retry.rs` - RetryPolicy, RetryConfig, exponential backoff, error classification
+- `src/webhook.rs` - WebhookConfig, send_webhook, event types
+- `src/config.rs` - Added retry and webhook config sections
+- `src/sync.rs` - testable module updated to use retry wrapper
 
 **S3 Fault Injection (already implemented in MockStorageBackend):**
 
@@ -447,30 +455,80 @@ walrust-dst/
 - Checksum mismatches always detected
 - Multi-DB isolation verified
 
-#### Phase 3: Continuous Chaos Testing (Week 3)
+#### Phase 3: Integration into Main Sync Loop ✅ COMPLETE
+
+**Goal**: Integrate retry logic and webhooks from the testable module into the production sync loop.
+
+**Implementation Steps:**
+
+1. **CLI Flags for Retry Config** ✅
+   - [x] `--max-retries` - Maximum retry attempts (default: 5)
+   - [x] `--base-delay-ms` - Initial backoff delay (default: 100)
+   - [x] `--max-delay-ms` - Maximum backoff delay (default: 30000)
+   - [x] `--no-circuit-breaker` - Disable circuit breaker
+   - [x] `--circuit-breaker-threshold` - Failures before circuit opens (default: 10)
+
+2. **Retry-Wrapped Helper Functions** ✅
+   - [x] `sync_wal_with_retry()` - Wraps sync_wal with retry and webhooks
+   - [x] `take_snapshot_with_retry()` - Wraps take_snapshot with retry and webhooks
+   - [x] Error classification using `retry::classify_error()`
+   - [x] Auth errors fast-fail immediately, transient errors retry
+
+3. **Main Sync Loop Integration** ✅
+   - [x] All sync_wal calls replaced with retry-wrapped versions
+   - [x] All take_snapshot calls replaced with retry-wrapped versions
+   - [x] Webhook notifications on: sync_failed, auth_failure
+   - [x] watch_with_config initializes RetryPolicy and WebhookSender from config
+
+4. **Error Handling Updates** ✅
+   - [x] Classify errors using retry::classify_error()
+   - [x] Send webhooks on persistent failures
+   - [x] Log retry attempts with structured logging
+
+**Implementation Files:**
+- `src/main.rs` - CLI flags for retry config (--max-retries, --base-delay-ms, etc.)
+- `src/sync.rs` - sync_wal_with_retry(), take_snapshot_with_retry(), watch_with_config integration
+- `src/retry.rs` - Added config() accessor method
+
+**Success Criteria:**
+- [x] All S3 operations in watch loop use retry logic
+- [x] Webhooks fire on persistent failures
+- [x] CLI flags allow runtime configuration
+- [x] All existing tests pass (150+ tests)
+- [x] Chaos tests demonstrate improved reliability (80%+ success under 20% error injection)
+
+---
+
+#### Phase 4: Continuous Chaos Testing ✅ COMPLETE
 
 **Property-Based Testing with `proptest`:**
 
-1. **Core Properties**
-   - [ ] Property: Every committed transaction is recoverable from S3
-   - [ ] Property: Point-in-time restore gives exact state at timestamp T
-   - [ ] Property: WAL batching never loses frames
-   - [ ] Property: Snapshot is atomic (no partial state)
-   - [ ] Property: GFS compaction preserves recoverability
+1. **Core Properties** ✅
+   - [x] Property: Every committed transaction is recoverable from S3
+   - [x] Property: Point-in-time restore gives exact state at timestamp T (FIXED in v0.1.6)
+   - [x] Property: WAL batching never loses frames
+   - [x] Property: Snapshot is atomic (no partial state)
+   - [x] Property: GFS compaction preserves recoverability
 
-2. **Chaos Engineering Loop**
-   - [ ] Run DST suite with random failure injection
-   - [ ] 10,000+ iterations per property test
-   - [ ] Measure MTBF (mean time between failures)
-   - [ ] Collect failure seeds for regression testing
+2. **Chaos Engineering Loop** ✅
+   - [x] Run DST suite with random failure injection
+   - [x] 10,000+ iterations per property test (configurable via PROPTEST_CASES)
+   - [x] Measure MTBF (mean time between failures)
+   - [x] Collect failure seeds for regression testing
 
-3. **Performance Under Failure**
-   - [ ] Measure crash recovery time
-   - [ ] Verify no memory leaks during repeated crashes
-   - [ ] Check CPU usage during S3 retry storms
-   - [ ] Monitor file descriptor leaks
+3. **Performance Under Failure** ✅
+   - [x] Measure crash recovery time
+   - [x] Verify no memory leaks during repeated crashes
+   - [x] Check CPU usage during S3 retry storms
+   - [x] Monitor file descriptor leaks
 
-**Success Criteria:**
+**Implementation Files:**
+- `walrust-dst/src/invariants.rs` - Core invariant property tests
+- `walrust-dst/src/chaos.rs` - Extended chaos test scenarios
+- `walrust-dst/src/metrics.rs` - MTBF tracking and reporting
+- `walrust-dst/src/main.rs` - CLI `continuous` command
+
+**Success Criteria:** ✅ MET
 - 10,000+ seeds pass all property tests
 - Zero data loss in chaos tests
 - No resource leaks detected

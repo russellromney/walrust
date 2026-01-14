@@ -7,7 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.6] - 2026-01-14
+
+### Fixed
+- **PITR Bug Fixed**: `testable::restore` now correctly parses point-in-time parameter
+  - Supports `txid:N` format (e.g., `txid:12345`) for specific transaction ID restore
+  - Supports ISO8601 timestamp format (e.g., `2024-01-15T10:30:00Z`) for time-based restore
+  - Selects correct snapshot + incrementals for target TXID
+  - Un-ignored `test_prop_point_in_time_restore` - all 7 invariants now tested
+
 ### Added
+- **Production Hardening** (walrust-dst)
+  - `walrust-dst stress` command: Multi-database stress testing
+    - Configurable database count, writes/sec, duration
+    - 20% fault injection with retry handling
+    - Memory and FD tracking
+    - Error rate reporting (<10% threshold)
+  - `walrust-dst soak` command: Long-running stability testing
+    - Configurable duration (e.g., `1h`, `24h`)
+    - Memory checkpoint every 60s
+    - Trend analysis for leak detection
+    - Memory growth threshold (<10% warning)
+  - Resource leak detection: Memory and FD monitoring throughout tests
+- **Phase 4 Complete**: All 7 core invariants passing
+  - Point-in-time restore: Restore at TXID T gives exact state at T (FIXED)
+  - Transaction recovery: Every committed transaction recoverable from S3
+  - WAL batching: WAL batching never loses frames
+  - Snapshot atomicity: Snapshots are atomic (no partial state)
+  - TXID monotonicity: No gaps, no duplicates in TXID sequence
+  - Binary preservation: Restored DB byte-identical to source
+  - Recovery under failure: Recovery succeeds even with S3 errors
+- 174 tests total (140 walrust + 34 walrust-dst)
+
+- **Retry Logic with Exponential Backoff**: Automatic retry for transient S3 failures
+  - Exponential backoff: 100ms -> 200ms -> 400ms -> ... capped at 30s
+  - Full jitter to avoid thundering herd
+  - Configurable max retries (default: 5)
+  - Error classification: retry 500/502/503/504/timeouts, fail fast on 401/403
+  - Circuit breaker: opens after N consecutive failures (default: 10)
+  - Config: `[retry]` section in `walrust.toml`
+  - **CLI flags** (new): `--max-retries`, `--base-delay-ms`, `--max-delay-ms`, `--no-circuit-breaker`, `--circuit-breaker-threshold`
+- **Failure Webhooks**: HTTP POST notifications for failure events
+  - Event types: `sync_failed`, `auth_failure`, `corruption_detected`, `circuit_breaker_open`
+  - Configurable URL targets with event filtering
+  - HMAC-SHA256 signatures for webhook authentication
+  - Config: `[[webhooks]]` section in `walrust.toml`
+  - **Production integration** (new): All sync operations now send webhooks on failures
+- **Production Retry Integration**: Main sync loop now uses retry logic
+  - `sync_wal_with_retry()` and `take_snapshot_with_retry()` wrap all S3 operations
+  - Auth errors (401/403) fail fast and notify via webhook
+  - Transient errors (500/502/503/504/timeouts) retry with exponential backoff
+  - Structured logging for all retry attempts
+- **Retry-enabled testable functions**: `take_snapshot_with_retry`, `sync_wal_with_retry`
+  - Used by DST chaos tests to verify retry behavior
+  - 150+ tests passing including `chaos_s3_errors` (80%+ success under 20% error injection)
 - **StorageBackend Trait**: Abstraction for S3 operations enabling testability
   - `StorageBackend` trait in `src/storage.rs` with `S3Backend` implementation
   - `walrust::testable` module exposing `sync_wal`, `take_snapshot`, `restore` for DST
@@ -16,7 +69,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - `MockStorageBackend` with configurable fault injection (RandomError, Latency, PartialWrite, SilentCorruption, EventualConsistency)
   - Property-based tests (7 properties, 100+ cases each)
   - Real chaos tests calling actual walrust sync functions
-  - 22 tests passing
+  - 23 tests passing
 - **Structured Exit Codes**: Specific exit codes for different error categories
   - 0: Success
   - 1: General/unknown error

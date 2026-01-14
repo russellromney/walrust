@@ -8,13 +8,15 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-use crate::config::{Config, ResolvedDbConfig, SyncConfig};
+use crate::config::{Config, ResolvedDbConfig, SyncConfig, WebhookConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::ltx;
 use crate::retention::{self, RetentionPolicy, SnapshotEntry};
+use crate::retry::{classify_error, ErrorKind, RetryConfig, RetryPolicy};
 use crate::s3::{self, create_client, parse_bucket};
 use crate::storage::StorageBackend;
 use crate::wal;
+use crate::webhook::{WebhookEvent, WebhookSender};
 
 /// State for a single watched database
 struct DbState {
@@ -324,9 +326,27 @@ pub async fn watch_with_config(
     compact_policy: Option<RetentionPolicy>,
     metrics_port: u16,
     no_metrics: bool,
+    retry_config: RetryConfig,
+    webhooks: Vec<WebhookConfig>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(create_client(endpoint).await?);
+
+    // Set up retry policy and webhook sender
+    let retry_policy = RetryPolicy::new(retry_config.clone());
+    let webhook_sender = Arc::new(WebhookSender::new(webhooks));
+
+    if retry_config.max_retries > 0 {
+        tracing::info!(
+            "Retry enabled: {} attempts, {}ms base delay, {}ms max delay",
+            retry_config.max_retries,
+            retry_config.base_delay_ms,
+            retry_config.max_delay_ms
+        );
+    }
+    if !webhook_sender.is_empty() {
+        tracing::info!("Webhooks enabled for failure notifications");
+    }
 
     // Set up metrics server (unless disabled)
     let metrics_state = Arc::new(MetricsState::new());
@@ -485,7 +505,7 @@ pub async fn watch_with_config(
     // Initial sync of any existing WAL data
     for (db_path, state) in db_states.iter_mut() {
         if state.wal_path.exists() {
-            let frame_count = sync_wal(&client, &bucket_name, &prefix, state).await?;
+            let frame_count = sync_wal_with_retry(&client, &bucket_name, &prefix, state, &retry_policy, &webhook_sender).await?;
             if frame_count > 0 {
                 if let Some(trigger) = trigger_states.get_mut(db_path) {
                     trigger.frames_since_snapshot += frame_count;
@@ -502,7 +522,7 @@ pub async fn watch_with_config(
     for (db_path, state) in db_states.iter_mut() {
         let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
         if sync_config.on_startup {
-            take_snapshot(&client, &bucket_name, &prefix, state).await?;
+            take_snapshot_with_retry(&client, &bucket_name, &prefix, state, &retry_policy, &webhook_sender).await?;
             if let Some(trigger) = trigger_states.get_mut(db_path) {
                 trigger.frames_since_snapshot = 0;
                 trigger.first_change_time = None;
@@ -614,7 +634,7 @@ pub async fn watch_with_config(
                     if let Some(state) = db_states.get_mut(&db_path) {
                         let sync_config = sync_configs.get(&db_path).unwrap_or(&global_sync);
 
-                        match sync_wal(&client, &bucket_name, &prefix, state).await {
+                        match sync_wal_with_retry(&client, &bucket_name, &prefix, state, &retry_policy, &webhook_sender).await {
                             Ok(frame_count) if frame_count > 0 => {
                                 // Update dashboard on successful sync
                                 let wal_size = std::fs::metadata(&state.wal_path).map(|m| m.len()).unwrap_or(0);
@@ -666,7 +686,7 @@ pub async fn watch_with_config(
                                             state.name,
                                             trigger.frames_since_snapshot
                                         );
-                                        if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
+                                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, state, &retry_policy, &webhook_sender).await {
                                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
                                             metrics_state.record_error(&state.name);
                                         } else {
@@ -743,7 +763,7 @@ pub async fn watch_with_config(
                             trigger.frames_since_snapshot
                         );
 
-                        if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
+                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, state, &retry_policy, &webhook_sender).await {
                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
                             metrics_state.record_error(&state.name);
                         } else {
@@ -765,7 +785,7 @@ pub async fn watch_with_config(
             // Periodic snapshot timer
             _ = snapshot_timer.tick() => {
                 for (db_path, state) in db_states.iter_mut() {
-                    if let Err(e) = take_snapshot(&client, &bucket_name, &prefix, state).await {
+                    if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, state, &retry_policy, &webhook_sender).await {
                         tracing::error!("Failed to snapshot {}: {}", state.name, e);
                         metrics_state.record_error(&state.name);
                     } else {
@@ -957,6 +977,128 @@ async fn run_compaction(
     );
 
     Ok(())
+}
+
+// ============================================================================
+// Retry-wrapped S3 operations for production use
+// ============================================================================
+
+/// Sync WAL changes with retry and webhook notifications
+async fn sync_wal_with_retry(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    state: &mut DbState,
+    retry_policy: &RetryPolicy,
+    webhook_sender: &Arc<WebhookSender>,
+) -> Result<u64> {
+    let db_name = state.name.clone();
+    let mut last_error: Option<anyhow::Error> = None;
+    let mut attempts = 0u32;
+
+    // Try the sync operation with retries
+    loop {
+        attempts += 1;
+        match sync_wal(client, bucket, prefix, state).await {
+            Ok(frames) => return Ok(frames),
+            Err(e) => {
+                let error_kind = classify_error(&e);
+                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
+
+                // Handle auth errors immediately
+                if error_kind == ErrorKind::AuthError {
+                    tracing::error!("{}: Authentication error during WAL sync: {}", db_name, e);
+                    webhook_sender.notify_auth_failure(&db_name, &e.to_string()).await;
+                    return Err(e);
+                }
+
+                // If not retryable or exhausted retries, fail
+                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
+                    tracing::error!(
+                        "{}: WAL sync failed after {} attempts: {}",
+                        db_name,
+                        attempts,
+                        e
+                    );
+                    webhook_sender
+                        .notify_sync_failed(&db_name, &e.to_string(), attempts)
+                        .await;
+                    return Err(e);
+                }
+
+                // Calculate backoff and retry
+                let delay = retry_policy.calculate_delay(attempts - 1);
+                tracing::warn!(
+                    "{}: WAL sync attempt {}/{} failed, retrying in {:?}: {}",
+                    db_name,
+                    attempts,
+                    retry_policy.config().max_retries + 1,
+                    delay,
+                    e
+                );
+                tokio::time::sleep(delay).await;
+                last_error = Some(e);
+            }
+        }
+    }
+}
+
+/// Take snapshot with retry and webhook notifications
+async fn take_snapshot_with_retry(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    state: &mut DbState,
+    retry_policy: &RetryPolicy,
+    webhook_sender: &Arc<WebhookSender>,
+) -> Result<()> {
+    let db_name = state.name.clone();
+    let mut attempts = 0u32;
+
+    // Try the snapshot operation with retries
+    loop {
+        attempts += 1;
+        match take_snapshot(client, bucket, prefix, state).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                let error_kind = classify_error(&e);
+                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
+
+                // Handle auth errors immediately
+                if error_kind == ErrorKind::AuthError {
+                    tracing::error!("{}: Authentication error during snapshot: {}", db_name, e);
+                    webhook_sender.notify_auth_failure(&db_name, &e.to_string()).await;
+                    return Err(e);
+                }
+
+                // If not retryable or exhausted retries, fail
+                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
+                    tracing::error!(
+                        "{}: Snapshot failed after {} attempts: {}",
+                        db_name,
+                        attempts,
+                        e
+                    );
+                    webhook_sender
+                        .notify_sync_failed(&db_name, &e.to_string(), attempts)
+                        .await;
+                    return Err(e);
+                }
+
+                // Calculate backoff and retry
+                let delay = retry_policy.calculate_delay(attempts - 1);
+                tracing::warn!(
+                    "{}: Snapshot attempt {}/{} failed, retrying in {:?}: {}",
+                    db_name,
+                    attempts,
+                    retry_policy.config().max_retries + 1,
+                    delay,
+                    e
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
 }
 
 /// Sync WAL changes to S3 as incremental LTX files
@@ -2523,6 +2665,7 @@ async fn run_checkpoint(db_path: &Path, mode: CheckpointMode) -> Result<()> {
 /// enabling fault injection and deterministic testing.
 pub mod testable {
     use super::*;
+    use crate::retry::RetryPolicy;
     use crate::storage::StorageBackend;
 
     /// State for a single database being synced (public version for testing)
@@ -2814,6 +2957,75 @@ pub mod testable {
         Ok(())
     }
 
+    /// Parse a point-in-time string into a target TXID
+    ///
+    /// Supported formats:
+    /// - `txid:N` - Specific transaction ID (e.g., "txid:12345")
+    /// - ISO8601 timestamp - Find nearest TXID before timestamp (e.g., "2024-01-15T10:30:00Z")
+    fn parse_point_in_time(pit: &str, files: &[&LtxEntry]) -> Result<u64> {
+        // Try txid:N format first
+        if let Some(txid_str) = pit.strip_prefix("txid:") {
+            let txid: u64 = txid_str
+                .parse()
+                .map_err(|_| anyhow!("Invalid TXID format: '{}'", pit))?;
+            return Ok(txid);
+        }
+
+        // Try ISO8601 timestamp format
+        use chrono::{DateTime, Utc};
+        let target_time: DateTime<Utc> = pit
+            .parse()
+            .map_err(|_| anyhow!("Invalid point-in-time format: '{}'. Use 'txid:N' or ISO8601 timestamp", pit))?;
+
+        // Find the highest TXID from files created before or at the target time
+        let target_txid = files
+            .iter()
+            .filter_map(|f| {
+                f.created_at.parse::<DateTime<Utc>>().ok().and_then(|created| {
+                    if created <= target_time {
+                        Some(f.max_txid)
+                    } else {
+                        None
+                    }
+                })
+            })
+            .max()
+            .ok_or_else(|| anyhow!("No files found before timestamp '{}'", pit))?;
+
+        Ok(target_txid)
+    }
+
+    /// Find the best snapshot and incrementals to restore to a target TXID
+    ///
+    /// Returns (snapshot, incrementals_to_apply) or error if target is unreachable
+    fn find_files_for_txid<'a>(
+        files: &[&'a LtxEntry],
+        target_txid: u64,
+    ) -> Result<(&'a LtxEntry, Vec<&'a LtxEntry>)> {
+        // Find the most recent snapshot with max_txid <= target_txid
+        let snapshot = files
+            .iter()
+            .filter(|f| f.is_snapshot && f.max_txid <= target_txid)
+            .max_by_key(|f| f.max_txid)
+            .ok_or_else(|| anyhow!(
+                "No snapshot found for TXID {}. Earliest available: {}",
+                target_txid,
+                files.iter().filter(|f| f.is_snapshot).map(|f| f.max_txid).min().unwrap_or(0)
+            ))?;
+
+        // Find incrementals to apply: min_txid > snapshot.max_txid AND max_txid <= target_txid
+        let mut incrementals: Vec<_> = files
+            .iter()
+            .filter(|f| !f.is_snapshot && f.min_txid > snapshot.max_txid && f.max_txid <= target_txid)
+            .cloned()
+            .collect();
+
+        // Sort by min_txid to apply in order
+        incrementals.sort_by_key(|f| f.min_txid);
+
+        Ok((snapshot, incrementals))
+    }
+
     /// Restore a database from storage using LTX files
     pub async fn restore(
         storage: &dyn StorageBackend,
@@ -2834,12 +3046,33 @@ pub mod testable {
         let mut files: Vec<_> = manifest.files.iter().collect();
         files.sort_by_key(|f| f.max_txid);
 
-        // Find latest snapshot
-        let snapshot = files
-            .iter()
-            .rev()
-            .find(|f| f.is_snapshot)
-            .ok_or_else(|| anyhow!("No snapshot found"))?;
+        // Determine target TXID
+        let target_txid = if let Some(pit) = point_in_time {
+            parse_point_in_time(pit, &files)?
+        } else {
+            manifest.current_txid
+        };
+
+        // Validate target TXID is reachable
+        let max_available = files.iter().map(|f| f.max_txid).max().unwrap_or(0);
+        if target_txid > max_available {
+            return Err(anyhow!(
+                "Target TXID {} exceeds maximum available TXID {}",
+                target_txid,
+                max_available
+            ));
+        }
+
+        // Find the appropriate snapshot and incrementals
+        let (snapshot, incrementals) = find_files_for_txid(&files, target_txid)?;
+
+        tracing::info!(
+            "Restoring to TXID {} using snapshot {} (TXID {}) + {} incrementals",
+            target_txid,
+            snapshot.filename,
+            snapshot.max_txid,
+            incrementals.len()
+        );
 
         // Download and decode snapshot
         let snapshot_key = format!("{}{}/{}", prefix, db_name, snapshot.filename);
@@ -2849,29 +3082,255 @@ pub mod testable {
 
         tracing::info!("Restored snapshot {} to {}", snapshot.filename, output.display());
 
-        // Apply incrementals if needed
-        let target_txid = if let Some(pit) = point_in_time {
-            // Parse point-in-time (implement as needed)
-            manifest.current_txid // For now, restore to latest
-        } else {
-            manifest.current_txid
-        };
-
-        // Find incrementals to apply
-        let incrementals: Vec<_> = files
-            .iter()
-            .filter(|f| !f.is_snapshot && f.min_txid > snapshot.max_txid && f.max_txid <= target_txid)
-            .collect();
-
+        // Apply incrementals in order
         for inc in incrementals {
             let inc_key = format!("{}{}/{}", prefix, db_name, inc.filename);
             let inc_data = storage.download_bytes(&inc_key).await?;
             let cursor = Cursor::new(inc_data);
             ltx::apply_ltx_to_db(cursor, output)?;
-            tracing::info!("Applied incremental {}", inc.filename);
+            tracing::info!("Applied incremental {} (TXID {}-{})", inc.filename, inc.min_txid, inc.max_txid);
         }
 
         Ok(())
+    }
+
+    // ========================================================================
+    // Retry-wrapped versions for production use
+    // ========================================================================
+
+    /// Take a snapshot with automatic retry on transient failures
+    pub async fn take_snapshot_with_retry(
+        storage: &dyn StorageBackend,
+        prefix: &str,
+        state: &mut SyncState,
+        retry_policy: &RetryPolicy,
+    ) -> Result<()> {
+        // We need to handle the mutable state carefully
+        // The actual snapshot operation is not purely retryable because
+        // it modifies state, but we can retry the storage operations
+        let timestamp = Utc::now();
+
+        // Get page size from database header
+        let page_size = get_page_size(&state.db_path).await?;
+
+        // Increment TXID for this snapshot
+        let new_txid = state.current_txid + 1;
+
+        // LTX filename: {min_txid:08}-{max_txid:08}.ltx
+        let ltx_filename = format!("{:08}-{:08}.ltx", 1, new_txid);
+        let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+
+        // Encode database as LTX
+        let mut ltx_buffer = Vec::new();
+        ltx::encode_snapshot(&mut ltx_buffer, &state.db_path, page_size, new_txid)?;
+
+        let ltx_size = ltx_buffer.len() as u64;
+
+        // Upload LTX file with retry
+        let upload_buffer = ltx_buffer.clone();
+        let upload_key = ltx_key.clone();
+        retry_policy
+            .execute_with_context("upload snapshot", || {
+                let data = upload_buffer.clone();
+                let key = upload_key.clone();
+                async move { storage.upload_bytes(&key, data).await }
+            })
+            .await?;
+
+        // Compute checksum
+        let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
+
+        tracing::info!(
+            "{}: LTX snapshot uploaded ({} bytes, TXID: {})",
+            state.name,
+            ltx_size,
+            new_txid
+        );
+
+        // Update manifest with retry
+        let mut manifest = load_manifest(storage, prefix, &state.name).await?;
+        manifest.current_txid = new_txid;
+        manifest.page_size = page_size;
+        manifest.last_checksum = Some(db_checksum.into_inner());
+        manifest.files.push(LtxEntry {
+            filename: ltx_filename,
+            min_txid: 1,
+            max_txid: new_txid,
+            size: ltx_size,
+            created_at: timestamp.to_rfc3339(),
+            is_snapshot: true,
+        });
+
+        let manifest_clone = manifest.clone();
+        let prefix_str = prefix.to_string();
+        retry_policy
+            .execute_with_context("save manifest", || {
+                let m = manifest_clone.clone();
+                let p = prefix_str.clone();
+                async move { save_manifest(storage, &p, &m).await }
+            })
+            .await?;
+
+        // Update state
+        state.current_txid = new_txid;
+        state.last_snapshot = Some(timestamp);
+        state.db_checksum = Some(db_checksum.into_inner());
+
+        // Save legacy state with retry
+        let state_clone = state.clone();
+        let prefix_str = prefix.to_string();
+        retry_policy
+            .execute_with_context("save state", || {
+                let s = state_clone.clone();
+                let p = prefix_str.clone();
+                async move { save_state(storage, &p, &s).await }
+            })
+            .await?;
+
+        Ok(())
+    }
+
+    /// Sync WAL changes with automatic retry on transient failures
+    pub async fn sync_wal_with_retry(
+        storage: &dyn StorageBackend,
+        prefix: &str,
+        state: &mut SyncState,
+        retry_policy: &RetryPolicy,
+    ) -> Result<u64> {
+        use litetx::Checksum;
+
+        let header = match wal::read_header(&state.wal_path).await? {
+            Some(h) => h,
+            None => return Ok(0), // No WAL file
+        };
+
+        // Check if WAL was reset (checkpoint happened)
+        let current_size = wal::get_wal_size(&state.wal_path).await?;
+        if current_size < state.wal_offset {
+            tracing::info!("{}: WAL checkpoint detected, resetting offset", state.name);
+            state.wal_offset = 0;
+            state.wal_generation += 1;
+
+            // Recompute checksum from current database state
+            match ltx::compute_checksum_from_file(&state.db_path) {
+                Ok(cs) => {
+                    state.db_checksum = Some(cs.into_inner());
+                }
+                Err(e) => {
+                    tracing::warn!("{}: Could not recompute checksum: {}", state.name, e);
+                }
+            }
+        }
+
+        // Read WAL frames as parsed pages
+        let (frames, new_offset, max_db_size) =
+            wal::read_frames_as_pages(&state.wal_path, header.page_size, state.wal_offset).await?;
+
+        if frames.is_empty() {
+            return Ok(0);
+        }
+
+        // Deduplicate pages
+        let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+        for frame in &frames {
+            page_map.insert(frame.page_number, frame.data.clone());
+        }
+
+        let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
+        let frame_count = frames.len();
+
+        // Get pre_apply_checksum
+        let pre_checksum = match state.db_checksum {
+            Some(cs) => Checksum::new(cs),
+            None => ltx::compute_checksum_from_file(&state.db_path)?,
+        };
+
+        // Calculate TXIDs
+        let min_txid = state.current_txid + 1;
+        let max_txid = min_txid + pages.len() as u64 - 1;
+        let commit_page = if max_db_size > 0 {
+            max_db_size
+        } else {
+            let db_size = std::fs::metadata(&state.db_path)?.len();
+            (db_size / header.page_size as u64) as u32
+        };
+
+        // Encode as incremental LTX
+        let mut ltx_buffer = Vec::new();
+        let post_checksum = ltx::encode_wal_changes(
+            &mut ltx_buffer,
+            &pages,
+            header.page_size,
+            min_txid,
+            max_txid,
+            commit_page,
+            Some(pre_checksum),
+        )?;
+
+        let ltx_size = ltx_buffer.len() as u64;
+        let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
+        let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+
+        // Upload LTX file with retry
+        let timestamp = Utc::now();
+        let upload_buffer = ltx_buffer.clone();
+        let upload_key = ltx_key.clone();
+        retry_policy
+            .execute_with_context("upload WAL changes", || {
+                let data = upload_buffer.clone();
+                let key = upload_key.clone();
+                async move { storage.upload_bytes(&key, data).await }
+            })
+            .await?;
+
+        tracing::info!(
+            "{}: Synced {} WAL frames as incremental LTX {} ({} bytes)",
+            state.name,
+            frame_count,
+            ltx_filename,
+            ltx_size
+        );
+
+        // Update manifest with retry
+        let mut manifest = load_manifest(storage, prefix, &state.name).await?;
+        manifest.current_txid = max_txid;
+        manifest.last_checksum = Some(post_checksum.into_inner());
+        manifest.files.push(LtxEntry {
+            filename: ltx_filename,
+            min_txid,
+            max_txid,
+            size: ltx_size,
+            created_at: timestamp.to_rfc3339(),
+            is_snapshot: false,
+        });
+
+        let manifest_clone = manifest.clone();
+        let prefix_str = prefix.to_string();
+        retry_policy
+            .execute_with_context("save manifest", || {
+                let m = manifest_clone.clone();
+                let p = prefix_str.clone();
+                async move { save_manifest(storage, &p, &m).await }
+            })
+            .await?;
+
+        // Update state
+        state.wal_offset = new_offset;
+        state.current_txid = max_txid;
+        state.db_checksum = Some(post_checksum.into_inner());
+
+        // Save legacy state with retry
+        let state_clone = state.clone();
+        let prefix_str = prefix.to_string();
+        retry_policy
+            .execute_with_context("save state", || {
+                let s = state_clone.clone();
+                let p = prefix_str.clone();
+                async move { save_state(storage, &p, &s).await }
+            })
+            .await?;
+
+        Ok(frame_count as u64)
     }
 }
 
@@ -5048,6 +5507,8 @@ mod tests {
                 weekly: 8,
                 monthly: 6,
             },
+            retry: Default::default(),
+            webhooks: vec![],
             databases: vec![], // Empty databases - explain should still work
         };
 
