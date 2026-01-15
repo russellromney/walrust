@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 use crate::config::{Config, ResolvedDbConfig, SyncConfig, WebhookConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::ltx;
+use crate::shadow::ShadowWal;
 use crate::retention::{self, RetentionPolicy, SnapshotEntry};
 use crate::retry::{classify_error, ErrorKind, RetryConfig, RetryPolicy};
 use crate::s3::{self, create_client, parse_bucket};
@@ -1051,6 +1052,976 @@ pub async fn watch_with_config(
     Ok(())
 }
 
+// ============================================================================
+// Shadow WAL mode - decouples S3 uploads from SQLite WAL
+// ============================================================================
+
+/// State for a watched database in shadow mode
+struct ShadowDbState {
+    /// Base database state
+    name: String,
+    db_path: PathBuf,
+    wal_path: PathBuf,
+    current_txid: u64,
+    last_snapshot: Option<chrono::DateTime<Utc>>,
+    db_checksum: Option<u64>,
+    /// Shadow WAL manager (owns the checkpoint blocker)
+    shadow: ShadowWal,
+    /// Offset within shadow segments for upload tracking
+    shadow_sync_offset: u64,
+    /// WAL offset for copy_frames tracking
+    wal_copy_offset: u64,
+}
+
+/// Input for concurrent shadow sync
+#[derive(Clone)]
+struct ShadowSyncInput {
+    db_path: PathBuf,
+    name: String,
+    current_txid: u64,
+    db_checksum: Option<u64>,
+    generation: u64,
+    shadow_sync_offset: u64,
+    page_size: u32,
+    shadow_dir: PathBuf,
+}
+
+/// Output from concurrent shadow sync
+struct ShadowSyncOutput {
+    db_path: PathBuf,
+    frame_count: u64,
+    new_shadow_sync_offset: u64,
+    new_current_txid: u64,
+    new_db_checksum: Option<u64>,
+}
+
+/// Watch databases with shadow WAL mode enabled
+///
+/// Shadow WAL mode decouples S3 uploads from SQLite's active WAL file:
+/// - Holds a read transaction to prevent SQLite auto-checkpoint
+/// - Copies WAL frames to shadow directory on notification
+/// - Uploads from shadow directory (not active WAL)
+/// - Manually triggers checkpoints when ready
+pub async fn watch_with_shadow(
+    databases: Vec<ResolvedDbConfig>,
+    bucket: &str,
+    endpoint: Option<&str>,
+    global_sync: SyncConfig,
+    compact_policy: Option<RetentionPolicy>,
+    metrics_port: u16,
+    no_metrics: bool,
+    retry_config: RetryConfig,
+    webhooks: Vec<WebhookConfig>,
+) -> Result<()> {
+    let (bucket_name, prefix) = parse_bucket(bucket);
+    let client = Arc::new(create_client(endpoint).await?);
+
+    // Set up retry policy and webhook sender
+    let retry_policy = RetryPolicy::new(retry_config.clone());
+    let webhook_sender = Arc::new(WebhookSender::new(webhooks));
+
+    if retry_config.max_retries > 0 {
+        tracing::info!(
+            "Retry enabled: {} attempts, {}ms base delay, {}ms max delay",
+            retry_config.max_retries,
+            retry_config.base_delay_ms,
+            retry_config.max_delay_ms
+        );
+    }
+    if !webhook_sender.is_empty() {
+        tracing::info!("Webhooks enabled for failure notifications");
+    }
+
+    // Set up metrics server (unless disabled)
+    let metrics_state = Arc::new(MetricsState::new());
+    if !no_metrics {
+        let state_clone = Arc::clone(&metrics_state);
+        tokio::spawn(async move {
+            dashboard::start_server(metrics_port, state_clone).await;
+        });
+    }
+
+    // Initialize shadow state for each database
+    let mut db_states: HashMap<PathBuf, ShadowDbState> = HashMap::new();
+    let mut trigger_states: HashMap<PathBuf, TriggerState> = HashMap::new();
+    let mut sync_configs: HashMap<PathBuf, SyncConfig> = HashMap::new();
+
+    for db_config in &databases {
+        let db_path = &db_config.path;
+        if !db_path.exists() {
+            return Err(anyhow!("Database not found: {}", db_path.display()));
+        }
+
+        let name = db_config.prefix.clone();
+        let wal_path = db_path.with_extension("db-wal");
+
+        // Check for existing state in S3 (manifest.json)
+        let manifest_key = format!("{}{}/manifest.json", prefix, name);
+        let (current_txid, manifest_checksum) =
+            match s3::download_bytes(&client, &bucket_name, &manifest_key).await {
+                Ok(data) => {
+                    let manifest: Manifest = serde_json::from_slice(&data).unwrap_or_default();
+                    (manifest.current_txid, manifest.last_checksum)
+                }
+                Err(_) => (0, None),
+            };
+
+        // Get initial checksum: from manifest if available, otherwise compute from db
+        let db_checksum = match manifest_checksum {
+            Some(cs) => {
+                tracing::debug!("{}: Using checksum from manifest: {:#x}", name, cs);
+                Some(cs)
+            }
+            None => match ltx::compute_checksum_from_file(db_path) {
+                Ok(cs) => {
+                    tracing::debug!(
+                        "{}: Computed initial checksum: {:#x}",
+                        name,
+                        cs.into_inner()
+                    );
+                    Some(cs.into_inner())
+                }
+                Err(e) => {
+                    tracing::warn!("{}: Could not compute initial checksum: {}", name, e);
+                    None
+                }
+            },
+        };
+
+        // Create shadow WAL manager (this holds the checkpoint blocker)
+        let shadow = match ShadowWal::new(db_path).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::error!("{}: Failed to create shadow WAL: {}", name, e);
+                return Err(e);
+            }
+        };
+
+        tracing::info!(
+            "Shadow WAL: Watching {} as '{}' (TXID: {}, generation: {}, shadow dir: {})",
+            db_path.display(),
+            name,
+            current_txid,
+            shadow.generation(),
+            shadow.shadow_dir().display()
+        );
+
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name,
+                db_path: db_path.clone(),
+                wal_path,
+                current_txid,
+                last_snapshot: None,
+                db_checksum,
+                shadow,
+                shadow_sync_offset: 0,
+                wal_copy_offset: 0,
+            },
+        );
+
+        trigger_states.insert(db_path.clone(), TriggerState::default());
+        sync_configs.insert(db_path.clone(), db_config.sync.clone());
+
+        // Update dashboard with initial state
+        let wal_size = std::fs::metadata(&db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        metrics_state
+            .update_db(DbStatus {
+                name: db_config.prefix.clone(),
+                path: db_path.display().to_string(),
+                last_sync_timestamp: 0,
+                wal_size_bytes: wal_size,
+                next_snapshot_timestamp: chrono::Utc::now().timestamp()
+                    + global_sync.snapshot_interval as i64,
+                error_count: 0,
+                snapshot_count: 0,
+                current_txid,
+            })
+            .await;
+    }
+
+    // Set up file watcher
+    let (tx, mut rx) = mpsc::channel::<PathBuf>(100);
+
+    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
+        if let Ok(event) = res {
+            for path in event.paths {
+                // Only care about WAL files
+                if path.extension().map(|e| e == "db-wal").unwrap_or(false) {
+                    let _ = tx.blocking_send(path);
+                }
+            }
+        }
+    })?;
+
+    // Watch parent directories of all databases
+    let mut watched_dirs = std::collections::HashSet::new();
+    for db_config in &databases {
+        if let Some(parent) = db_config.path.parent() {
+            if watched_dirs.insert(parent.to_path_buf()) {
+                watcher.watch(parent, RecursiveMode::NonRecursive)?;
+                tracing::debug!("Watching directory: {}", parent.display());
+            }
+        }
+    }
+
+    // Initial copy of any existing WAL data to shadow
+    for (_db_path, state) in db_states.iter_mut() {
+        if state.wal_path.exists() {
+            match state.shadow.copy_frames(state.wal_copy_offset).await {
+                Ok((frames, new_offset)) => {
+                    if !frames.is_empty() {
+                        tracing::debug!(
+                            "{}: Initial shadow copy: {} frames",
+                            state.name,
+                            frames.len()
+                        );
+                        state.wal_copy_offset = new_offset;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("{}: Initial shadow copy failed: {}", state.name, e);
+                }
+            }
+        }
+    }
+
+    // Take initial snapshots if on_startup is enabled
+    for (db_path, state) in db_states.iter_mut() {
+        let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
+        if sync_config.on_startup {
+            // Convert to DbState temporarily for snapshot
+            let mut db_state = DbState {
+                name: state.name.clone(),
+                db_path: state.db_path.clone(),
+                wal_path: state.wal_path.clone(),
+                wal_offset: 0,
+                wal_generation: state.shadow.generation(),
+                current_txid: state.current_txid,
+                last_snapshot: state.last_snapshot,
+                db_checksum: state.db_checksum,
+            };
+            if let Err(e) = take_snapshot_with_retry(
+                &client,
+                &bucket_name,
+                &prefix,
+                &mut db_state,
+                &retry_policy,
+                &webhook_sender,
+            )
+            .await
+            {
+                tracing::error!("{}: Initial snapshot failed: {}", state.name, e);
+            } else {
+                state.current_txid = db_state.current_txid;
+                state.last_snapshot = db_state.last_snapshot;
+                state.db_checksum = db_state.db_checksum;
+
+                if let Some(trigger) = trigger_states.get_mut(db_path) {
+                    trigger.frames_since_snapshot = 0;
+                    trigger.first_change_time = None;
+                }
+            }
+        }
+    }
+
+    // Set up periodic timers
+    let snapshot_interval = Duration::from_secs(global_sync.snapshot_interval);
+    let mut snapshot_timer = tokio::time::interval(snapshot_interval);
+
+    let wal_sync_interval = Duration::from_secs(global_sync.wal_sync_interval);
+    let mut wal_sync_timer = tokio::time::interval(wal_sync_interval);
+    wal_sync_timer.tick().await;
+
+    let compact_interval_duration = if global_sync.compact_interval > 0 {
+        Duration::from_secs(global_sync.compact_interval)
+    } else {
+        Duration::from_secs(u64::MAX)
+    };
+    let mut compact_timer = tokio::time::interval(compact_interval_duration);
+    compact_timer.tick().await;
+
+    // Shadow mode: checkpoint is manual via shadow.checkpoint()
+    let checkpoint_interval_duration = if global_sync.checkpoint_interval > 0 {
+        Duration::from_secs(global_sync.checkpoint_interval)
+    } else {
+        Duration::from_secs(u64::MAX)
+    };
+    let mut checkpoint_timer = tokio::time::interval(checkpoint_interval_duration);
+    checkpoint_timer.tick().await;
+
+    let monitor_interval_duration = Duration::from_secs(global_sync.monitor_interval);
+    let mut trigger_timer = tokio::time::interval(monitor_interval_duration);
+
+    let validation_interval_duration = if global_sync.validation_interval > 0 {
+        Duration::from_secs(global_sync.validation_interval)
+    } else {
+        Duration::from_secs(u64::MAX)
+    };
+    let mut validation_timer = tokio::time::interval(validation_interval_duration);
+    validation_timer.tick().await;
+
+    // Track databases with pending shadow syncs
+    let mut pending_shadow_syncs = std::collections::HashSet::new();
+
+    tracing::info!(
+        "walrust shadow mode running (snapshot: {}s, WAL sync: {}s, checkpoint: {}s)",
+        global_sync.snapshot_interval,
+        global_sync.wal_sync_interval,
+        global_sync.checkpoint_interval
+    );
+
+    // Set up shutdown signal
+    let shutdown_signal = async {
+        #[cfg(unix)]
+        {
+            use signal::unix::{signal, SignalKind};
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => "SIGTERM",
+                _ = sigint.recv() => "SIGINT",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            signal::ctrl_c()
+                .await
+                .expect("Failed to set up Ctrl+C handler");
+            "Ctrl+C"
+        }
+    };
+    tokio::pin!(shutdown_signal);
+
+    loop {
+        tokio::select! {
+            // Handle shutdown signals
+            signal_name = &mut shutdown_signal => {
+                tracing::info!("Received {}, initiating graceful shutdown...", signal_name);
+                break;
+            }
+
+            // WAL file changed - copy frames to shadow immediately
+            Some(wal_path) = rx.recv() => {
+                let db_path = wal_path.with_extension("db");
+                if let Some(state) = db_states.get_mut(&db_path) {
+                    // Copy frames to shadow directory immediately
+                    match state.shadow.copy_frames(state.wal_copy_offset).await {
+                        Ok((frames, new_offset)) => {
+                            if !frames.is_empty() {
+                                tracing::debug!(
+                                    "{}: Copied {} frames to shadow (offset {} -> {})",
+                                    state.name,
+                                    frames.len(),
+                                    state.wal_copy_offset,
+                                    new_offset
+                                );
+                                state.wal_copy_offset = new_offset;
+                                // Mark for upload
+                                pending_shadow_syncs.insert(db_path);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("{}: Shadow copy failed: {}", state.name, e);
+                        }
+                    }
+                }
+            }
+
+            // Sync timer - upload from shadow segments
+            _ = wal_sync_timer.tick() => {
+                let pending_paths: Vec<PathBuf> = pending_shadow_syncs.drain().collect();
+                if pending_paths.is_empty() {
+                    continue;
+                }
+
+                // Phase 1: Collect inputs for concurrent sync
+                let sync_inputs: Vec<ShadowSyncInput> = pending_paths
+                    .iter()
+                    .filter_map(|db_path| {
+                        db_states.get(db_path).map(|state| ShadowSyncInput {
+                            db_path: state.db_path.clone(),
+                            name: state.name.clone(),
+                            current_txid: state.current_txid,
+                            db_checksum: state.db_checksum,
+                            generation: state.shadow.generation(),
+                            shadow_sync_offset: state.shadow_sync_offset,
+                            page_size: state.shadow.page_size(),
+                            shadow_dir: state.shadow.shadow_dir().to_path_buf(),
+                        })
+                    })
+                    .collect();
+
+                if sync_inputs.is_empty() {
+                    continue;
+                }
+
+                // Phase 2: Run all syncs concurrently
+                let sync_futures: Vec<_> = sync_inputs
+                    .into_iter()
+                    .map(|input| {
+                        let client = Arc::clone(&client);
+                        let bucket = bucket_name.clone();
+                        let pfx = prefix.clone();
+                        let policy = retry_policy.clone();
+                        let webhooks = Arc::clone(&webhook_sender);
+                        sync_shadow_concurrent_with_retry(client, bucket, pfx, input, policy, webhooks)
+                    })
+                    .collect();
+
+                let results = join_all(sync_futures).await;
+
+                // Phase 3: Apply results sequentially
+                for result in results {
+                    match result {
+                        Ok(output) if output.frame_count > 0 => {
+                            if let Some(state) = db_states.get_mut(&output.db_path) {
+                                state.shadow_sync_offset = output.new_shadow_sync_offset;
+                                state.current_txid = output.new_current_txid;
+                                state.db_checksum = output.new_db_checksum;
+
+                                // Update dashboard
+                                let shadow_size = walkdir::WalkDir::new(state.shadow.shadow_dir())
+                                    .into_iter()
+                                    .filter_map(|e| e.ok())
+                                    .filter_map(|e| e.metadata().ok())
+                                    .map(|m| m.len())
+                                    .sum::<u64>();
+
+                                metrics_state.update_db(DbStatus {
+                                    name: state.name.clone(),
+                                    path: state.db_path.display().to_string(),
+                                    last_sync_timestamp: chrono::Utc::now().timestamp(),
+                                    wal_size_bytes: shadow_size,
+                                    next_snapshot_timestamp: state.last_snapshot.map(|t| t.timestamp() + global_sync.snapshot_interval as i64).unwrap_or(0),
+                                    error_count: 0,
+                                    snapshot_count: 0,
+                                    current_txid: state.current_txid,
+                                }).await;
+
+                                // Update trigger state
+                                if let Some(trigger) = trigger_states.get_mut(&output.db_path) {
+                                    trigger.frames_since_snapshot += output.frame_count;
+                                    trigger.last_wal_activity = Some(std::time::Instant::now());
+                                    if trigger.first_change_time.is_none() {
+                                        trigger.first_change_time = Some(std::time::Instant::now());
+                                    }
+
+                                    // Check max_changes trigger
+                                    let sync_config = sync_configs.get(&output.db_path).unwrap_or(&global_sync);
+                                    if sync_config.max_changes > 0
+                                        && trigger.frames_since_snapshot >= sync_config.max_changes
+                                    {
+                                        tracing::info!(
+                                            "{}: max_changes trigger ({} frames)",
+                                            state.name,
+                                            trigger.frames_since_snapshot
+                                        );
+                                        // Trigger snapshot
+                                        let mut db_state = DbState {
+                                            name: state.name.clone(),
+                                            db_path: state.db_path.clone(),
+                                            wal_path: state.wal_path.clone(),
+                                            wal_offset: 0,
+                                            wal_generation: state.shadow.generation(),
+                                            current_txid: state.current_txid,
+                                            last_snapshot: state.last_snapshot,
+                                            db_checksum: state.db_checksum,
+                                        };
+                                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                                            tracing::error!("Failed to snapshot {}: {}", state.name, e);
+                                            metrics_state.record_error(&state.name);
+                                        } else {
+                                            state.current_txid = db_state.current_txid;
+                                            state.last_snapshot = db_state.last_snapshot;
+                                            state.db_checksum = db_state.db_checksum;
+                                            metrics_state.record_snapshot(&state.name);
+                                            trigger.frames_since_snapshot = 0;
+                                            trigger.first_change_time = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Ok(_) => {} // No frames synced
+                        Err(e) => {
+                            tracing::error!("Shadow sync failed: {}", e);
+                        }
+                    }
+                }
+            }
+
+            // Trigger timer for max_interval and on_idle checks
+            _ = trigger_timer.tick() => {
+                let now = std::time::Instant::now();
+
+                for (db_path, trigger) in trigger_states.iter_mut() {
+                    let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
+
+                    if trigger.frames_since_snapshot == 0 {
+                        continue;
+                    }
+
+                    let state = match db_states.get_mut(db_path) {
+                        Some(s) => s,
+                        None => continue,
+                    };
+
+                    let mut should_snapshot = false;
+                    let mut reason = "";
+
+                    // Check max_interval
+                    if sync_config.max_interval > 0 {
+                        if let Some(first_change) = trigger.first_change_time {
+                            if now.duration_since(first_change).as_secs() >= sync_config.max_interval {
+                                should_snapshot = true;
+                                reason = "max_interval";
+                            }
+                        }
+                    }
+
+                    // Check on_idle
+                    if !should_snapshot && sync_config.on_idle > 0 {
+                        if let Some(last_activity) = trigger.last_wal_activity {
+                            if now.duration_since(last_activity).as_secs() >= sync_config.on_idle {
+                                should_snapshot = true;
+                                reason = "on_idle";
+                            }
+                        }
+                    }
+
+                    if should_snapshot {
+                        tracing::info!(
+                            "{}: {} trigger ({} frames)",
+                            state.name,
+                            reason,
+                            trigger.frames_since_snapshot
+                        );
+
+                        let mut db_state = DbState {
+                            name: state.name.clone(),
+                            db_path: state.db_path.clone(),
+                            wal_path: state.wal_path.clone(),
+                            wal_offset: 0,
+                            wal_generation: state.shadow.generation(),
+                            current_txid: state.current_txid,
+                            last_snapshot: state.last_snapshot,
+                            db_checksum: state.db_checksum,
+                        };
+
+                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                            tracing::error!("Failed to snapshot {}: {}", state.name, e);
+                            metrics_state.record_error(&state.name);
+                        } else {
+                            state.current_txid = db_state.current_txid;
+                            state.last_snapshot = db_state.last_snapshot;
+                            state.db_checksum = db_state.db_checksum;
+                            metrics_state.record_snapshot(&state.name);
+                            trigger.frames_since_snapshot = 0;
+                            trigger.first_change_time = None;
+                        }
+                    }
+                }
+            }
+
+            // Periodic snapshot timer
+            _ = snapshot_timer.tick() => {
+                for (db_path, state) in db_states.iter_mut() {
+                    let mut db_state = DbState {
+                        name: state.name.clone(),
+                        db_path: state.db_path.clone(),
+                        wal_path: state.wal_path.clone(),
+                        wal_offset: 0,
+                        wal_generation: state.shadow.generation(),
+                        current_txid: state.current_txid,
+                        last_snapshot: state.last_snapshot,
+                        db_checksum: state.db_checksum,
+                    };
+
+                    if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                        tracing::error!("Failed to snapshot {}: {}", state.name, e);
+                        metrics_state.record_error(&state.name);
+                    } else {
+                        state.current_txid = db_state.current_txid;
+                        state.last_snapshot = db_state.last_snapshot;
+                        state.db_checksum = db_state.db_checksum;
+                        metrics_state.record_snapshot(&state.name);
+
+                        if let Some(trigger) = trigger_states.get_mut(db_path) {
+                            trigger.frames_since_snapshot = 0;
+                            trigger.first_change_time = None;
+                        }
+                    }
+                }
+
+                // Run compaction after snapshots if enabled
+                if global_sync.compact_after_snapshot {
+                    if let Some(ref policy) = compact_policy {
+                        for state in db_states.values() {
+                            if let Err(e) = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await {
+                                tracing::error!("Failed to compact {}: {}", state.name, e);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Compaction timer
+            _ = compact_timer.tick(), if global_sync.compact_interval > 0 => {
+                if let Some(ref policy) = compact_policy {
+                    for state in db_states.values() {
+                        if let Err(e) = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await {
+                            tracing::error!("Failed to compact {}: {}", state.name, e);
+                        }
+                    }
+                }
+            }
+
+            // Checkpoint timer - use shadow.checkpoint() for manual control
+            _ = checkpoint_timer.tick(), if global_sync.checkpoint_interval > 0 => {
+                for (_db_path, state) in db_states.iter_mut() {
+                    // Check if shadow has accumulated enough data
+                    let segments = match state.shadow.list_segments(state.shadow.generation()).await {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+
+                    let total_segment_size: u64 = segments.iter().map(|s| s.size).sum();
+                    let page_size = state.shadow.page_size() as u64;
+                    let frame_size = 24 + page_size; // header + page
+                    let estimated_frames = if frame_size > 0 { total_segment_size / frame_size } else { 0 };
+
+                    let sync_config = sync_configs.get(&state.db_path).unwrap_or(&global_sync);
+
+                    if estimated_frames >= sync_config.min_checkpoint_page_count {
+                        tracing::info!(
+                            "{}: Running shadow checkpoint (~{} frames)",
+                            state.name,
+                            estimated_frames
+                        );
+
+                        // First, ensure all shadow data is uploaded
+                        // Then trigger checkpoint via shadow
+                        if let Err(e) = state.shadow.checkpoint().await {
+                            tracing::error!("{}: Shadow checkpoint failed: {}", state.name, e);
+                        } else {
+                            tracing::debug!("{}: Shadow checkpoint completed", state.name);
+                            // Clean up old generation segments
+                            let current_gen = state.shadow.generation();
+                            if current_gen > 0 {
+                                if let Err(e) = state.shadow.cleanup_segments(current_gen).await {
+                                    tracing::warn!("{}: Shadow cleanup failed: {}", state.name, e);
+                                }
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            "{}: Skipping checkpoint (only ~{} frames, need {})",
+                            state.name,
+                            estimated_frames,
+                            sync_config.min_checkpoint_page_count
+                        );
+                    }
+                }
+            }
+
+            // Validation timer
+            _ = validation_timer.tick(), if global_sync.validation_interval > 0 => {
+                for (_db_path, state) in db_states.iter() {
+                    let db_name = &state.name;
+
+                    tracing::debug!("{}: Running periodic backup validation", db_name);
+
+                    match validate_backup_integrity(&client, &bucket_name, &prefix, db_name).await {
+                        Ok(result) => {
+                            if result.is_valid {
+                                tracing::info!(
+                                    "{}: Validation passed ({} files, {:.2} MB)",
+                                    db_name,
+                                    result.verified_count,
+                                    result.verified_size_bytes as f64 / (1024.0 * 1024.0)
+                                );
+                                metrics_state.record_validation_success(db_name);
+                            } else {
+                                tracing::error!(
+                                    "{}: Validation failed with {} issues",
+                                    db_name,
+                                    result.issues.len()
+                                );
+                                for issue in &result.issues {
+                                    tracing::error!("  {}: {}", issue.filename, issue.issue);
+                                }
+                                metrics_state.record_validation_failure(db_name);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("{}: Validation error: {}", db_name, e);
+                            metrics_state.record_validation_failure(db_name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Graceful shutdown - sync remaining shadow data
+    tracing::info!("Shadow mode shutdown: syncing remaining data...");
+
+    for (_db_path, state) in db_states.iter_mut() {
+        // Copy any remaining WAL frames
+        if let Ok((frames, _)) = state.shadow.copy_frames(state.wal_copy_offset).await {
+            if !frames.is_empty() {
+                tracing::debug!("{}: Final shadow copy: {} frames", state.name, frames.len());
+            }
+        }
+    }
+
+    tracing::info!("walrust shadow mode shutdown complete");
+    Ok(())
+}
+
+/// Sync shadow WAL to S3 concurrently
+async fn sync_shadow_concurrent(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    input: ShadowSyncInput,
+) -> Result<ShadowSyncOutput> {
+    use litetx::Checksum;
+
+    // Read frames from shadow segments
+    let shadow_dir = &input.shadow_dir;
+    let mut frames = Vec::new();
+    let mut total_offset = 0u64;
+    let frame_size = 24u64 + input.page_size as u64;
+
+    // List segment files for the current generation
+    let mut entries: Vec<_> = std::fs::read_dir(shadow_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+
+        // Parse generation from filename: {gen:08x}-{idx:08x}.wal
+        let parts: Vec<&str> = name_str.trim_end_matches(".wal").split('-').collect();
+        if parts.len() != 2 {
+            continue;
+        }
+        let gen = u64::from_str_radix(parts[0], 16).unwrap_or(u64::MAX);
+        if gen != input.generation {
+            continue;
+        }
+
+        let path = entry.path();
+        let metadata = std::fs::metadata(&path)?;
+        let segment_size = metadata.len();
+        let segment_start = total_offset;
+        let segment_end = segment_start + segment_size;
+
+        // Skip if we've already synced past this segment
+        if segment_end <= input.shadow_sync_offset {
+            total_offset = segment_end;
+            continue;
+        }
+
+        // Read frames from this segment
+        let mut file = std::fs::File::open(&path)?;
+        use std::io::{Read, Seek, SeekFrom};
+
+        let relative_offset = if input.shadow_sync_offset > segment_start {
+            input.shadow_sync_offset - segment_start
+        } else {
+            0
+        };
+
+        file.seek(SeekFrom::Start(relative_offset))?;
+
+        let bytes_to_read = segment_size - relative_offset;
+        let frame_count = bytes_to_read / frame_size;
+
+        for _ in 0..frame_count {
+            let mut header = [0u8; 24];
+            file.read_exact(&mut header)?;
+
+            let page_number = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+            let db_size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+
+            let mut data = vec![0u8; input.page_size as usize];
+            file.read_exact(&mut data)?;
+
+            frames.push(wal::ParsedFrame {
+                page_number,
+                db_size,
+                data,
+            });
+        }
+
+        total_offset = segment_end;
+    }
+
+    if frames.is_empty() {
+        return Ok(ShadowSyncOutput {
+            db_path: input.db_path,
+            frame_count: 0,
+            new_shadow_sync_offset: input.shadow_sync_offset,
+            new_current_txid: input.current_txid,
+            new_db_checksum: input.db_checksum,
+        });
+    }
+
+    // Deduplicate pages (keep only latest version of each page)
+    let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    let mut max_db_size = 0u32;
+    let frame_count = frames.len();
+    for frame in frames {
+        max_db_size = max_db_size.max(frame.db_size);
+        page_map.insert(frame.page_number, frame.data);
+    }
+
+    // Convert to format expected by encode_wal_changes
+    let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
+
+    // Get pre_apply_checksum from state
+    let pre_checksum = input.db_checksum.map(|cs| Checksum::new(cs));
+
+    // Calculate TXIDs
+    let min_txid = input.current_txid + 1;
+    let max_txid = min_txid + pages.len() as u64 - 1;
+    let commit_page = if max_db_size > 0 {
+        max_db_size
+    } else {
+        // Fallback: estimate from input
+        1
+    };
+
+    // Encode as incremental LTX (CPU-bound, run in blocking thread pool)
+    // Pre-allocate buffer: estimate 2x pages * page_size for compression headroom
+    let unique_pages = pages.len();
+    let estimated_size = unique_pages.saturating_mul(input.page_size as usize).saturating_mul(2);
+    let page_size = input.page_size;
+    let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
+        let mut ltx_buffer = Vec::with_capacity(estimated_size);
+        let post_checksum = ltx::encode_wal_changes(
+            &mut ltx_buffer,
+            &pages,
+            page_size,
+            min_txid,
+            max_txid,
+            commit_page,
+            pre_checksum,
+        )?;
+        Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
+    }).await??;
+
+    let ltx_size = ltx_buffer.len() as u64;
+
+    // Upload LTX file
+    let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
+    let ltx_key = format!("{}{}/{}", prefix, input.name, ltx_filename);
+
+    s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
+
+    tracing::info!(
+        "{}: Shadow sync uploaded {} frames as {} ({} bytes, {} unique pages, TXID {}-{})",
+        input.name,
+        frame_count,
+        ltx_filename,
+        ltx_size,
+        unique_pages,
+        min_txid,
+        max_txid
+    );
+
+    // Update manifest
+    let mut manifest = load_manifest(client, bucket, prefix, &input.name).await?;
+    manifest.current_txid = max_txid;
+    manifest.last_checksum = Some(post_checksum.into_inner());
+    manifest.files.push(LtxEntry {
+        filename: ltx_filename,
+        min_txid,
+        max_txid,
+        size: ltx_size,
+        created_at: Utc::now().to_rfc3339(),
+        is_snapshot: false,
+    });
+    save_manifest(client, bucket, prefix, &manifest).await?;
+
+    let new_offset = input.shadow_sync_offset + (frame_count as u64 * frame_size);
+
+    Ok(ShadowSyncOutput {
+        db_path: input.db_path,
+        frame_count: unique_pages as u64,
+        new_shadow_sync_offset: new_offset,
+        new_current_txid: max_txid,
+        new_db_checksum: Some(post_checksum.into_inner()),
+    })
+}
+
+/// Sync shadow WAL with retry logic
+async fn sync_shadow_concurrent_with_retry(
+    client: Arc<aws_sdk_s3::Client>,
+    bucket: String,
+    prefix: String,
+    input: ShadowSyncInput,
+    retry_policy: RetryPolicy,
+    webhook_sender: Arc<WebhookSender>,
+) -> Result<ShadowSyncOutput> {
+    let db_name = input.name.clone();
+    let mut attempts = 0u32;
+
+    loop {
+        attempts += 1;
+        match sync_shadow_concurrent(&client, &bucket, &prefix, input.clone()).await {
+            Ok(output) => return Ok(output),
+            Err(e) => {
+                let error_kind = classify_error(&e);
+                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
+
+                if error_kind == ErrorKind::AuthError {
+                    tracing::error!("{}: Auth error during shadow sync: {}", db_name, e);
+                    webhook_sender
+                        .notify_auth_failure(&db_name, &e.to_string())
+                        .await;
+                    return Err(e);
+                }
+
+                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
+                    tracing::error!(
+                        "{}: Shadow sync failed after {} attempts: {}",
+                        db_name,
+                        attempts,
+                        e
+                    );
+                    webhook_sender
+                        .notify_sync_failed(&db_name, &e.to_string(), attempts)
+                        .await;
+                    return Err(e);
+                }
+
+                let delay = retry_policy.calculate_delay(attempts - 1);
+                tracing::warn!(
+                    "{}: Shadow sync attempt {}/{} failed, retrying in {:?}: {}",
+                    db_name,
+                    attempts,
+                    retry_policy.config().max_retries + 1,
+                    delay,
+                    e
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
 /// Internal compaction for watch mode (non-interactive, always force)
 async fn run_compaction(
     client: &aws_sdk_s3::Client,
@@ -1238,17 +2209,24 @@ async fn sync_wal_concurrent(
         (db_size / header.page_size as u64) as u32
     };
 
-    // Encode as incremental LTX
-    let mut ltx_buffer = Vec::new();
-    let post_checksum = ltx::encode_wal_changes(
-        &mut ltx_buffer,
-        &pages,
-        header.page_size,
-        min_txid,
-        max_txid,
-        commit_page,
-        Some(pre_checksum),
-    )?;
+    // Encode as incremental LTX (CPU-bound, run in blocking thread pool)
+    // Pre-allocate buffer: estimate 2x pages * page_size for compression headroom
+    let unique_pages = pages.len();
+    let estimated_size = unique_pages.saturating_mul(header.page_size as usize).saturating_mul(2);
+    let page_size = header.page_size;
+    let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
+        let mut ltx_buffer = Vec::with_capacity(estimated_size);
+        let post_checksum = ltx::encode_wal_changes(
+            &mut ltx_buffer,
+            &pages,
+            page_size,
+            min_txid,
+            max_txid,
+            commit_page,
+            Some(pre_checksum),
+        )?;
+        Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
+    }).await??;
 
     let ltx_size = ltx_buffer.len() as u64;
 
@@ -1266,7 +2244,7 @@ async fn sync_wal_concurrent(
         frame_count,
         ltx_filename,
         ltx_size,
-        pages.len(),
+        unique_pages,
         min_txid,
         max_txid
     );
@@ -1552,35 +2530,41 @@ async fn sync_wal(
         (db_size / header.page_size as u64) as u32
     };
 
-    // Encode as incremental LTX
-    let mut ltx_buffer = Vec::new();
-    let post_checksum = ltx::encode_wal_changes(
-        &mut ltx_buffer,
-        &pages,
-        header.page_size,
-        min_txid,
-        max_txid,
-        commit_page,
-        Some(pre_checksum),
-    )?;
+    // Encode as incremental LTX (CPU-bound, run in blocking thread pool)
+    // Pre-allocate buffer: estimate 2x pages * page_size for compression headroom
+    let estimated_size = pages.len().saturating_mul(header.page_size as usize).saturating_mul(2);
+    let page_size = header.page_size;
+    let db_name = state.name.clone();
+    let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
+        let mut ltx_buffer = Vec::with_capacity(estimated_size);
+        let post_checksum = ltx::encode_wal_changes(
+            &mut ltx_buffer,
+            &pages,
+            page_size,
+            min_txid,
+            max_txid,
+            commit_page,
+            Some(pre_checksum),
+        )?;
+        Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
+    }).await??;
 
     let ltx_size = ltx_buffer.len() as u64;
 
     // LTX filename: {min_txid:08}-{max_txid:08}.ltx
     let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
-    let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+    let ltx_key = format!("{}{}/{}", prefix, db_name, ltx_filename);
 
     // Upload incremental LTX file
     let timestamp = Utc::now();
     s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
 
     tracing::info!(
-        "{}: Synced {} WAL frames as incremental LTX {} ({} bytes, {} unique pages, TXID {}-{})",
+        "{}: Synced {} WAL frames as incremental LTX {} ({} bytes, TXID {}-{})",
         state.name,
         frame_count,
         ltx_filename,
         ltx_size,
-        pages.len(),
         min_txid,
         max_txid
     );
@@ -1631,7 +2615,10 @@ async fn take_snapshot(
     let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
 
     // Encode database as LTX
-    let mut ltx_buffer = Vec::new();
+    // Pre-allocate buffer: estimate 2x db size for compression headroom
+    let db_size = std::fs::metadata(&state.db_path)?.len() as usize;
+    let estimated_size = db_size.saturating_mul(2);
+    let mut ltx_buffer = Vec::with_capacity(estimated_size);
     ltx::encode_snapshot(&mut ltx_buffer, &state.db_path, page_size, new_txid)?;
 
     let ltx_size = ltx_buffer.len() as u64;
@@ -2157,7 +3144,10 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
     let ltx_key = format!("{}{}/{}", prefix, name, ltx_filename);
 
     // Encode database as LTX
-    let mut ltx_buffer = Vec::new();
+    // Pre-allocate buffer: estimate 2x db size for compression headroom
+    let db_size = std::fs::metadata(database)?.len() as usize;
+    let estimated_size = db_size.saturating_mul(2);
+    let mut ltx_buffer = Vec::with_capacity(estimated_size);
     ltx::encode_snapshot(&mut ltx_buffer, database, page_size, new_txid)?;
 
     let ltx_size = ltx_buffer.len() as u64;
@@ -3213,7 +4203,9 @@ pub mod testable {
         };
 
         // Encode as incremental LTX
-        let mut ltx_buffer = Vec::new();
+        // Pre-allocate buffer: estimate 2x pages * page_size for compression headroom
+        let estimated_size = pages.len().saturating_mul(header.page_size as usize).saturating_mul(2);
+        let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,
             &pages,
@@ -3284,7 +4276,10 @@ pub mod testable {
         let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
 
         // Encode database as LTX
-        let mut ltx_buffer = Vec::new();
+        // Pre-allocate buffer: estimate 2x db size for compression headroom
+        let db_size = std::fs::metadata(&state.db_path)?.len() as usize;
+        let estimated_size = db_size.saturating_mul(2);
+        let mut ltx_buffer = Vec::with_capacity(estimated_size);
         ltx::encode_snapshot(&mut ltx_buffer, &state.db_path, page_size, new_txid)?;
 
         let ltx_size = ltx_buffer.len() as u64;
@@ -3492,7 +4487,10 @@ pub mod testable {
         let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
 
         // Encode database as LTX
-        let mut ltx_buffer = Vec::new();
+        // Pre-allocate buffer: estimate 2x db size for compression headroom
+        let db_size = std::fs::metadata(&state.db_path)?.len() as usize;
+        let estimated_size = db_size.saturating_mul(2);
+        let mut ltx_buffer = Vec::with_capacity(estimated_size);
         ltx::encode_snapshot(&mut ltx_buffer, &state.db_path, page_size, new_txid)?;
 
         let ltx_size = ltx_buffer.len() as u64;
@@ -3627,7 +4625,9 @@ pub mod testable {
         };
 
         // Encode as incremental LTX
-        let mut ltx_buffer = Vec::new();
+        // Pre-allocate buffer: estimate 2x pages * page_size for compression headroom
+        let estimated_size = pages.len().saturating_mul(header.page_size as usize).saturating_mul(2);
+        let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,
             &pages,

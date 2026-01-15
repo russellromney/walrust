@@ -30,9 +30,13 @@ pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 
+# Parallelization for LTX encoding (CPU-bound compression)
+rayon = "1.10"
+
 # S3
 aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
+aws-smithy-runtime = { version = "1", features = ["client"] }
 
 # File watching
 notify = "6"
@@ -65,6 +69,9 @@ litetx = "0.1"
 
 # SQLite for checkpointing
 rusqlite = { version = "0.32", features = ["bundled"] }
+
+# Directory traversal (for shadow WAL size calculation)
+walkdir = "2"
 
 # Dashboard + metrics
 axum = "0.7"

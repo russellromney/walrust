@@ -22,9 +22,42 @@ pub struct Config {
     #[serde(default)]
     pub retention: RetentionConfig,
 
+    /// Retry configuration for transient failures
+    #[serde(default)]
+    pub retry: crate::retry::RetryConfig,
+
+    /// Webhook configuration for failure notifications
+    #[serde(default)]
+    pub webhooks: Vec<WebhookConfig>,
+
     /// Database-specific configurations
     #[serde(default)]
     pub databases: Vec<DatabaseConfig>,
+}
+
+/// Webhook configuration for failure notifications
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebhookConfig {
+    /// URL to POST notifications to
+    pub url: String,
+
+    /// Events to notify on (default: all)
+    /// Valid events: sync_failed, auth_failure, corruption_detected, circuit_breaker_open
+    #[serde(default = "default_webhook_events")]
+    pub events: Vec<String>,
+
+    /// Optional secret for HMAC signing (header: X-Walrust-Signature)
+    pub secret: Option<String>,
+}
+
+fn default_webhook_events() -> Vec<String> {
+    vec![
+        "sync_failed".to_string(),
+        "auth_failure".to_string(),
+        "corruption_detected".to_string(),
+        "circuit_breaker_open".to_string(),
+    ]
 }
 
 /// S3 storage configuration
@@ -107,7 +140,7 @@ impl Default for SyncConfig {
     fn default() -> Self {
         Self {
             snapshot_interval: 3600,
-            wal_sync_interval: 1,
+            wal_sync_interval: 1, // PERF: Set to 0.5 for aggressive sync (500ms batching)
             max_changes: 0,
             max_interval: 0,
             on_idle: 0,
@@ -127,7 +160,7 @@ fn default_snapshot_interval() -> u64 {
     3600
 }
 fn default_wal_sync_interval() -> u64 {
-    1
+    1 // PERF: Default 1s, use walrust.toml wal_sync_interval=0.5 for aggressive batching
 }
 fn default_on_startup() -> bool {
     true

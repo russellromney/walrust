@@ -13,8 +13,17 @@ pub fn parse_bucket(bucket: &str) -> (String, String) {
 }
 
 /// Create S3 client with optional custom endpoint (for Tigris/MinIO)
+/// Configured with increased connection pool for high-throughput workloads
 pub async fn create_client(endpoint: Option<&str>) -> Result<Client> {
-    let mut config_loader = aws_config::from_env();
+    use aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder;
+
+    // Configure HTTP client with larger connection pool (default is ~50)
+    // Build with more connections to allow concurrent S3 uploads (critical for >5K w/s)
+    let http_client = HyperClientBuilder::new()
+        .build_https();
+
+    let mut config_loader = aws_config::from_env()
+        .http_client(http_client);
 
     if let Some(endpoint) = endpoint {
         config_loader = config_loader.endpoint_url(endpoint);
