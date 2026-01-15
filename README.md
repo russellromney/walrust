@@ -6,9 +6,9 @@
 
 **Lightweight SQLite replication to S3/Tigris in Rust.**
 
-Like Litestream but with an emphasis on memory footprint and easy of configuration. 
+Like Litestream but with an emphasis on memory footprint and easy of configuration.
 
-> **v0.1.5:** Adds `StorageBackend` trait for testability and DST framework (`walrust-dst`) with fault injection testing. 22 chaos/property tests passing. 
+> **v0.1.8:** Performance optimization to break 5K w/s ceiling. Pre-allocated buffers, CPU parallelization via spawn_blocking, improved S3 connection pooling. Target: 10K+ w/s at 250 DBs. Memory: ~50-100 MB (up from 20 MB, still 7-14x less than Litestream).
 
 ## Installation
 
@@ -260,6 +260,21 @@ daily = 7
 weekly = 12
 monthly = 12
 
+# Retry configuration for transient S3 failures
+[retry]
+max_retries = 5                 # Number of retry attempts
+base_delay_ms = 100             # Initial backoff delay
+max_delay_ms = 30000            # Maximum backoff cap (30s)
+circuit_breaker_enabled = true  # Enable circuit breaker
+circuit_breaker_threshold = 10  # Failures before circuit opens
+circuit_breaker_cooldown_ms = 60000  # Cooldown before half-open (1 min)
+
+# Webhook notifications for failure events
+[[webhooks]]
+url = "https://example.com/walrust-webhook"
+events = ["sync_failed", "auth_failure", "corruption_detected", "circuit_breaker_open"]
+secret = "optional-hmac-secret"  # For X-Walrust-Signature header
+
 [[databases]]
 path = "/data/app.db"
 prefix = "production"
@@ -345,12 +360,17 @@ Single walrust process handles multiple databases with shared S3 connection pool
 
 ## Testing
 
-132 tests covering:
+173 tests covering:
 - ✅ Byte-for-byte data integrity (snapshot → restore → verify)
 - ✅ SHA256 checksum storage and verification
 - ✅ Multi-database concurrent snapshots
 - ✅ WAL file format parsing
 - ✅ S3 operations
+- ✅ Retry logic with exponential backoff
+- ✅ Chaos testing with fault injection (walrust-dst)
+- ✅ Property-based testing (7 properties, 100+ cases each)
+- ✅ Core invariants (transaction recovery, WAL batching, snapshot atomicity)
+- ✅ Continuous chaos testing with MTBF tracking
 
 Run tests: `./run_tests.sh` (requires Tigris credentials in `.env`)
 

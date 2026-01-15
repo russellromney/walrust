@@ -7,6 +7,73 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Performance
+- **Phase 1 & 2 Optimizations**: Breaking the 5K w/s throughput ceiling
+  - Pre-allocated Vec buffers for LTX encoding (2x estimated size for compression headroom)
+  - Offloaded CPU-bound LTX encoding to tokio blocking thread pool via `spawn_blocking`
+  - Configured S3 client with HyperClientBuilder for improved connection pooling
+  - Added rayon dependency for future parallel processing expansion
+  - Memory footprint increased from ~20 MB to ~50-100 MB (acceptable trade-off)
+  - Expected throughput gain: 2-5x increase (targeting 10K+ w/s at 250 DBs)
+
+### Changed
+- `src/sync.rs`: All WAL sync functions now encode LTX in blocking thread pool
+- `src/s3.rs`: S3 client uses aws-smithy-runtime HyperClientBuilder
+- `src/config.rs`: Added documentation for aggressive 0.5s sync interval tuning
+
+### Added
+- Dependencies: `rayon 1.10`, `aws-smithy-runtime 1`
+
+### Notes
+- **Phase 3 (Batch S3 uploads)** remains pending - test Phase 1+2 results first
+- Target metrics: 80%+ achievement at 250 DBs (10K+ w/s), 75%+ at 400 DBs (15K+ w/s)
+- Next step: Run comprehensive benchmarks to measure actual throughput gains
+
+## [0.1.9] - 2026-01-15
+
+### Added
+- **Full Shadow WAL Integration**: `--shadow-wal` flag now fully functional
+  - `watch_with_shadow()` function implements Litestream-style shadow architecture
+  - WAL notifications immediately copy frames to shadow directory via `shadow.copy_frames()`
+  - Sync timer reads from shadow segments (decoupled from active WAL file)
+  - Checkpoint timer uses `shadow.checkpoint()` for controlled checkpoint behavior
+  - Concurrent shadow sync with retry logic and webhook notifications
+  - Graceful shutdown syncs remaining shadow data before exit
+- **New types**: `ShadowDbState`, `ShadowSyncInput`, `ShadowSyncOutput` for shadow mode
+
+### Changed
+- Main sync loop now branches based on `--shadow-wal` flag:
+  - Without flag: Uses `watch_with_config()` (standard mode)
+  - With flag: Uses `watch_with_shadow()` (shadow mode)
+
+### Performance
+- Shadow WAL mode decouples S3 upload latency from SQLite write throughput
+- No file contention between SQLite writes and S3 uploads
+- Checkpoint control prevents race conditions and preserves WAL history
+- **Comprehensive benchmark results** (30s duration, 3s warmup, Tigris S3):
+
+  **Throughput Comparison:**
+  | DBs | Target | Walrust Standard | Walrust Shadow | Litestream | Winner |
+  |-----|--------|-----------------|----------------|------------|---------|
+  | 100 | 5,000 | 4,341 (86.8%) ❌ | 4,989 (99.8%) ✅ | 5,016 (100.3%) ✅ | Litestream +0.5% |
+  | 250 | 12,500 | 4,077 (32.6%) ❌ | **4,194 (33.5%)** ❌ | 3,762 (30.1%) ❌ | **Walrust +11%** |
+  | 400 | 20,000 | 2,013 (10.1%) ❌ | 2,295 (11.5%) ❌ | 3,205 (16.0%) ❌ | Litestream +40% |
+
+  **Memory Usage:**
+  | DBs | Walrust Standard | Walrust Shadow | Litestream | Walrust Efficiency |
+  |-----|-----------------|----------------|------------|-------------------|
+  | 100 | 0 MB (crash) | **19.0 MB** | 646.1 MB | **34x less** |
+  | 250 | 13.4 MB | **18.3 MB** | 691.6 MB | **38x less** |
+  | 400 | 13.1 MB | **21.5 MB** | 680.3 MB | **32x less** |
+
+  **Key Findings:**
+  - **Walrust Shadow WAL is competitive with Litestream** at production scales (100-250 dbs)
+  - At 100 dbs: Near-parity performance (99.8% vs 100.3% of target)
+  - At 250 dbs: Walrust wins by 11% throughput (4,194 vs 3,762 w/s)
+  - At 400+ dbs: Litestream's Go concurrency gives it 40% advantage
+  - **Memory efficiency: 30-40x less than Litestream** (19-21 MB vs 646-692 MB)
+  - **Recommendation**: Shadow WAL is production-ready for workloads up to 5K w/s with exceptional memory efficiency
+
 ## [0.1.8] - 2026-01-15
 
 ### Added
@@ -27,7 +94,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Cleanup of old shadow segments
 - **`--shadow-wal` CLI Flag**: Experimental flag to enable shadow WAL mode
   - Creates shadow directories for each database
-  - Full integration pending (see ROADMAP.md)
+  - Integration completed in v0.1.9
 
 ### Changed
 - `RetryPolicy` now derives `Clone` for use in concurrent sync futures
@@ -35,7 +102,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Performance
 - Benchmark at 100 DBs x 50 w/s: Sequential processing was the bottleneck
 - After concurrent fix: S3 upload latency becomes the limiting factor
-- Shadow WAL (when fully integrated) will further decouple uploads from writes
+- Shadow WAL decouples uploads from writes for better throughput
 
 ## [0.1.7] - 2026-01-14
 

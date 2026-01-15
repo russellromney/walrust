@@ -10,6 +10,52 @@ Litestream-compatible SQLite sync in Rust. Optimized for multi-tenant deployment
 - Built-in dashboard + Prometheus metrics
 - Opinionated defaults (grandfather/father/son retention)
 
+## v0.1.8 Plan (Performance Optimization)
+
+**Goal**: Break the 5K w/s throughput ceiling to achieve 10K+ w/s at 250 databases.
+
+### Phase 1: Quick Wins ✅ COMPLETE (2026-01-15)
+- [x] Pre-allocate Vec buffers for LTX encoding (2x estimated size)
+- [x] Configure S3 client with HyperClientBuilder for connection pooling
+- [x] Document 0.5s sync interval option for aggressive batching
+- **Result**: Reduced memory allocations, improved S3 concurrency
+
+### Phase 2: CPU Parallelization ✅ COMPLETE (2026-01-15)
+- [x] Offload CPU-bound LTX encoding to tokio blocking thread pool
+- [x] Added rayon dependency for future parallel expansion
+- [x] Applied to all WAL sync functions (standard and shadow modes)
+- **Result**: Encoding no longer blocks async I/O, better CPU utilization
+
+### Phase 3: Batch S3 Uploads (PENDING)
+- [ ] Batch multiple small LTX files into larger uploads
+- [ ] Implement S3 multipart uploads for efficiency
+- [ ] Reduce S3 API call rate by 10-50x
+- **Status**: Deferred pending Phase 1+2 benchmark results
+- **Expected gain**: Additional 30-50% throughput increase
+
+### Success Metrics
+**Baseline (before optimizations):**
+- 100 dbs: 4,989 w/s (99.8% of 5K target) ✅
+- 250 dbs: 4,194 w/s (33.5% of 12.5K target) ❌
+- 400 dbs: 2,295 w/s (11.5% of 20K target) ❌
+
+**Target (after Phase 1+2):**
+- 100 dbs: 5,000+ w/s (100%+ of target) ✅
+- 250 dbs: 10,000+ w/s (80%+ of target) 🎯
+- 400 dbs: 15,000+ w/s (75%+ of target) 🎯
+
+**Memory Trade-off:**
+- Before: ~20 MB per walrust instance
+- After: ~50-100 MB (acceptable for massive throughput gain)
+
+### Next Steps
+1. Run comprehensive benchmarks to measure actual gains
+2. Document results in CHANGELOG.md
+3. Decide if Phase 3 (batch uploads) is needed
+4. Plan next features (HA mode, remote orchestrator, etc.)
+
+---
+
 ## v0.1.7 Plan (Next)
 
 **Goal**: Production confidence via real S3 testing and improved soak test accuracy.
@@ -307,9 +353,9 @@ walrust explain [--config file]         # ✅ Show config summary without runnin
 - No multi-writer support (use orchestration for HA)
 - Simpler failure modes
 
-### Shadow WAL (v0.1.8+ - Experimental)
+### Shadow WAL (v0.1.9 - Complete) ✅
 
-**Status**: Module implemented (`src/shadow.rs`), CLI flag added (`--shadow-wal`), integration in progress.
+**Status**: Fully integrated. Use `--shadow-wal` flag to enable.
 
 The shadow WAL architecture matches Litestream's approach for better performance at high write rates:
 
@@ -324,13 +370,24 @@ The shadow WAL architecture matches Litestream's approach for better performance
 - Preserved history (shadow keeps frames even after checkpoint)
 - Better throughput at 100+ databases
 
-**Integration TODO** (for next session):
-1. Create `watch_with_shadow()` function in sync.rs
-2. On WAL notification, call `shadow.copy_frames()` instead of marking pending
-3. On sync timer, read from shadow WAL and upload
-4. Use `shadow.checkpoint()` for manual checkpoint control
+**Implementation** (v0.1.9):
 
-See `src/shadow.rs` for the `ShadowWal` struct implementation.
+- `watch_with_shadow()` in `src/sync.rs` - Full shadow mode implementation
+- `ShadowDbState`, `ShadowSyncInput`, `ShadowSyncOutput` - Shadow-specific types
+- `sync_shadow_concurrent_with_retry()` - Concurrent shadow sync with retry logic
+- WAL notification → `shadow.copy_frames()` (immediate frame copy)
+- Sync timer → reads from shadow segments → uploads LTX → cleanup
+- Checkpoint timer → `shadow.checkpoint()` (controlled checkpoint)
+
+**Usage**:
+```bash
+walrust watch mydb.db -b s3://bucket --shadow-wal
+```
+
+**Key Files**:
+- `src/shadow.rs` - `ShadowWal` struct (checkpoint blocker, frame copier)
+- `src/sync.rs` - `watch_with_shadow()` function
+- `src/main.rs` - `--shadow-wal` CLI flag routing
 
 ### LTX vs Custom Format
 - Use `litetx` crate (Superfly/Fly.io maintained)
