@@ -10,7 +10,52 @@ Litestream-compatible SQLite sync in Rust. Optimized for multi-tenant deployment
 - Built-in dashboard + Prometheus metrics
 - Opinionated defaults (grandfather/father/son retention)
 
-## v0.1.5 Highlights (Current)
+## v0.1.7 Plan (Next)
+
+**Goal**: Production confidence via real S3 testing and improved soak test accuracy.
+
+### Phase 1: Soak Test Warmup Fix ✅ COMPLETE
+- [x] Add warmup period (5s default) before memory baseline measurement
+- [x] Warmup runs typical operations (writes, syncs, snapshots) to stabilize memory
+- [x] Add `--warmup-secs` CLI flag for configurability
+
+### Phase 2: Real S3 Integration Testing ✅ COMPLETE
+- [x] `walrust-dst s3-test` command for real Tigris/S3 testing
+- [x] Configurable via `S3_TEST_BUCKET` and `AWS_ENDPOINT_URL_S3` env vars
+- [x] 12 integration tests covering core functionality, edge cases, and error handling:
+  - Basic operations: basic_upload_download, snapshot_restore, incremental_sync
+  - Advanced features: point_in_time, concurrent_snapshots
+  - Scale testing: large_database (10MB+), binary_data (BLOB), many_incrementals (50+), large_wal (1000+ frames)
+  - Error handling: manifest_corruption, corruption_detection, missing_files
+- [x] Automatic cleanup after tests (delete test objects)
+
+### Future Considerations (Deferred)
+- **Virtual Time**: Deterministic chaos replay with controlled time
+- **Checkpoint/Restart**: Resume long soak tests from checkpoint
+- **CI Nightly Runs**: Automated 24h soak tests in GitHub Actions
+
+---
+
+## v0.1.6 Highlights (Current)
+
+- ✅ **PITR Bug Fixed** - `testable::restore` now correctly parses point-in-time
+  - Supports `txid:N` format (e.g., `txid:12345`)
+  - Supports ISO8601 timestamp format
+  - Proper snapshot + incrementals selection for target TXID
+  - All 7 invariants now tested (un-ignored `test_prop_point_in_time_restore`)
+- ✅ **Production Hardening (walrust-dst)**
+  - `stress` command: Multi-DB stress testing with 20% fault injection
+  - `soak` command: Long-running stability testing with memory trend analysis
+  - Resource leak detection (memory and FD tracking)
+- ✅ **174 tests** (140 walrust + 34 walrust-dst)
+
+**Known Issues:**
+- Soak test memory warning is false positive for short durations (startup overhead)
+  - Fix planned for v0.1.7 with warmup period
+
+---
+
+## v0.1.5 Highlights (Previous)
 
 - ✅ **StorageBackend Trait** - Abstraction for S3 operations enabling testability
   - `StorageBackend` trait with `S3Backend` implementation
@@ -165,7 +210,19 @@ snapshot_interval = 1800  # Per-DB override (seconds)
 - SHA256 checksum in S3 metadata (existing)
 - LTX CRC64 checksum (from litetx)
 - Reject partial uploads on restore
-- Graceful shutdown: complete in-flight uploads (5s timeout)
+- Graceful shutdown: complete in-flight uploads (5s timeout) ✅ COMPLETE
+
+### Concurrent Database Processing (CRITICAL)
+- Current: WAL syncs process databases SEQUENTIALLY in a for loop
+- Problem: At 100 DBs, each sync cycle takes 100x longer than needed
+- Solution: Use `futures::join_all` or `tokio::spawn` to sync all DBs concurrently
+- Location: `src/sync.rs` lines 658-740, the `wal_sync_timer.tick()` branch
+- Challenge: Mutable state borrows - need to restructure to:
+  1. Clone/collect sync tasks with immutable state reads
+  2. Spawn concurrent futures for S3 uploads
+  3. Collect results and update state sequentially after
+- Benchmark showed: walrust 3896 w/s vs litestream 4956 w/s at 100 DBs x 50 w/s
+- Memory was "stable" at 12MB because only 1 DB processed at a time (bug!)
 
 ---
 
@@ -250,10 +307,30 @@ walrust explain [--config file]         # ✅ Show config summary without runnin
 - No multi-writer support (use orchestration for HA)
 - Simpler failure modes
 
-### No Shadow WAL
-- Let SQLite checkpoint freely
-- Detect WAL reset, take new snapshot
-- Trade: more snapshots vs simpler code
+### Shadow WAL (v0.1.8+ - Experimental)
+
+**Status**: Module implemented (`src/shadow.rs`), CLI flag added (`--shadow-wal`), integration in progress.
+
+The shadow WAL architecture matches Litestream's approach for better performance at high write rates:
+
+1. **Read Transaction Blocker**: Holds open read transaction to prevent SQLite auto-checkpoint
+2. **Shadow Directory**: Copies WAL frames to `.walrust-{dbname}/` as they arrive
+3. **Decoupled Uploads**: S3 uploads read from shadow (not active WAL)
+4. **Manual Checkpoint**: Walrust triggers checkpoints when ready
+
+**Benefits**:
+- No file contention between SQLite writes and S3 uploads
+- Checkpoint control (prevents race conditions)
+- Preserved history (shadow keeps frames even after checkpoint)
+- Better throughput at 100+ databases
+
+**Integration TODO** (for next session):
+1. Create `watch_with_shadow()` function in sync.rs
+2. On WAL notification, call `shadow.copy_frames()` instead of marking pending
+3. On sync timer, read from shadow WAL and upload
+4. Use `shadow.checkpoint()` for manual checkpoint control
+
+See `src/shadow.rs` for the `ShadowWal` struct implementation.
 
 ### LTX vs Custom Format
 - Use `litetx` crate (Superfly/Fly.io maintained)

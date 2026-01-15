@@ -7,6 +7,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8] - 2026-01-15
+
+### Added
+- **Concurrent WAL Sync**: Refactored sync loop to process databases concurrently
+  - Uses `futures::join_all` instead of sequential `for` loop
+  - Added `SyncInput`/`SyncOutput` structs for immutable concurrent processing
+  - At 100 DBs, sync cycle now runs in parallel instead of 100x sequential
+  - Added `futures` crate dependency
+- **`walrust pragma` Command**: Output recommended SQLite PRAGMA settings
+  - Includes `wal_autocheckpoint=0` (walrust manages checkpoints)
+  - Includes `synchronous=NORMAL`, `journal_mode=WAL`, cache and mmap settings
+  - `--output` flag to write to file, `--comments` flag for explanatory comments
+- **Shadow WAL Module** (`src/shadow.rs`): Foundation for Litestream-style architecture
+  - `ShadowWal` struct with checkpoint blocker (read transaction prevents auto-checkpoint)
+  - Frame copier to shadow directory (decouples uploads from active WAL)
+  - Segment file management with generation tracking
+  - Manual checkpoint trigger with shadow rotation
+  - Cleanup of old shadow segments
+- **`--shadow-wal` CLI Flag**: Experimental flag to enable shadow WAL mode
+  - Creates shadow directories for each database
+  - Full integration pending (see ROADMAP.md)
+
+### Changed
+- `RetryPolicy` now derives `Clone` for use in concurrent sync futures
+
+### Performance
+- Benchmark at 100 DBs x 50 w/s: Sequential processing was the bottleneck
+- After concurrent fix: S3 upload latency becomes the limiting factor
+- Shadow WAL (when fully integrated) will further decouple uploads from writes
+
+## [0.1.7] - 2026-01-14
+
+### Fixed
+- **Soak Test Warmup Period**: Fixed false positive memory warnings in short soak tests
+  - Added `--warmup-secs` CLI flag (default: 5 seconds)
+  - Warmup runs typical operations before taking memory baseline
+  - Baseline measurement now reflects steady-state memory, not startup overhead
+  - Eliminates false positive "memory growth" warnings for short test runs
+
+### Added
+- **Real S3 Integration Testing** (`walrust-dst s3-test`)
+  - Tests against real Tigris/S3 storage (not mocks)
+  - 12 comprehensive integration tests covering core functionality, scale, and error handling:
+    - `basic_upload_download` - S3 operations verification
+    - `snapshot_restore` - Full snapshot and restore cycle (100 rows)
+    - `incremental_sync` - WAL sync with multiple batches (3 batches, 30 rows total)
+    - `point_in_time` - PITR restore to specific TXID (restore at TXID 6)
+    - `concurrent_snapshots` - Multi-database parallel snapshots (5 databases)
+    - `large_database` - Large database handling (10MB+, 2500 rows, 11MB)
+    - `binary_data` - Binary data preservation (BLOB patterns with PASSIVE checkpoint)
+    - `many_incrementals` - Many incremental syncs (50+ syncs, TXID 1→51)
+    - `large_wal` - Large WAL file handling (1000+ frames, 1013 frames synced)
+    - `manifest_corruption` - Manifest corruption detection (invalid JSON)
+    - `corruption_detection` - Corrupted LTX file detection (checksum failure)
+    - `missing_files` - Restore with missing S3 files (error handling)
+  - Automatic cleanup of test objects after each run
+  - Configurable via `S3_TEST_BUCKET` and `AWS_ENDPOINT_URL_S3` env vars
+  - `--no-cleanup` flag to preserve test objects for debugging
+  - `--test <name>` flag to run specific test
+- **Improved Soak Test Reporting**
+  - Shows initial (pre-warmup) and baseline (post-warmup) memory separately
+  - Warmup operation count reported for transparency
+
 ## [0.1.6] - 2026-01-14
 
 ### Fixed

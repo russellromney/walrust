@@ -28,6 +28,7 @@ pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 
 # S3
 aws-config = { version = "1", features = ["behavior-version-latest"] }
@@ -39,6 +40,9 @@ notify = "6"
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
+# Async trait support
+async-trait = "0.1"
+
 # Utilities
 anyhow = "1"
 tracing = "0.1"
@@ -49,6 +53,12 @@ serde_json = "1"
 toml = "0.8"
 glob = "0.3"
 sha2 = "0.10"
+rand = "0.8"
+
+# Webhooks
+reqwest = { version = "0.12", features = ["json"] }
+hmac = "0.12"
+hex = "0.4"
 
 # LTX format (Litestream-compatible)
 litetx = "0.1"

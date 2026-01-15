@@ -3,10 +3,12 @@ mod dashboard;
 mod errors;
 mod ltx;
 mod retention;
+mod retry;
 mod s3;
 mod storage;
 mod sync;
 mod wal;
+mod webhook;
 
 use anyhow::{anyhow, Result};
 use errors::{classify_error, ExitStatus};
@@ -128,6 +130,35 @@ enum Commands {
         /// Disable metrics server
         #[arg(long)]
         no_metrics: bool,
+
+        // Retry configuration
+        /// Maximum retry attempts for S3 operations (default: 5)
+        #[arg(long)]
+        max_retries: Option<u32>,
+
+        /// Initial backoff delay in milliseconds (default: 100)
+        #[arg(long)]
+        base_delay_ms: Option<u64>,
+
+        /// Maximum backoff delay in milliseconds (default: 30000)
+        #[arg(long)]
+        max_delay_ms: Option<u64>,
+
+        /// Disable circuit breaker (default: enabled)
+        #[arg(long)]
+        no_circuit_breaker: bool,
+
+        /// Failures before circuit breaker opens (default: 10)
+        #[arg(long)]
+        circuit_breaker_threshold: Option<u32>,
+
+        /// Enable shadow WAL mode (experimental)
+        ///
+        /// Shadow WAL decouples S3 uploads from SQLite's active WAL file,
+        /// providing better performance at high write rates. This matches
+        /// Litestream's architecture.
+        #[arg(long)]
+        shadow_wal: bool,
     },
 
     /// Restore a database from S3
@@ -255,6 +286,20 @@ enum Commands {
         #[arg(long)]
         fix: bool,
     },
+
+    /// Output recommended SQLite PRAGMA settings for optimal walrust performance
+    ///
+    /// These settings disable auto-checkpointing (walrust manages checkpoints),
+    /// enable WAL mode, and optimize for replication workloads.
+    Pragma {
+        /// Output as SQL file instead of printing to stdout
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Include comments explaining each setting
+        #[arg(long, default_value = "true")]
+        comments: bool,
+    },
 }
 
 /// CLI arguments for Watch command
@@ -281,13 +326,21 @@ struct WatchArgs {
     retain_monthly: Option<usize>,
     metrics_port: u16,
     no_metrics: bool,
+    // Retry configuration
+    max_retries: Option<u32>,
+    base_delay_ms: Option<u64>,
+    max_delay_ms: Option<u64>,
+    no_circuit_breaker: bool,
+    circuit_breaker_threshold: Option<u32>,
+    // Shadow WAL mode
+    shadow_wal: bool,
 }
 
 /// Resolve watch configuration by merging config file with CLI args
 fn resolve_watch_config(
     config: &Option<Config>,
     cli: &WatchArgs,
-) -> Result<(Vec<ResolvedDbConfig>, String, Option<String>, SyncConfig, RetentionConfig)> {
+) -> Result<(Vec<ResolvedDbConfig>, String, Option<String>, SyncConfig, RetentionConfig, retry::RetryConfig, Vec<config::WebhookConfig>)> {
     match config {
         Some(cfg) => {
             // Start with config file values, CLI overrides
@@ -338,8 +391,10 @@ fn resolve_watch_config(
             // For global sync/retention, merge CLI overrides with config
             let sync = merge_cli_sync_overrides(&cfg.sync, cli);
             let retention = merge_cli_retention_overrides(&cfg.retention, cli);
+            let retry_config = merge_cli_retry_overrides(&cfg.retry, cli);
+            let webhooks = cfg.webhooks.clone();
 
-            Ok((resolved_dbs, bucket, endpoint, sync, retention))
+            Ok((resolved_dbs, bucket, endpoint, sync, retention, retry_config, webhooks))
         }
         None => {
             // No config file - require CLI args
@@ -378,6 +433,8 @@ fn resolve_watch_config(
                 monthly: cli.retain_monthly.unwrap_or(12),
             };
 
+            let retry_config = merge_cli_retry_overrides(&retry::RetryConfig::default(), cli);
+
             let resolved_dbs = cli
                 .databases
                 .iter()
@@ -399,6 +456,8 @@ fn resolve_watch_config(
                 cli.endpoint.clone(),
                 sync,
                 retention,
+                retry_config,
+                vec![], // No webhooks from CLI-only mode
             ))
         }
     }
@@ -430,6 +489,18 @@ fn merge_cli_retention_overrides(base: &RetentionConfig, cli: &WatchArgs) -> Ret
         daily: cli.retain_daily.unwrap_or(base.daily),
         weekly: cli.retain_weekly.unwrap_or(base.weekly),
         monthly: cli.retain_monthly.unwrap_or(base.monthly),
+    }
+}
+
+/// Merge CLI retry overrides with base config
+fn merge_cli_retry_overrides(base: &retry::RetryConfig, cli: &WatchArgs) -> retry::RetryConfig {
+    retry::RetryConfig {
+        max_retries: cli.max_retries.unwrap_or(base.max_retries),
+        base_delay_ms: cli.base_delay_ms.unwrap_or(base.base_delay_ms),
+        max_delay_ms: cli.max_delay_ms.unwrap_or(base.max_delay_ms),
+        circuit_breaker_enabled: !cli.no_circuit_breaker && base.circuit_breaker_enabled,
+        circuit_breaker_threshold: cli.circuit_breaker_threshold.unwrap_or(base.circuit_breaker_threshold),
+        circuit_breaker_cooldown_ms: base.circuit_breaker_cooldown_ms,
     }
 }
 
@@ -528,6 +599,12 @@ async fn run() -> Result<()> {
             retain_monthly,
             metrics_port,
             no_metrics,
+            max_retries,
+            base_delay_ms,
+            max_delay_ms,
+            no_circuit_breaker,
+            circuit_breaker_threshold,
+            shadow_wal,
         } => {
             let watch_args = WatchArgs {
                 databases,
@@ -552,10 +629,31 @@ async fn run() -> Result<()> {
                 retain_monthly,
                 metrics_port,
                 no_metrics,
+                max_retries,
+                base_delay_ms,
+                max_delay_ms,
+                no_circuit_breaker,
+                circuit_breaker_threshold,
+                shadow_wal,
             };
 
-            let (resolved_dbs, bucket, endpoint, sync_config, retention_config) =
+            let (resolved_dbs, bucket, endpoint, sync_config, retention_config, retry_config, webhooks) =
                 resolve_watch_config(&config, &watch_args)?;
+
+            if shadow_wal {
+                tracing::info!("Shadow WAL mode enabled (experimental)");
+                tracing::warn!("Shadow WAL integration is in progress - using standard mode for now");
+                // TODO: Call watch_with_shadow when fully implemented
+                // For now, initialize shadow directories for each database
+                for db in &resolved_dbs {
+                    let shadow_dir = walrust::shadow::ShadowWal::shadow_dir_for(&db.path);
+                    if let Err(e) = std::fs::create_dir_all(&shadow_dir) {
+                        tracing::warn!("Could not create shadow dir {}: {}", shadow_dir.display(), e);
+                    } else {
+                        tracing::debug!("Shadow WAL directory: {}", shadow_dir.display());
+                    }
+                }
+            }
 
             let compact_policy =
                 if sync_config.compact_after_snapshot || sync_config.compact_interval > 0 {
@@ -577,6 +675,8 @@ async fn run() -> Result<()> {
                 compact_policy,
                 watch_args.metrics_port,
                 watch_args.no_metrics,
+                retry_config,
+                webhooks,
             )
             .await?;
         }
@@ -635,7 +735,157 @@ async fn run() -> Result<()> {
         } => {
             sync::verify(&name, &bucket, endpoint.as_deref(), fix).await?;
         }
+
+        Commands::Pragma { output, comments } => {
+            let pragma_sql = generate_pragma_sql(comments);
+
+            if let Some(path) = output {
+                std::fs::write(&path, &pragma_sql)?;
+                println!("Wrote PRAGMA settings to {}", path.display());
+            } else {
+                println!("{}", pragma_sql);
+            }
+        }
     }
 
     Ok(())
+}
+
+/// Generate recommended PRAGMA SQL for walrust
+fn generate_pragma_sql(with_comments: bool) -> String {
+    let mut sql = String::new();
+
+    if with_comments {
+        sql.push_str("-- Recommended SQLite PRAGMA settings for walrust\n");
+        sql.push_str("-- Run these once when creating your database, or on every connection\n\n");
+
+        sql.push_str("-- Enable WAL mode (required for walrust)\n");
+    }
+    sql.push_str("PRAGMA journal_mode=WAL;\n");
+
+    if with_comments {
+        sql.push_str("\n-- Disable auto-checkpointing (walrust manages checkpoints)\n");
+        sql.push_str("-- This prevents checkpoint contention and ensures walrust captures all WAL frames\n");
+    }
+    sql.push_str("PRAGMA wal_autocheckpoint=0;\n");
+
+    if with_comments {
+        sql.push_str("\n-- Use NORMAL synchronous mode for better performance\n");
+        sql.push_str("-- WAL mode + walrust provides durability guarantees\n");
+    }
+    sql.push_str("PRAGMA synchronous=NORMAL;\n");
+
+    if with_comments {
+        sql.push_str("\n-- Optional: Set page size (must be done before any tables are created)\n");
+        sql.push_str("-- 4096 is a good default, 8192 or 16384 can improve large row performance\n");
+    }
+    sql.push_str("PRAGMA page_size=4096;\n");
+
+    if with_comments {
+        sql.push_str("\n-- Optional: Increase cache size for better read performance\n");
+        sql.push_str("-- Negative value = KB, so -64000 = ~64MB cache\n");
+    }
+    sql.push_str("PRAGMA cache_size=-64000;\n");
+
+    if with_comments {
+        sql.push_str("\n-- Optional: Enable memory-mapped I/O for better read performance\n");
+        sql.push_str("-- Set to desired size in bytes (256MB shown)\n");
+    }
+    sql.push_str("PRAGMA mmap_size=268435456;\n");
+
+    sql
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_watch_args() -> WatchArgs {
+        WatchArgs {
+            databases: vec![],
+            bucket: None,
+            snapshot_interval: None,
+            wal_sync_interval: None,
+            endpoint: None,
+            max_changes: None,
+            max_interval: None,
+            on_idle: None,
+            on_startup: None,
+            compact_after_snapshot: false,
+            compact_interval: None,
+            checkpoint_interval: None,
+            min_checkpoint_pages: None,
+            wal_truncate_threshold: None,
+            monitor_interval: None,
+            validation_interval: None,
+            retain_hourly: None,
+            retain_daily: None,
+            retain_weekly: None,
+            retain_monthly: None,
+            metrics_port: 16767,
+            no_metrics: false,
+            max_retries: None,
+            base_delay_ms: None,
+            max_delay_ms: None,
+            no_circuit_breaker: false,
+            circuit_breaker_threshold: None,
+            shadow_wal: false,
+        }
+    }
+
+    #[test]
+    fn test_merge_cli_retry_overrides_defaults() {
+        let base = retry::RetryConfig::default();
+        let cli = default_watch_args();
+
+        let result = merge_cli_retry_overrides(&base, &cli);
+
+        assert_eq!(result.max_retries, 5);
+        assert_eq!(result.base_delay_ms, 100);
+        assert_eq!(result.max_delay_ms, 30000);
+        assert!(result.circuit_breaker_enabled);
+        assert_eq!(result.circuit_breaker_threshold, 10);
+    }
+
+    #[test]
+    fn test_merge_cli_retry_overrides_cli_values() {
+        let base = retry::RetryConfig::default();
+        let mut cli = default_watch_args();
+        cli.max_retries = Some(10);
+        cli.base_delay_ms = Some(200);
+        cli.max_delay_ms = Some(60000);
+        cli.circuit_breaker_threshold = Some(20);
+
+        let result = merge_cli_retry_overrides(&base, &cli);
+
+        assert_eq!(result.max_retries, 10);
+        assert_eq!(result.base_delay_ms, 200);
+        assert_eq!(result.max_delay_ms, 60000);
+        assert!(result.circuit_breaker_enabled);
+        assert_eq!(result.circuit_breaker_threshold, 20);
+    }
+
+    #[test]
+    fn test_merge_cli_retry_overrides_disable_circuit_breaker() {
+        let base = retry::RetryConfig::default();
+        let mut cli = default_watch_args();
+        cli.no_circuit_breaker = true;
+
+        let result = merge_cli_retry_overrides(&base, &cli);
+
+        assert!(!result.circuit_breaker_enabled);
+    }
+
+    #[test]
+    fn test_merge_cli_retry_overrides_partial() {
+        let base = retry::RetryConfig::default();
+        let mut cli = default_watch_args();
+        cli.max_retries = Some(3); // Only override max_retries
+
+        let result = merge_cli_retry_overrides(&base, &cli);
+
+        assert_eq!(result.max_retries, 3);
+        assert_eq!(result.base_delay_ms, 100); // Default
+        assert_eq!(result.max_delay_ms, 30000); // Default
+    }
 }

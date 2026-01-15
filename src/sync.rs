@@ -1,11 +1,13 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
+use futures::future::join_all;
 use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::signal;
 use tokio::sync::mpsc;
 
 use crate::config::{Config, ResolvedDbConfig, SyncConfig, WebhookConfig};
@@ -37,6 +39,44 @@ struct DbState {
     /// Current database checksum (for incremental LTX chaining)
     /// Computed from database on startup, updated after each LTX upload
     db_checksum: Option<u64>,
+}
+
+/// Input for concurrent WAL sync (immutable snapshot of state)
+#[derive(Clone)]
+struct SyncInput {
+    db_path: PathBuf,
+    name: String,
+    wal_path: PathBuf,
+    wal_offset: u64,
+    wal_generation: u64,
+    current_txid: u64,
+    db_checksum: Option<u64>,
+}
+
+impl From<&DbState> for SyncInput {
+    fn from(state: &DbState) -> Self {
+        Self {
+            db_path: state.db_path.clone(),
+            name: state.name.clone(),
+            wal_path: state.wal_path.clone(),
+            wal_offset: state.wal_offset,
+            wal_generation: state.wal_generation,
+            current_txid: state.current_txid,
+            db_checksum: state.db_checksum,
+        }
+    }
+}
+
+/// Output from concurrent WAL sync (changes to apply to state)
+struct SyncOutput {
+    db_path: PathBuf,
+    frame_count: u64,
+    new_wal_offset: u64,
+    new_current_txid: u64,
+    new_db_checksum: Option<u64>,
+    /// If checkpoint was detected, new generation
+    checkpoint_detected: bool,
+    new_wal_generation: u64,
 }
 
 /// Entry in the manifest tracking LTX files
@@ -618,8 +658,34 @@ pub async fn watch_with_config(
         );
     }
 
+    // Set up shutdown signal future (SIGTERM or SIGINT on Unix, Ctrl+C on other platforms)
+    let shutdown_signal = async {
+        #[cfg(unix)]
+        {
+            use signal::unix::{signal, SignalKind};
+            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
+            let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
+            tokio::select! {
+                _ = sigterm.recv() => "SIGTERM",
+                _ = sigint.recv() => "SIGINT",
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            signal::ctrl_c().await.expect("Failed to set up Ctrl+C handler");
+            "Ctrl+C"
+        }
+    };
+    tokio::pin!(shutdown_signal);
+
     loop {
         tokio::select! {
+            // Handle shutdown signals for graceful shutdown
+            signal_name = &mut shutdown_signal => {
+                tracing::info!("Received {}, initiating graceful shutdown...", signal_name);
+                break;
+            }
+
             // WAL file changed - mark for sync instead of syncing immediately
             Some(wal_path) = rx.recv() => {
                 let db_path = wal_path.with_extension("db");
@@ -628,15 +694,52 @@ pub async fn watch_with_config(
                 }
             }
 
-            // Batch sync pending WAL changes
+            // Batch sync pending WAL changes - CONCURRENT processing
             _ = wal_sync_timer.tick() => {
-                for db_path in pending_wal_syncs.drain() {
-                    if let Some(state) = db_states.get_mut(&db_path) {
-                        let sync_config = sync_configs.get(&db_path).unwrap_or(&global_sync);
+                // Phase 1: Collect inputs for concurrent sync
+                let pending_paths: Vec<PathBuf> = pending_wal_syncs.drain().collect();
+                if pending_paths.is_empty() {
+                    continue;
+                }
 
-                        match sync_wal_with_retry(&client, &bucket_name, &prefix, state, &retry_policy, &webhook_sender).await {
-                            Ok(frame_count) if frame_count > 0 => {
-                                // Update dashboard on successful sync
+                let sync_inputs: Vec<SyncInput> = pending_paths
+                    .iter()
+                    .filter_map(|db_path| db_states.get(db_path).map(SyncInput::from))
+                    .collect();
+
+                if sync_inputs.is_empty() {
+                    continue;
+                }
+
+                // Phase 2: Run all syncs concurrently
+                let sync_futures: Vec<_> = sync_inputs
+                    .into_iter()
+                    .map(|input| {
+                        let client = Arc::clone(&client);
+                        let bucket = bucket_name.clone();
+                        let pfx = prefix.clone();
+                        let policy = retry_policy.clone();
+                        let webhooks = Arc::clone(&webhook_sender);
+                        sync_wal_concurrent_with_retry(client, bucket, pfx, input, policy, webhooks)
+                    })
+                    .collect();
+
+                let results = join_all(sync_futures).await;
+
+                // Phase 3: Apply results sequentially (state updates)
+                for result in results {
+                    match result {
+                        Ok(output) if output.frame_count > 0 => {
+                            // Apply state changes
+                            if let Some(state) = db_states.get_mut(&output.db_path) {
+                                state.wal_offset = output.new_wal_offset;
+                                state.current_txid = output.new_current_txid;
+                                state.db_checksum = output.new_db_checksum;
+                                if output.checkpoint_detected {
+                                    state.wal_generation = output.new_wal_generation;
+                                }
+
+                                // Update dashboard
                                 let wal_size = std::fs::metadata(&state.wal_path).map(|m| m.len()).unwrap_or(0);
                                 metrics_state.update_db(DbStatus {
                                     name: state.name.clone(),
@@ -650,6 +753,7 @@ pub async fn watch_with_config(
                                 }).await;
 
                                 // Check for emergency truncate threshold
+                                let sync_config = sync_configs.get(&output.db_path).unwrap_or(&global_sync);
                                 if sync_config.wal_truncate_threshold_pages > 0 {
                                     if let Ok(wal_pages) = get_wal_page_count(&state.wal_path).await {
                                         if wal_pages >= sync_config.wal_truncate_threshold_pages {
@@ -659,8 +763,6 @@ pub async fn watch_with_config(
                                                 wal_pages,
                                                 sync_config.wal_truncate_threshold_pages
                                             );
-
-                                            // TRUNCATE checkpoint blocks readers and writers!
                                             if let Err(e) = run_checkpoint(&state.db_path, CheckpointMode::Truncate).await {
                                                 tracing::error!("{}: Emergency TRUNCATE checkpoint failed: {}", state.name, e);
                                             } else {
@@ -670,14 +772,14 @@ pub async fn watch_with_config(
                                     }
                                 }
 
-                                if let Some(trigger) = trigger_states.get_mut(&db_path) {
-                                    trigger.frames_since_snapshot += frame_count;
+                                // Update trigger state and check max_changes
+                                if let Some(trigger) = trigger_states.get_mut(&output.db_path) {
+                                    trigger.frames_since_snapshot += output.frame_count;
                                     trigger.last_wal_activity = Some(std::time::Instant::now());
                                     if trigger.first_change_time.is_none() {
                                         trigger.first_change_time = Some(std::time::Instant::now());
                                     }
 
-                                    // Check max_changes trigger
                                     if sync_config.max_changes > 0
                                         && trigger.frames_since_snapshot >= sync_config.max_changes
                                     {
@@ -703,11 +805,11 @@ pub async fn watch_with_config(
                                     }
                                 }
                             }
-                            Ok(_) => {}
-                            Err(e) => {
-                                tracing::error!("Failed to sync WAL for {}: {}", state.name, e);
-                                metrics_state.record_error(&state.name);
-                            }
+                        }
+                        Ok(_) => {} // No frames synced
+                        Err(e) => {
+                            tracing::error!("Failed to sync WAL: {}", e);
+                            // Error already recorded in concurrent_with_retry via webhook
                         }
                     }
                 }
@@ -890,6 +992,63 @@ pub async fn watch_with_config(
             }
         }
     }
+
+    // Graceful shutdown: complete any pending WAL syncs (5s timeout per roadmap)
+    let pending_paths: Vec<_> = pending_wal_syncs.drain().collect();
+    let pending_count = pending_paths.len();
+
+    if pending_count > 0 {
+        tracing::info!("Completing {} in-flight uploads before shutdown...", pending_count);
+    } else {
+        tracing::info!("No pending uploads, shutting down...");
+    }
+
+    let shutdown_start = std::time::Instant::now();
+    let shutdown_timeout = Duration::from_secs(5);
+    let mut synced_count = 0;
+    let mut failed_count = 0;
+    let mut remaining_count = pending_count;
+
+    for db_path in pending_paths {
+        remaining_count -= 1;
+        if shutdown_start.elapsed() >= shutdown_timeout {
+            tracing::warn!("Shutdown timeout reached, {} syncs remaining", remaining_count + 1);
+            break;
+        }
+
+        if let Some(state) = db_states.get_mut(&db_path) {
+            let remaining = shutdown_timeout.saturating_sub(shutdown_start.elapsed());
+            match tokio::time::timeout(
+                remaining,
+                sync_wal_with_retry(&client, &bucket_name, &prefix, state, &retry_policy, &webhook_sender)
+            ).await {
+                Ok(Ok(frame_count)) if frame_count > 0 => {
+                    tracing::debug!("{}: Final sync completed ({} frames)", state.name, frame_count);
+                    synced_count += 1;
+                }
+                Ok(Ok(_)) => {} // No frames to sync
+                Ok(Err(e)) => {
+                    tracing::error!("{}: Final sync failed: {}", state.name, e);
+                    failed_count += 1;
+                }
+                Err(_) => {
+                    tracing::warn!("{}: Final sync timed out", state.name);
+                    failed_count += 1;
+                }
+            }
+        }
+    }
+
+    if synced_count > 0 || failed_count > 0 {
+        tracing::info!(
+            "Shutdown sync complete: {} succeeded, {} failed",
+            synced_count,
+            failed_count
+        );
+    }
+
+    tracing::info!("walrust shutdown complete");
+    Ok(())
 }
 
 /// Internal compaction for watch mode (non-interactive, always force)
@@ -977,6 +1136,218 @@ async fn run_compaction(
     );
 
     Ok(())
+}
+
+// ============================================================================
+// Concurrent WAL sync operations (immutable, for parallel execution)
+// ============================================================================
+
+/// Sync WAL changes concurrently (immutable version)
+/// Returns SyncOutput with changes to apply, or None if no changes
+async fn sync_wal_concurrent(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    input: SyncInput,
+) -> Result<SyncOutput> {
+    use litetx::Checksum;
+
+    let header = match wal::read_header(&input.wal_path).await? {
+        Some(h) => h,
+        None => {
+            // No WAL file - return no-op output
+            return Ok(SyncOutput {
+                db_path: input.db_path,
+                frame_count: 0,
+                new_wal_offset: input.wal_offset,
+                new_current_txid: input.current_txid,
+                new_db_checksum: input.db_checksum,
+                checkpoint_detected: false,
+                new_wal_generation: input.wal_generation,
+            });
+        }
+    };
+
+    // Track state changes locally
+    let mut wal_offset = input.wal_offset;
+    let mut wal_generation = input.wal_generation;
+    let mut db_checksum = input.db_checksum;
+    let mut checkpoint_detected = false;
+
+    // Check if WAL was reset (checkpoint happened)
+    let current_size = wal::get_wal_size(&input.wal_path).await?;
+    if current_size < wal_offset {
+        // WAL was truncated, start fresh and recompute checksum
+        tracing::info!("{}: WAL checkpoint detected, resetting offset", input.name);
+        wal_offset = 0;
+        wal_generation += 1;
+        checkpoint_detected = true;
+
+        // Recompute checksum from current database state after checkpoint
+        match ltx::compute_checksum_from_file(&input.db_path) {
+            Ok(cs) => {
+                db_checksum = Some(cs.into_inner());
+                tracing::debug!("{}: Recomputed checksum after checkpoint: {:#x}", input.name, cs.into_inner());
+            }
+            Err(e) => {
+                tracing::warn!("{}: Could not recompute checksum: {}", input.name, e);
+            }
+        }
+    }
+
+    // Read WAL frames as parsed pages
+    let (frames, new_offset, max_db_size) =
+        wal::read_frames_as_pages(&input.wal_path, header.page_size, wal_offset).await?;
+
+    if frames.is_empty() {
+        return Ok(SyncOutput {
+            db_path: input.db_path,
+            frame_count: 0,
+            new_wal_offset: wal_offset,
+            new_current_txid: input.current_txid,
+            new_db_checksum: db_checksum,
+            checkpoint_detected,
+            new_wal_generation: wal_generation,
+        });
+    }
+
+    // Deduplicate pages: keep only the latest version of each page
+    let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    for frame in &frames {
+        page_map.insert(frame.page_number, frame.data.clone());
+    }
+
+    // Convert to format expected by encode_wal_changes
+    let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
+    let frame_count = frames.len();
+
+    // Get pre_apply_checksum from state or compute from db
+    let pre_checksum = match db_checksum {
+        Some(cs) => Checksum::new(cs),
+        None => {
+            tracing::debug!("{}: Computing checksum from database (no cached value)", input.name);
+            ltx::compute_checksum_from_file(&input.db_path)?
+        }
+    };
+
+    // Increment TXID for this incremental
+    let min_txid = input.current_txid + 1;
+    let max_txid = min_txid + pages.len() as u64 - 1;
+    let commit_page = if max_db_size > 0 { max_db_size } else {
+        let db_size = std::fs::metadata(&input.db_path)?.len();
+        (db_size / header.page_size as u64) as u32
+    };
+
+    // Encode as incremental LTX
+    let mut ltx_buffer = Vec::new();
+    let post_checksum = ltx::encode_wal_changes(
+        &mut ltx_buffer,
+        &pages,
+        header.page_size,
+        min_txid,
+        max_txid,
+        commit_page,
+        Some(pre_checksum),
+    )?;
+
+    let ltx_size = ltx_buffer.len() as u64;
+
+    // LTX filename: {min_txid:08}-{max_txid:08}.ltx
+    let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
+    let ltx_key = format!("{}{}/{}", prefix, input.name, ltx_filename);
+
+    // Upload incremental LTX file
+    let timestamp = Utc::now();
+    s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
+
+    tracing::info!(
+        "{}: Synced {} WAL frames as incremental LTX {} ({} bytes, {} unique pages, TXID {}-{})",
+        input.name,
+        frame_count,
+        ltx_filename,
+        ltx_size,
+        pages.len(),
+        min_txid,
+        max_txid
+    );
+
+    // Update manifest with new incremental entry
+    let mut manifest = load_manifest(client, bucket, prefix, &input.name).await?;
+    manifest.current_txid = max_txid;
+    manifest.last_checksum = Some(post_checksum.into_inner());
+    manifest.files.push(LtxEntry {
+        filename: ltx_filename,
+        min_txid,
+        max_txid,
+        size: ltx_size,
+        created_at: timestamp.to_rfc3339(),
+        is_snapshot: false,
+    });
+    save_manifest(client, bucket, prefix, &manifest).await?;
+
+    Ok(SyncOutput {
+        db_path: input.db_path,
+        frame_count: frame_count as u64,
+        new_wal_offset: new_offset,
+        new_current_txid: max_txid,
+        new_db_checksum: Some(post_checksum.into_inner()),
+        checkpoint_detected,
+        new_wal_generation: wal_generation,
+    })
+}
+
+/// Sync WAL concurrently with retry and webhook notifications
+async fn sync_wal_concurrent_with_retry(
+    client: Arc<aws_sdk_s3::Client>,
+    bucket: String,
+    prefix: String,
+    input: SyncInput,
+    retry_policy: RetryPolicy,
+    webhook_sender: Arc<WebhookSender>,
+) -> Result<SyncOutput> {
+    let db_name = input.name.clone();
+    let mut attempts = 0u32;
+
+    loop {
+        attempts += 1;
+        match sync_wal_concurrent(&client, &bucket, &prefix, input.clone()).await {
+            Ok(output) => return Ok(output),
+            Err(e) => {
+                let error_kind = classify_error(&e);
+                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
+
+                if error_kind == ErrorKind::AuthError {
+                    tracing::error!("{}: Authentication error during WAL sync: {}", db_name, e);
+                    webhook_sender.notify_auth_failure(&db_name, &e.to_string()).await;
+                    return Err(e);
+                }
+
+                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
+                    tracing::error!(
+                        "{}: WAL sync failed after {} attempts: {}",
+                        db_name,
+                        attempts,
+                        e
+                    );
+                    webhook_sender
+                        .notify_sync_failed(&db_name, &e.to_string(), attempts)
+                        .await;
+                    return Err(e);
+                }
+
+                let delay = retry_policy.calculate_delay(attempts - 1);
+                tracing::warn!(
+                    "{}: WAL sync attempt {}/{} failed, retrying in {:?}: {}",
+                    db_name,
+                    attempts,
+                    retry_policy.config().max_retries + 1,
+                    delay,
+                    e
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
 }
 
 // ============================================================================
