@@ -1,0 +1,26 @@
+name: "verify-test"
+
+# Small test to validate full database verification
+matrix:
+  databases: [3]
+  writes_per_second: [10]
+  duration_seconds: [10]
+  tools: [walrust]
+
+workload:
+  type: "rate-limited"
+  writes_per_second: 10
+  duration_seconds: 10
+
+databases:
+  count: 3
+  size_kb: 10
+
+storage:
+  bucket: "s3://walrust-bench"
+  endpoint: "https://fly.storage.tigris.dev"
+
+metrics:
+  resource_sample_interval_ms: 100
+
+# This will test 3 databases with full verification

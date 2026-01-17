@@ -163,47 +163,78 @@ def run_benchmark(
     print("Waiting 5s for final sync...")
     time.sleep(5)
 
-    # Verify replication
-    print("\nVerifying replication...")
+    # Verify replication for ALL databases
+    print(f"\nVerifying replication for all {len(db_paths)} databases...")
     verifier = ReplicationVerifier(s3_endpoint=config.storage['endpoint'])
 
-    # Verify first database as a sample
-    # (In production, we'd verify all databases)
-    db_name = db_paths[0].stem
+    # Track aggregated metrics across all databases
+    total_expected_writes = 0
+    total_replicated_writes = 0
+    total_missing_writes = 0
+    all_sync_latencies = []
+    verification_errors = []
 
-    # Get expected writes for first database
-    first_writer = writers[0]
-    expected_writes = first_writer.get_writes()
+    for i, (db_path, writer) in enumerate(zip(db_paths, writers)):
+        db_name = db_path.stem
+        expected_writes = writer.get_writes()
+        total_expected_writes += len(expected_writes)
 
-    try:
-        replication_metrics = verifier.verify(
-            tool=tool,
-            db_name=db_name,
-            bucket=config.storage['bucket'],
-            expected_writes=expected_writes
-        )
+        try:
+            metrics = verifier.verify(
+                tool=tool,
+                db_name=db_name,
+                bucket=config.storage['bucket'],
+                expected_writes=expected_writes
+            )
 
-        print(f"Replication verification:")
-        print(f"  Total writes: {replication_metrics['total_writes']}")
-        print(f"  Replicated: {replication_metrics['replicated_writes']}")
-        print(f"  Missing: {replication_metrics['missing_writes']}")
-        print(f"  Data loss: {replication_metrics['data_loss']}")
-        if not replication_metrics['data_loss']:
-            print(f"  Sync latency P95: {replication_metrics['sync_latency_p95_ms']:.1f}ms")
+            total_replicated_writes += metrics['replicated_writes']
+            total_missing_writes += metrics['missing_writes']
 
-    except Exception as e:
-        print(f"Replication verification failed: {e}")
-        # Use default values
-        replication_metrics = {
-            'total_writes': len(expected_writes),
-            'replicated_writes': 0,
-            'missing_writes': len(expected_writes),
-            'data_loss': True,
-            'sync_latency_p50_ms': 0,
-            'sync_latency_p95_ms': 0,
-            'sync_latency_p99_ms': 0,
-            'sync_latency_max_ms': 0,
-        }
+            # Collect sync latencies if available
+            if metrics['sync_latency_p50_ms'] > 0:
+                all_sync_latencies.append(metrics['sync_latency_p95_ms'])
+
+            # Log progress
+            if metrics['data_loss']:
+                print(f"  DB {i+1}/{len(db_paths)}: {metrics['missing_writes']} missing writes ⚠️")
+            else:
+                print(f"  DB {i+1}/{len(db_paths)}: ✓ all writes replicated")
+
+        except Exception as e:
+            # Track verification errors but continue with other databases
+            verification_errors.append(f"DB {i+1} ({db_name}): {str(e)[:100]}")
+            total_missing_writes += len(expected_writes)
+
+    # Aggregate results
+    data_loss = total_missing_writes > 0
+
+    # Compute sync latency from all databases
+    if all_sync_latencies:
+        avg_sync_latency = sum(all_sync_latencies) / len(all_sync_latencies)
+    else:
+        avg_sync_latency = 0
+
+    print(f"\nReplication summary:")
+    print(f"  Total writes: {total_expected_writes}")
+    print(f"  Replicated: {total_replicated_writes}")
+    print(f"  Missing: {total_missing_writes}")
+    print(f"  Data loss: {data_loss}")
+    if verification_errors:
+        print(f"  Verification errors: {len(verification_errors)}")
+        for err in verification_errors[:3]:  # Show first 3 errors
+            print(f"    - {err}")
+
+    # Package metrics for result
+    replication_metrics = {
+        'total_writes': total_expected_writes,
+        'replicated_writes': total_replicated_writes,
+        'missing_writes': total_missing_writes,
+        'data_loss': data_loss,
+        'sync_latency_p50_ms': avg_sync_latency,  # Average P95 across all DBs
+        'sync_latency_p95_ms': avg_sync_latency,
+        'sync_latency_p99_ms': avg_sync_latency,
+        'sync_latency_max_ms': avg_sync_latency,
+    }
 
     # Cleanup databases
     if cleanup:

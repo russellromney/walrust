@@ -1,0 +1,28 @@
+name: "stress-100db"
+
+# Hardcore stress test: up to 100 DBs at 50 w/s
+matrix:
+  databases: [10, 25, 50, 100]
+  writes_per_second: [50]
+  duration_seconds: [30]
+  tools: [walrust, litestream]
+
+workload:
+  type: "rate-limited"
+  writes_per_second: 50
+  duration_seconds: 30
+
+databases:
+  count: 10
+  size_kb: 100
+
+storage:
+  bucket: "s3://walrust-bench"
+  endpoint: "https://fly.storage.tigris.dev"
+
+metrics:
+  resource_sample_interval_ms: 100
+
+# This expands to: 4 DB counts × 1 write rate × 2 tools = 8 benchmark runs
+# Total: ~4 minutes of benchmarking
+# Max throughput: 100 DBs × 50 w/s = 5000 writes/sec
