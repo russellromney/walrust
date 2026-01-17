@@ -1,0 +1,170 @@
+name: Benchmarks
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      db_counts:
+        description: 'Database counts to test (comma-separated)'
+        required: false
+        default: '1,10,100'
+
+env:
+  CARGO_TERM_COLOR: always
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_ENDPOINT_URL_S3: http://localhost:9000
+  AWS_REGION: us-east-1
+
+jobs:
+  benchmark:
+    name: Run Benchmarks
+    runs-on: ubuntu-latest
+    services:
+      minio:
+        image: minio/minio:latest
+        ports:
+          - 9000:9000
+          - 9001:9001
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        options: >-
+          --health-cmd "curl -f http://localhost:9000/minio/health/live || exit 1"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-action@stable
+        with:
+          components: clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build walrust
+        run: cargo build --release
+
+      - name: Install Litestream
+        run: |
+          wget https://github.com/benbjohnson/litestream/releases/download/v0.3.13/litestream-v0.3.13-linux-amd64.tar.gz
+          tar -xzf litestream-v0.3.13-linux-amd64.tar.gz
+          sudo mv litestream /usr/local/bin/
+          litestream version
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          pip install uv
+          uv pip install --system psutil boto3
+
+      - name: Create MinIO bucket
+        run: |
+          pip install minio
+          python -c "
+          from minio import Minio
+          client = Minio('localhost:9000', access_key='minioadmin', secret_key='minioadmin', secure=False)
+          if not client.bucket_exists('walrust-bench'):
+              client.make_bucket('walrust-bench')
+          print('Bucket walrust-bench ready')
+          "
+
+      - name: Create results directory
+        run: mkdir -p bench/results
+
+      - name: Run comparison benchmarks
+        run: |
+          DB_COUNTS="${{ github.event.inputs.db_counts || '1,10,100' }}"
+          uv run bench/compare.py --use-minio --dbs "$DB_COUNTS" --json > bench/results/compare.json
+          echo "=== Comparison Results ==="
+          cat bench/results/compare.json
+
+      - name: Run multi-database benchmarks
+        run: |
+          uv run bench/multidb.py --use-minio --json > bench/results/multidb.json
+          echo "=== Multi-DB Results ==="
+          cat bench/results/multidb.json
+
+      - name: Run real-world benchmarks
+        run: |
+          uv run bench/realworld.py --use-minio --json > bench/results/realworld.json
+          echo "=== Real-world Results ==="
+          cat bench/results/realworld.json
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench/results/*.json
+          retention-days: 90
+
+      - name: Generate summary
+        run: |
+          echo "## Benchmark Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Memory Comparison (walrust vs litestream)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          python -c "
+          import json
+          with open('bench/results/compare.json') as f:
+              data = json.load(f)
+          print('| DBs | walrust (MB) | litestream (MB) | Savings |')
+          print('|-----|-------------|-----------------|---------|')
+          for r in data.get('benchmarks', {}).get('memory_scaling', []):
+              w = r.get('walrust_mb', 0)
+              l = r.get('litestream_mb', 0)
+              savings = ((l - w) / l * 100) if l > 0 else 0
+              print(f'| {r.get(\"db_count\", \"?\")} | {w:.1f} | {l:.1f} | {savings:.1f}% |')
+          " >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Multi-Database Performance" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          python -c "
+          import json
+          with open('bench/results/multidb.json') as f:
+              data = json.load(f)
+          benchmarks = data.get('benchmarks', {})
+          if 'startup_time' in benchmarks:
+              print('**Startup Time:**')
+              for r in benchmarks['startup_time']:
+                  print(f'- {r.get(\"db_count\", \"?\")} DBs: {r.get(\"startup_time_ms\", 0):.0f}ms')
+          if 'change_detection' in benchmarks:
+              print('')
+              print('**Change Detection Latency:**')
+              for r in benchmarks['change_detection']:
+                  print(f'- {r.get(\"db_count\", \"?\")} DBs: p50={r.get(\"p50_ms\", 0):.1f}ms, p99={r.get(\"p99_ms\", 0):.1f}ms')
+          " >> $GITHUB_STEP_SUMMARY
+
+      - name: Comment on release
+        if: github.event_name == 'release'
+        uses: peter-evans/create-or-update-comment@v4
+        with:
+          issue-number: ${{ github.event.release.id }}
+          body: |
+            ## Benchmark Results
+
+            Benchmark results for this release have been generated.
+
+            **Artifacts:** [Download JSON results](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            See the [workflow summary](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}) for detailed tables.

@@ -5,6 +5,7 @@ mod ltx;
 mod retention;
 mod retry;
 mod s3;
+mod shadow;
 mod storage;
 mod sync;
 mod wal;
@@ -159,6 +160,15 @@ enum Commands {
         /// Litestream's architecture.
         #[arg(long)]
         shadow_wal: bool,
+
+        /// Enable independent per-DB tasks (experimental)
+        ///
+        /// Each database gets its own task that independently watches
+        /// for WAL changes and syncs to S3. This allows maximum concurrency
+        /// across all databases with CPU-bound encoding distributed across
+        /// the thread pool.
+        #[arg(long)]
+        independent_tasks: bool,
     },
 
     /// Restore a database from S3
@@ -334,6 +344,8 @@ struct WatchArgs {
     circuit_breaker_threshold: Option<u32>,
     // Shadow WAL mode
     shadow_wal: bool,
+    // Independent per-DB tasks mode
+    independent_tasks: bool,
 }
 
 /// Resolve watch configuration by merging config file with CLI args
@@ -605,6 +617,7 @@ async fn run() -> Result<()> {
             no_circuit_breaker,
             circuit_breaker_threshold,
             shadow_wal,
+            independent_tasks,
         } => {
             let watch_args = WatchArgs {
                 databases,
@@ -635,6 +648,7 @@ async fn run() -> Result<()> {
                 no_circuit_breaker,
                 circuit_breaker_threshold,
                 shadow_wal,
+                independent_tasks,
             };
 
             let (resolved_dbs, bucket, endpoint, sync_config, retention_config, retry_config, webhooks) =
@@ -667,18 +681,35 @@ async fn run() -> Result<()> {
                     None
                 };
 
-            sync::watch_with_config(
-                resolved_dbs,
-                &bucket,
-                endpoint.as_deref(),
-                sync_config,
-                compact_policy,
-                watch_args.metrics_port,
-                watch_args.no_metrics,
-                retry_config,
-                webhooks,
-            )
-            .await?;
+            // Choose sync mode based on flags
+            if independent_tasks {
+                tracing::info!("Independent tasks mode enabled (experimental)");
+                sync::watch_with_independent_tasks(
+                    resolved_dbs,
+                    &bucket,
+                    endpoint.as_deref(),
+                    sync_config,
+                    compact_policy,
+                    watch_args.metrics_port,
+                    watch_args.no_metrics,
+                    retry_config,
+                    webhooks,
+                )
+                .await?;
+            } else {
+                sync::watch_with_config(
+                    resolved_dbs,
+                    &bucket,
+                    endpoint.as_deref(),
+                    sync_config,
+                    compact_policy,
+                    watch_args.metrics_port,
+                    watch_args.no_metrics,
+                    retry_config,
+                    webhooks,
+                )
+                .await?;
+            }
         }
         Commands::Restore {
             name,
@@ -830,6 +861,7 @@ mod tests {
             no_circuit_breaker: false,
             circuit_breaker_threshold: None,
             shadow_wal: false,
+            independent_tasks: false,
         }
     }
 

@@ -10,6 +10,266 @@ Litestream-compatible SQLite sync in Rust. Optimized for multi-tenant deployment
 - Built-in dashboard + Prometheus metrics
 - Opinionated defaults (grandfather/father/son retention)
 
+## v0.1.9 Plan (Disk-Based Upload Queue)
+
+**Goal**: Implement litestream-style disk caching for decoupled WAL encoding and S3 uploads, enabling crash recovery and eliminating upload bottlenecks.
+
+### Problem Statement
+
+Current architecture couples WAL encoding directly to S3 uploads:
+- Upload blocks next WAL segment encoding
+- Failed uploads waste encoding work (must re-read and re-encode WAL)
+- No crash recovery (in-flight uploads lost on restart)
+- No local cache for fast restore
+- Memory concerns if uploads queue in RAM during S3 slowdowns
+
+### Litestream's Solution (Studied Architecture)
+
+Litestream uses a **two-goroutine architecture** with disk-based intermediary:
+
+**Goroutine 1: DB Monitor**
+- Watches WAL for changes every 1 second
+- Encodes WAL frames to LTX files on disk
+- Notifies upload goroutine via channel
+- Never blocks on S3
+
+**Goroutine 2: S3 Uploader**
+- Runs independently, waits for notification
+- Reads LTX files from disk cache
+- Uploads to S3 sequentially (TXID ordering preserved)
+- Retries from disk on failure (no re-encoding)
+- Only deletes cache after successful upload + retention period
+
+**Directory Structure:**
+```
+/path/to/.app.db-litestream/
+  ltx/
+    0/                      # Level 0 (incremental)
+      00000001-00000001.ltx
+      00000002-00000002.ltx
+      ...
+    1/                      # Level 1 (compacted)
+    snapshot/               # Snapshots
+```
+
+**Key Benefits Observed:**
+- Zero memory buffering (everything on disk)
+- Crash recovery (restart reads pending files)
+- Fast retry (read from disk, don't re-encode)
+- Local cache = fast restore without S3
+- Upload failures don't block encoding
+
+### Proposed Walrust Architecture
+
+**Two Independent Tasks per Database:**
+
+**Task 1: WAL Monitor Task** (fast, never blocks)
+- Detects WAL changes
+- Encodes WAL frames to LTX format
+- Writes LTX to disk cache (atomic write via .tmp rename)
+- Sends TXID to upload channel
+- Updates manifest with pending status
+- Continues immediately to next WAL segment
+
+**Task 2: S3 Uploader Task** (slow, independent)
+- Receives TXID from channel
+- Reads LTX file from disk cache
+- Uploads to S3 with retry logic
+- Marks as uploaded in manifest
+- Preserves file for local cache (retention policy)
+- Processes sequentially to preserve TXID ordering
+
+### Directory Structure
+
+```
+/path/to/app.db
+/path/to/.app.db-walrust/           # Cache directory
+  manifest.json                      # Upload state tracking
+  ltx/
+    00000001.ltx                     # TXID 1 (uploaded)
+    00000002.ltx                     # TXID 2 (uploaded)
+    00000003.ltx                     # TXID 3 (pending)
+    00000004.ltx                     # TXID 4 (pending)
+```
+
+**Manifest Format:**
+```json
+{
+  "last_uploaded_txid": 2,
+  "pending_txids": [3, 4],
+  "cache_size_bytes": 12345,
+  "last_cleanup": "2024-01-15T10:30:00Z"
+}
+```
+
+### Implementation Phases
+
+**Phase 1: Disk Cache Foundation**
+- New module: `src/cache.rs`
+- `LocalCache` struct with methods:
+  - `write_ltx()` - Write LTX to cache (atomic via .tmp)
+  - `read_ltx()` - Read LTX from cache
+  - `mark_uploaded()` - Update manifest
+  - `pending_uploads()` - Get list of pending TXIDs
+  - `cleanup()` - Retention policy enforcement
+- Manifest persistence in JSON format
+- Atomic operations using tempfile + rename
+- Thread-safe with Arc<Mutex<>> for concurrent access
+
+**Phase 2: Independent Uploader Task**
+- New module: `src/uploader.rs`
+- `Uploader` struct managing S3 upload task
+- Channel-based communication (mpsc::channel)
+- Sequential TXID processing (no out-of-order uploads)
+- Integration with existing retry logic
+- Webhook notifications on upload failure
+- Graceful shutdown (complete pending uploads)
+
+**Phase 3: Main Sync Loop Integration**
+- Modify `src/sync.rs`:
+  - Replace direct S3 upload with cache write
+  - Spawn uploader task per database
+  - Send TXID notifications via channel
+  - Track upload status in database state
+
+**Phase 4: Startup Recovery**
+- On walrust restart:
+  - Scan cache directories for pending uploads
+  - Resume uploads from where we left off
+  - Log recovery progress
+  - Verify TXID continuity
+
+**Phase 5: Fast Local Restore**
+- Modify `src/restore.rs`:
+  - Check local cache before fetching from S3
+  - If cache complete, restore locally (no S3 needed)
+  - Fall back to S3 if cache incomplete/missing
+  - Hybrid approach: cache + S3 for best performance
+
+### Testing Strategy
+
+**Unit Tests:**
+- Cache operations (write, read, mark, cleanup)
+- Manifest persistence and corruption recovery
+- TXID ordering preservation
+- Concurrent access safety
+
+**Integration Tests:**
+- Write 100 LTX → kill walrust → restart → verify resume
+- Network disconnect → verify caching continues → reconnect → verify upload
+- Restore from cache without S3 access
+- Cache retention policy enforcement
+
+**Chaos Tests:**
+- Random crashes during encoding/uploading
+- S3 failures with pending queue
+- Disk full scenarios
+- Concurrent multi-database stress
+
+**Benchmarks:**
+- Compare current (direct upload) vs new (cached)
+- Measure WAL encoding latency
+- Measure memory usage under load
+- Measure throughput improvement
+
+### Benefits
+
+1. **Crash Recovery**: Walrust restarts resume pending uploads automatically
+2. **Decoupled Performance**: S3 slowness doesn't block WAL encoding
+3. **Efficient Retries**: Failed uploads retry from disk (no re-encoding)
+4. **Fast Local Restore**: Recent backups available locally without S3 fetch
+5. **Gap Prevention**: Sequential upload preserves TXID ordering
+6. **Memory Bounded**: Disk buffering prevents unbounded memory growth
+7. **Observability**: Manifest tracks upload status, cache size, pending count
+
+### Configuration
+
+**CLI Flags:**
+```bash
+--cache-dir <path>              # Override default cache location
+--cache-retention <duration>    # How long to keep uploaded files (default: 24h)
+--cache-max-size <bytes>        # Max cache size before cleanup
+--no-cache                      # Disable caching (direct upload)
+```
+
+**Config File:**
+```toml
+[cache]
+enabled = true
+retention = "24h"        # Keep uploaded files for 24h
+max_size = "10GB"       # Cleanup when cache exceeds 10GB
+path = "/custom/cache"  # Override default location
+```
+
+### Migration Path
+
+**v1 (Compatible - v0.1.9):**
+- Add cache module and uploader task
+- Keep direct upload as fallback for errors
+- Feature flag: `--enable-cache` (opt-in)
+
+**v2 (Beta - v0.2.0):**
+- Make cache default behavior
+- Direct upload only if `--no-cache` specified
+- Migration guide for existing deployments
+
+**v3 (Stable - v1.0):**
+- Remove direct upload code path entirely
+- Cache is mandatory
+- Cleanup old configuration options
+
+### Success Metrics
+
+**Performance:**
+- WAL encoding latency reduced by 50%+ (no upload blocking)
+- Throughput increased by 30%+ (especially at high DB counts)
+- Memory usage stable (bounded by cache, not upload queue)
+
+**Reliability:**
+- 100% upload resume success after crash
+- Zero data loss in chaos tests
+- Fast local restore (10x faster than S3 fetch)
+
+**Observability:**
+- Manifest tracks pending uploads
+- Metrics for cache size, upload queue depth
+- Logging for recovery operations
+
+### Dependencies
+
+**New Crates:**
+- `serde_json` - Manifest persistence (already have serde)
+- No additional dependencies needed
+
+**Modified Files:**
+- `src/cache.rs` (NEW) - Local cache implementation
+- `src/uploader.rs` (NEW) - Independent upload task
+- `src/manifest.rs` (NEW) - Upload state tracking
+- `src/sync.rs` (MODIFIED) - Integration with cache
+- `src/restore.rs` (MODIFIED) - Cache-first restore
+- `src/main.rs` (MODIFIED) - CLI flags and initialization
+- `src/config.rs` (MODIFIED) - Cache configuration
+
+### Timeline Estimate
+
+- Phase 1 (Cache): 2-3 days
+- Phase 2 (Uploader): 2-3 days
+- Phase 3 (Integration): 1-2 days
+- Phase 4 (Recovery): 1 day
+- Phase 5 (Fast Restore): 1-2 days
+- Testing & Documentation: 2-3 days
+- **Total**: ~2 weeks
+
+### References
+
+- Litestream source: `/Users/russellromney/Documents/Github/litestream`
+  - `db.go:1277-1455` - Disk-first sync implementation
+  - `replica.go:127-193` - Independent upload goroutine
+  - `db.go:252-288` - LTX cache directory structure
+- Analysis session: 2026-01-17 (this conversation)
+
+---
+
 ## v0.1.8 Plan (Performance Optimization)
 
 **Goal**: Break the 5K w/s throughput ceiling to achieve 10K+ w/s at 250 databases.

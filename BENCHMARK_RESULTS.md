@@ -29,7 +29,7 @@ Run date: 2026-01-13
 
 **Key findings:**
 - Single process handles 10 databases efficiently
-- ~18 MB total memory (vs ~500 MB for litestream with 10 processes)
+- ~18 MB total memory (efficient memory footprint)
 - Very low CPU overhead
 
 ### Sync Latency (snapshot to Tigris)

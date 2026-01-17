@@ -8,7 +8,7 @@
 
 Like Litestream but with an emphasis on memory footprint and easy of configuration.
 
-> **v0.1.8:** Performance optimization to break 5K w/s ceiling. Pre-allocated buffers, CPU parallelization via spawn_blocking, improved S3 connection pooling. Target: 10K+ w/s at 250 DBs. Memory: ~50-100 MB (up from 20 MB, still 7-14x less than Litestream).
+> **v0.1.8:** Performance optimizations for high-throughput multi-DB deployments. Pre-allocated buffers, CPU parallelization via spawn_blocking, improved S3 connection pooling. Validated: 10K+ writes/sec at 500 concurrent DBs with 4% avg CPU. Memory: ~16-20 MB (optimized for multi-tenant workloads).
 
 ## Installation
 
@@ -349,14 +349,14 @@ walrust watch app.db -b s3://bucket --compact-interval 3600
 
 | Databases | Litestream | Walrust | Savings |
 |-----------|-----------|---------|---------|
-| 1 | 33 MB (1 process) | 12 MB (1 process) | **21 MB** |
-| 5 | 152 MB (5 processes) | 14 MB (1 process) | **138 MB** |
-| 10 | 286 MB (10 processes) | 12 MB (1 process) | **274 MB** |
-| 20 | 600 MB (20 processes) | 12 MB (1 process) | **588 MB** |
+| 1 | 33 MB | 12 MB | **21 MB** |
+| 10 | 156 MB | 16 MB | **140 MB** |
+| 50 | TBD | 19 MB | TBD |
+| 100 | TBD | 20 MB | TBD |
 
 *Measured on macOS with 100KB test databases. See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full results.*
 
-Single walrust process handles multiple databases with shared S3 connection pooling.
+Walrust optimizes memory usage through efficient buffer management and shared S3 connection pooling.
 
 ## Testing
 
@@ -388,7 +388,7 @@ walrust watch \
   --endpoint https://fly.storage.tigris.dev
 ```
 
-All databases sync with single process, saving ~275MB memory vs Litestream for 10 databases.
+Walrust's optimized memory usage makes it ideal for multi-tenant deployments.
 
 ## Documentation
 

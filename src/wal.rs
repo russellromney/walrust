@@ -150,7 +150,11 @@ pub async fn read_frames_as_pages(
         start_offset
     };
 
+    tracing::debug!("read_frames_as_pages: path={:?}, file_size={}, page_size={}, start_offset={}, start_pos={}, frame_size={}",
+        path, file_size, page_size, start_offset, start_pos, frame_size);
+
     if start_pos >= file_size {
+        tracing::debug!("read_frames_as_pages: start_pos ({}) >= file_size ({}), returning empty", start_pos, file_size);
         return Ok((Vec::new(), start_pos, 0));
     }
 
@@ -159,7 +163,10 @@ pub async fn read_frames_as_pages(
     let available = file_size - start_pos;
     let full_frames = available / frame_size;
 
+    tracing::debug!("read_frames_as_pages: available={}, full_frames={}", available, full_frames);
+
     if full_frames == 0 {
+        tracing::debug!("read_frames_as_pages: full_frames=0, returning empty");
         return Ok((Vec::new(), start_pos, 0));
     }
 
