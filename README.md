@@ -374,6 +374,33 @@ Walrust optimizes memory usage through efficient buffer management and shared S3
 
 Run tests: `./run_tests.sh` (requires Tigris credentials in `.env`)
 
+## Benchmarking
+
+Walrust includes a comprehensive benchmark framework for measuring data loss prevention and replication lag vs litestream.
+
+Quick start:
+```bash
+# Simple 2-database test
+uv run python bench/benchmark.py --config bench/configs/quick.yml
+
+# Scalability matrix: 4 DB counts × 3 write rates = 24 runs
+uv run python bench/benchmark.py --config bench/configs/scalability-matrix.yml
+```
+
+**What it measures:**
+- Data loss detection (all committed writes in S3?)
+- Replication lag (P50/P95/P99 sync latency)
+- Resource usage (CPU/memory under load)
+- Throughput (writes/sec achieved)
+
+**Architecture:**
+- DatabaseWriter threads write to SQLite at controlled rates
+- walrust/litestream sync to S3 in background
+- Restore from S3 and compare expected vs actual writes
+- Report data loss and sync latency percentiles
+
+See [bench/BENCHMARK_FRAMEWORK.md](bench/BENCHMARK_FRAMEWORK.md) for full documentation.
+
 ## Use with Tenement/Slum
 
 Perfect for backing up tenant SQLite databases:

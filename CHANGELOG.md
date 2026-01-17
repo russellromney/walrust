@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Benchmark Framework (Phase 1)**: Comprehensive benchmarking for data loss verification
+  - `bench/lib/workload.py`: DatabaseWriter with rate-limited writes and timestamp tracking
+  - `bench/lib/runners.py`: WalrustRunner and LitestreamRunner for process management
+  - `bench/lib/monitor.py`: ResourceMonitor for CPU/memory tracking
+  - `bench/lib/verify.py`: ReplicationVerifier for S3 restore and data loss detection
+  - `bench/benchmark.py`: Main CLI orchestrator with YAML config support
+  - `bench/lib/config.py`: BenchmarkConfig with matrix expansion support
+  - Config files: `bench/configs/quick.yml` and `bench/configs/scalability-matrix.yml`
+  - Documentation: `bench/BENCHMARK_FRAMEWORK.md` with complete usage guide
+- Measures data loss (expected vs replicated writes), sync latency (P50/P95/P99), and resource usage
+
 ### Performance
 - **Phase 1 & 2 Optimizations**: Breaking the 5K w/s throughput ceiling
   - Pre-allocated Vec buffers for LTX encoding (2x estimated size for compression headroom)
@@ -23,8 +35,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - Dependencies: `rayon 1.10`, `aws-smithy-runtime 1`
+- Python dependencies for benchmarking: `pyyaml`, `boto3`, `psutil`
 
 ### Notes
+- **Benchmark Phase 2**: Planned fly-benchmark-engine integration for production infrastructure testing
 - **Phase 3 (Batch S3 uploads)** remains pending - test Phase 1+2 results first
 - Target metrics: 80%+ achievement at 250 DBs (10K+ w/s), 75%+ at 400 DBs (15K+ w/s)
 - Next step: Run comprehensive benchmarks to measure actual throughput gains

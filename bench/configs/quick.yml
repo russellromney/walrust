@@ -1,0 +1,21 @@
+name: "quick-test"
+
+workload:
+  type: "rate-limited"
+  writes_per_second: 10
+  duration_seconds: 30
+
+databases:
+  count: 2
+  size_kb: 100
+
+tools:
+  - walrust
+  - litestream
+
+storage:
+  bucket: "s3://walrust-bench"
+  endpoint: "https://fly.storage.tigris.dev"
+
+metrics:
+  resource_sample_interval_ms: 100

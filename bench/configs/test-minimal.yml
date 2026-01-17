@@ -1,0 +1,24 @@
+name: "test-minimal"
+
+# Minimal test: 1 DB × 2 write rates × 2 tools = 4 runs (~2 minutes total)
+matrix:
+  databases: [1]
+  writes_per_second: [5, 10]
+  duration_seconds: [15]
+  tools: [walrust, litestream]
+
+workload:
+  type: "rate-limited"
+  writes_per_second: 5
+  duration_seconds: 15
+
+databases:
+  count: 1
+  size_kb: 10
+
+storage:
+  bucket: "s3://walrust-bench"
+  endpoint: "https://fly.storage.tigris.dev"
+
+metrics:
+  resource_sample_interval_ms: 100
