@@ -6,7 +6,7 @@
 
 **Lightweight SQLite replication to S3/Tigris in Rust.**
 
-Like Litestream but with an emphasis on memory footprint and easy of configuration.
+Walrust continuously replicates SQLite databases to S3-compatible storage, ensuring **minimal data loss** on server crashes, power failures, or disk corruption. Like Litestream but with an emphasis on memory footprint and ease of configuration.
 
 > **v0.1.8:** Performance optimizations for high-throughput multi-DB deployments. Pre-allocated buffers, CPU parallelization via spawn_blocking, improved S3 connection pooling. Validated: 10K+ writes/sec at 500 concurrent DBs with 4% avg CPU. Memory: ~16-20 MB (optimized for multi-tenant workloads).
 

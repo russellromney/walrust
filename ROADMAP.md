@@ -148,29 +148,63 @@ Litestream uses a **two-goroutine architecture** with disk-based intermediary:
 
 ### Testing Strategy
 
-**Unit Tests:**
-- Cache operations (write, read, mark, cleanup)
-- Manifest persistence and corruption recovery
-- TXID ordering preservation
-- Concurrent access safety
+**Unit Tests (src/cache.rs - 24 tests):**
+- ✅ Cache creation and directory structure
+- ✅ Write and read LTX files
+- ✅ Atomic write verification (tempfile + rename)
+- ✅ Mark uploaded status tracking
+- ✅ Pending uploads sorted by TXID
+- ✅ Sequential upload tracking (TXID ordering)
+- ✅ Cleanup with retention policy (time-based and size-based)
+- ✅ Never delete pending uploads (safety guarantee)
+- ✅ Cache persistence across restarts (manifest recovery)
+- ✅ Verify integrity (detect missing files, orphans, size mismatches)
+- ✅ Concurrent access safety (thread-safe operations)
+- ✅ Manifest corruption detection
+- ✅ Empty cache edge cases
+- ✅ Large TXID values (u64::MAX)
 
-**Integration Tests:**
-- Write 100 LTX → kill walrust → restart → verify resume
-- Network disconnect → verify caching continues → reconnect → verify upload
-- Restore from cache without S3 access
-- Cache retention policy enforcement
+**Unit Tests (src/uploader.rs - 11 tests):**
+- ✅ Basic upload flow (cache → S3)
+- ✅ Sequential TXID processing (ordered uploads)
+- ✅ Resume pending uploads on startup (crash recovery)
+- ✅ Retry on S3 failures (with exponential backoff)
+- ✅ Channel buffering (handle bursts)
+- ✅ Graceful shutdown (complete pending uploads)
+- ✅ Statistics tracking (attempts, successes, failures, bytes)
+- ✅ spawn_uploader helper function
 
-**Chaos Tests:**
-- Random crashes during encoding/uploading
-- S3 failures with pending queue
-- Disk full scenarios
-- Concurrent multi-database stress
+**Integration Tests (walrust-dst/disk_queue_tests.rs - 15 tests):**
+- ✅ Crash recovery basic (write 10, crash, restart, verify all upload)
+- ✅ Crash recovery partial (write 10, upload 5, crash, verify remaining 5)
+- ✅ Network disconnect recovery (cache continues, reconnect, upload)
+- ✅ Cache continues during S3 failure (100 writes don't block)
+- ✅ Fast local restore (restore from cache without S3)
+- ✅ Cleanup retention policy (100 files → keep 10 most recent)
+- ✅ TXID ordering preserved (out-of-order writes → sequential uploads)
+- ✅ Concurrent multi-database (10 DBs × 50 uploads each)
+- ✅ Chaos random failures (20% S3 failure rate, retries succeed)
+- ✅ Cache verify integrity (detect corruption)
+- ✅ Uploader graceful shutdown completes pending
+- ✅ Cache persistence across restarts
 
-**Benchmarks:**
-- Compare current (direct upload) vs new (cached)
-- Measure WAL encoding latency
-- Measure memory usage under load
-- Measure throughput improvement
+**Chaos Tests (walrust-dst/chaos.rs - 4 new tests):**
+- ✅ Atomic write crashes (verify tempfile+rename atomicity)
+- ✅ Crash recovery (N writes, M uploads, crash, verify N-M resume)
+- ✅ Manifest corruption (invalid JSON, missing file, inconsistencies)
+- ✅ Concurrent multi-database isolation (failures don't cascade)
+
+**Benchmarks (future):**
+- [ ] Compare current (direct upload) vs new (cached)
+- [ ] Measure WAL encoding latency improvement
+- [ ] Measure memory usage under load (bounded by cache)
+- [ ] Measure throughput improvement (30%+ expected)
+
+**Test Coverage Summary:**
+- **Total Tests**: 54 (24 cache + 11 uploader + 15 integration + 4 chaos)
+- **Test Execution**: `cargo test` (unit tests) + `cargo test --package walrust-dst` (integration/chaos)
+- **CI Integration**: All tests run on every commit
+- **Property Tests**: Chaos tests use seeded RNG for reproducibility
 
 ### Benefits
 
@@ -567,6 +601,413 @@ snapshot_interval = 1800  # Per-DB override (seconds)
    - [x] Checksum chaining for LTX integrity verification
    - [x] In-place apply_ltx_to_db for efficient restore
    - [x] Comprehensive tests (105 total, all passing)
+
+---
+
+## Benchmark Framework
+
+### Goal
+
+Measure how successfully walrust/litestream replicate SQLite data to S3, ensuring **minimal data loss** on server crashes, power failures, or disk corruption.
+
+**Success Metric:** All committed SQLite writes appear in S3 with minimal replication lag.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ Benchmark Runner (bench/benchmark.py)                          │
+│                                                                 │
+│  1. Read config (bench/configs/*.yml)                          │
+│  2. Create test databases                                      │
+│  3. Start tool (walrust/litestream)                            │
+│  4. Run workload (DatabaseWriter threads)                      │
+│  5. Monitor resources (ResourceMonitor)                        │
+│  6. Stop tool                                                  │
+│  7. Verify replication (restore from S3 + compare)             │
+│  8. Generate report                                            │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Components
+
+#### 1. Workload Generator (`bench/lib/workload.py`)
+
+**Purpose:** Write data to SQLite databases at controlled rates.
+
+```python
+class DatabaseWriter:
+    """Write data to SQLite with known timestamps."""
+
+    def __init__(self, db_path: Path, writes_per_second: int):
+        self.db_path = db_path
+        self.writes_per_second = writes_per_second
+        self.writes = []  # [(write_id, commit_timestamp), ...]
+
+    def write_loop(self):
+        """Write loop with rate limiting."""
+        conn = sqlite3.connect(str(self.db_path))
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS benchmark_data (
+                id TEXT PRIMARY KEY,
+                created_at REAL,
+                data BLOB
+            )
+        """)
+
+        while self.running:
+            write_id = str(uuid4())
+            commit_ts = time.time()
+
+            conn.execute(
+                "INSERT INTO benchmark_data (id, created_at, data) VALUES (?, ?, ?)",
+                (write_id, commit_ts, os.urandom(1024))
+            )
+            conn.commit()
+
+            self.writes.append((write_id, commit_ts))
+
+            time.sleep(1.0 / self.writes_per_second)
+```
+
+**No latency tracking** - just recording ground truth: what we wrote and when.
+
+#### 2. Tool Runners (`bench/lib/runners.py`)
+
+**Purpose:** Abstract walrust/litestream process management.
+
+```python
+class WalrustRunner:
+    """Manage walrust process."""
+
+    def start(self, databases: List[Path], bucket: str, endpoint: str):
+        cmd = [
+            "walrust", "watch",
+            "--bucket", bucket,
+            "--endpoint", endpoint,
+            "--independent-tasks"  # Multi-DB mode
+        ] + [str(db) for db in databases]
+
+        self.proc = subprocess.Popen(cmd, ...)
+        time.sleep(2)  # Wait for startup
+        return self.proc.pid
+
+class LitestreamRunner:
+    """Manage litestream process with single-process multi-DB config."""
+
+    def start(self, databases: List[Path], bucket: str, endpoint: str):
+        # Generate litestream.yml
+        config = {
+            'dbs': [
+                {
+                    'path': str(db),
+                    'replicas': [{
+                        'url': f's3://{bucket}/{db.name}',
+                        'endpoint': endpoint
+                    }]
+                }
+                for db in databases
+            ]
+        }
+
+        config_path = Path(tempfile.mktemp(suffix='.yml'))
+        config_path.write_text(yaml.dump(config))
+
+        self.proc = subprocess.Popen(
+            ["litestream", "replicate", "-config", str(config_path)],
+            ...
+        )
+        time.sleep(2)
+        return self.proc.pid
+```
+
+#### 3. Resource Monitor (`bench/lib/monitor.py`)
+
+**Purpose:** Track CPU and memory usage.
+
+```python
+class ResourceMonitor:
+    """Monitor process resources."""
+
+    def __init__(self, pid: int, include_children: bool = False):
+        self.pid = pid
+        self.include_children = include_children
+        self.samples = []  # {'timestamp', 'cpu_percent', 'memory_mb'}
+
+    def monitor_loop(self):
+        """Sample every 100ms."""
+        while self.running:
+            proc = psutil.Process(self.pid)
+
+            if self.include_children:
+                # For litestream (may spawn children)
+                all_procs = [proc] + proc.children(recursive=True)
+                cpu = sum(p.cpu_percent(interval=0.1) for p in all_procs)
+                mem = sum(p.memory_info().rss for p in all_procs)
+            else:
+                # For walrust (single process)
+                cpu = proc.cpu_percent(interval=0.1)
+                mem = proc.memory_info().rss
+
+            self.samples.append({
+                'timestamp': time.time(),
+                'cpu_percent': cpu,
+                'memory_mb': mem / (1024 * 1024)
+            })
+
+            time.sleep(0.1)
+```
+
+#### 4. Replication Verifier (`bench/lib/verify.py`)
+
+**Purpose:** Verify all writes made it to S3 and measure replication lag.
+
+**Approach:**
+1. Restore database from S3 using `walrust restore` or `litestream restore`
+2. Query restored database for all rows
+3. Get S3 object metadata (LastModified) for LTX files
+4. Compare: commit timestamp (from SQLite row) vs upload timestamp (from S3 metadata)
+
+```python
+class ReplicationVerifier:
+    """Verify replication completeness and latency."""
+
+    def verify(
+        self,
+        tool: str,
+        db_name: str,
+        bucket: str,
+        endpoint: str,
+        expected_writes: List[Tuple[str, float]]
+    ) -> dict:
+        """
+        Args:
+            tool: "walrust" or "litestream"
+            db_name: Database name for S3 prefix
+            bucket: S3 bucket
+            endpoint: S3 endpoint
+            expected_writes: [(write_id, commit_timestamp), ...]
+
+        Returns:
+            Replication metrics dict
+        """
+
+        # 1. Restore database from S3
+        restore_path = Path(tempfile.mktemp(suffix='.db'))
+
+        if tool == "walrust":
+            subprocess.run([
+                "walrust", "restore", db_name,
+                "-o", str(restore_path),
+                "-b", bucket,
+                "--endpoint", endpoint
+            ], check=True)
+        else:  # litestream
+            subprocess.run([
+                "litestream", "restore",
+                "-o", str(restore_path),
+                f"s3://{bucket}/{db_name}"
+            ], check=True)
+
+        # 2. Query restored database
+        conn = sqlite3.connect(str(restore_path))
+        cursor = conn.execute("SELECT id, created_at FROM benchmark_data")
+        restored_writes = {row[0]: row[1] for row in cursor.fetchall()}
+        conn.close()
+
+        # 3. Get S3 metadata for LTX files (upload timestamps)
+        s3_client = boto3.client('s3', endpoint_url=endpoint)
+
+        # List all LTX files for this database
+        bucket_name = bucket.replace('s3://', '')
+        response = s3_client.list_objects_v2(
+            Bucket=bucket_name,
+            Prefix=f'{db_name}/'
+        )
+
+        # Get upload timestamps (only WAL frames, ignore snapshots)
+        ltx_uploads = {}
+        for obj in response.get('Contents', []):
+            if '-' in obj['Key'] and obj['Key'].endswith('.ltx'):
+                # WAL frame file: "00000001-00000100.ltx"
+                ltx_uploads[obj['Key']] = obj['LastModified'].timestamp()
+
+        # For simplicity, use the LATEST LTX upload time
+        # (In reality, we'd need to map write_id -> specific LTX file)
+        latest_upload_ts = max(ltx_uploads.values()) if ltx_uploads else None
+
+        # 4. Compare and compute metrics
+        replicated = []
+        missing = []
+        sync_latencies = []
+
+        for write_id, commit_ts in expected_writes:
+            if write_id in restored_writes:
+                replicated.append(write_id)
+
+                # Sync latency = S3 upload time - SQLite commit time
+                # Using latest upload as approximation
+                if latest_upload_ts:
+                    latency = latest_upload_ts - commit_ts
+                    sync_latencies.append(latency)
+            else:
+                missing.append(write_id)
+
+        return {
+            'total_writes': len(expected_writes),
+            'replicated_writes': len(replicated),
+            'missing_writes': len(missing),
+            'data_loss': len(missing) > 0,
+            'sync_latency_p50_ms': percentile(sync_latencies, 0.5) * 1000,
+            'sync_latency_p95_ms': percentile(sync_latencies, 0.95) * 1000,
+            'sync_latency_p99_ms': percentile(sync_latencies, 0.99) * 1000,
+            'sync_latency_max_ms': max(sync_latencies) * 1000 if sync_latencies else 0,
+        }
+```
+
+**Note:** This is simplified. For accurate per-write latency, we'd need to:
+- Parse LTX filename ranges to map write_id → specific LTX file
+- Or track TXID in SQLite and map TXID → LTX file
+
+### Metrics
+
+**Replication Metrics:**
+- `total_writes` - Total writes performed
+- `replicated_writes` - Writes found in restored database
+- `missing_writes` - Writes NOT found (data loss!)
+- `data_loss` - Boolean: any missing writes?
+- `sync_latency_p50_ms` - Median replication lag
+- `sync_latency_p95_ms` - 95th percentile replication lag
+- `sync_latency_p99_ms` - 99th percentile replication lag
+- `sync_latency_max_ms` - Maximum replication lag
+
+**Resource Metrics (from ResourceMonitor):**
+- `peak_memory_mb` - Peak process memory
+- `avg_memory_mb` - Average process memory
+- `min_memory_mb` - Minimum process memory
+- `peak_cpu_percent` - Peak CPU usage
+- `avg_cpu_percent` - Average CPU usage
+- `min_cpu_percent` - Minimum CPU usage
+
+**Workload Metrics (from DatabaseWriter):**
+- `duration_seconds` - Actual benchmark duration
+- `target_writes_per_second` - Configured write rate
+- `actual_writes_per_second` - Achieved write rate
+
+### Configuration Format
+
+**Simple Config (`bench/configs/quick.yml`):**
+
+```yaml
+name: "quick-test"
+
+workload:
+  type: "rate-limited"
+  writes_per_second: 10
+  duration_seconds: 30
+
+databases:
+  count: 5
+  size_kb: 100
+
+tools:
+  - walrust
+  - litestream
+
+storage:
+  bucket: "s3://walrust-bench"
+  endpoint: "https://fly.storage.tigris.dev"
+
+metrics:
+  resource_sample_interval_ms: 100
+```
+
+**Matrix Config (`bench/configs/scalability-matrix.yml`):**
+
+```yaml
+name: "scalability-matrix"
+
+matrix:
+  databases: [1, 10, 50, 100]
+  writes_per_second: [10, 100, 1000]
+  duration_seconds: [30]
+  tools: [walrust, litestream]
+
+storage:
+  bucket: "s3://walrust-bench"
+  endpoint: "https://fly.storage.tigris.dev"
+
+metrics:
+  resource_sample_interval_ms: 100
+```
+
+This generates: 4 × 3 × 1 × 2 = **24 runs**
+
+Each run produces:
+```json
+{
+  "config": {
+    "databases": 10,
+    "writes_per_second": 100,
+    "duration_seconds": 30,
+    "tool": "walrust"
+  },
+  "replication": {
+    "total_writes": 3000,
+    "replicated_writes": 3000,
+    "missing_writes": 0,
+    "data_loss": false,
+    "sync_latency_p50_ms": 145,
+    "sync_latency_p95_ms": 890,
+    "sync_latency_p99_ms": 1250,
+    "sync_latency_max_ms": 2100
+  },
+  "resources": {
+    "peak_memory_mb": 19.5,
+    "avg_memory_mb": 18.2,
+    "min_memory_mb": 17.1,
+    "peak_cpu_percent": 12.3,
+    "avg_cpu_percent": 4.5,
+    "min_cpu_percent": 2.1
+  },
+  "workload": {
+    "duration_seconds": 30.2,
+    "target_writes_per_second": 100,
+    "actual_writes_per_second": 99.3
+  }
+}
+```
+
+### Implementation Plan
+
+1. ✅ Update README with data loss prevention goal
+2. Create `bench/lib/` utilities:
+   - `workload.py` - DatabaseWriter
+   - `runners.py` - WalrustRunner, LitestreamRunner
+   - `monitor.py` - ResourceMonitor
+   - `verify.py` - ReplicationVerifier
+   - `config.py` - Config loading (already exists, may need updates)
+3. Create `bench/benchmark.py` - Main CLI runner
+4. Test with simple config
+5. Test with matrix config
+6. Once working, deprecate old `bench/compare.py` and `bench/realworld.py`
+7. Delete root experimental scripts
+
+### Open Questions
+
+1. **Per-write sync latency accuracy** - Current approach uses latest LTX upload time as approximation. For exact per-write latency, we need to:
+   - Track SQLite TXID for each write
+   - Map TXID → LTX file using filename ranges
+   - Use that specific LTX file's upload timestamp
+
+   Should we implement this, or is the approximation good enough?
+
+2. **WAL frame identification** - How do we distinguish WAL frame LTX from snapshot LTX in S3?
+   - By filename pattern? (e.g., snapshots are `00000001-00000001.ltx`)
+   - By file size?
+   - By metadata tag?
+
+3. **Cleanup between runs** - Should we delete S3 data between matrix runs to avoid pollution?
 
 ---
 
