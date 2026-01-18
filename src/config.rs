@@ -22,6 +22,10 @@ pub struct Config {
     #[serde(default)]
     pub retention: RetentionConfig,
 
+    /// Cache configuration for disk-based upload queue
+    #[serde(default)]
+    pub cache: CacheConfig,
+
     /// Retry configuration for transient failures
     #[serde(default)]
     pub retry: crate::retry::RetryConfig,
@@ -33,6 +37,82 @@ pub struct Config {
     /// Database-specific configurations
     #[serde(default)]
     pub databases: Vec<DatabaseConfig>,
+}
+
+/// Cache configuration for disk-based upload queue
+///
+/// When enabled, LTX files are written to disk cache before uploading to S3.
+/// This provides crash recovery, decouples encoding from uploads, and enables
+/// fast local restore.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    /// Enable disk cache (default: false, opt-in for v0.1.9)
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// How long to keep uploaded files in cache (default: "24h")
+    /// Supports: "1h", "24h", "7d", etc.
+    #[serde(default = "default_cache_retention")]
+    pub retention: String,
+
+    /// Maximum cache size in bytes before cleanup (default: 5GB)
+    #[serde(default = "default_cache_max_size")]
+    pub max_size: u64,
+
+    /// Override default cache location
+    /// Default: .{db_name}-walrust/ next to database file
+    pub path: Option<String>,
+}
+
+impl Default for CacheConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            retention: "24h".to_string(),
+            max_size: 5 * 1024 * 1024 * 1024, // 5GB
+            path: None,
+        }
+    }
+}
+
+fn default_cache_retention() -> String {
+    "24h".to_string()
+}
+
+fn default_cache_max_size() -> u64 {
+    5 * 1024 * 1024 * 1024 // 5GB
+}
+
+/// Parse duration string like "24h", "7d", "30m" into chrono::Duration
+pub fn parse_duration_string(s: &str) -> Result<chrono::Duration> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(anyhow!("Empty duration string"));
+    }
+
+    let (num_str, unit) = if s.ends_with('h') {
+        (&s[..s.len() - 1], 'h')
+    } else if s.ends_with('d') {
+        (&s[..s.len() - 1], 'd')
+    } else if s.ends_with('m') {
+        (&s[..s.len() - 1], 'm')
+    } else if s.ends_with('s') {
+        (&s[..s.len() - 1], 's')
+    } else {
+        return Err(anyhow!("Invalid duration format '{}': must end with h, d, m, or s", s));
+    };
+
+    let num: i64 = num_str.parse()
+        .map_err(|_| anyhow!("Invalid duration number '{}' in '{}'", num_str, s))?;
+
+    match unit {
+        'h' => Ok(chrono::Duration::hours(num)),
+        'd' => Ok(chrono::Duration::days(num)),
+        'm' => Ok(chrono::Duration::minutes(num)),
+        's' => Ok(chrono::Duration::seconds(num)),
+        _ => unreachable!(),
+    }
 }
 
 /// Webhook configuration for failure notifications
@@ -761,5 +841,73 @@ mod tests {
         let merged = config.merge_sync_config(&config.databases[0]);
         assert_eq!(merged.monitor_interval, 10);
         assert_eq!(merged.validation_interval, 3600);
+    }
+
+    // ============================================
+    // Cache Config Tests
+    // ============================================
+
+    #[test]
+    fn test_cache_config_defaults() {
+        let toml = r#"
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(!config.cache.enabled);
+        assert_eq!(config.cache.retention, "24h");
+        assert_eq!(config.cache.max_size, 5 * 1024 * 1024 * 1024); // 5GB
+        assert!(config.cache.path.is_none());
+    }
+
+    #[test]
+    fn test_cache_config_enabled() {
+        let toml = r#"
+            [cache]
+            enabled = true
+            retention = "7d"
+            max_size = 5368709120
+            path = "/var/cache/walrust"
+
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.cache.enabled);
+        assert_eq!(config.cache.retention, "7d");
+        assert_eq!(config.cache.max_size, 5 * 1024 * 1024 * 1024); // 5GB
+        assert_eq!(config.cache.path, Some("/var/cache/walrust".to_string()));
+    }
+
+    #[test]
+    fn test_parse_duration_string_hours() {
+        let duration = parse_duration_string("24h").unwrap();
+        assert_eq!(duration.num_hours(), 24);
+    }
+
+    #[test]
+    fn test_parse_duration_string_days() {
+        let duration = parse_duration_string("7d").unwrap();
+        assert_eq!(duration.num_days(), 7);
+    }
+
+    #[test]
+    fn test_parse_duration_string_minutes() {
+        let duration = parse_duration_string("30m").unwrap();
+        assert_eq!(duration.num_minutes(), 30);
+    }
+
+    #[test]
+    fn test_parse_duration_string_seconds() {
+        let duration = parse_duration_string("60s").unwrap();
+        assert_eq!(duration.num_seconds(), 60);
+    }
+
+    #[test]
+    fn test_parse_duration_string_invalid() {
+        assert!(parse_duration_string("").is_err());
+        assert!(parse_duration_string("24").is_err());
+        assert!(parse_duration_string("abc").is_err());
+        assert!(parse_duration_string("24x").is_err());
     }
 }

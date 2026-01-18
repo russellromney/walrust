@@ -169,6 +169,39 @@ enum Commands {
         /// the thread pool.
         #[arg(long)]
         independent_tasks: bool,
+
+        // Cache configuration (disk-based upload queue)
+        /// Enable disk cache for decoupled uploads (experimental)
+        ///
+        /// When enabled, LTX files are written to disk cache before uploading
+        /// to S3. This provides crash recovery, decouples encoding from uploads,
+        /// and enables fast local restore.
+        #[arg(long)]
+        enable_cache: bool,
+
+        /// Override cache directory location
+        ///
+        /// Default: .{db_name}-walrust/ next to each database file
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
+
+        /// Cache retention duration (default: 24h)
+        ///
+        /// How long to keep uploaded files in cache. Supports: "1h", "24h", "7d"
+        #[arg(long, default_value = "24h")]
+        cache_retention: String,
+
+        /// Maximum cache size in bytes (default: 5GB)
+        ///
+        /// Cleanup deletes oldest uploaded files when cache exceeds this size.
+        #[arg(long)]
+        cache_max_size: Option<u64>,
+
+        /// Disable cache (direct S3 upload)
+        ///
+        /// Forces direct S3 upload even if cache is enabled in config file.
+        #[arg(long)]
+        no_cache: bool,
     },
 
     /// Restore a database from S3
@@ -346,6 +379,12 @@ struct WatchArgs {
     shadow_wal: bool,
     // Independent per-DB tasks mode
     independent_tasks: bool,
+    // Cache configuration
+    enable_cache: bool,
+    cache_dir: Option<PathBuf>,
+    cache_retention: String,
+    cache_max_size: Option<u64>,
+    no_cache: bool,
 }
 
 /// Resolve watch configuration by merging config file with CLI args
@@ -516,6 +555,28 @@ fn merge_cli_retry_overrides(base: &retry::RetryConfig, cli: &WatchArgs) -> retr
     }
 }
 
+/// Resolve cache configuration from config file and CLI args
+fn resolve_cache_config(config: &Option<Config>, cli: &WatchArgs) -> config::CacheConfig {
+    let base = config
+        .as_ref()
+        .map(|c| c.cache.clone())
+        .unwrap_or_default();
+
+    // CLI --enable-cache overrides config, --no-cache forces disable
+    let enabled = if cli.no_cache {
+        false
+    } else {
+        cli.enable_cache || base.enabled
+    };
+
+    config::CacheConfig {
+        enabled,
+        retention: cli.cache_retention.clone(),
+        max_size: cli.cache_max_size.unwrap_or(base.max_size),
+        path: cli.cache_dir.as_ref().map(|p| p.display().to_string()).or(base.path),
+    }
+}
+
 /// Parse duration string like "5s", "1m", "30s", "2h"
 fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
@@ -618,6 +679,11 @@ async fn run() -> Result<()> {
             circuit_breaker_threshold,
             shadow_wal,
             independent_tasks,
+            enable_cache,
+            cache_dir,
+            cache_retention,
+            cache_max_size,
+            no_cache,
         } => {
             let watch_args = WatchArgs {
                 databases,
@@ -649,10 +715,25 @@ async fn run() -> Result<()> {
                 circuit_breaker_threshold,
                 shadow_wal,
                 independent_tasks,
+                enable_cache,
+                cache_dir,
+                cache_retention,
+                cache_max_size,
+                no_cache,
             };
 
             let (resolved_dbs, bucket, endpoint, sync_config, retention_config, retry_config, webhooks) =
                 resolve_watch_config(&config, &watch_args)?;
+
+            // Resolve cache configuration
+            let cache_config = resolve_cache_config(&config, &watch_args);
+            if cache_config.enabled {
+                tracing::info!(
+                    "Disk cache enabled (experimental): retention={}, max_size={}MB",
+                    cache_config.retention,
+                    cache_config.max_size / (1024 * 1024)
+                );
+            }
 
             if shadow_wal {
                 tracing::info!("Shadow WAL mode enabled (experimental)");
@@ -694,6 +775,7 @@ async fn run() -> Result<()> {
                     watch_args.no_metrics,
                     retry_config,
                     webhooks,
+                    cache_config.clone(),
                 )
                 .await?;
             } else {
@@ -707,6 +789,7 @@ async fn run() -> Result<()> {
                     watch_args.no_metrics,
                     retry_config,
                     webhooks,
+                    cache_config,
                 )
                 .await?;
             }
@@ -862,6 +945,11 @@ mod tests {
             circuit_breaker_threshold: None,
             shadow_wal: false,
             independent_tasks: false,
+            enable_cache: false,
+            cache_dir: None,
+            cache_retention: "24h".to_string(),
+            cache_max_size: None,
+            no_cache: false,
         }
     }
 
@@ -919,5 +1007,74 @@ mod tests {
         assert_eq!(result.max_retries, 3);
         assert_eq!(result.base_delay_ms, 100); // Default
         assert_eq!(result.max_delay_ms, 30000); // Default
+    }
+
+    // ============================================
+    // Cache Config Resolution Tests
+    // ============================================
+
+    #[test]
+    fn test_resolve_cache_config_defaults() {
+        let cli = default_watch_args();
+        let config = resolve_cache_config(&None, &cli);
+
+        assert!(!config.enabled);
+        assert_eq!(config.retention, "24h");
+        assert_eq!(config.max_size, 5 * 1024 * 1024 * 1024);
+        assert!(config.path.is_none());
+    }
+
+    #[test]
+    fn test_resolve_cache_config_cli_enable() {
+        let mut cli = default_watch_args();
+        cli.enable_cache = true;
+
+        let config = resolve_cache_config(&None, &cli);
+
+        assert!(config.enabled);
+    }
+
+    #[test]
+    fn test_resolve_cache_config_cli_no_cache_overrides() {
+        let mut cli = default_watch_args();
+        cli.enable_cache = true;
+        cli.no_cache = true;
+
+        let config = resolve_cache_config(&None, &cli);
+
+        assert!(!config.enabled); // --no-cache wins
+    }
+
+    #[test]
+    fn test_resolve_cache_config_cli_overrides() {
+        let mut cli = default_watch_args();
+        cli.enable_cache = true;
+        cli.cache_retention = "7d".to_string();
+        cli.cache_max_size = Some(5 * 1024 * 1024 * 1024);
+        cli.cache_dir = Some(PathBuf::from("/custom/cache"));
+
+        let config = resolve_cache_config(&None, &cli);
+
+        assert!(config.enabled);
+        assert_eq!(config.retention, "7d");
+        assert_eq!(config.max_size, 5 * 1024 * 1024 * 1024);
+        assert_eq!(config.path, Some("/custom/cache".to_string()));
+    }
+
+    #[test]
+    fn test_resolve_cache_config_from_config_file() {
+        let mut file_config = Config::default();
+        file_config.cache.enabled = true;
+        file_config.cache.retention = "48h".to_string();
+        file_config.cache.max_size = 20 * 1024 * 1024 * 1024;
+        file_config.cache.path = Some("/config/cache".to_string());
+
+        let cli = default_watch_args();
+        let config = resolve_cache_config(&Some(file_config), &cli);
+
+        assert!(config.enabled);
+        assert_eq!(config.retention, "24h"); // CLI default overrides
+        assert_eq!(config.max_size, 20 * 1024 * 1024 * 1024); // From file
+        assert_eq!(config.path, Some("/config/cache".to_string())); // From file
     }
 }

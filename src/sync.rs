@@ -10,7 +10,7 @@ use std::time::Duration;
 use tokio::signal;
 use tokio::sync::mpsc;
 
-use crate::config::{Config, ResolvedDbConfig, SyncConfig, WebhookConfig};
+use crate::config::{CacheConfig, Config, ResolvedDbConfig, SyncConfig, WebhookConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::ltx;
 use crate::shadow::ShadowWal;
@@ -509,9 +509,17 @@ pub async fn watch_with_config(
     no_metrics: bool,
     retry_config: RetryConfig,
     webhooks: Vec<WebhookConfig>,
+    cache_config: CacheConfig,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(create_client(endpoint).await?);
+
+    // Log cache status (integration pending)
+    if cache_config.enabled {
+        tracing::debug!("Cache enabled but integration pending - using direct S3 upload");
+    }
+    // TODO: Phase 3 - Initialize LocalCache and spawn Uploader per database
+    let _ = cache_config; // Suppress unused warning until integration complete
 
     // Set up retry policy and webhook sender
     let retry_policy = RetryPolicy::new(retry_config.clone());
@@ -1182,8 +1190,16 @@ pub async fn watch_with_independent_tasks(
     no_metrics: bool,
     retry_config: RetryConfig,
     webhooks: Vec<WebhookConfig>,
+    cache_config: CacheConfig,
 ) -> Result<()> {
     use tokio::sync::broadcast;
+
+    // Log cache status (integration pending)
+    if cache_config.enabled {
+        tracing::debug!("Cache enabled but integration pending - using direct S3 upload");
+    }
+    // TODO: Phase 3 - Initialize LocalCache and spawn Uploader per database
+    let _ = cache_config; // Suppress unused warning until integration complete
 
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(create_client(endpoint).await?);
@@ -7524,6 +7540,7 @@ mod tests {
                 weekly: 8,
                 monthly: 6,
             },
+            cache: Default::default(),
             retry: Default::default(),
             webhooks: vec![],
             databases: vec![], // Empty databases - explain should still work
