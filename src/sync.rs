@@ -114,6 +114,183 @@ pub struct Manifest {
     pub last_checksum: Option<u64>,
 }
 
+// ============================================
+// Litestream-compatible format helpers
+// ============================================
+// Litestream format:
+//   db_name/0000/{min_txid}-{max_txid}.ltx  <- live incrementals
+//   db_name/0001/{min_txid}-{max_txid}.ltx  <- generation 1 (snapshot + compacted)
+//   db_name/0002/...                         <- generation 2, etc.
+// TXIDs are 16-char lowercase hex (e.g., 0000000000000001)
+
+/// Format a TXID as 16-char lowercase hex (litestream format)
+fn format_txid_hex(txid: u64) -> String {
+    format!("{:016x}", txid)
+}
+
+/// Parse a TXID from 16-char hex string
+fn parse_txid_hex(s: &str) -> Option<u64> {
+    u64::from_str_radix(s, 16).ok()
+}
+
+/// Format an LTX filename in litestream format
+fn format_ltx_filename(min_txid: u64, max_txid: u64) -> String {
+    format!("{}-{}.ltx", format_txid_hex(min_txid), format_txid_hex(max_txid))
+}
+
+/// Parse min/max TXID from litestream-format filename
+/// e.g., "0000000000000001-0000000000000010.ltx" -> Some((1, 16))
+fn parse_ltx_filename(filename: &str) -> Option<(u64, u64)> {
+    let name = filename.strip_suffix(".ltx")?;
+    let parts: Vec<&str> = name.split('-').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let min_txid = parse_txid_hex(parts[0])?;
+    let max_txid = parse_txid_hex(parts[1])?;
+    Some((min_txid, max_txid))
+}
+
+/// Format generation folder name (4-char hex)
+fn format_generation(gen: u64) -> String {
+    format!("{:04x}", gen)
+}
+
+/// Parse generation from folder name
+fn parse_generation(s: &str) -> Option<u64> {
+    u64::from_str_radix(s, 16).ok()
+}
+
+/// Build S3 key for an LTX file in litestream format
+/// - generation 0 = live incrementals (0000/)
+/// - generation 1+ = snapshots and compacted files
+fn build_ltx_key(prefix: &str, db_name: &str, generation: u64, min_txid: u64, max_txid: u64) -> String {
+    format!(
+        "{}{}/{}/{}",
+        prefix,
+        db_name,
+        format_generation(generation),
+        format_ltx_filename(min_txid, max_txid)
+    )
+}
+
+/// Live incrementals go to generation 0 (0000/)
+const GENERATION_LIVE: u64 = 0;
+
+/// Discover current state from S3 by listing files (no manifest needed)
+/// Returns (current_txid, latest_generation, last_checksum)
+async fn discover_state_from_s3(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    db_name: &str,
+) -> Result<(u64, u64, Option<u64>)> {
+    // List all objects under db_name/
+    let db_prefix = format!("{}{}/", prefix, db_name);
+    let objects = s3::list_objects(client, bucket, &db_prefix).await?;
+
+    if objects.is_empty() {
+        return Ok((0, 0, None));
+    }
+
+    let mut max_txid: u64 = 0;
+    let mut max_generation: u64 = 0;
+
+    for key in &objects {
+        // Extract generation and filename from key
+        // Key format: prefix/db_name/GGGG/min-max.ltx
+        let relative = key.strip_prefix(&db_prefix).unwrap_or(key);
+        let parts: Vec<&str> = relative.split('/').collect();
+
+        if parts.len() == 2 {
+            if let Some(gen) = parse_generation(parts[0]) {
+                if gen > max_generation && gen > 0 {
+                    max_generation = gen;
+                }
+                if let Some((_, file_max_txid)) = parse_ltx_filename(parts[1]) {
+                    if file_max_txid > max_txid {
+                        max_txid = file_max_txid;
+                    }
+                }
+            }
+        }
+    }
+
+    // For checksum, we'd need to read the latest LTX header
+    // For now, return None - we'll compute from local DB on startup
+    Ok((max_txid, max_generation, None))
+}
+
+/// Find the latest snapshot in S3 (file with min_txid = 1 in highest generation)
+async fn find_latest_snapshot(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    db_name: &str,
+) -> Result<Option<(u64, String, u64, u64)>> {
+    // Returns: (generation, key, min_txid, max_txid)
+    let db_prefix = format!("{}{}/", prefix, db_name);
+    let objects = s3::list_objects(client, bucket, &db_prefix).await?;
+
+    let mut best_snapshot: Option<(u64, String, u64, u64)> = None;
+
+    for key in &objects {
+        let relative = key.strip_prefix(&db_prefix).unwrap_or(key);
+        let parts: Vec<&str> = relative.split('/').collect();
+
+        if parts.len() == 2 {
+            if let Some(gen) = parse_generation(parts[0]) {
+                // Only look in generation 1+ for snapshots
+                if gen > 0 {
+                    if let Some((min_txid, max_txid)) = parse_ltx_filename(parts[1]) {
+                        // A snapshot has min_txid = 1
+                        if min_txid == 1 {
+                            match &best_snapshot {
+                                None => {
+                                    best_snapshot = Some((gen, key.clone(), min_txid, max_txid));
+                                }
+                                Some((best_gen, _, _, best_max)) => {
+                                    // Prefer higher generation, or higher max_txid in same generation
+                                    if gen > *best_gen || (gen == *best_gen && max_txid > *best_max) {
+                                        best_snapshot = Some((gen, key.clone(), min_txid, max_txid));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(best_snapshot)
+}
+
+/// List all LTX files in a generation folder
+async fn list_generation_files(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    db_name: &str,
+    generation: u64,
+) -> Result<Vec<(String, u64, u64)>> {
+    // Returns: Vec<(key, min_txid, max_txid)>
+    let gen_prefix = format!("{}{}/{}/", prefix, db_name, format_generation(generation));
+    let objects = s3::list_objects(client, bucket, &gen_prefix).await?;
+
+    let mut files = Vec::new();
+    for key in objects {
+        let filename = key.rsplit('/').next().unwrap_or(&key);
+        if let Some((min_txid, max_txid)) = parse_ltx_filename(filename) {
+            files.push((key, min_txid, max_txid));
+        }
+    }
+
+    // Sort by min_txid
+    files.sort_by_key(|(_, min, _)| *min);
+    Ok(files)
+}
+
 /// Watch multiple databases and sync to S3
 pub async fn watch(
     databases: Vec<PathBuf>,
@@ -143,61 +320,24 @@ pub async fn watch(
 
         let wal_path = db_path.with_extension("db-wal");
 
-        // Check for existing state in S3 (manifest.json)
-        let manifest_key = format!("{}{}/manifest.json", prefix, name);
-        let (wal_offset, wal_generation, current_txid, manifest_checksum) = match s3::download_bytes(&client, &bucket_name, &manifest_key).await {
-            Ok(data) => {
-                let manifest: Manifest = serde_json::from_slice(&data).unwrap_or_default();
-                // For backwards compat, also check old state.json
-                let state_key = format!("{}{}/state.json", prefix, name);
-                let (offset, gen) = match s3::download_bytes(&client, &bucket_name, &state_key).await {
-                    Ok(state_data) => {
-                        let state: serde_json::Value = serde_json::from_slice(&state_data)?;
-                        (
-                            state["wal_offset"].as_u64().unwrap_or(0),
-                            state["wal_generation"].as_u64().unwrap_or(0),
-                        )
-                    }
-                    Err(_) => (0, 0),
-                };
-                (offset, gen, manifest.current_txid, manifest.last_checksum)
-            }
-            Err(_) => {
-                // Try old state.json for backwards compat
-                let state_key = format!("{}{}/state.json", prefix, name);
-                match s3::download_bytes(&client, &bucket_name, &state_key).await {
-                    Ok(data) => {
-                        let state: serde_json::Value = serde_json::from_slice(&data)?;
-                        (
-                            state["wal_offset"].as_u64().unwrap_or(0),
-                            state["wal_generation"].as_u64().unwrap_or(0),
-                            state["current_txid"].as_u64().unwrap_or(0),
-                            None,
-                        )
-                    }
-                    Err(_) => (0, 0, 0, None),
-                }
-            }
-        };
+        // Discover state from S3 file listings (litestream format - no manifest)
+        let (current_txid, _max_gen, _) =
+            discover_state_from_s3(&client, &bucket_name, &prefix, &name).await?;
 
-        // Get initial checksum: from manifest if available, otherwise compute from db
-        let db_checksum = match manifest_checksum {
-            Some(cs) => {
-                tracing::debug!("{}: Using checksum from manifest: {:#x}", name, cs);
-                Some(cs)
+        // WAL offset and generation are local state - start fresh
+        // (we always take a snapshot on startup to ensure consistency)
+        let wal_offset = 0u64;
+        let wal_generation = 0u64;
+
+        // Compute checksum from database file
+        let db_checksum = match ltx::compute_checksum_from_file(db_path) {
+            Ok(cs) => {
+                tracing::debug!("{}: Computed initial checksum: {:#x}", name, cs.into_inner());
+                Some(cs.into_inner())
             }
-            None => {
-                // Compute from database file
-                match ltx::compute_checksum_from_file(db_path) {
-                    Ok(cs) => {
-                        tracing::debug!("{}: Computed initial checksum: {:#x}", name, cs.into_inner());
-                        Some(cs.into_inner())
-                    }
-                    Err(e) => {
-                        tracing::warn!("{}: Could not compute initial checksum: {}", name, e);
-                        None
-                    }
-                }
+            Err(e) => {
+                tracing::warn!("{}: Could not compute initial checksum: {}", name, e);
+                None
             }
         };
 
@@ -412,63 +552,24 @@ pub async fn watch_with_config(
         let name = db_config.prefix.clone();
         let wal_path = db_path.with_extension("db-wal");
 
-        // Check for existing state in S3 (manifest.json)
-        let manifest_key = format!("{}{}/manifest.json", prefix, name);
-        let (wal_offset, wal_generation, current_txid, manifest_checksum) =
-            match s3::download_bytes(&client, &bucket_name, &manifest_key).await {
-                Ok(data) => {
-                    let manifest: Manifest = serde_json::from_slice(&data).unwrap_or_default();
-                    // For backwards compat, also check old state.json
-                    let state_key = format!("{}{}/state.json", prefix, name);
-                    let (offset, gen) =
-                        match s3::download_bytes(&client, &bucket_name, &state_key).await {
-                            Ok(state_data) => {
-                                let state: serde_json::Value =
-                                    serde_json::from_slice(&state_data)?;
-                                (
-                                    state["wal_offset"].as_u64().unwrap_or(0),
-                                    state["wal_generation"].as_u64().unwrap_or(0),
-                                )
-                            }
-                            Err(_) => (0, 0),
-                        };
-                    (offset, gen, manifest.current_txid, manifest.last_checksum)
-                }
-                Err(_) => {
-                    // Try old state.json for backwards compat
-                    let state_key = format!("{}{}/state.json", prefix, name);
-                    match s3::download_bytes(&client, &bucket_name, &state_key).await {
-                        Ok(data) => {
-                            let state: serde_json::Value = serde_json::from_slice(&data)?;
-                            (
-                                state["wal_offset"].as_u64().unwrap_or(0),
-                                state["wal_generation"].as_u64().unwrap_or(0),
-                                state["current_txid"].as_u64().unwrap_or(0),
-                                None,
-                            )
-                        }
-                        Err(_) => (0, 0, 0, None),
-                    }
-                }
-            };
+        // Discover state from S3 file listings (litestream format - no manifest)
+        let (current_txid, _max_gen, _) =
+            discover_state_from_s3(&client, &bucket_name, &prefix, &name).await?;
 
-        // Get initial checksum: from manifest if available, otherwise compute from db
-        let db_checksum = match manifest_checksum {
-            Some(cs) => {
-                tracing::debug!("{}: Using checksum from manifest: {:#x}", name, cs);
-                Some(cs)
+        // WAL offset and generation are local state - start fresh
+        // (we always take a snapshot on startup to ensure consistency)
+        let wal_offset = 0u64;
+        let wal_generation = 0u64;
+
+        // Compute checksum from database file
+        let db_checksum = match ltx::compute_checksum_from_file(db_path) {
+            Ok(cs) => {
+                tracing::debug!("{}: Computed initial checksum: {:#x}", name, cs.into_inner());
+                Some(cs.into_inner())
             }
-            None => {
-                match ltx::compute_checksum_from_file(db_path) {
-                    Ok(cs) => {
-                        tracing::debug!("{}: Computed initial checksum: {:#x}", name, cs.into_inner());
-                        Some(cs.into_inner())
-                    }
-                    Err(e) => {
-                        tracing::warn!("{}: Could not compute initial checksum: {}", name, e);
-                        None
-                    }
-                }
+            Err(e) => {
+                tracing::warn!("{}: Could not compute initial checksum: {}", name, e);
+                None
             }
         };
 
@@ -1111,53 +1212,18 @@ pub async fn watch_with_independent_tasks(
         let name = db_config.prefix.clone();
         let wal_path = db_path.with_extension("db-wal");
 
-        // Check for existing state in S3 (manifest.json)
-        let manifest_key = format!("{}{}/manifest.json", prefix, name);
-        let (wal_offset, wal_generation, current_txid, manifest_checksum) =
-            match s3::download_bytes(&client, &bucket_name, &manifest_key).await {
-                Ok(data) => {
-                    let manifest: Manifest = serde_json::from_slice(&data).unwrap_or_default();
-                    let state_key = format!("{}{}/state.json", prefix, name);
-                    let (offset, gen) =
-                        match s3::download_bytes(&client, &bucket_name, &state_key).await {
-                            Ok(state_data) => {
-                                let state: serde_json::Value =
-                                    serde_json::from_slice(&state_data)?;
-                                (
-                                    state["wal_offset"].as_u64().unwrap_or(0),
-                                    state["wal_generation"].as_u64().unwrap_or(0),
-                                )
-                            }
-                            Err(_) => (0, 0),
-                        };
-                    (offset, gen, manifest.current_txid, manifest.last_checksum)
-                }
-                Err(_) => {
-                    let state_key = format!("{}{}/state.json", prefix, name);
-                    match s3::download_bytes(&client, &bucket_name, &state_key).await {
-                        Ok(data) => {
-                            let state: serde_json::Value = serde_json::from_slice(&data)?;
-                            (
-                                state["wal_offset"].as_u64().unwrap_or(0),
-                                state["wal_generation"].as_u64().unwrap_or(0),
-                                state["current_txid"].as_u64().unwrap_or(0),
-                                None,
-                            )
-                        }
-                        Err(_) => (0, 0, 0, None),
-                    }
-                }
-            };
+        // Discover state from S3 file listings (litestream format - no manifest)
+        let (current_txid, _max_gen, _) =
+            discover_state_from_s3(&client, &bucket_name, &prefix, &name).await?;
 
-        // Get initial checksum
-        let db_checksum = match manifest_checksum {
-            Some(cs) => Some(cs),
-            None => {
-                match ltx::compute_checksum_from_file(db_path) {
-                    Ok(cs) => Some(cs.into_inner()),
-                    Err(_) => None,
-                }
-            }
+        // WAL offset and generation are local state - start fresh
+        let wal_offset = 0u64;
+        let wal_generation = 0u64;
+
+        // Compute checksum from database file
+        let db_checksum = match ltx::compute_checksum_from_file(db_path) {
+            Ok(cs) => Some(cs.into_inner()),
+            Err(_) => None,
         };
 
         tracing::info!(
@@ -2199,36 +2265,21 @@ async fn sync_shadow_concurrent(
 
     let ltx_size = ltx_buffer.len() as u64;
 
-    // Upload LTX file
-    let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
-    let ltx_key = format!("{}{}/{}", prefix, input.name, ltx_filename);
+    // Incrementals go to generation 0 (live folder, litestream format)
+    let ltx_key = build_ltx_key(prefix, &input.name, GENERATION_LIVE, min_txid, max_txid);
 
     s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
 
     tracing::info!(
-        "{}: Shadow sync uploaded {} frames as {} ({} bytes, {} unique pages, TXID {}-{})",
+        "{}: Shadow sync uploaded {} frames ({} bytes, {} unique pages, TXID {}-{}) -> {}",
         input.name,
         frame_count,
-        ltx_filename,
         ltx_size,
         unique_pages,
         min_txid,
-        max_txid
-    );
-
-    // Update manifest
-    let mut manifest = load_manifest(client, bucket, prefix, &input.name).await?;
-    manifest.current_txid = max_txid;
-    manifest.last_checksum = Some(post_checksum.into_inner());
-    manifest.files.push(LtxEntry {
-        filename: ltx_filename,
-        min_txid,
         max_txid,
-        size: ltx_size,
-        created_at: Utc::now().to_rfc3339(),
-        is_snapshot: false,
-    });
-    save_manifest(client, bucket, prefix, &manifest).await?;
+        ltx_key
+    );
 
     let new_offset = input.shadow_sync_offset + (frame_count as u64 * frame_size);
 
@@ -2424,36 +2475,19 @@ async fn sync_wal_concurrent(
         }).await??;
 
         let ltx_size = ltx_buffer.len() as u64;
-        let ltx_filename = format!("{:08}-{:08}.ltx", 1, new_txid);
-        let ltx_key = format!("{}{}/{}", prefix, input.name, ltx_filename);
+        // Snapshots go to generation 1+ (litestream format)
+        let ltx_key = build_ltx_key(prefix, &input.name, 1, 1, new_txid);
 
         // Upload snapshot LTX file
-        let timestamp = Utc::now();
         s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
 
         tracing::info!(
-            "{}: Created initial snapshot LTX {} ({} bytes, TXID 1-{})",
+            "{}: Created initial snapshot LTX ({} bytes, TXID 1-{}) -> {}",
             input.name,
-            ltx_filename,
             ltx_size,
-            new_txid
+            new_txid,
+            ltx_key
         );
-
-        // Update manifest with snapshot entry
-        let mut manifest = load_manifest(client, bucket, prefix, &input.name).await?;
-        manifest.name = input.name.clone();
-        manifest.current_txid = new_txid;
-        manifest.page_size = page_size;
-        manifest.last_checksum = Some(db_checksum_new.into_inner());
-        manifest.files.push(LtxEntry {
-            filename: ltx_filename,
-            min_txid: 1,
-            max_txid: new_txid,
-            size: ltx_size,
-            created_at: timestamp.to_rfc3339(),
-            is_snapshot: true,
-        });
-        save_manifest(client, bucket, prefix, &manifest).await?;
 
         return Ok(SyncOutput {
             db_path: input.db_path,
@@ -2580,38 +2614,22 @@ async fn sync_wal_concurrent(
 
     let ltx_size = ltx_buffer.len() as u64;
 
-    // LTX filename: {min_txid:08}-{max_txid:08}.ltx
-    let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
-    let ltx_key = format!("{}{}/{}", prefix, input.name, ltx_filename);
+    // Incrementals go to generation 0 (live folder, litestream format)
+    let ltx_key = build_ltx_key(prefix, &input.name, GENERATION_LIVE, min_txid, max_txid);
 
     // Upload incremental LTX file
-    let timestamp = Utc::now();
     s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
 
     tracing::info!(
-        "{}: Synced {} WAL frames as incremental LTX {} ({} bytes, {} unique pages, TXID {}-{})",
+        "{}: Synced {} WAL frames as incremental LTX ({} bytes, {} unique pages, TXID {}-{}) -> {}",
         input.name,
         frame_count,
-        ltx_filename,
         ltx_size,
         unique_pages,
         min_txid,
-        max_txid
-    );
-
-    // Update manifest with new incremental entry
-    let mut manifest = load_manifest(client, bucket, prefix, &input.name).await?;
-    manifest.current_txid = max_txid;
-    manifest.last_checksum = Some(post_checksum.into_inner());
-    manifest.files.push(LtxEntry {
-        filename: ltx_filename,
-        min_txid,
         max_txid,
-        size: ltx_size,
-        created_at: timestamp.to_rfc3339(),
-        is_snapshot: false,
-    });
-    save_manifest(client, bucket, prefix, &manifest).await?;
+        ltx_key
+    );
 
     Ok(SyncOutput {
         db_path: input.db_path,
@@ -3106,37 +3124,21 @@ async fn sync_wal(
 
     let ltx_size = ltx_buffer.len() as u64;
 
-    // LTX filename: {min_txid:08}-{max_txid:08}.ltx
-    let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
-    let ltx_key = format!("{}{}/{}", prefix, db_name, ltx_filename);
+    // Incrementals go to generation 0 (live folder, litestream format)
+    let ltx_key = build_ltx_key(prefix, &db_name, GENERATION_LIVE, min_txid, max_txid);
 
     // Upload incremental LTX file
-    let timestamp = Utc::now();
     s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
 
     tracing::info!(
-        "{}: Synced {} WAL frames as incremental LTX {} ({} bytes, TXID {}-{})",
+        "{}: Synced {} WAL frames as incremental LTX ({} bytes, TXID {}-{}) -> {}",
         state.name,
         frame_count,
-        ltx_filename,
         ltx_size,
         min_txid,
-        max_txid
-    );
-
-    // Update manifest with new incremental entry
-    let mut manifest = load_manifest(client, bucket, prefix, &state.name).await?;
-    manifest.current_txid = max_txid;
-    manifest.last_checksum = Some(post_checksum.into_inner());
-    manifest.files.push(LtxEntry {
-        filename: ltx_filename,
-        min_txid,
         max_txid,
-        size: ltx_size,
-        created_at: timestamp.to_rfc3339(),
-        is_snapshot: false,
-    });
-    save_manifest(client, bucket, prefix, &manifest).await?;
+        ltx_key
+    );
 
     // Update state
     state.wal_offset = new_offset;
@@ -3164,10 +3166,12 @@ async fn take_snapshot(
     // Increment TXID for this snapshot
     let new_txid = state.current_txid + 1;
 
-    // LTX filename: {min_txid:08}-{max_txid:08}.ltx
-    // For a snapshot, min=1 and max=new_txid (it contains all pages up to this point)
-    let ltx_filename = format!("{:08}-{:08}.ltx", 1, new_txid);
-    let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+    // Discover current generation from S3 and create new one
+    let (_, current_gen, _) = discover_state_from_s3(client, bucket, prefix, &state.name).await?;
+    let snapshot_gen = current_gen + 1;
+
+    // Snapshots go to generation 1+ (litestream format)
+    let ltx_key = build_ltx_key(prefix, &state.name, snapshot_gen, 1, new_txid);
 
     // Encode database as LTX
     // Pre-allocate buffer: estimate 2x db size for compression headroom
@@ -3185,28 +3189,14 @@ async fn take_snapshot(
     let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
 
     tracing::info!(
-        "{}: LTX snapshot uploaded to {} (TXID: {}, size: {} bytes, checksum: {:#x})",
+        "{}: LTX snapshot uploaded (gen {}, TXID 1-{}, {} bytes, checksum {:#x}) -> {}",
         state.name,
-        ltx_key,
+        snapshot_gen,
         new_txid,
         ltx_size,
-        db_checksum.into_inner()
+        db_checksum.into_inner(),
+        ltx_key
     );
-
-    // Update manifest
-    let mut manifest = load_manifest(client, bucket, prefix, &state.name).await?;
-    manifest.current_txid = new_txid;
-    manifest.page_size = page_size;
-    manifest.last_checksum = Some(db_checksum.into_inner());
-    manifest.files.push(LtxEntry {
-        filename: ltx_filename,
-        min_txid: 1,
-        max_txid: new_txid,
-        size: ltx_size,
-        created_at: timestamp.to_rfc3339(),
-        is_snapshot: true,
-    });
-    save_manifest(client, bucket, prefix, &manifest).await?;
 
     // Update state
     state.current_txid = new_txid;
@@ -3304,61 +3294,40 @@ pub async fn restore(
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint).await?;
 
-    // Load manifest to find LTX files
-    let manifest = load_manifest(&client, &bucket_name, &prefix, name).await?;
+    // Discover state from S3 file listings (litestream format - no manifest)
+    let (current_txid, _max_gen, _) =
+        discover_state_from_s3(&client, &bucket_name, &prefix, name).await?;
 
-    if manifest.files.is_empty() {
-        // Fall back to legacy snapshot-based restore for backwards compatibility
-        return restore_legacy(name, output, bucket, endpoint, point_in_time).await;
+    if current_txid == 0 {
+        return Err(anyhow!("No LTX files found for database: {}", name));
     }
 
-    // Parse point in time if provided (as TXID or timestamp)
+    // Find the latest snapshot (min_txid=1 in generation 1+)
+    let snapshot = find_latest_snapshot(&client, &bucket_name, &prefix, name)
+        .await?
+        .ok_or_else(|| anyhow!("No snapshot found for database: {}", name))?;
+
+    let (snapshot_gen, snapshot_key, snapshot_min_txid, snapshot_max_txid) = snapshot;
+
+    // Parse point in time if provided (TXID only for litestream format)
     let target_txid = if let Some(pit) = point_in_time {
-        // Try parsing as TXID first
-        if let Ok(txid) = pit.parse::<u64>() {
-            txid
-        } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(pit) {
-            // Find latest file before timestamp
-            manifest
-                .files
-                .iter()
-                .filter(|f| {
-                    chrono::DateTime::parse_from_rfc3339(&f.created_at)
-                        .map(|fdt| fdt <= dt)
-                        .unwrap_or(false)
-                })
-                .map(|f| f.max_txid)
-                .max()
-                .ok_or_else(|| anyhow!("No LTX file found before {}", pit))?
-        } else {
-            return Err(anyhow!(
-                "Invalid point_in_time format. Use TXID (number) or ISO 8601 timestamp"
-            ));
-        }
+        pit.parse::<u64>().map_err(|_| {
+            anyhow!("Invalid point_in_time format. Use TXID (number)")
+        })?
     } else {
-        manifest.current_txid
+        current_txid
     };
 
-    // Find the best snapshot that covers our target TXID
-    // A snapshot has min_txid=1 and should have max_txid >= target_txid
-    let snapshot = manifest
-        .files
-        .iter()
-        .filter(|f| f.is_snapshot && f.max_txid <= target_txid)
-        .max_by_key(|f| f.max_txid)
-        .ok_or_else(|| anyhow!("No LTX snapshot found for TXID {}", target_txid))?;
-
     tracing::info!(
-        "Restoring from LTX snapshot: {} (TXID: {}-{})",
-        snapshot.filename,
-        snapshot.min_txid,
-        snapshot.max_txid
+        "Restoring from LTX snapshot: {} (TXID: {}-{}, generation: {})",
+        snapshot_key,
+        snapshot_min_txid,
+        snapshot_max_txid,
+        snapshot_gen
     );
 
     // Download and decode LTX snapshot
-    let ltx_key = format!("{}{}/{}", prefix, name, snapshot.filename);
-    let ltx_data = s3::download_bytes(&client, &bucket_name, &ltx_key).await?;
-
+    let ltx_data = s3::download_bytes(&client, &bucket_name, &snapshot_key).await?;
     let cursor = std::io::Cursor::new(ltx_data);
     let header = ltx::decode_to_db(cursor, output)?;
 
@@ -3371,45 +3340,38 @@ pub async fn restore(
         header.max_txid.into_inner()
     );
 
-    // Find incremental LTX files to apply (if any)
-    let mut incrementals: Vec<_> = manifest
-        .files
+    let mut final_txid = snapshot_max_txid;
+
+    // Get incrementals from generation 0 (live folder)
+    let incrementals = list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE).await?;
+
+    // Filter to files we need: min_txid > snapshot_max_txid and max_txid <= target_txid
+    let applicable: Vec<_> = incrementals
         .iter()
-        .filter(|f| {
-            !f.is_snapshot
-                && f.min_txid > snapshot.max_txid
-                && f.max_txid <= target_txid
-        })
+        .filter(|(_, min, max)| *min > snapshot_max_txid && *max <= target_txid)
         .collect();
 
-    // Sort by min_txid to apply in order
-    incrementals.sort_by_key(|f| f.min_txid);
+    if !applicable.is_empty() {
+        tracing::info!("Applying {} incremental LTX files", applicable.len());
 
-    let mut final_txid = snapshot.max_txid;
-
-    if !incrementals.is_empty() {
-        tracing::info!("Applying {} incremental LTX files", incrementals.len());
-
-        for entry in &incrementals {
-            let ltx_key = format!("{}{}/{}", prefix, name, entry.filename);
-            let ltx_data = s3::download_bytes(&client, &bucket_name, &ltx_key).await?;
-
+        for (key, min_txid, max_txid) in &applicable {
+            let ltx_data = s3::download_bytes(&client, &bucket_name, key).await?;
             let cursor = std::io::Cursor::new(ltx_data);
             let header = ltx::apply_ltx_to_db(cursor, output)?;
 
             tracing::debug!(
                 "Applied {} (TXID: {}-{})",
-                entry.filename,
+                key,
                 header.min_txid.into_inner(),
                 header.max_txid.into_inner()
             );
 
-            final_txid = header.max_txid.into_inner();
+            final_txid = *max_txid;
         }
 
         tracing::info!(
             "Applied {} incremental LTX files (final TXID: {})",
-            incrementals.len(),
+            applicable.len(),
             final_txid
         );
     }
@@ -3499,7 +3461,7 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
 
     let objects = s3::list_objects(&client, &bucket_name, &prefix).await?;
 
-    // Extract unique database names
+    // Extract unique database names (litestream format: db_name/GGGG/file.ltx)
     let mut dbs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     for key in &objects {
@@ -3516,17 +3478,28 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
         println!("No databases found in s3://{}/{}", bucket_name, prefix);
     } else {
         println!("Databases in s3://{}/{}:", bucket_name, prefix);
-        for db in dbs {
-            // Get latest snapshot info
-            let snapshots_prefix = format!("{}{}/snapshots/", prefix, db);
-            let snapshots = s3::list_objects(&client, &bucket_name, &snapshots_prefix).await?;
-            let snapshot_count = snapshots.len();
+        for db in &dbs {
+            // Discover state from S3 (litestream format)
+            let (current_txid, max_gen, _) =
+                discover_state_from_s3(&client, &bucket_name, &prefix, db).await?;
 
-            let wal_prefix = format!("{}{}/wal/", prefix, db);
-            let wals = s3::list_objects(&client, &bucket_name, &wal_prefix).await?;
-            let wal_count = wals.len();
+            // Count files in generation 0 (live incrementals)
+            let live_files = list_generation_files(&client, &bucket_name, &prefix, db, GENERATION_LIVE).await?;
 
-            println!("  {} ({} snapshots, {} WAL segments)", db, snapshot_count, wal_count);
+            // Find snapshots (generation 1+)
+            let snapshot = find_latest_snapshot(&client, &bucket_name, &prefix, db).await?;
+            let snapshot_info = match snapshot {
+                Some((gen, _, _, max_txid)) => format!("snapshot gen {} (TXID {})", gen, max_txid),
+                None => "no snapshot".to_string(),
+            };
+
+            println!(
+                "  {} (TXID: {}, {} incrementals, {})",
+                db,
+                current_txid,
+                live_files.len(),
+                snapshot_info
+            );
         }
     }
 
@@ -3709,19 +3682,16 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("Invalid database path"))?;
 
-    let timestamp = Utc::now();
-
     // Get page size from database header
     let page_size = get_page_size(database).await?;
 
-    // Load existing manifest to get current TXID
-    let mut manifest = load_manifest(&client, &bucket_name, &prefix, name).await?;
-    let new_txid = manifest.current_txid + 1;
+    // Discover current state from S3 to get current TXID and generation
+    let (current_txid, current_gen, _) = discover_state_from_s3(&client, &bucket_name, &prefix, name).await?;
+    let new_txid = current_txid + 1;
+    let snapshot_gen = current_gen + 1;
 
-    // LTX filename: {min_txid:08}-{max_txid:08}.ltx
-    // For a snapshot, min=1 (contains all pages)
-    let ltx_filename = format!("{:08}-{:08}.ltx", 1, new_txid);
-    let ltx_key = format!("{}{}/{}", prefix, name, ltx_filename);
+    // Snapshots go to generation 1+ (litestream format)
+    let ltx_key = build_ltx_key(&prefix, name, snapshot_gen, 1, new_txid);
 
     // Encode database as LTX
     // Pre-allocate buffer: estimate 2x db size for compression headroom
@@ -3735,29 +3705,16 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
     // Upload LTX file
     s3::upload_bytes(&client, &bucket_name, &ltx_key, ltx_buffer).await?;
 
-    // Update manifest
-    manifest.name = name.to_string();
-    manifest.current_txid = new_txid;
-    manifest.page_size = page_size;
-    manifest.files.push(LtxEntry {
-        filename: ltx_filename.clone(),
-        min_txid: 1,
-        max_txid: new_txid,
-        size: ltx_size,
-        created_at: timestamp.to_rfc3339(),
-        is_snapshot: true,
-    });
-    save_manifest(&client, &bucket_name, &prefix, &manifest).await?;
-
     tracing::info!(
-        "LTX snapshot uploaded: {} (TXID: {}, size: {} bytes)",
-        ltx_key,
+        "LTX snapshot uploaded (gen {}, TXID 1-{}, {} bytes) -> {}",
+        snapshot_gen,
         new_txid,
-        ltx_size
+        ltx_size,
+        ltx_key
     );
     println!(
-        "Snapshot uploaded: s3://{}/{} (TXID: {})",
-        bucket_name, ltx_key, new_txid
+        "Snapshot uploaded: s3://{}/{} (gen {}, TXID 1-{})",
+        bucket_name, ltx_key, snapshot_gen, new_txid
     );
     Ok(())
 }
@@ -4341,7 +4298,7 @@ pub async fn verify(
     name: &str,
     bucket: &str,
     endpoint: Option<&str>,
-    fix: bool,
+    _fix: bool, // No longer used - files are source of truth in litestream format
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint).await?;
@@ -4350,116 +4307,108 @@ pub async fn verify(
         name, bucket_name, prefix, name);
     println!();
 
-    // Load manifest
-    let manifest = load_manifest(&client, &bucket_name, &prefix, name).await?;
+    // Discover state from S3 (litestream format - no manifest)
+    let (current_txid, max_gen, _) =
+        discover_state_from_s3(&client, &bucket_name, &prefix, name).await?;
 
-    if manifest.files.is_empty() {
-        println!("No LTX files found in manifest.");
+    if current_txid == 0 {
+        println!("No LTX files found for database: {}", name);
         return Ok(());
     }
 
-    println!("Found {} LTX files in manifest", manifest.files.len());
-    println!("Current TXID: {}", manifest.current_txid);
-    println!("Page size: {} bytes", manifest.page_size);
+    // Collect all files from all generations
+    let mut all_files: Vec<(String, u64, u64, u64)> = Vec::new(); // (key, gen, min, max)
+
+    // Get files from generation 0 (live incrementals)
+    let live_files = list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE).await?;
+    for (key, min, max) in live_files {
+        all_files.push((key, GENERATION_LIVE, min, max));
+    }
+
+    // Get files from snapshot generations (1+)
+    for gen in 1..=max_gen {
+        let gen_files = list_generation_files(&client, &bucket_name, &prefix, name, gen).await?;
+        for (key, min, max) in gen_files {
+            all_files.push((key, gen, min, max));
+        }
+    }
+
+    println!("Found {} LTX files across {} generations", all_files.len(), max_gen + 1);
+    println!("Current TXID: {}", current_txid);
     println!();
 
     let mut issues: Vec<VerifyIssue> = Vec::new();
     let mut verified_count = 0;
     let mut total_size: u64 = 0;
 
-    // Check each LTX file
-    for entry in &manifest.files {
-        let ltx_key = format!("{}{}/{}", prefix, name, entry.filename);
+    // Verify each file
+    for (key, _gen, expected_min, expected_max) in &all_files {
+        match s3::download_bytes(&client, &bucket_name, key).await {
+            Ok(data) => {
+                let cursor = std::io::Cursor::new(&data);
+                match ltx::verify_ltx(cursor) {
+                    Ok(header) => {
+                        let header_min = header.min_txid.into_inner();
+                        let header_max = header.max_txid.into_inner();
 
-        // Check if file exists in S3
-        match s3::exists(&client, &bucket_name, &ltx_key).await {
-            Ok(true) => {
-                // File exists, download and verify
-                match s3::download_bytes(&client, &bucket_name, &ltx_key).await {
-                    Ok(data) => {
-                        let cursor = std::io::Cursor::new(&data);
-                        match ltx::verify_ltx(cursor) {
-                            Ok(header) => {
-                                // Verify header matches manifest entry
-                                let header_min = header.min_txid.into_inner();
-                                let header_max = header.max_txid.into_inner();
-
-                                if header_min != entry.min_txid || header_max != entry.max_txid {
-                                    issues.push(VerifyIssue {
-                                        filename: entry.filename.clone(),
-                                        issue: format!(
-                                            "TXID mismatch: manifest says {}-{}, header says {}-{}",
-                                            entry.min_txid, entry.max_txid,
-                                            header_min, header_max
-                                        ),
-                                        is_orphan: false,
-                                    });
-                                } else {
-                                    verified_count += 1;
-                                    total_size += data.len() as u64;
-                                }
-                            }
-                            Err(e) => {
-                                issues.push(VerifyIssue {
-                                    filename: entry.filename.clone(),
-                                    issue: format!("Checksum verification failed: {}", e),
-                                    is_orphan: false,
-                                });
-                            }
+                        // Verify header matches filename
+                        if header_min != *expected_min || header_max != *expected_max {
+                            issues.push(VerifyIssue {
+                                filename: key.clone(),
+                                issue: format!(
+                                    "TXID mismatch: filename says {}-{}, header says {}-{}",
+                                    expected_min, expected_max,
+                                    header_min, header_max
+                                ),
+                                is_orphan: false,
+                            });
+                        } else {
+                            verified_count += 1;
+                            total_size += data.len() as u64;
                         }
                     }
                     Err(e) => {
                         issues.push(VerifyIssue {
-                            filename: entry.filename.clone(),
-                            issue: format!("Download failed: {}", e),
+                            filename: key.clone(),
+                            issue: format!("Checksum verification failed: {}", e),
                             is_orphan: false,
                         });
                     }
                 }
             }
-            Ok(false) => {
-                // File missing from S3 but in manifest
-                issues.push(VerifyIssue {
-                    filename: entry.filename.clone(),
-                    issue: "File missing from S3".to_string(),
-                    is_orphan: true,
-                });
-            }
             Err(e) => {
                 issues.push(VerifyIssue {
-                    filename: entry.filename.clone(),
-                    issue: format!("S3 check failed: {}", e),
+                    filename: key.clone(),
+                    issue: format!("Download failed: {}", e),
                     is_orphan: false,
                 });
             }
         }
     }
 
-    // Check TXID continuity
-    let mut sorted_files: Vec<_> = manifest.files.iter().collect();
-    sorted_files.sort_by_key(|f| f.min_txid);
+    // Check TXID continuity in generation 0 (live)
+    let mut live_files: Vec<_> = all_files
+        .iter()
+        .filter(|(_, gen, _, _)| *gen == GENERATION_LIVE)
+        .collect();
+    live_files.sort_by_key(|(_, _, min, _)| *min);
 
     let mut expected_next_txid: Option<u64> = None;
-    for entry in &sorted_files {
+    for (key, _, min_txid, max_txid) in &live_files {
         if let Some(expected) = expected_next_txid {
-            // For incrementals, min_txid should be expected (previous max + 1)
-            // For snapshots, they can reset the chain (min_txid = 1)
-            if !entry.is_snapshot && entry.min_txid != expected {
-                // Check if there's a gap
-                if entry.min_txid > expected {
-                    issues.push(VerifyIssue {
-                        filename: entry.filename.clone(),
-                        issue: format!(
-                            "TXID gap: expected min_txid={}, got {} (missing TXIDs {}-{})",
-                            expected, entry.min_txid,
-                            expected, entry.min_txid - 1
-                        ),
-                        is_orphan: false,
-                    });
-                }
+            if *min_txid != expected && *min_txid > expected {
+                issues.push(VerifyIssue {
+                    filename: key.clone(),
+                    issue: format!(
+                        "TXID gap: expected min_txid={}, got {} (missing TXIDs {}-{})",
+                        expected, min_txid,
+                        expected, min_txid - 1
+                    ),
+                    is_orphan: false,
+                });
             }
         }
-        expected_next_txid = Some(entry.max_txid + 1);
+        expected_next_txid = Some(max_txid + 1);
     }
 
     // Report results
@@ -4476,42 +4425,13 @@ pub async fn verify(
 
     // Report issues
     println!("Issues Found:");
-    let orphan_count = issues.iter().filter(|i| i.is_orphan).count();
-    let other_count = issues.len() - orphan_count;
-
     for issue in &issues {
-        let marker = if issue.is_orphan { "[ORPHAN]" } else { "[ERROR]" };
-        println!("  {} {}: {}", marker, issue.filename, issue.issue);
+        println!("  [ERROR] {}: {}", issue.filename, issue.issue);
     }
     println!();
 
-    // Fix orphaned entries if requested
-    if fix && orphan_count > 0 {
-        println!("Fixing {} orphaned manifest entries...", orphan_count);
-
-        let orphan_filenames: std::collections::HashSet<_> = issues
-            .iter()
-            .filter(|i| i.is_orphan)
-            .map(|i| &i.filename)
-            .collect();
-
-        let mut fixed_manifest = manifest.clone();
-        fixed_manifest.files.retain(|f| !orphan_filenames.contains(&f.filename));
-
-        // Update current_txid to latest remaining file
-        if let Some(latest) = fixed_manifest.files.iter().max_by_key(|f| f.max_txid) {
-            fixed_manifest.current_txid = latest.max_txid;
-        }
-
-        save_manifest(&client, &bucket_name, &prefix, &fixed_manifest).await?;
-        println!("Removed {} orphaned entries from manifest.", orphan_count);
-    } else if orphan_count > 0 {
-        println!("Run with --fix to remove {} orphaned manifest entries.", orphan_count);
-    }
-
-    if other_count > 0 {
-        println!();
-        println!("Note: {} non-orphan issues found. These may require manual intervention:", other_count);
+    if !issues.is_empty() {
+        println!("Note: Issues may require manual intervention:");
         println!("  - Checksum failures indicate corrupted files");
         println!("  - TXID gaps may require restoring from an earlier snapshot");
     }
@@ -4797,34 +4717,21 @@ pub mod testable {
         )?;
 
         let ltx_size = ltx_buffer.len() as u64;
-        let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
-        let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+        // Incrementals go to generation 0 (live folder, litestream format)
+        let ltx_key = build_ltx_key(prefix, &state.name, GENERATION_LIVE, min_txid, max_txid);
 
         // Upload LTX file
-        let timestamp = Utc::now();
         storage.upload_bytes(&ltx_key, ltx_buffer).await?;
 
         tracing::info!(
-            "{}: Synced {} WAL frames as incremental LTX {} ({} bytes)",
+            "{}: Synced {} WAL frames as incremental LTX ({} bytes, TXID {}-{}) -> {}",
             state.name,
             frame_count,
-            ltx_filename,
-            ltx_size
-        );
-
-        // Update manifest
-        let mut manifest = load_manifest(storage, prefix, &state.name).await?;
-        manifest.current_txid = max_txid;
-        manifest.last_checksum = Some(post_checksum.into_inner());
-        manifest.files.push(LtxEntry {
-            filename: ltx_filename,
+            ltx_size,
             min_txid,
             max_txid,
-            size: ltx_size,
-            created_at: timestamp.to_rfc3339(),
-            is_snapshot: false,
-        });
-        save_manifest(storage, prefix, &manifest).await?;
+            ltx_key
+        );
 
         // Update state
         state.wal_offset = new_offset;
@@ -4851,9 +4758,9 @@ pub mod testable {
         // Increment TXID for this snapshot
         let new_txid = state.current_txid + 1;
 
-        // LTX filename: {min_txid:08}-{max_txid:08}.ltx
-        let ltx_filename = format!("{:08}-{:08}.ltx", 1, new_txid);
-        let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+        // Snapshots go to generation 1+ (litestream format)
+        // TODO: Increment generation properly when StorageBackend supports listing
+        let ltx_key = build_ltx_key(prefix, &state.name, 1, 1, new_txid);
 
         // Encode database as LTX
         // Pre-allocate buffer: estimate 2x db size for compression headroom
@@ -4871,34 +4778,17 @@ pub mod testable {
         let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
 
         tracing::info!(
-            "{}: LTX snapshot uploaded ({} bytes, TXID: {})",
+            "{}: LTX snapshot uploaded ({} bytes, TXID 1-{}) -> {}",
             state.name,
             ltx_size,
-            new_txid
+            new_txid,
+            ltx_key
         );
-
-        // Update manifest
-        let mut manifest = load_manifest(storage, prefix, &state.name).await?;
-        manifest.current_txid = new_txid;
-        manifest.page_size = page_size;
-        manifest.last_checksum = Some(db_checksum.into_inner());
-        manifest.files.push(LtxEntry {
-            filename: ltx_filename,
-            min_txid: 1,
-            max_txid: new_txid,
-            size: ltx_size,
-            created_at: timestamp.to_rfc3339(),
-            is_snapshot: true,
-        });
-        save_manifest(storage, prefix, &manifest).await?;
 
         // Update state
         state.current_txid = new_txid;
         state.last_snapshot = Some(timestamp);
         state.db_checksum = Some(db_checksum.into_inner());
-
-        // Save legacy state
-        save_state(storage, prefix, state).await?;
 
         Ok(())
     }
@@ -5051,9 +4941,6 @@ pub mod testable {
         state: &mut SyncState,
         retry_policy: &RetryPolicy,
     ) -> Result<()> {
-        // We need to handle the mutable state carefully
-        // The actual snapshot operation is not purely retryable because
-        // it modifies state, but we can retry the storage operations
         let timestamp = Utc::now();
 
         // Get page size from database header
@@ -5062,9 +4949,9 @@ pub mod testable {
         // Increment TXID for this snapshot
         let new_txid = state.current_txid + 1;
 
-        // LTX filename: {min_txid:08}-{max_txid:08}.ltx
-        let ltx_filename = format!("{:08}-{:08}.ltx", 1, new_txid);
-        let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+        // Snapshots go to generation 1+ (litestream format)
+        // TODO: Increment generation properly when StorageBackend supports listing
+        let ltx_key = build_ltx_key(prefix, &state.name, 1, 1, new_txid);
 
         // Encode database as LTX
         // Pre-allocate buffer: estimate 2x db size for compression headroom
@@ -5090,51 +4977,17 @@ pub mod testable {
         let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
 
         tracing::info!(
-            "{}: LTX snapshot uploaded ({} bytes, TXID: {})",
+            "{}: LTX snapshot uploaded ({} bytes, TXID 1-{}) -> {}",
             state.name,
             ltx_size,
-            new_txid
+            new_txid,
+            ltx_key
         );
-
-        // Update manifest with retry
-        let mut manifest = load_manifest(storage, prefix, &state.name).await?;
-        manifest.current_txid = new_txid;
-        manifest.page_size = page_size;
-        manifest.last_checksum = Some(db_checksum.into_inner());
-        manifest.files.push(LtxEntry {
-            filename: ltx_filename,
-            min_txid: 1,
-            max_txid: new_txid,
-            size: ltx_size,
-            created_at: timestamp.to_rfc3339(),
-            is_snapshot: true,
-        });
-
-        let manifest_clone = manifest.clone();
-        let prefix_str = prefix.to_string();
-        retry_policy
-            .execute_with_context("save manifest", || {
-                let m = manifest_clone.clone();
-                let p = prefix_str.clone();
-                async move { save_manifest(storage, &p, &m).await }
-            })
-            .await?;
 
         // Update state
         state.current_txid = new_txid;
         state.last_snapshot = Some(timestamp);
         state.db_checksum = Some(db_checksum.into_inner());
-
-        // Save legacy state with retry
-        let state_clone = state.clone();
-        let prefix_str = prefix.to_string();
-        retry_policy
-            .execute_with_context("save state", || {
-                let s = state_clone.clone();
-                let p = prefix_str.clone();
-                async move { save_state(storage, &p, &s).await }
-            })
-            .await?;
 
         Ok(())
     }
@@ -5219,11 +5072,10 @@ pub mod testable {
         )?;
 
         let ltx_size = ltx_buffer.len() as u64;
-        let ltx_filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
-        let ltx_key = format!("{}{}/{}", prefix, state.name, ltx_filename);
+        // Incrementals go to generation 0 (live folder, litestream format)
+        let ltx_key = build_ltx_key(prefix, &state.name, GENERATION_LIVE, min_txid, max_txid);
 
         // Upload LTX file with retry
-        let timestamp = Utc::now();
         let upload_buffer = ltx_buffer.clone();
         let upload_key = ltx_key.clone();
         retry_policy
@@ -5235,51 +5087,19 @@ pub mod testable {
             .await?;
 
         tracing::info!(
-            "{}: Synced {} WAL frames as incremental LTX {} ({} bytes)",
+            "{}: Synced {} WAL frames as incremental LTX ({} bytes, TXID {}-{}) -> {}",
             state.name,
             frame_count,
-            ltx_filename,
-            ltx_size
-        );
-
-        // Update manifest with retry
-        let mut manifest = load_manifest(storage, prefix, &state.name).await?;
-        manifest.current_txid = max_txid;
-        manifest.last_checksum = Some(post_checksum.into_inner());
-        manifest.files.push(LtxEntry {
-            filename: ltx_filename,
+            ltx_size,
             min_txid,
             max_txid,
-            size: ltx_size,
-            created_at: timestamp.to_rfc3339(),
-            is_snapshot: false,
-        });
-
-        let manifest_clone = manifest.clone();
-        let prefix_str = prefix.to_string();
-        retry_policy
-            .execute_with_context("save manifest", || {
-                let m = manifest_clone.clone();
-                let p = prefix_str.clone();
-                async move { save_manifest(storage, &p, &m).await }
-            })
-            .await?;
+            ltx_key
+        );
 
         // Update state
         state.wal_offset = new_offset;
         state.current_txid = max_txid;
         state.db_checksum = Some(post_checksum.into_inner());
-
-        // Save legacy state with retry
-        let state_clone = state.clone();
-        let prefix_str = prefix.to_string();
-        retry_policy
-            .execute_with_context("save state", || {
-                let s = state_clone.clone();
-                let p = prefix_str.clone();
-                async move { save_state(storage, &p, &s).await }
-            })
-            .await?;
 
         Ok(frame_count as u64)
     }
@@ -5888,18 +5708,41 @@ mod tests {
 
     #[test]
     fn test_ltx_filename_format() {
-        // Test the LTX filename format: {min_txid:08}-{max_txid:08}.ltx
+        // Test litestream-compatible LTX filename format: {min_txid:016x}-{max_txid:016x}.ltx
         let test_cases = vec![
-            (1, 1, "00000001-00000001.ltx"),
-            (1, 100, "00000001-00000100.ltx"),
-            (50, 150, "00000050-00000150.ltx"),
-            (1000000, 1000050, "01000000-01000050.ltx"),
+            (1, 1, "0000000000000001-0000000000000001.ltx"),
+            (1, 100, "0000000000000001-0000000000000064.ltx"),
+            (50, 150, "0000000000000032-0000000000000096.ltx"),
+            (1000000, 1000050, "00000000000f4240-00000000000f4272.ltx"),
         ];
 
         for (min_txid, max_txid, expected) in test_cases {
-            let filename = format!("{:08}-{:08}.ltx", min_txid, max_txid);
+            let filename = format_ltx_filename(min_txid, max_txid);
             assert_eq!(filename, expected);
         }
+    }
+
+    #[test]
+    fn test_parse_ltx_filename() {
+        // Test parsing litestream-format filenames
+        assert_eq!(parse_ltx_filename("0000000000000001-0000000000000001.ltx"), Some((1, 1)));
+        assert_eq!(parse_ltx_filename("0000000000000001-0000000000000064.ltx"), Some((1, 100)));
+        assert_eq!(parse_ltx_filename("00000000000f4240-00000000000f4272.ltx"), Some((1000000, 1000050)));
+        assert_eq!(parse_ltx_filename("invalid.ltx"), None);
+        assert_eq!(parse_ltx_filename("no-extension"), None);
+    }
+
+    #[test]
+    fn test_build_ltx_key() {
+        // Test building full S3 keys
+        assert_eq!(
+            build_ltx_key("prefix/", "mydb", 0, 1, 10),
+            "prefix/mydb/0000/0000000000000001-000000000000000a.ltx"
+        );
+        assert_eq!(
+            build_ltx_key("", "mydb", 1, 1, 100),
+            "mydb/0001/0000000000000001-0000000000000064.ltx"
+        );
     }
 
     #[test]
@@ -7664,13 +7507,10 @@ mod tests {
         // Take initial snapshot
         snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
 
-        // Get initial manifest state
+        // Get initial state from S3 (litestream format - no manifest)
         let client = crate::s3::create_client(endpoint.as_deref()).await.unwrap();
         let (bucket_name, prefix) = crate::s3::parse_bucket(&bucket);
-        let manifest_key = format!("{}{}/manifest.json", prefix, db_name);
-        let initial_manifest = crate::s3::download_bytes(&client, &bucket_name, &manifest_key).await.unwrap();
-        let initial_manifest: Manifest = serde_json::from_slice(&initial_manifest).unwrap();
-        let initial_txid = initial_manifest.current_txid;
+        let (initial_txid, _, _) = discover_state_from_s3(&client, &bucket_name, &prefix, db_name).await.unwrap();
 
         // Write more data to grow the WAL (keeping connection open = mmap writes)
         let conn = Connection::open(&db_path).unwrap();
@@ -7693,6 +7533,7 @@ mod tests {
 
         // Create DbState for sync - start fresh after snapshot
         // The snapshot resets WAL state, so we start from offset 0
+        let db_checksum = ltx::compute_checksum_from_file(&db_path).ok().map(|c| c.into_inner());
         let mut state = DbState {
             name: db_name.to_string(),
             db_path: db_path.clone(),
@@ -7701,7 +7542,7 @@ mod tests {
             wal_generation: 0,
             current_txid: initial_txid,
             last_snapshot: None,
-            db_checksum: initial_manifest.last_checksum,
+            db_checksum,
         };
 
         // Sync WAL - this should detect and upload new frames
@@ -7710,14 +7551,13 @@ mod tests {
         let frame_count = result.unwrap();
         assert!(frame_count > 0, "Should have synced new WAL frames, got {}", frame_count);
 
-        // Verify manifest was updated
-        let updated_manifest = crate::s3::download_bytes(&client, &bucket_name, &manifest_key).await.unwrap();
-        let updated_manifest: Manifest = serde_json::from_slice(&updated_manifest).unwrap();
+        // Verify TXID increased (using discover_state_from_s3 instead of manifest)
+        let (updated_txid, _, _) = discover_state_from_s3(&client, &bucket_name, &prefix, db_name).await.unwrap();
         assert!(
-            updated_manifest.current_txid > initial_txid,
+            updated_txid > initial_txid,
             "TXID should have increased: {} -> {}",
             initial_txid,
-            updated_manifest.current_txid
+            updated_txid
         );
 
         // Cleanup
@@ -7780,17 +7620,10 @@ mod tests {
         for db_path in &db_paths {
             let db_name = db_path.file_stem().unwrap().to_str().unwrap();
             let wal_path = db_path.with_extension("db-wal");
-            let manifest_key = format!("{}{}/manifest.json", prefix, db_name);
 
-            // Get current_txid and last_checksum from manifest
-            let (current_txid, db_checksum) =
-                match crate::s3::download_bytes(&client, &bucket_name, &manifest_key).await {
-                    Ok(data) => {
-                        let manifest: Manifest = serde_json::from_slice(&data).unwrap();
-                        (manifest.current_txid, manifest.last_checksum)
-                    }
-                    Err(_) => (0, None),
-                };
+            // Get current_txid from S3 (litestream format - no manifest)
+            let (current_txid, _, _) = discover_state_from_s3(&client, &bucket_name, &prefix, db_name).await.unwrap();
+            let db_checksum = ltx::compute_checksum_from_file(db_path).ok().map(|c| c.into_inner());
 
             // Start fresh after snapshot - WAL offset resets to 0
             let mut state = DbState {

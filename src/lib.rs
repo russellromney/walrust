@@ -2,8 +2,10 @@
 //!
 //! This library provides Python bindings for syncing SQLite WAL files to S3-compatible storage.
 
+pub mod cache;
 pub mod config;
 pub mod dashboard;
+pub mod errors;
 pub mod ltx;
 pub mod retention;
 pub mod retry;
@@ -11,6 +13,7 @@ pub mod s3;
 pub mod shadow;
 pub mod storage;
 pub mod sync;
+pub mod uploader;
 pub mod wal;
 pub mod webhook;
 
