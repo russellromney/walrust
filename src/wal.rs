@@ -17,6 +17,20 @@ pub struct WalHeader {
     pub checksum2: u32,
 }
 
+impl WalHeader {
+    /// Get salt values as a tuple for comparison
+    /// Salt changes indicate a checkpoint occurred
+    pub fn salt(&self) -> (u32, u32) {
+        (self.salt1, self.salt2)
+    }
+
+    /// Check if this header represents a different WAL generation than another
+    /// Used to detect checkpoints
+    pub fn is_different_generation(&self, other: &WalHeader) -> bool {
+        self.salt1 != other.salt1 || self.salt2 != other.salt2
+    }
+}
+
 /// WAL frame header (24 bytes per frame)
 #[derive(Debug, Clone)]
 pub struct FrameHeader {
@@ -133,6 +147,21 @@ pub struct ParsedFrame {
     pub data: Vec<u8>,
 }
 
+/// Result of reading WAL frames with additional metadata for checkpoint detection
+#[derive(Debug)]
+pub struct WalReadResult {
+    /// Parsed frames
+    pub frames: Vec<ParsedFrame>,
+    /// New offset after reading
+    pub new_offset: u64,
+    /// Maximum database size in pages (from commit frames)
+    pub max_db_size: u32,
+    /// WAL header salt values (for checkpoint detection)
+    pub salt: (u32, u32),
+    /// Whether WAL was truncated during read (file smaller than expected)
+    pub truncated_during_read: bool,
+}
+
 /// Read and parse WAL frames into pages, returns (pages, new_offset, max_db_size)
 pub async fn read_frames_as_pages(
     path: &Path,
@@ -199,6 +228,167 @@ pub async fn read_frames_as_pages(
     let new_offset = start_pos + full_frames * frame_size;
 
     Ok((frames, new_offset, max_db_size))
+}
+
+/// Read WAL frames with full metadata for robust checkpoint detection
+///
+/// This function provides:
+/// - Salt values for detecting checkpoint (WAL reset)
+/// - Post-read size verification to detect truncation during read
+/// - All frame data with commit information
+pub async fn read_frames_with_metadata(
+    path: &Path,
+    page_size: u32,
+    start_offset: u64,
+    expected_salt: Option<(u32, u32)>,
+) -> Result<WalReadResult> {
+    // Read header first to get salt values
+    let header = match read_header(path).await? {
+        Some(h) => h,
+        None => {
+            return Ok(WalReadResult {
+                frames: Vec::new(),
+                new_offset: start_offset,
+                max_db_size: 0,
+                salt: (0, 0),
+                truncated_during_read: false,
+            });
+        }
+    };
+
+    let current_salt = header.salt();
+
+    // Check if checkpoint occurred (salt changed)
+    let checkpoint_detected = expected_salt
+        .map(|expected| expected != current_salt && expected != (0, 0))
+        .unwrap_or(false);
+
+    if checkpoint_detected {
+        tracing::info!(
+            "WAL checkpoint detected: salt changed from {:?} to {:?}",
+            expected_salt,
+            current_salt
+        );
+        // Return empty result with new salt - caller should take a snapshot
+        return Ok(WalReadResult {
+            frames: Vec::new(),
+            new_offset: 0, // Reset offset since WAL was reset
+            max_db_size: 0,
+            salt: current_salt,
+            truncated_during_read: false,
+        });
+    }
+
+    let mut file = File::open(path).await?;
+    let file_size_before = file.metadata().await?.len();
+
+    let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+
+    let start_pos = if start_offset == 0 {
+        WAL_HEADER_SIZE
+    } else {
+        start_offset
+    };
+
+    if start_pos >= file_size_before {
+        return Ok(WalReadResult {
+            frames: Vec::new(),
+            new_offset: start_pos,
+            max_db_size: 0,
+            salt: current_salt,
+            truncated_during_read: false,
+        });
+    }
+
+    file.seek(SeekFrom::Start(start_pos)).await?;
+
+    let available = file_size_before - start_pos;
+    let full_frames = available / frame_size;
+
+    if full_frames == 0 {
+        return Ok(WalReadResult {
+            frames: Vec::new(),
+            new_offset: start_pos,
+            max_db_size: 0,
+            salt: current_salt,
+            truncated_during_read: false,
+        });
+    }
+
+    let mut frames = Vec::with_capacity(full_frames as usize);
+    let mut max_db_size: u32 = 0;
+    let mut truncated = false;
+
+    for i in 0..full_frames {
+        // Read frame header (24 bytes)
+        let mut header_buf = [0u8; 24];
+        match file.read_exact(&mut header_buf).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                // WAL was truncated during read
+                tracing::warn!(
+                    "WAL truncated during read at frame {} (expected {} frames)",
+                    i,
+                    full_frames
+                );
+                truncated = true;
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        let page_number =
+            u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let db_size =
+            u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+
+        // Read page data
+        let mut page_data = vec![0u8; page_size as usize];
+        match file.read_exact(&mut page_data).await {
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                tracing::warn!(
+                    "WAL truncated during page read at frame {} (expected {} frames)",
+                    i,
+                    full_frames
+                );
+                truncated = true;
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+
+        if db_size > max_db_size {
+            max_db_size = db_size;
+        }
+
+        frames.push(ParsedFrame {
+            page_number,
+            db_size,
+            data: page_data,
+        });
+    }
+
+    // Post-read verification: check if file size changed
+    let file_size_after = get_wal_size(path).await?;
+    if file_size_after < file_size_before {
+        tracing::warn!(
+            "WAL size decreased during read ({} -> {}), possible checkpoint",
+            file_size_before,
+            file_size_after
+        );
+        truncated = true;
+    }
+
+    let new_offset = start_pos + (frames.len() as u64 * frame_size);
+
+    Ok(WalReadResult {
+        frames,
+        new_offset,
+        max_db_size,
+        salt: current_salt,
+        truncated_during_read: truncated,
+    })
 }
 
 #[cfg(test)]
@@ -415,6 +605,117 @@ mod tests {
         // Should only return 1 complete frame, ignoring partial
         assert_eq!(count, 1);
         assert_eq!(frames.len(), frame_size);
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[test]
+    fn test_wal_header_salt() {
+        let header = WalHeader {
+            magic: 0x377F0682,
+            format_version: 3007000,
+            page_size: 4096,
+            checkpoint_seq: 1,
+            salt1: 0x12345678,
+            salt2: 0xABCDEF00,
+            checksum1: 0,
+            checksum2: 0,
+        };
+
+        assert_eq!(header.salt(), (0x12345678, 0xABCDEF00));
+    }
+
+    #[test]
+    fn test_wal_header_is_different_generation() {
+        let header1 = WalHeader {
+            magic: 0x377F0682,
+            format_version: 3007000,
+            page_size: 4096,
+            checkpoint_seq: 1,
+            salt1: 0x12345678,
+            salt2: 0xABCDEF00,
+            checksum1: 0,
+            checksum2: 0,
+        };
+
+        let header2 = WalHeader {
+            salt1: 0x12345678,
+            salt2: 0xABCDEF00,
+            ..header1.clone()
+        };
+
+        let header3 = WalHeader {
+            salt1: 0x87654321, // Different salt
+            salt2: 0xABCDEF00,
+            ..header1.clone()
+        };
+
+        assert!(!header1.is_different_generation(&header2));
+        assert!(header1.is_different_generation(&header3));
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_with_metadata_no_wal() {
+        let path = PathBuf::from("/tmp/nonexistent-wal-for-metadata.db-wal");
+
+        let result = read_frames_with_metadata(&path, 4096, 0, None).await.unwrap();
+
+        assert!(result.frames.is_empty());
+        assert_eq!(result.salt, (0, 0));
+        assert!(!result.truncated_during_read);
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_with_metadata_checkpoint_detection() {
+        let path = PathBuf::from(format!("/tmp/walrust-test-meta-{}.db-wal", uuid::Uuid::new_v4()));
+
+        // Create WAL header with specific salt
+        let mut header = [0u8; 32];
+        header[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        header[8..12].copy_from_slice(&4096u32.to_be_bytes());
+        header[16..20].copy_from_slice(&0x11111111u32.to_be_bytes()); // salt1
+        header[20..24].copy_from_slice(&0x22222222u32.to_be_bytes()); // salt2
+
+        tokio::fs::write(&path, &header).await.unwrap();
+
+        // Read with different expected salt - should detect checkpoint
+        let old_salt = (0xAAAAAAAA, 0xBBBBBBBB);
+        let result = read_frames_with_metadata(&path, 4096, 0, Some(old_salt)).await.unwrap();
+
+        // Should return new salt and reset offset
+        assert_eq!(result.salt, (0x11111111, 0x22222222));
+        assert_eq!(result.new_offset, 0); // Reset due to checkpoint
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_with_metadata_same_salt() {
+        let path = PathBuf::from(format!("/tmp/walrust-test-meta-{}.db-wal", uuid::Uuid::new_v4()));
+
+        let page_size: u32 = 4096;
+        let frame_size = FRAME_HEADER_SIZE as usize + page_size as usize;
+
+        // Create WAL header + 1 frame with specific salt
+        let mut data = vec![0u8; 32 + frame_size];
+        data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        data[8..12].copy_from_slice(&page_size.to_be_bytes());
+        data[16..20].copy_from_slice(&0x11111111u32.to_be_bytes()); // salt1
+        data[20..24].copy_from_slice(&0x22222222u32.to_be_bytes()); // salt2
+
+        // Frame header: page 1, db_size 1
+        data[32..36].copy_from_slice(&1u32.to_be_bytes()); // page_number
+        data[36..40].copy_from_slice(&1u32.to_be_bytes()); // db_size
+
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        // Read with same salt - should proceed normally
+        let same_salt = (0x11111111, 0x22222222);
+        let result = read_frames_with_metadata(&path, page_size, 0, Some(same_salt)).await.unwrap();
+
+        assert_eq!(result.frames.len(), 1);
+        assert_eq!(result.salt, same_salt);
+        assert!(!result.truncated_during_read);
 
         tokio::fs::remove_file(&path).await.ok();
     }

@@ -615,6 +615,8 @@ pub async fn watch_with_config(
                 error_count: 0,
                 snapshot_count: 0,
                 current_txid,
+                last_error: None,
+                errors_last_hour: None,
             })
             .await;
     }
@@ -853,6 +855,8 @@ pub async fn watch_with_config(
                                     error_count: 0,
                                     snapshot_count: 0,
                                     current_txid: state.current_txid,
+                                    last_error: None,
+                                    errors_last_hour: None,
                                 }).await;
 
                                 // Check for emergency truncate threshold
@@ -1559,6 +1563,8 @@ pub async fn watch_with_shadow(
                 error_count: 0,
                 snapshot_count: 0,
                 current_txid,
+                last_error: None,
+                errors_last_hour: None,
             })
             .await;
     }
@@ -1843,6 +1849,8 @@ pub async fn watch_with_shadow(
                                     error_count: 0,
                                     snapshot_count: 0,
                                     current_txid: state.current_txid,
+                                    last_error: None,
+                                    errors_last_hour: None,
                                 }).await;
 
                                 // Update trigger state
@@ -2895,6 +2903,8 @@ async fn do_sync(
             error_count: 0,
             snapshot_count: 0,
             current_txid: state.db_state.current_txid,
+            last_error: None,
+            errors_last_hour: None,
         }).await;
     }
 
@@ -3629,6 +3639,224 @@ pub async fn compact(
     );
 
     Ok(())
+}
+
+/// Compaction result statistics
+#[derive(Debug, Clone)]
+pub struct CompactionStats {
+    /// Number of incrementals merged
+    pub incrementals_merged: usize,
+    /// Total bytes of merged incrementals
+    pub bytes_merged: u64,
+    /// New snapshot TXID range
+    pub new_snapshot_txid: u64,
+    /// S3 key of new snapshot
+    pub new_snapshot_key: String,
+    /// Incrementals deleted (if cleanup enabled)
+    pub incrementals_deleted: usize,
+}
+
+/// Configuration for incremental compaction
+#[derive(Debug, Clone)]
+pub struct CompactionConfig {
+    /// Minimum number of incrementals before compacting
+    pub min_incrementals: usize,
+    /// Maximum total size of incrementals before compacting (bytes)
+    pub max_incremental_bytes: u64,
+    /// Maximum age of oldest incremental before compacting (seconds)
+    pub max_incremental_age_secs: u64,
+    /// Delete incrementals after successful compaction
+    pub delete_incrementals: bool,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            min_incrementals: 10,
+            max_incremental_bytes: 100 * 1024 * 1024, // 100 MB
+            max_incremental_age_secs: 3600,            // 1 hour
+            delete_incrementals: true,
+        }
+    }
+}
+
+/// Read the change counter (TXID) from SQLite database header
+async fn read_database_txid(db_path: &Path) -> Result<u64> {
+    use tokio::io::AsyncReadExt;
+    let mut file = tokio::fs::File::open(db_path).await?;
+    let mut header = [0u8; 100];
+    file.read_exact(&mut header).await?;
+
+    // Change counter is at offset 24-27, big-endian
+    let change_counter = u32::from_be_bytes([header[24], header[25], header[26], header[27]]);
+
+    Ok(change_counter as u64)
+}
+
+/// Compact incrementals in generation 0 into a new snapshot
+///
+/// This function:
+/// 1. Lists all incrementals in generation 0
+/// 2. Downloads the latest snapshot (from generation 1+) if exists
+/// 3. Applies all incrementals to restore the full database state
+/// 4. Creates a new snapshot with all data merged
+/// 5. Uploads new snapshot to generation 1 (or higher)
+/// 6. Optionally deletes old incrementals from generation 0
+pub async fn compact_incrementals(
+    name: &str,
+    bucket: &str,
+    endpoint: Option<&str>,
+    config: &CompactionConfig,
+    force: bool,
+) -> Result<Option<CompactionStats>> {
+    let (bucket_name, prefix) = parse_bucket(bucket);
+    let client = create_client(endpoint).await?;
+
+    // List all files in generation 0 (incrementals)
+    let gen0_prefix = format!("{}{}/0000/", prefix, name);
+    let gen0_files = s3::list_objects(&client, &bucket_name, &gen0_prefix).await?;
+
+    // Parse incremental files (key only, size estimated later)
+    let mut incrementals: Vec<(String, u64, u64)> = Vec::new(); // (key, min_txid, max_txid)
+
+    for key in &gen0_files {
+        if let Some(filename) = key.strip_prefix(&gen0_prefix) {
+            if filename.ends_with(".ltx") {
+                // Parse TXID range from filename: {min}-{max}.ltx
+                if let Some((min_str, rest)) = filename.strip_suffix(".ltx").and_then(|f| f.split_once('-')) {
+                    if let (Ok(min_txid), Ok(max_txid)) = (
+                        u64::from_str_radix(min_str, 16),
+                        u64::from_str_radix(rest, 16),
+                    ) {
+                        // Skip snapshots (min_txid == 1)
+                        if min_txid > 1 {
+                            incrementals.push((key.clone(), min_txid, max_txid));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Sort by min_txid
+    incrementals.sort_by_key(|(_, min_txid, _)| *min_txid);
+
+    // Check if compaction is needed (based on count only, no size info available)
+    if incrementals.len() < config.min_incrementals {
+        tracing::debug!(
+            "Compaction not needed: {} incrementals (threshold: {})",
+            incrementals.len(),
+            config.min_incrementals
+        );
+        return Ok(None);
+    }
+
+    tracing::info!(
+        "Compacting {} incrementals for database '{}'",
+        incrementals.len(),
+        name
+    );
+
+    // Create temp directory for restoration
+    let temp_dir = tempfile::tempdir()?;
+    let restore_path = temp_dir.path().join(format!("{}.db", name));
+
+    // Restore to temp file (this applies snapshot + all incrementals)
+    restore(
+        name,
+        restore_path.as_path(),
+        bucket,
+        endpoint,
+        None,
+    )
+    .await?;
+
+    // Get page size from restored database
+    let page_size = get_page_size(&restore_path).await?;
+
+    // Get the max TXID from the restored database
+    let restored_txid = read_database_txid(&restore_path).await?;
+
+    // Determine generation for new snapshot (use generation 1 for compacted snapshots)
+    let snapshot_gen = 1u32;
+    let gen_folder = format!("{:04x}", snapshot_gen);
+
+    // Create LTX snapshot buffer
+    let db_path_for_encode = restore_path.clone();
+    let (ltx_buffer, _) = tokio::task::spawn_blocking(move || {
+        let mut ltx_buffer = Vec::new();
+        crate::ltx::encode_snapshot(&mut ltx_buffer, &db_path_for_encode, page_size, restored_txid)
+            .map_err(|e| anyhow::anyhow!("Compaction snapshot encode failed: {}", e))?;
+        let db_checksum = crate::ltx::compute_checksum_from_file(&db_path_for_encode)?;
+        Ok::<_, anyhow::Error>((ltx_buffer, db_checksum))
+    })
+    .await??;
+
+    let ltx_size = ltx_buffer.len() as u64;
+
+    // Upload new snapshot to S3
+    let s3_key = format!("{}{}/{}/{:016x}-{:016x}.ltx", prefix, name, gen_folder, 1u64, restored_txid);
+
+    if !force {
+        println!("Dry-run mode: would upload snapshot to {}", s3_key);
+        println!("  New snapshot: TXID 1-{}", restored_txid);
+        println!("  Size: {} bytes", ltx_size);
+        println!("  Would delete {} incrementals", incrementals.len());
+        return Ok(None);
+    }
+
+    tracing::info!("Uploading compacted snapshot: {}", s3_key);
+    s3::upload_bytes(&client, &bucket_name, &s3_key, ltx_buffer).await?;
+
+    // Delete old incrementals if configured
+    let mut deleted_count = 0;
+    if config.delete_incrementals {
+        let keys_to_delete: Vec<String> = incrementals.iter().map(|(k, _, _)| k.clone()).collect();
+        deleted_count = s3::delete_objects(&client, &bucket_name, &keys_to_delete).await?;
+        tracing::info!("Deleted {} incrementals after compaction", deleted_count);
+    }
+
+    Ok(Some(CompactionStats {
+        incrementals_merged: incrementals.len(),
+        bytes_merged: ltx_size, // Use new snapshot size as proxy
+        new_snapshot_txid: restored_txid,
+        new_snapshot_key: s3_key,
+        incrementals_deleted: deleted_count,
+    }))
+}
+
+/// Check if compaction should be triggered based on config
+pub async fn should_compact(
+    name: &str,
+    bucket: &str,
+    endpoint: Option<&str>,
+    config: &CompactionConfig,
+) -> Result<bool> {
+    let (bucket_name, prefix) = parse_bucket(bucket);
+    let client = create_client(endpoint).await?;
+
+    // List files in generation 0
+    let gen0_prefix = format!("{}{}/0000/", prefix, name);
+    let gen0_files = s3::list_objects(&client, &bucket_name, &gen0_prefix).await?;
+
+    let mut incremental_count = 0;
+
+    for key in &gen0_files {
+        if let Some(filename) = key.strip_prefix(&gen0_prefix) {
+            if filename.ends_with(".ltx") {
+                if let Some((min_str, _rest)) = filename.strip_suffix(".ltx").and_then(|f| f.split_once('-')) {
+                    if let Ok(min_txid) = u64::from_str_radix(min_str, 16) {
+                        if min_txid > 1 {
+                            // It's an incremental
+                            incremental_count += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(incremental_count >= config.min_incrementals)
 }
 
 /// Format age of a snapshot in human-readable form

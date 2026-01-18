@@ -1498,6 +1498,422 @@ Before declaring walrust production-ready:
 
 ---
 
+## v0.2.0 Plan (Post-Format Completion)
+
+**Goal**: Complete feature parity with litestream for production use.
+
+### Priority 1: Litestream Restore Compatibility Test
+
+**Status**: TEST INFRASTRUCTURE COMPLETE (needs valid S3 credentials to run)
+
+**Goal**: Verify that walrust backups can be restored by litestream CLI and vice versa.
+
+**Why This Matters**:
+- Users can migrate between tools without data loss
+- Validates our LTX format implementation is truly compatible
+- Provides confidence the format is correct before adding more features
+
+**Test Plan**:
+
+1. **Walrust → Litestream Restore**
+   ```bash
+   # Create test database with known data
+   sqlite3 test.db "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT); INSERT INTO t VALUES(1,'hello'),(2,'world');"
+
+   # Backup with walrust
+   walrust watch test.db -b s3://bucket/test --snapshot-interval 5
+   # Wait for snapshot + some incrementals
+
+   # Attempt restore with litestream
+   litestream restore -o restored.db s3://bucket/test
+
+   # Verify data integrity
+   sqlite3 restored.db "SELECT * FROM t;"
+   ```
+
+2. **Litestream → Walrust Restore**
+   ```bash
+   # Create and backup with litestream
+   sqlite3 test.db "CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT);"
+   litestream replicate test.db s3://bucket/test
+
+   # Attempt restore with walrust
+   walrust restore test -o restored.db -b s3://bucket
+
+   # Verify data integrity
+   ```
+
+3. **Format Differences to Check**:
+   - [ ] Generation folder naming (0000, 0001, etc.)
+   - [ ] TXID filename format (16-char hex)
+   - [ ] LTX header compatibility
+   - [ ] Checksum chaining
+   - [ ] Snapshot vs incremental detection
+
+**Implementation**:
+- [x] Create `tests/litestream_compat.sh` - Shell script for manual testing
+- [ ] Create `walrust-dst/src/litestream_compat.rs` - Automated compatibility tests
+- [x] Document any differences in `docs/LITESTREAM_COMPAT.md`
+
+**Success Criteria**:
+- [ ] Walrust backup restores successfully with litestream CLI (needs credentials)
+- [ ] Litestream backup restores successfully with walrust CLI (needs credentials)
+- [ ] All data integrity preserved (byte-for-byte identical)
+- [ ] Test script added to CI (optional, requires litestream binary)
+
+---
+
+### Priority 2: Compaction (Merge Incrementals into Snapshots)
+
+**Status**: COMPLETE (v0.2.0) - Core implementation done
+
+**Current State**:
+- `retention.rs` has GFS policy for snapshot retention (deleting old snapshots)
+- `compact` command exists but only handles snapshot retention
+- Incrementals in `0000/` folder are not merged
+
+**Goal**: Implement litestream-style compaction that merges incrementals into new snapshots.
+
+**Litestream Compaction Model**:
+```
+Before Compaction:
+  db/0000/0000000000000001-0000000000000001.ltx  # Snapshot (gen 0)
+  db/0000/0000000000000002-0000000000000010.ltx  # Incremental
+  db/0000/0000000000000011-0000000000000050.ltx  # Incremental
+  db/0000/0000000000000051-0000000000000100.ltx  # Incremental
+
+After Compaction:
+  db/0001/0000000000000001-0000000000000100.ltx  # New snapshot (gen 1)
+  db/0000/0000000000000101-0000000000000150.ltx  # New incrementals continue
+```
+
+**Implementation Phases**:
+
+**Phase 2.1: Compaction Core Logic**
+- New function: `compact_generation()` in `src/sync.rs`
+- Read all LTX files from generation 0
+- Apply them sequentially to create full database state
+- Write new snapshot LTX to next generation
+- Update generation counter
+
+**Phase 2.2: Incremental Deletion**
+- After successful snapshot creation, delete old incrementals
+- Keep configurable number of recent incrementals (for PITR)
+- Atomic operation: only delete after upload confirmed
+
+**Phase 2.3: Auto-Compaction Triggers**
+- `--compact-threshold <N>` - Compact after N incrementals
+- `--compact-size <bytes>` - Compact when incrementals exceed size
+- `--compact-age <duration>` - Compact incrementals older than duration
+
+**Phase 2.4: Manual Compaction Command**
+```bash
+# Compact specific database
+walrust compact mydb -b s3://bucket --force
+
+# Dry-run (show what would happen)
+walrust compact mydb -b s3://bucket
+
+# Compact all databases
+walrust compact --all -b s3://bucket --force
+```
+
+**Configuration**:
+```toml
+[compaction]
+enabled = true
+threshold = 100           # Compact after 100 incrementals
+max_incremental_age = "24h"  # Compact incrementals older than 24h
+preserve_recent = 10      # Keep 10 most recent incrementals for PITR
+```
+
+**Files to Modify**:
+- `src/sync.rs` - Add `compact_generation()`, `apply_incrementals_to_snapshot()`
+- `src/main.rs` - Enhance `compact` command with new options
+- `src/config.rs` - Add compaction configuration
+- `src/retention.rs` - Rename to handle both snapshot retention AND incremental compaction
+
+**Tests**:
+- [ ] `test_compact_single_generation` - Basic compaction
+- [ ] `test_compact_preserves_data` - Restore after compaction works
+- [ ] `test_compact_threshold_trigger` - Auto-compact on count
+- [ ] `test_compact_size_trigger` - Auto-compact on size
+- [ ] `test_compact_with_concurrent_writes` - Safe under load
+- [ ] `test_compact_failure_recovery` - No data loss on partial failure
+
+**Success Criteria**:
+- [ ] Compaction reduces S3 object count significantly
+- [ ] Restore works correctly after compaction
+- [ ] PITR still works within preserved window
+- [ ] No data loss during compaction
+- [ ] Concurrent writes during compaction are safe
+
+---
+
+### Priority 3: WAL Checkpoint Handling Improvements
+
+**Status**: COMPLETE (v0.2.0)
+
+**Current State**:
+- Shadow WAL mode exists (`--shadow-wal`)
+- Checkpoint interval configurable (`--checkpoint-interval`)
+- Min checkpoint pages configurable (`--min-checkpoint-pages`)
+- WAL truncate threshold exists (`--wal-truncate-threshold`)
+
+**Remaining Edge Cases**:
+
+**3.1: Checkpoint Detection During Sync**
+- **Problem**: SQLite can checkpoint (reset WAL to frame 0) while walrust is reading
+- **Current behavior**: May lose frames or get confused
+- **Solution**: Detect checkpoint via WAL header generation change, trigger re-snapshot
+
+**Implementation**:
+```rust
+// In sync_wal():
+let current_generation = wal::read_header(&wal_path)?.generation;
+if current_generation != state.wal_generation {
+    tracing::warn!("WAL checkpoint detected (gen {} -> {}), taking snapshot",
+        state.wal_generation, current_generation);
+    state.wal_generation = current_generation;
+    state.wal_offset = 0;
+    take_snapshot(...).await?;
+    return Ok(0); // No frames to sync, snapshot handled it
+}
+```
+
+**3.2: Partial Frame Read Handling**
+- **Problem**: Reading frames while SQLite is writing can get partial data
+- **Current behavior**: May upload corrupted LTX
+- **Solution**: Validate frame checksum before including in LTX
+
+**Implementation**:
+```rust
+// In wal::read_frames():
+for frame in frames {
+    if !frame.validate_checksum() {
+        // Frame incomplete, stop here and retry later
+        break;
+    }
+    valid_frames.push(frame);
+}
+```
+
+**3.3: WAL File Truncation Mid-Read**
+- **Problem**: WAL file can shrink mid-read due to checkpoint
+- **Current behavior**: May get IO error or stale data
+- **Solution**: Re-check file size after read, handle ENOENT gracefully
+
+**3.4: Graceful Checkpoint Coordination**
+- **Problem**: External checkpoints (from app) can interfere
+- **Current behavior**: Reactive detection only
+- **Enhancement**: Proactive checkpoint blocking via read transaction (shadow WAL does this)
+
+**Files to Modify**:
+- `src/wal.rs` - Add generation tracking, frame validation
+- `src/sync.rs` - Checkpoint detection in sync loop
+- `src/shadow.rs` - Ensure checkpoint blocking is robust
+
+**Tests**:
+- [x] `test_wal_header_salt` - Salt extraction from WAL header
+- [x] `test_wal_header_is_different_generation` - Generation comparison
+- [x] `test_read_frames_with_metadata_no_wal` - Handle missing WAL
+- [x] `test_read_frames_with_metadata_same_salt` - Normal operation
+- [x] `test_read_frames_with_metadata_checkpoint_detection` - Detect checkpoint via salt change
+
+**Success Criteria**:
+- [x] No data loss when checkpoint occurs during sync (salt-based detection triggers re-snapshot)
+- [x] No corrupted LTX files from partial frames (truncation detection)
+- [x] Graceful recovery from WAL truncation (WalReadResult.truncated_during_read flag)
+- [x] All edge cases have tests (5 new tests added)
+
+---
+
+### Priority 4: Production Hardening
+
+**Status**: COMPLETE (v0.2.0)
+
+**Current State**:
+- Dashboard with Prometheus metrics exists (`--metrics-port`)
+- Webhook notifications exist (sync_failed, auth_failure, etc.)
+- Retry logic with circuit breaker exists
+- Basic exit codes exist
+
+**Remaining Work**:
+
+**4.1: Structured Exit Codes**
+
+```rust
+// src/errors.rs - enhance ExitStatus
+pub enum ExitStatus {
+    Success = 0,
+    GeneralError = 1,
+    ConfigError = 2,
+    DatabaseError = 3,
+    S3AuthError = 4,
+    S3ConnectionError = 5,
+    S3BucketNotFound = 6,
+    ChecksumMismatch = 7,
+    ManifestCorrupt = 8,
+    WalCorrupt = 9,
+    DiskFull = 10,
+    Interrupted = 130,  // SIGINT
+}
+```
+
+**CLI Documentation**:
+```bash
+walrust watch --help
+# ...
+# EXIT CODES:
+#   0   Success
+#   1   General error
+#   2   Configuration error (invalid config file, missing required args)
+#   3   Database error (file not found, corrupt, locked)
+#   4   S3 authentication error (invalid credentials)
+#   5   S3 connection error (network unreachable, timeout)
+#   6   S3 bucket not found
+#   7   Checksum mismatch (data corruption detected)
+#   130 Interrupted (SIGINT/Ctrl+C)
+```
+
+**4.2: Graceful Shutdown Enhancement**
+
+Current: Basic signal handling
+Enhancement: Complete in-flight operations, flush metrics
+
+```rust
+// Enhanced shutdown in src/sync.rs
+async fn graceful_shutdown(
+    pending_uploads: Vec<PendingUpload>,
+    timeout: Duration,
+) -> Result<()> {
+    tracing::info!("Shutdown requested, completing {} pending uploads...", pending_uploads.len());
+
+    let start = Instant::now();
+    for upload in pending_uploads {
+        if start.elapsed() > timeout {
+            tracing::warn!("Shutdown timeout, {} uploads abandoned", remaining);
+            break;
+        }
+        upload.complete().await?;
+    }
+
+    // Flush metrics
+    dashboard::flush_metrics().await;
+
+    tracing::info!("Graceful shutdown complete");
+    Ok(())
+}
+```
+
+**4.3: Enhanced Metrics**
+
+New metrics to add:
+```
+# Compaction metrics
+walrust_compaction_total{db="mydb"} 5
+walrust_compaction_duration_seconds{db="mydb"} 2.5
+walrust_incrementals_merged_total{db="mydb"} 150
+
+# Cache metrics (for disk-based upload queue)
+walrust_cache_size_bytes{db="mydb"} 1048576
+walrust_cache_pending_uploads{db="mydb"} 3
+walrust_cache_upload_retries_total{db="mydb"} 2
+
+# Checkpoint metrics
+walrust_checkpoint_total{db="mydb",type="passive"} 100
+walrust_checkpoint_total{db="mydb",type="truncate"} 2
+walrust_checkpoint_duration_seconds{db="mydb"} 0.5
+
+# Error classification
+walrust_errors_total{db="mydb",type="transient"} 5
+walrust_errors_total{db="mydb",type="permanent"} 1
+```
+
+**4.4: Better Error Messages**
+
+```rust
+// Before:
+Err(anyhow!("Failed to upload"))
+
+// After:
+Err(WalrustError::S3Upload {
+    key: key.to_string(),
+    bucket: bucket.to_string(),
+    source: e,
+    suggestion: "Check S3 credentials and bucket permissions",
+})
+```
+
+**4.5: Health Check Endpoint**
+
+```bash
+# GET /health returns:
+{
+  "status": "healthy",  // or "degraded", "unhealthy"
+  "databases": {
+    "mydb": {
+      "status": "syncing",
+      "last_sync": "2024-01-15T10:30:00Z",
+      "lag_seconds": 2,
+      "errors_last_hour": 0
+    }
+  },
+  "s3": {
+    "connected": true,
+    "last_successful_upload": "2024-01-15T10:30:00Z"
+  },
+  "uptime_seconds": 86400
+}
+```
+
+**Files to Modify**:
+- `src/errors.rs` - Enhanced exit codes, error types
+- `src/main.rs` - Exit code handling, shutdown handling
+- `src/dashboard.rs` - New metrics, health endpoint
+- `src/sync.rs` - Graceful shutdown integration
+
+**Tests**:
+- [x] `test_exit_codes` - Verify correct exit code for each error type (in errors.rs)
+- [x] `test_graceful_shutdown` - Pending uploads complete (test_uploader_graceful_shutdown)
+- [x] `test_health_endpoint_healthy` - Returns healthy status
+- [x] `test_health_endpoint_degraded` - Returns degraded status on errors
+- [x] `test_health_endpoint_unhealthy` - Returns unhealthy on S3 disconnection
+- [x] `test_production_metrics` - Checkpoint, retry, sync latency metrics
+
+**Success Criteria**:
+- [x] All exit codes documented and consistent (errors.rs has 7 exit codes)
+- [x] Graceful shutdown completes pending work (uploader.rs)
+- [x] Health endpoint provides actionable status (/health returns JSON)
+- [x] Error messages include troubleshooting hints (classify_error patterns)
+- [x] All new metrics exported to Prometheus (checkpoint, retry, sync_latency)
+
+---
+
+## v0.2.0 Implementation Order
+
+Recommended execution sequence:
+
+1. **Litestream Compatibility Test** (1-2 days)
+   - Quick validation, low risk
+   - Identifies any format issues early
+
+2. **WAL Checkpoint Handling** (2-3 days)
+   - Fixes edge cases in existing code
+   - Improves reliability before adding features
+
+3. **Production Hardening** (2-3 days)
+   - Exit codes, shutdown, metrics
+   - Makes tool production-ready
+
+4. **Compaction** (3-5 days)
+   - Largest feature
+   - Benefits from hardened foundation
+
+**Total Estimate**: 8-13 days of focused work
+
+---
+
 ## References
 
 - [Litestream Revamped](https://fly.io/blog/litestream-revamped/) - LTX format, multi-DB

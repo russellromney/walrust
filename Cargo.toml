@@ -77,10 +77,12 @@ walkdir = "2"
 axum = "0.7"
 prometheus = "0.13"
 
+# Compaction
+tempfile = "3"
+
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 brunch = "0.5"
-tempfile = "3"
 tower = "0.5"
 
 [[bench]]
