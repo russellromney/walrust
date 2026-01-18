@@ -3372,7 +3372,7 @@ pub async fn restore(
     );
 
     // Find incremental LTX files to apply (if any)
-    let incrementals: Vec<_> = manifest
+    let mut incrementals: Vec<_> = manifest
         .files
         .iter()
         .filter(|f| {
@@ -3382,18 +3382,43 @@ pub async fn restore(
         })
         .collect();
 
+    // Sort by min_txid to apply in order
+    incrementals.sort_by_key(|f| f.min_txid);
+
+    let mut final_txid = snapshot.max_txid;
+
     if !incrementals.is_empty() {
-        tracing::info!("Found {} incremental LTX files to apply", incrementals.len());
-        // TODO: Apply incremental LTX files
-        // For now, snapshots are sufficient for basic restore
-        tracing::warn!("Incremental LTX replay not yet implemented - using snapshot only");
+        tracing::info!("Applying {} incremental LTX files", incrementals.len());
+
+        for entry in &incrementals {
+            let ltx_key = format!("{}{}/{}", prefix, name, entry.filename);
+            let ltx_data = s3::download_bytes(&client, &bucket_name, &ltx_key).await?;
+
+            let cursor = std::io::Cursor::new(ltx_data);
+            let header = ltx::apply_ltx_to_db(cursor, output)?;
+
+            tracing::debug!(
+                "Applied {} (TXID: {}-{})",
+                entry.filename,
+                header.min_txid.into_inner(),
+                header.max_txid.into_inner()
+            );
+
+            final_txid = header.max_txid.into_inner();
+        }
+
+        tracing::info!(
+            "Applied {} incremental LTX files (final TXID: {})",
+            incrementals.len(),
+            final_txid
+        );
     }
 
     println!(
         "Restored {} to {} (TXID: {})",
         name,
         output.display(),
-        snapshot.max_txid
+        final_txid
     );
     Ok(())
 }
