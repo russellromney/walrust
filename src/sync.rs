@@ -10,14 +10,16 @@ use std::time::Duration;
 use tokio::signal;
 use tokio::sync::mpsc;
 
-use crate::config::{CacheConfig, Config, ResolvedDbConfig, SyncConfig, WebhookConfig};
+use crate::cache::LocalCache;
+use crate::config::{parse_duration_string, CacheConfig, Config, ResolvedDbConfig, SyncConfig, WebhookConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::ltx;
 use crate::shadow::ShadowWal;
 use crate::retention::{self, RetentionPolicy, SnapshotEntry};
 use crate::retry::{classify_error, ErrorKind, RetryConfig, RetryPolicy};
 use crate::s3::{self, create_client, parse_bucket};
-use crate::storage::StorageBackend;
+use crate::storage::{S3Backend, StorageBackend};
+use crate::uploader::{spawn_uploader, UploadMessage, Uploader};
 use crate::wal;
 use crate::webhook::{WebhookEvent, WebhookSender};
 
@@ -514,12 +516,11 @@ pub async fn watch_with_config(
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(create_client(endpoint).await?);
 
-    // Log cache status (integration pending)
+    // Note: Cache mode is only supported with independent tasks (watch_with_independent_tasks)
+    // This legacy shared-state mode doesn't support cache - log warning if enabled
     if cache_config.enabled {
-        tracing::debug!("Cache enabled but integration pending - using direct S3 upload");
+        tracing::warn!("Cache mode is only supported with independent tasks architecture. Using direct S3 upload.");
     }
-    // TODO: Phase 3 - Initialize LocalCache and spawn Uploader per database
-    let _ = cache_config; // Suppress unused warning until integration complete
 
     // Set up retry policy and webhook sender
     let retry_policy = RetryPolicy::new(retry_config.clone());
@@ -654,23 +655,9 @@ pub async fn watch_with_config(
         }
     }
 
-    // Initial sync of any existing WAL data
-    for (db_path, state) in db_states.iter_mut() {
-        if state.wal_path.exists() {
-            let frame_count = sync_wal_with_retry(&client, &bucket_name, &prefix, state, &retry_policy, &webhook_sender).await?;
-            if frame_count > 0 {
-                if let Some(trigger) = trigger_states.get_mut(db_path) {
-                    trigger.frames_since_snapshot += frame_count;
-                    trigger.last_wal_activity = Some(std::time::Instant::now());
-                    if trigger.first_change_time.is_none() {
-                        trigger.first_change_time = Some(std::time::Instant::now());
-                    }
-                }
-            }
-        }
-    }
-
-    // Take initial snapshots if on_startup is enabled
+    // Take initial snapshots FIRST if on_startup is enabled.
+    // This establishes the base state before any incremental WAL syncs.
+    // The snapshot checkpoints WAL to main db, ensuring all committed data is captured.
     for (db_path, state) in db_states.iter_mut() {
         let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
         if sync_config.on_startup {
@@ -688,6 +675,28 @@ pub async fn watch_with_config(
                     {
                         tracing::error!("Failed to compact {}: {}", state.name, e);
                     }
+                }
+            }
+        }
+    }
+
+    // Sync any WAL data that accumulated since the snapshot (typically empty after checkpoint)
+    for (db_path, state) in db_states.iter_mut() {
+        if state.wal_path.exists() {
+            match sync_wal_with_retry(&client, &bucket_name, &prefix, state, &retry_policy, &webhook_sender).await {
+                Ok(frame_count) if frame_count > 0 => {
+                    if let Some(trigger) = trigger_states.get_mut(db_path) {
+                        trigger.frames_since_snapshot += frame_count;
+                        trigger.last_wal_activity = Some(std::time::Instant::now());
+                        if trigger.first_change_time.is_none() {
+                            trigger.first_change_time = Some(std::time::Instant::now());
+                        }
+                    }
+                }
+                Ok(_) => {} // No frames to sync
+                Err(e) => {
+                    // WAL sync failure after snapshot is non-fatal - log and continue
+                    tracing::warn!("{}: Initial WAL sync failed (will retry on next change): {}", state.name, e);
                 }
             }
         }
@@ -1194,12 +1203,24 @@ pub async fn watch_with_independent_tasks(
 ) -> Result<()> {
     use tokio::sync::broadcast;
 
-    // Log cache status (integration pending)
-    if cache_config.enabled {
-        tracing::debug!("Cache enabled but integration pending - using direct S3 upload");
-    }
-    // TODO: Phase 3 - Initialize LocalCache and spawn Uploader per database
-    let _ = cache_config; // Suppress unused warning until integration complete
+    // Parse cache retention duration
+    let cache_retention = if cache_config.enabled {
+        match parse_duration_string(&cache_config.retention) {
+            Ok(d) => {
+                tracing::info!(
+                    "Cache enabled: retention={}, max_size={}MB",
+                    cache_config.retention,
+                    cache_config.max_size / 1024 / 1024
+                );
+                Some(d)
+            }
+            Err(e) => {
+                return Err(anyhow!("Invalid cache retention '{}': {}", cache_config.retention, e));
+            }
+        }
+    } else {
+        None
+    };
 
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(create_client(endpoint).await?);
@@ -1308,7 +1329,7 @@ pub async fn watch_with_independent_tasks(
             db_state: DbState {
                 name: name.clone(),
                 db_path: db_path.clone(),
-                wal_path,
+                wal_path: wal_path.clone(),
                 wal_offset,
                 wal_generation,
                 current_txid,
@@ -1317,6 +1338,70 @@ pub async fn watch_with_independent_tasks(
             },
             trigger_state: TriggerState::default(),
             sync_config: db_config.sync.clone(),
+        };
+
+        // Initialize cache and uploader if cache is enabled
+        let cache_state = if let Some(ref retention) = cache_retention {
+            // Determine cache directory path
+            let cache_dir = if let Some(ref custom_path) = cache_config.path {
+                PathBuf::from(custom_path).join(&name)
+            } else {
+                // Default: .{db_name}-walrust/ next to database file
+                let parent = db_path.parent().unwrap_or(Path::new("."));
+                parent.join(format!(".{}-walrust", name))
+            };
+
+            // Create cache directory if it doesn't exist
+            if !cache_dir.exists() {
+                std::fs::create_dir_all(&cache_dir)
+                    .map_err(|e| anyhow!("Failed to create cache directory {}: {}", cache_dir.display(), e))?;
+            }
+
+            // Create LocalCache
+            let cache = Arc::new(LocalCache::new(&cache_dir)?);
+            tracing::debug!("{}: LocalCache initialized at {}", name, cache_dir.display());
+
+            // Create ShadowWal for checkpoint-safe frame copying
+            let shadow = ShadowWal::new(db_path).await
+                .map_err(|e| anyhow!("{}: Failed to create shadow WAL: {}", name, e))?;
+            let shadow = Arc::new(tokio::sync::Mutex::new(shadow));
+            tracing::debug!("{}: ShadowWal initialized (checkpoint blocker active)", name);
+
+            // Resume pending uploads count
+            let pending_count = cache.pending_uploads().len();
+            if pending_count > 0 {
+                tracing::info!("{}: Found {} pending uploads to resume", name, pending_count);
+            }
+
+            // Create S3Backend for uploader
+            // Note: AWS SDK Client is Clone (cheap Arc internally)
+            let storage: Arc<dyn StorageBackend> = Arc::new(
+                S3Backend::new((*client).clone(), bucket_name.clone())
+            );
+
+            // Create Uploader
+            let s3_prefix = format!("{}/{}", prefix, name);
+            let uploader = Arc::new(Uploader::new(
+                name.clone(),
+                Arc::clone(&cache),
+                storage,
+                s3_prefix,
+                Arc::new(retry_policy.clone()),
+                Arc::clone(&webhook_sender),
+            ));
+
+            // Spawn uploader task and get channel
+            let upload_tx = spawn_uploader(uploader);
+
+            Some(CacheState {
+                cache,
+                shadow,
+                upload_tx,
+                retention_duration: *retention,
+                max_cache_size: cache_config.max_size,
+            })
+        } else {
+            None
         };
 
         // Spawn independent task
@@ -1338,6 +1423,7 @@ pub async fn watch_with_independent_tasks(
                 webhooks,
                 metrics,
                 shutdown_rx,
+                cache_state,
             ).await {
                 tracing::error!("{}: Task failed: {}", name, e);
             }
@@ -2734,6 +2820,19 @@ struct DbTaskState {
     sync_config: SyncConfig,
 }
 
+/// Optional cache state for disk-based upload queue
+struct CacheState {
+    /// Local disk cache for LTX files
+    cache: Arc<LocalCache>,
+    /// Shadow WAL for checkpoint-safe frame copying
+    shadow: Arc<tokio::sync::Mutex<ShadowWal>>,
+    /// Channel to send upload notifications to uploader task
+    upload_tx: mpsc::Sender<UploadMessage>,
+    /// Cache config for cleanup parameters
+    retention_duration: chrono::Duration,
+    max_cache_size: u64,
+}
+
 /// Run an independent task for a single database
 ///
 /// Each database gets its own task that:
@@ -2741,6 +2840,9 @@ struct DbTaskState {
 /// 2. Debounces rapid writes (configurable, default 100ms)
 /// 3. Syncs at max_interval even under continuous writes
 /// 4. Uses spawn_blocking for CPU-bound encoding
+///
+/// When cache_state is Some, writes go to local disk cache first,
+/// then a separate uploader task handles S3 uploads asynchronously.
 async fn run_db_task(
     mut state: DbTaskState,
     client: Arc<aws_sdk_s3::Client>,
@@ -2750,6 +2852,7 @@ async fn run_db_task(
     webhook_sender: Arc<WebhookSender>,
     metrics_state: Arc<MetricsState>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    cache_state: Option<CacheState>,
 ) -> Result<()> {
     let db_name = state.db_state.name.clone();
     let wal_path = state.db_state.wal_path.clone();
@@ -2832,7 +2935,11 @@ async fn run_db_task(
             _ = shutdown_rx.recv() => {
                 // Final sync before shutdown
                 if changes_pending {
-                    let _ = do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state).await;
+                    let _ = do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await;
+                }
+                // Signal uploader to shutdown if cache is enabled
+                if let Some(ref cache) = cache_state {
+                    let _ = cache.upload_tx.send(UploadMessage::Shutdown).await;
                 }
                 break;
             }
@@ -2849,7 +2956,7 @@ async fn run_db_task(
             // Timeout expired - always try to sync (handles both pending changes and polling)
             _ = tokio::time::sleep(timeout) => {
                 // Time to sync
-                match do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state).await {
+                match do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await {
                     Ok(frame_count) => {
                         if frame_count > 0 {
                             tracing::debug!("{}: Synced {} frames", db_name, frame_count);
@@ -2873,6 +2980,9 @@ async fn run_db_task(
 }
 
 /// Perform a single sync operation for a DB task
+///
+/// When cache_state is Some, encodes LTX to disk cache and notifies uploader.
+/// When cache_state is None, uploads directly to S3 with retry logic.
 async fn do_sync(
     state: &mut DbTaskState,
     client: &aws_sdk_s3::Client,
@@ -2881,17 +2991,29 @@ async fn do_sync(
     retry_policy: &RetryPolicy,
     webhook_sender: &Arc<WebhookSender>,
     metrics_state: &Arc<MetricsState>,
+    cache_state: Option<&CacheState>,
 ) -> Result<u64> {
     let input = SyncInput::from(&state.db_state);
 
-    let result = sync_wal_concurrent_with_retry(
-        Arc::new(client.clone()),
-        bucket.to_string(),
-        prefix.to_string(),
-        input,
-        retry_policy.clone(),
-        Arc::clone(webhook_sender),
-    ).await?;
+    let result = if let Some(cache) = cache_state {
+        // Cache-enabled path: shadow WAL → encode → cache → notify uploader
+        sync_wal_to_cache(
+            &input,
+            &cache.cache,
+            &cache.shadow,
+            &cache.upload_tx,
+        ).await?
+    } else {
+        // Direct S3 upload path (current behavior)
+        sync_wal_concurrent_with_retry(
+            Arc::new(client.clone()),
+            bucket.to_string(),
+            prefix.to_string(),
+            input,
+            retry_policy.clone(),
+            Arc::clone(webhook_sender),
+        ).await?
+    };
 
     if result.frame_count > 0 {
         // Update state
@@ -2925,6 +3047,204 @@ async fn do_sync(
     }
 
     Ok(result.frame_count)
+}
+
+/// Sync WAL to local cache via shadow WAL (checkpoint-safe)
+///
+/// This function uses the Litestream-style shadow WAL architecture:
+/// 1. Shadow WAL holds checkpoint blocker (prevents SQLite from truncating WAL)
+/// 2. Frames are copied from live WAL to shadow (now safe from checkpoint)
+/// 3. Frames are encoded to LTX format
+/// 4. LTX is written to local disk cache (atomic write)
+/// 5. TXID notification sent to uploader task
+///
+/// The shadow WAL ensures no frames are lost to checkpoints. The uploader task
+/// runs independently and handles S3 uploads with retry. This provides both
+/// checkpoint safety and crash recovery.
+async fn sync_wal_to_cache(
+    input: &SyncInput,
+    cache: &Arc<LocalCache>,
+    shadow: &Arc<tokio::sync::Mutex<ShadowWal>>,
+    upload_tx: &mpsc::Sender<UploadMessage>,
+) -> Result<SyncOutput> {
+    use litetx::Checksum;
+
+    // Special case: Initial sync (current_txid == 0) should create a snapshot
+    if input.current_txid == 0 {
+        tracing::debug!("{}: Initial sync - creating snapshot from database file", input.name);
+
+        let page_size = {
+            let shadow_guard = shadow.lock().await;
+            shadow_guard.page_size()
+        };
+
+        let db_path_for_encode = input.db_path.clone();
+        let db_size = std::fs::metadata(&input.db_path)?.len() as usize;
+        let estimated_size = db_size.saturating_mul(2);
+        let db_name_for_error = input.name.clone();
+        let new_txid = 1u64;
+
+        let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
+            let mut ltx_buffer = Vec::with_capacity(estimated_size);
+            ltx::encode_snapshot(&mut ltx_buffer, &db_path_for_encode, page_size, new_txid)
+                .map_err(|e| anyhow::anyhow!("{}: Initial snapshot encode failed: {}", db_name_for_error, e))?;
+            let db_checksum = ltx::compute_checksum_from_file(&db_path_for_encode)?;
+            Ok::<_, anyhow::Error>((ltx_buffer, db_checksum))
+        }).await??;
+
+        let ltx_size = ltx_buffer.len();
+
+        // Write to cache instead of S3
+        cache.write_ltx(new_txid, &ltx_buffer)?;
+
+        // Notify uploader
+        if let Err(e) = upload_tx.send(UploadMessage::Upload(new_txid)).await {
+            tracing::warn!("{}: Failed to notify uploader for TXID {}: {}", input.name, new_txid, e);
+        }
+
+        tracing::info!(
+            "{}: Created initial snapshot LTX ({} bytes, TXID 1) -> cache",
+            input.name,
+            ltx_size
+        );
+
+        return Ok(SyncOutput {
+            db_path: input.db_path.clone(),
+            frame_count: 1,
+            new_wal_offset: 0,
+            new_current_txid: new_txid,
+            new_db_checksum: Some(db_checksum_new.into_inner()),
+            checkpoint_detected: false,
+            new_wal_generation: input.wal_generation,
+        });
+    }
+
+    // Normal incremental sync path using shadow WAL
+    // The shadow WAL:
+    // 1. Holds a checkpoint blocker connection (prevents auto-checkpoint)
+    // 2. Copies frames from live WAL to shadow segment files
+    // 3. Detects checkpoints via WAL salt changes
+    // 4. Returns frames that are now safely stored in shadow
+    let mut shadow_guard = shadow.lock().await;
+    let page_size = shadow_guard.page_size();
+
+    // Copy frames from live WAL to shadow (checkpoint-safe)
+    let (frames, new_offset) = shadow_guard.copy_frames(input.wal_offset).await?;
+
+    // Track if checkpoint was detected (shadow increments generation on checkpoint)
+    let shadow_gen = shadow_guard.generation();
+    let checkpoint_detected = shadow_gen > input.wal_generation;
+    let wal_generation = shadow_gen;
+
+    // Recompute checksum if checkpoint occurred
+    let db_checksum = if checkpoint_detected {
+        match ltx::compute_checksum_from_file(&input.db_path) {
+            Ok(cs) => {
+                tracing::debug!("{}: Recomputed checksum after checkpoint: {:#x}", input.name, cs.into_inner());
+                Some(cs.into_inner())
+            }
+            Err(e) => {
+                tracing::warn!("{}: Could not recompute checksum: {}", input.name, e);
+                input.db_checksum
+            }
+        }
+    } else {
+        input.db_checksum
+    };
+
+    drop(shadow_guard); // Release lock before CPU-bound encoding
+
+    // Get max_db_size from last commit frame (or 0 if none)
+    let max_db_size = frames.iter().filter(|f| f.db_size > 0).map(|f| f.db_size).max().unwrap_or(0);
+
+    if frames.is_empty() {
+        return Ok(SyncOutput {
+            db_path: input.db_path.clone(),
+            frame_count: 0,
+            new_wal_offset: new_offset,
+            new_current_txid: input.current_txid,
+            new_db_checksum: db_checksum,
+            checkpoint_detected,
+            new_wal_generation: wal_generation,
+        });
+    }
+
+    // Deduplicate pages: keep only the latest version of each page
+    let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    for frame in &frames {
+        page_map.insert(frame.page_number, frame.data.clone());
+    }
+
+    let frame_count = frames.len();
+    let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
+
+    // Get pre_apply_checksum from state or compute from db
+    let pre_checksum = match db_checksum {
+        Some(cs) => Checksum::new(cs),
+        None => {
+            tracing::debug!("{}: Computing checksum from database (no cached value)", input.name);
+            ltx::compute_checksum_from_file(&input.db_path)?
+        }
+    };
+
+    // Increment TXID for this incremental
+    let min_txid = input.current_txid + 1;
+    let max_txid = min_txid + pages.len() as u64 - 1;
+    let commit_page = if max_db_size > 0 { max_db_size } else {
+        let db_size = std::fs::metadata(&input.db_path)?.len();
+        (db_size / page_size as u64) as u32
+    };
+
+    // Encode as incremental LTX
+    let unique_pages = pages.len();
+    let estimated_size = unique_pages.saturating_mul(page_size as usize).saturating_mul(2);
+    let db_name_for_error = input.name.clone();
+    let page_nums: Vec<u32> = pages.iter().map(|(n, _)| *n).collect();
+
+    let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
+        let mut ltx_buffer = Vec::with_capacity(estimated_size);
+        let post_checksum = ltx::encode_wal_changes(
+            &mut ltx_buffer,
+            &pages,
+            page_size,
+            min_txid,
+            max_txid,
+            commit_page,
+            Some(pre_checksum),
+        ).map_err(|e| anyhow::anyhow!("{}: LTX encode failed (pages={:?}, page_size={}, txid={}-{}, commit={}): {}",
+            db_name_for_error, page_nums, page_size, min_txid, max_txid, commit_page, e))?;
+        Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
+    }).await??;
+
+    let ltx_size = ltx_buffer.len();
+
+    // Write to cache - use max_txid as the file identifier
+    cache.write_ltx(max_txid, &ltx_buffer)?;
+
+    // Notify uploader
+    if let Err(e) = upload_tx.send(UploadMessage::Upload(max_txid)).await {
+        tracing::warn!("{}: Failed to notify uploader for TXID {}: {}", input.name, max_txid, e);
+    }
+
+    tracing::info!(
+        "{}: Synced {} WAL frames to cache ({} bytes, {} unique pages, TXID {}-{})",
+        input.name,
+        frame_count,
+        ltx_size,
+        unique_pages,
+        min_txid,
+        max_txid
+    );
+
+    Ok(SyncOutput {
+        db_path: input.db_path.clone(),
+        frame_count: frame_count as u64,
+        new_wal_offset: new_offset,
+        new_current_txid: max_txid,
+        new_db_checksum: Some(post_checksum.into_inner()),
+        checkpoint_detected,
+        new_wal_generation: wal_generation,
+    })
 }
 
 // ============================================================================
@@ -3186,6 +3506,11 @@ async fn take_snapshot(
 ) -> Result<()> {
     let timestamp = Utc::now();
 
+    // CRITICAL: Checkpoint WAL to ensure all committed data is in the main database file.
+    // Without this, we could snapshot stale data if another connection holds WAL frames.
+    // Use PASSIVE to avoid blocking writers (we'll get whatever is safely checkpointable).
+    checkpoint_wal(&state.db_path).await?;
+
     // Get page size from database header
     let page_size = get_page_size(&state.db_path).await?;
 
@@ -3229,6 +3554,25 @@ async fn take_snapshot(
     state.last_snapshot = Some(timestamp);
     state.db_checksum = Some(db_checksum.into_inner());
 
+    Ok(())
+}
+
+/// Checkpoint WAL to ensure all committed data is in the main database file.
+/// Uses PASSIVE mode to avoid blocking active writers - this checkpoints whatever
+/// frames are safe to checkpoint without waiting for readers/writers.
+async fn checkpoint_wal(db_path: &Path) -> Result<()> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        // PASSIVE: checkpoint frames that can be checkpointed without blocking
+        // This won't block if there are active readers, but ensures we get committed data
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
     Ok(())
 }
 

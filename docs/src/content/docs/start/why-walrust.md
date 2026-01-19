@@ -7,16 +7,31 @@ Walrust exists for multi-tenant SQLite architectures - think a SaaS platform whe
 
 ## The Problem
 
-With multi-tenant SQLite, you might have hundreds, thousands, or even millions of databases on a single server. Each one needs backup and replication. Running a Litestream process per database didn't use to scale:
+With multi-tenant SQLite, you might have hundreds, thousands, or even millions of databases on a single server. Each one needs backup and replication. Walrust is optimized for lower memory usage in multi-database scenarios:
 
-| Databases | Litestream (before) | Walrust |
-|-----------|-----------|---------|
-| 1 | 33 MB | 12 MB |
-| 10 | 330 MB | 12 MB |
-| 100 | 3.3 GB | 15 MB |
-| 1000 | 33 GB | 50 MB |
+### Idle Databases
 
-## The Solution
+| Databases | Litestream | Walrust | Savings |
+|-----------|------------|---------|---------|
+| 5 | 40 MB | 13 MB | 27 MB |
+| 10 | 50 MB | 14 MB | 36 MB |
+| 20 | 62 MB | 17 MB | 45 MB |
+| 50 | 71 MB | 17 MB | 54 MB |
+
+### Under Write Load
+
+The difference grows dramatically under active writes:
+
+| DBs | Writes/s/db | Litestream | Walrust | Savings |
+|-----|-------------|------------|---------|---------|
+| 20 | 10 | 80 MB | 19 MB | 61 MB |
+| 20 | 100 | 103 MB | 24 MB | 78 MB |
+| 50 | 10 | 266 MB | 21 MB | **245 MB** |
+| 50 | 100 | 285 MB | 45 MB | **240 MB** |
+
+Both tools run as a single process watching multiple databases. Walrust scales flat (17-45 MB regardless of DB count) while litestream scales linearly. At 50 databases with active writes, walrust uses **6x less memory**.
+
+## Usage
 
 One walrust process watches all databases:
 

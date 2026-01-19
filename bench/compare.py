@@ -16,6 +16,7 @@ Usage:
     python bench/compare.py --litestream-only  # Only benchmark litestream
     python bench/compare.py --duration 10      # Measure for 10 seconds
     python bench/compare.py --db-size 1000     # 1MB test databases
+    python bench/compare.py --writes-per-sec 10  # 10 writes/sec per database
     python bench/compare.py --json             # Output as JSON
 """
 
@@ -28,6 +29,7 @@ import sqlite3
 import subprocess
 import tempfile
 import shutil
+import threading
 from pathlib import Path
 from dataclasses import dataclass, asdict
 from typing import Optional
@@ -42,6 +44,55 @@ try:
     import boto3
 except ImportError:
     boto3 = None  # Cleanup will be skipped
+
+
+def check_s3_credentials(bucket: str, endpoint: Optional[str] = None) -> None:
+    """Verify S3 credentials work before running benchmarks."""
+    if not boto3:
+        print("Warning: boto3 not installed, skipping credentials check")
+        return
+
+    # Check environment variables
+    access_key = os.environ.get("AWS_ACCESS_KEY_ID")
+    secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY")
+
+    if not access_key or not secret_key:
+        print("ERROR: AWS credentials not set!")
+        print("Required environment variables:")
+        print("  AWS_ACCESS_KEY_ID")
+        print("  AWS_SECRET_ACCESS_KEY")
+        print("  AWS_ENDPOINT_URL_S3 (for Tigris/MinIO)")
+        print("  LITESTREAM_ACCESS_KEY_ID (same as AWS_ACCESS_KEY_ID)")
+        print("  LITESTREAM_SECRET_ACCESS_KEY (same as AWS_SECRET_ACCESS_KEY)")
+        sys.exit(1)
+
+    # Check litestream credentials
+    ls_access = os.environ.get("LITESTREAM_ACCESS_KEY_ID")
+    ls_secret = os.environ.get("LITESTREAM_SECRET_ACCESS_KEY")
+    if not ls_access or not ls_secret:
+        print("ERROR: Litestream credentials not set!")
+        print("Set LITESTREAM_ACCESS_KEY_ID and LITESTREAM_SECRET_ACCESS_KEY")
+        sys.exit(1)
+
+    # Try to access the bucket
+    try:
+        session = boto3.Session()
+        config_kwargs = {}
+        if endpoint:
+            config_kwargs["endpoint_url"] = endpoint
+
+        s3 = session.client("s3", **config_kwargs)
+        bucket_name = bucket.replace("s3://", "").split("/")[0]
+
+        # Try to list (head_bucket requires different permissions)
+        s3.list_objects_v2(Bucket=bucket_name, MaxKeys=1)
+        print(f"S3 credentials verified (bucket: {bucket_name})")
+    except Exception as e:
+        print(f"ERROR: S3 credentials check failed!")
+        print(f"  Bucket: {bucket}")
+        print(f"  Endpoint: {endpoint or 'default'}")
+        print(f"  Error: {e}")
+        sys.exit(1)
 
 
 @dataclass
@@ -68,6 +119,61 @@ def create_test_database(path: Path, size_kb: int = 100) -> None:
 
     conn.commit()
     conn.close()
+
+
+class DatabaseWriter:
+    """Generates write load on databases during benchmark."""
+
+    def __init__(self, databases: list[Path], writes_per_sec: float):
+        self.databases = databases
+        self.writes_per_sec = writes_per_sec
+        self.running = False
+        self.threads: list[threading.Thread] = []
+        self.total_writes = 0
+        self.lock = threading.Lock()
+
+    def _writer_thread(self, db_path: Path):
+        """Writer thread for a single database."""
+        conn = sqlite3.connect(str(db_path), timeout=30.0)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")  # Faster writes
+
+        interval = 1.0 / self.writes_per_sec if self.writes_per_sec > 0 else 1.0
+        chunk = b"y" * 512  # 512 byte writes
+
+        while self.running:
+            try:
+                conn.execute("INSERT INTO data (value) VALUES (?)", (chunk,))
+                conn.commit()
+                with self.lock:
+                    self.total_writes += 1
+            except sqlite3.OperationalError as e:
+                # Database locked, skip this write
+                pass
+            time.sleep(interval)
+
+        conn.close()
+
+    def start(self):
+        """Start writer threads for all databases."""
+        if self.writes_per_sec <= 0:
+            return
+
+        self.running = True
+        self.total_writes = 0
+
+        for db_path in self.databases:
+            t = threading.Thread(target=self._writer_thread, args=(db_path,), daemon=True)
+            t.start()
+            self.threads.append(t)
+
+    def stop(self) -> int:
+        """Stop all writer threads and return total writes."""
+        self.running = False
+        for t in self.threads:
+            t.join(timeout=2.0)
+        self.threads = []
+        return self.total_writes
 
 
 def measure_process_stats(pids: list[int], duration_secs: float = 5.0) -> tuple[float, float, float]:
@@ -107,6 +213,7 @@ def benchmark_walrust(
     bucket: str,
     endpoint: Optional[str] = None,
     duration: float = 5.0,
+    writes_per_sec: float = 0,
 ) -> BenchmarkResult:
     """Benchmark walrust with multiple databases (single process)."""
     walrust_bin = Path(__file__).parent.parent / "target" / "release" / "walrust"
@@ -143,8 +250,15 @@ def benchmark_walrust(
             startup_time_ms=startup_time,
         )
 
+    # Start write load if specified
+    writer = DatabaseWriter(databases, writes_per_sec)
+    writer.start()
+
     # Measure stats
     peak_mem, avg_mem, cpu = measure_process_stats([proc.pid], duration)
+
+    # Stop writers
+    total_writes = writer.stop()
 
     proc.terminate()
     proc.wait()
@@ -164,8 +278,9 @@ def benchmark_litestream(
     databases: list[Path],
     bucket: str,
     duration: float = 5.0,
+    writes_per_sec: float = 0,
 ) -> BenchmarkResult:
-    """Benchmark litestream with multiple databases (one process per db)."""
+    """Benchmark litestream with multiple databases (single process, multi-db config)."""
     litestream_bin = shutil.which("litestream")
 
     if not litestream_bin:
@@ -180,44 +295,47 @@ def benchmark_litestream(
             startup_time_ms=0,
         )
 
-    processes = []
+    # Create single litestream config with all databases
+    db_configs = []
+    for db in databases:
+        db_configs.append(f"""  - path: {db}
+    replicas:
+      - url: {bucket}/{db.stem}""")
+
+    config = "dbs:\n" + "\n".join(db_configs)
+    config_file = databases[0].parent / "litestream.yml"
+    config_file.write_text(config)
+
     start_time = time.time()
 
-    for db in databases:
-        # Create litestream config for this database
-        config = f"""
-dbs:
-  - path: {db}
-    replicas:
-      - url: {bucket}/{db.stem}
-"""
-        config_file = db.with_suffix(".litestream.yml")
-        config_file.write_text(config)
-
-        proc = subprocess.Popen(
-            [litestream_bin, "replicate", "-config", str(config_file)],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-        )
-        processes.append(proc)
+    proc = subprocess.Popen(
+        [litestream_bin, "replicate", "-config", str(config_file)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
 
     startup_time = (time.time() - start_time) * 1000
 
-    # Wait for processes to stabilize
+    # Wait for process to stabilize
     time.sleep(1)
 
-    # Measure stats
-    pids = [p.pid for p in processes]
-    peak_mem, avg_mem, cpu = measure_process_stats(pids, duration)
+    # Start write load if specified
+    writer = DatabaseWriter(databases, writes_per_sec)
+    writer.start()
 
-    for proc in processes:
-        proc.terminate()
-        proc.wait()
+    # Measure stats for single process
+    peak_mem, avg_mem, cpu = measure_process_stats([proc.pid], duration)
+
+    # Stop writers
+    total_writes = writer.stop()
+
+    proc.terminate()
+    proc.wait()
 
     return BenchmarkResult(
         name="litestream",
         num_databases=len(databases),
-        num_processes=len(databases),
+        num_processes=1,
         peak_memory_mb=peak_mem,
         avg_memory_mb=avg_mem,
         cpu_percent=cpu,
@@ -231,6 +349,7 @@ def run_comparison(
     endpoint: Optional[str] = None,
     db_size_kb: int = 100,
     duration: float = 5.0,
+    writes_per_sec: float = 0,
     walrust_only: bool = False,
     litestream_only: bool = False,
     quiet: bool = False,
@@ -253,22 +372,23 @@ def run_comparison(
                 databases.append(db_path)
 
             if not quiet:
-                print(f"Created {count} test databases ({db_size_kb}KB each)")
+                write_info = f", {writes_per_sec} writes/sec/db" if writes_per_sec > 0 else ""
+                print(f"Created {count} test databases ({db_size_kb}KB each{write_info})")
 
-            result = {"num_databases": count}
+            result = {"num_databases": count, "writes_per_sec": writes_per_sec}
 
             # Benchmark walrust
             if not litestream_only:
                 if not quiet:
                     print("Benchmarking walrust...")
-                walrust_result = benchmark_walrust(databases, bucket, endpoint, duration)
+                walrust_result = benchmark_walrust(databases, bucket, endpoint, duration, writes_per_sec)
                 result["walrust"] = asdict(walrust_result)
 
             # Benchmark litestream
             if not walrust_only:
                 if not quiet:
                     print("Benchmarking litestream...")
-                litestream_result = benchmark_litestream(databases, bucket, duration)
+                litestream_result = benchmark_litestream(databases, bucket, duration, writes_per_sec)
                 result["litestream"] = asdict(litestream_result)
 
             results.append(result)
@@ -309,21 +429,37 @@ def cleanup_s3_prefix(bucket: str, prefix: str, endpoint: Optional[str] = None) 
 
 def print_summary(results: list[dict]) -> None:
     """Print a summary table of all results."""
-    if not results or "walrust" not in results[0] or "litestream" not in results[0]:
+    if not results:
         return
 
-    print("\n" + "=" * 80)
-    print("SUMMARY: walrust vs litestream")
-    print("=" * 80)
-    print(f"\n{'DBs':>4} | {'walrust':^30} | {'litestream':^30} | {'Memory Saved':>12}")
-    print(f"{'':>4} | {'Procs':>6} {'Peak MB':>10} {'Avg MB':>10} | {'Procs':>6} {'Peak MB':>10} {'Avg MB':>10} |")
-    print("-" * 80)
+    has_walrust = "walrust" in results[0]
+    has_litestream = "litestream" in results[0]
 
-    for r in results:
-        w = r["walrust"]
-        l = r["litestream"]
-        savings = l["avg_memory_mb"] - w["avg_memory_mb"]
-        print(f"{r['num_databases']:>4} | {w['num_processes']:>6} {w['peak_memory_mb']:>10.1f} {w['avg_memory_mb']:>10.1f} | {l['num_processes']:>6} {l['peak_memory_mb']:>10.1f} {l['avg_memory_mb']:>10.1f} | {savings:>10.1f} MB")
+    print("\n" + "=" * 80)
+    if has_walrust and has_litestream:
+        print("SUMMARY: walrust vs litestream")
+    elif has_walrust:
+        print("SUMMARY: walrust only")
+    else:
+        print("SUMMARY: litestream only")
+    print("=" * 80)
+
+    if has_walrust and has_litestream:
+        print(f"\n{'DBs':>4} | {'walrust':^30} | {'litestream':^30} | {'Memory Saved':>12}")
+        print(f"{'':>4} | {'Procs':>6} {'Peak MB':>10} {'Avg MB':>10} | {'Procs':>6} {'Peak MB':>10} {'Avg MB':>10} |")
+        print("-" * 80)
+        for r in results:
+            w = r["walrust"]
+            l = r["litestream"]
+            savings = l["avg_memory_mb"] - w["avg_memory_mb"]
+            print(f"{r['num_databases']:>4} | {w['num_processes']:>6} {w['peak_memory_mb']:>10.1f} {w['avg_memory_mb']:>10.1f} | {l['num_processes']:>6} {l['peak_memory_mb']:>10.1f} {l['avg_memory_mb']:>10.1f} | {savings:>10.1f} MB")
+    else:
+        tool = "walrust" if has_walrust else "litestream"
+        print(f"\n{'DBs':>4} | {'Peak MB':>10} {'Avg MB':>10} {'CPU %':>10} {'Startup ms':>12}")
+        print("-" * 60)
+        for r in results:
+            t = r[tool]
+            print(f"{r['num_databases']:>4} | {t['peak_memory_mb']:>10.1f} {t['avg_memory_mb']:>10.1f} {t['cpu_percent']:>10.1f} {t['startup_time_ms']:>12.0f}")
 
     print("-" * 80)
 
@@ -371,6 +507,12 @@ Examples:
         help="Size of each test database in KB (default: 100)",
     )
     parser.add_argument(
+        "--writes-per-sec",
+        type=float,
+        default=0,
+        help="Writes per second per database during benchmark (default: 0 = idle)",
+    )
+    parser.add_argument(
         "--bucket",
         type=str,
         default=os.environ.get("WALSYNC_TEST_BUCKET", "s3://walrust-bench"),
@@ -390,15 +532,19 @@ Examples:
 
     args = parser.parse_args()
 
+    # Verify credentials before running benchmarks
+    check_s3_credentials(args.bucket, args.endpoint)
+
     # Parse database counts
     db_counts = [int(x.strip()) for x in args.dbs.split(",")]
 
     if not args.json:
-        print("Walrust vs Litestream Benchmark")
+        print("\nWalrust vs Litestream Benchmark")
         print(f"Bucket: {args.bucket}")
         print(f"Endpoint: {args.endpoint or 'default'}")
         print(f"Database counts: {db_counts}")
         print(f"Database size: {args.db_size}KB")
+        print(f"Writes per second per DB: {args.writes_per_sec}")
         print(f"Measurement duration: {args.duration}s")
 
     # Run benchmarks
@@ -408,6 +554,7 @@ Examples:
         endpoint=args.endpoint,
         db_size_kb=args.db_size,
         duration=args.duration,
+        writes_per_sec=args.writes_per_sec,
         walrust_only=args.walrust_only,
         litestream_only=args.litestream_only,
         quiet=args.json,
