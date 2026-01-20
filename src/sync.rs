@@ -242,20 +242,18 @@ async fn find_latest_snapshot(
 
         if parts.len() == 2 {
             if let Some(gen) = parse_generation(parts[0]) {
-                // Only look in generation 1+ for snapshots
-                if gen > 0 {
-                    if let Some((min_txid, max_txid)) = parse_ltx_filename(parts[1]) {
-                        // A snapshot has min_txid = 1
-                        if min_txid == 1 {
-                            match &best_snapshot {
-                                None => {
+                if let Some((min_txid, max_txid)) = parse_ltx_filename(parts[1]) {
+                    // A snapshot has min_txid = 1
+                    // Look in all generations (litestream puts initial snapshot in gen 0)
+                    if min_txid == 1 {
+                        match &best_snapshot {
+                            None => {
+                                best_snapshot = Some((gen, key.clone(), min_txid, max_txid));
+                            }
+                            Some((best_gen, _, _, best_max)) => {
+                                // Prefer higher generation, or higher max_txid in same generation
+                                if gen > *best_gen || (gen == *best_gen && max_txid > *best_max) {
                                     best_snapshot = Some((gen, key.clone(), min_txid, max_txid));
-                                }
-                                Some((best_gen, _, _, best_max)) => {
-                                    // Prefer higher generation, or higher max_txid in same generation
-                                    if gen > *best_gen || (gen == *best_gen && max_txid > *best_max) {
-                                        best_snapshot = Some((gen, key.clone(), min_txid, max_txid));
-                                    }
                                 }
                             }
                         }
@@ -2359,7 +2357,11 @@ async fn sync_shadow_concurrent(
     let unique_pages = pages.len();
     let estimated_size = unique_pages.saturating_mul(input.page_size as usize).saturating_mul(2);
     let page_size = input.page_size;
+    let db_path_for_checksum = input.db_path.clone();
     let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
+        // Compute expected post_checksum by simulating changes against current DB
+        let expected_post = ltx::compute_expected_post_checksum(&db_path_for_checksum, page_size, &pages)?;
+
         let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,
@@ -2369,6 +2371,7 @@ async fn sync_shadow_concurrent(
             max_txid,
             commit_page,
             pre_checksum,
+            expected_post,
         )?;
         Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
     }).await??;
@@ -2707,7 +2710,11 @@ async fn sync_wal_concurrent(
     let estimated_size = unique_pages.saturating_mul(page_size as usize).saturating_mul(2);
     let db_name_for_error = input.name.clone();
     let page_nums: Vec<u32> = pages.iter().map(|(n, _)| *n).collect();
+    let db_path_for_checksum = input.db_path.clone();
     let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
+        // Compute expected post_checksum by simulating changes against current DB
+        let expected_post = ltx::compute_expected_post_checksum(&db_path_for_checksum, page_size, &pages)?;
+
         let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,
@@ -2717,6 +2724,7 @@ async fn sync_wal_concurrent(
             max_txid,
             commit_page,
             Some(pre_checksum),
+            expected_post,
         ).map_err(|e| anyhow::anyhow!("{}: LTX encode failed (pages={:?}, page_size={}, txid={}-{}, commit={}): {}",
             db_name_for_error, page_nums, page_size, min_txid, max_txid, commit_page, e))?;
         Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
@@ -3200,8 +3208,12 @@ async fn sync_wal_to_cache(
     let estimated_size = unique_pages.saturating_mul(page_size as usize).saturating_mul(2);
     let db_name_for_error = input.name.clone();
     let page_nums: Vec<u32> = pages.iter().map(|(n, _)| *n).collect();
+    let db_path_for_checksum = input.db_path.clone();
 
     let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
+        // Compute expected post_checksum by simulating changes against current DB
+        let expected_post = ltx::compute_expected_post_checksum(&db_path_for_checksum, page_size, &pages)?;
+
         let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,
@@ -3211,6 +3223,7 @@ async fn sync_wal_to_cache(
             max_txid,
             commit_page,
             Some(pre_checksum),
+            expected_post,
         ).map_err(|e| anyhow::anyhow!("{}: LTX encode failed (pages={:?}, page_size={}, txid={}-{}, commit={}): {}",
             db_name_for_error, page_nums, page_size, min_txid, max_txid, commit_page, e))?;
         Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
@@ -3454,7 +3467,11 @@ async fn sync_wal(
     let estimated_size = pages.len().saturating_mul(header.page_size as usize).saturating_mul(2);
     let page_size = header.page_size;
     let db_name = state.name.clone();
+    let db_path_for_checksum = state.db_path.clone();
     let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
+        // Compute expected post_checksum by simulating changes against current DB
+        let expected_post = ltx::compute_expected_post_checksum(&db_path_for_checksum, page_size, &pages)?;
+
         let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,
@@ -3464,6 +3481,7 @@ async fn sync_wal(
             max_txid,
             commit_page,
             Some(pre_checksum),
+            expected_post,
         )?;
         Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
     }).await??;
@@ -3654,15 +3672,36 @@ async fn save_manifest(
 }
 
 /// Restore a database from S3 using LTX files
+///
+/// If cache_dir is provided, attempts to restore from local cache first,
+/// falling back to S3 for any missing files. This provides fast local restore
+/// when the cache contains all needed LTX files.
 pub async fn restore(
     name: &str,
     output: &Path,
     bucket: &str,
     endpoint: Option<&str>,
     point_in_time: Option<&str>,
+    cache_dir: Option<&Path>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint).await?;
+
+    // Try to open local cache if provided
+    let cache = if let Some(dir) = cache_dir {
+        match LocalCache::open(dir)? {
+            Some(c) => {
+                tracing::info!("Opened local cache at {}", dir.display());
+                Some(c)
+            }
+            None => {
+                tracing::warn!("Cache directory {} has no manifest, falling back to S3", dir.display());
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // Discover state from S3 file listings (litestream format - no manifest)
     let (current_txid, _max_gen, _) =
@@ -3697,17 +3736,30 @@ pub async fn restore(
     );
 
     // Download and decode LTX snapshot
-    let ltx_data = s3::download_bytes(&client, &bucket_name, &snapshot_key).await?;
+    // Try cache first, fall back to S3
+    let ltx_data = if let Some(ref cache) = cache {
+        if cache.has_txid(snapshot_max_txid) {
+            tracing::info!("Reading snapshot TXID {} from cache", snapshot_max_txid);
+            cache.read_ltx(snapshot_max_txid)?
+        } else {
+            tracing::debug!("Snapshot TXID {} not in cache, fetching from S3", snapshot_max_txid);
+            s3::download_bytes(&client, &bucket_name, &snapshot_key).await?
+        }
+    } else {
+        s3::download_bytes(&client, &bucket_name, &snapshot_key).await?
+    };
+
     let cursor = std::io::Cursor::new(ltx_data);
-    let header = ltx::decode_to_db(cursor, output)?;
+    let decode_result = ltx::decode_to_db(cursor, output)?;
 
     tracing::info!(
-        "Restored {} from LTX (page_size: {}, pages: {}, TXID: {}-{})",
+        "Restored {} from LTX (page_size: {}, pages: {}, TXID: {}-{}, checksum: {:016x})",
         name,
-        header.page_size.into_inner(),
-        header.commit.into_inner(),
-        header.min_txid.into_inner(),
-        header.max_txid.into_inner()
+        decode_result.header.page_size.into_inner(),
+        decode_result.header.commit.into_inner(),
+        decode_result.header.min_txid.into_inner(),
+        decode_result.header.max_txid.into_inner(),
+        decode_result.post_apply_checksum.into_inner()
     );
 
     let mut final_txid = snapshot_max_txid;
@@ -3724,26 +3776,57 @@ pub async fn restore(
     if !applicable.is_empty() {
         tracing::info!("Applying {} incremental LTX files", applicable.len());
 
+        // Track cache hits for logging
+        let mut cache_hits = 0;
+        let mut s3_fetches = 0;
+
         for (key, min_txid, max_txid) in &applicable {
-            let ltx_data = s3::download_bytes(&client, &bucket_name, key).await?;
+            // Try to read from cache first using max_txid as the key
+            let ltx_data = if let Some(ref cache) = cache {
+                if cache.has_txid(*max_txid) {
+                    cache_hits += 1;
+                    tracing::debug!("Reading TXID {} from cache", max_txid);
+                    cache.read_ltx(*max_txid)?
+                } else {
+                    s3_fetches += 1;
+                    tracing::debug!("TXID {} not in cache, fetching from S3", max_txid);
+                    s3::download_bytes(&client, &bucket_name, key).await?
+                }
+            } else {
+                s3_fetches += 1;
+                s3::download_bytes(&client, &bucket_name, key).await?
+            };
+
             let cursor = std::io::Cursor::new(ltx_data);
-            let header = ltx::apply_ltx_to_db(cursor, output)?;
+            // apply_ltx_to_db now verifies pre_apply and post_apply checksums
+            let apply_result = ltx::apply_ltx_to_db(cursor, output)?;
 
             tracing::debug!(
-                "Applied {} (TXID: {}-{})",
+                "Applied {} (TXID: {}-{}, checksum: {:016x})",
                 key,
-                header.min_txid.into_inner(),
-                header.max_txid.into_inner()
+                apply_result.header.min_txid.into_inner(),
+                apply_result.header.max_txid.into_inner(),
+                apply_result.post_apply_checksum.into_inner()
             );
 
             final_txid = *max_txid;
         }
 
-        tracing::info!(
-            "Applied {} incremental LTX files (final TXID: {})",
-            applicable.len(),
-            final_txid
-        );
+        if cache.is_some() {
+            tracing::info!(
+                "Applied {} incremental LTX files (cache: {}, S3: {}, final TXID: {})",
+                applicable.len(),
+                cache_hits,
+                s3_fetches,
+                final_txid
+            );
+        } else {
+            tracing::info!(
+                "Applied {} incremental LTX files (final TXID: {})",
+                applicable.len(),
+                final_txid
+            );
+        }
     }
 
     println!(
@@ -4128,6 +4211,7 @@ pub async fn compact_incrementals(
         bucket,
         endpoint,
         None,
+        None, // No cache for validation
     )
     .await?;
 
@@ -4512,14 +4596,15 @@ async fn replicate_poll(
         let ltx_data = s3::download_bytes(client, bucket, &ltx_key).await?;
         let cursor = std::io::Cursor::new(ltx_data);
 
-        // Apply in-place
-        let header = ltx::apply_ltx_to_db(cursor, local)?;
+        // Apply in-place (verifies checksum chain)
+        let apply_result = ltx::apply_ltx_to_db(cursor, local)?;
 
         tracing::info!(
-            "Applied {} (TXID {}-{})",
+            "Applied {} (TXID {}-{}, checksum: {:016x})",
             ltx_entry.filename,
-            header.min_txid.into_inner(),
-            header.max_txid.into_inner()
+            apply_result.header.min_txid.into_inner(),
+            apply_result.header.max_txid.into_inner(),
+            apply_result.post_apply_checksum.into_inner()
         );
 
         *current_txid = ltx_entry.max_txid;
@@ -4558,14 +4643,15 @@ async fn bootstrap_replica(
     let ltx_key = format!("{}{}/{}", prefix, db_name, snapshot.filename);
     let ltx_data = s3::download_bytes(client, bucket, &ltx_key).await?;
 
-    // Decode snapshot to local database
+    // Decode snapshot to local database (verifies checksum)
     let cursor = std::io::Cursor::new(ltx_data);
-    let header = ltx::decode_to_db(cursor, local)?;
+    let decode_result = ltx::decode_to_db(cursor, local)?;
 
     println!(
-        "Bootstrapped from snapshot: {} pages, TXID {}",
-        header.commit.into_inner(),
-        header.max_txid.into_inner()
+        "Bootstrapped from snapshot: {} pages, TXID {}, checksum: {:016x}",
+        decode_result.header.commit.into_inner(),
+        decode_result.header.max_txid.into_inner(),
+        decode_result.post_apply_checksum.into_inner()
     );
 
     Ok(())
@@ -5293,6 +5379,10 @@ pub mod testable {
         // Encode as incremental LTX
         // Pre-allocate buffer: estimate 2x pages * page_size for compression headroom
         let estimated_size = pages.len().saturating_mul(header.page_size as usize).saturating_mul(2);
+
+        // Compute expected post_checksum by simulating changes against current DB
+        let expected_post = ltx::compute_expected_post_checksum(&state.db_path, header.page_size, &pages)?;
+
         let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,
@@ -5302,6 +5392,7 @@ pub mod testable {
             max_txid,
             commit_page,
             Some(pre_checksum),
+            expected_post,
         )?;
 
         let ltx_size = ltx_buffer.len() as u64;
@@ -5498,21 +5589,32 @@ pub mod testable {
             incrementals.len()
         );
 
-        // Download and decode snapshot
+        // Download and decode snapshot (verifies checksum)
         let snapshot_key = format!("{}{}/{}", prefix, db_name, snapshot.filename);
         let snapshot_data = storage.download_bytes(&snapshot_key).await?;
         let cursor = Cursor::new(snapshot_data);
-        ltx::decode_to_db(cursor, output)?;
+        let decode_result = ltx::decode_to_db(cursor, output)?;
 
-        tracing::info!("Restored snapshot {} to {}", snapshot.filename, output.display());
+        tracing::info!(
+            "Restored snapshot {} to {} (checksum: {:016x})",
+            snapshot.filename,
+            output.display(),
+            decode_result.post_apply_checksum.into_inner()
+        );
 
-        // Apply incrementals in order
+        // Apply incrementals in order (each verifies checksum chain)
         for inc in incrementals {
             let inc_key = format!("{}{}/{}", prefix, db_name, inc.filename);
             let inc_data = storage.download_bytes(&inc_key).await?;
             let cursor = Cursor::new(inc_data);
-            ltx::apply_ltx_to_db(cursor, output)?;
-            tracing::info!("Applied incremental {} (TXID {}-{})", inc.filename, inc.min_txid, inc.max_txid);
+            let apply_result = ltx::apply_ltx_to_db(cursor, output)?;
+            tracing::info!(
+                "Applied incremental {} (TXID {}-{}, checksum: {:016x})",
+                inc.filename,
+                inc.min_txid,
+                inc.max_txid,
+                apply_result.post_apply_checksum.into_inner()
+            );
         }
 
         Ok(())
@@ -5648,6 +5750,10 @@ pub mod testable {
         // Encode as incremental LTX
         // Pre-allocate buffer: estimate 2x pages * page_size for compression headroom
         let estimated_size = pages.len().saturating_mul(header.page_size as usize).saturating_mul(2);
+
+        // Compute expected post_checksum by simulating changes against current DB
+        let expected_post = ltx::compute_expected_post_checksum(&state.db_path, header.page_size, &pages)?;
+
         let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,
@@ -5657,6 +5763,7 @@ pub mod testable {
             max_txid,
             commit_page,
             Some(pre_checksum),
+            expected_post,
         )?;
 
         let ltx_size = ltx_buffer.len() as u64;
@@ -5814,7 +5921,7 @@ mod tests {
         let endpoint = get_test_endpoint();
         let output = PathBuf::from(format!("/tmp/restored-{}.db", uuid::Uuid::new_v4()));
 
-        let result = restore("nonexistent-db", &output, &bucket, endpoint.as_deref(), None).await;
+        let result = restore("nonexistent-db", &output, &bucket, endpoint.as_deref(), None, None).await;
 
         // Should fail - no snapshots exist
         assert!(result.is_err(), "Restore of nonexistent database should fail");
@@ -5845,7 +5952,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Restore database
-        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None).await;
+        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None, None).await;
         assert!(restore_result.is_ok(), "Restore should succeed");
 
         // Verify restored file exists
@@ -5901,7 +6008,7 @@ mod tests {
 
         let (bucket3, prefix3) = crate::s3::parse_bucket("my-bucket/path/to/prefix");
         assert_eq!(bucket3, "my-bucket");
-        assert_eq!(prefix3, "path/to/prefix");
+        assert_eq!(prefix3, "path/to/prefix/"); // Trailing slash added
     }
 
     #[tokio::test]
@@ -5960,7 +6067,7 @@ mod tests {
         // Snapshot -> Restore -> Verify exact match
         snapshot(&db_path, &bucket, endpoint.as_deref()).await.unwrap();
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-        restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None).await.unwrap();
+        restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None, None).await.unwrap();
 
         let restored_data = tokio::fs::read(&restored_path).await.unwrap();
 
@@ -6038,7 +6145,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Restore (should verify checksum)
-        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None).await;
+        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None, None).await;
         assert!(restore_result.is_ok(), "Restore with valid checksum should succeed");
 
         // Verify restored data
@@ -6077,7 +6184,7 @@ mod tests {
         // Verify manifest has 3 entries (we can't directly check without downloading,
         // but restore should succeed with latest TXID)
         let restored_path = PathBuf::from(format!("/tmp/restored-manifest-{}.db", uuid::Uuid::new_v4()));
-        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None).await;
+        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None, None).await;
         assert!(restore_result.is_ok(), "Restore should find latest snapshot from manifest");
 
         // Cleanup
@@ -6109,7 +6216,7 @@ mod tests {
 
         // Restore to TXID 1 (first snapshot)
         let restored_path = PathBuf::from(format!("/tmp/restored-pit-{}.db", uuid::Uuid::new_v4()));
-        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), Some("1")).await;
+        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), Some("1"), None).await;
         assert!(restore_result.is_ok(), "Point-in-time restore by TXID should succeed");
 
         // Cleanup
@@ -6182,7 +6289,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
         // Restore
-        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None).await;
+        let restore_result = restore(db_name, &restored_path, &bucket, endpoint.as_deref(), None, None).await;
         assert!(restore_result.is_ok(), "Restore should succeed");
 
         // Verify byte-for-byte match
@@ -6968,13 +7075,13 @@ mod tests {
 
         // Decode from LTX
         let ltx_file = std::fs::File::open(&ltx_path).unwrap();
-        let header = ltx::decode_to_db(ltx_file, &restored_path).unwrap();
+        let result = ltx::decode_to_db(ltx_file, &restored_path).unwrap();
 
         // Verify
         let restored_data = tokio::fs::read(&restored_path).await.unwrap();
         assert_eq!(original_data, restored_data);
-        assert_eq!(header.page_size.into_inner(), page_size);
-        assert_eq!(header.commit.into_inner(), 3); // 3 pages
+        assert_eq!(result.header.page_size.into_inner(), page_size);
+        assert_eq!(result.header.commit.into_inner(), 3); // 3 pages
     }
 
     #[tokio::test]
@@ -7005,7 +7112,7 @@ mod tests {
         ltx::encode_snapshot(&mut ltx_buffer, &db_path, page_size, 100).unwrap();
 
         let cursor = std::io::Cursor::new(ltx_buffer);
-        let header = ltx::decode_to_db(cursor, &restored_path).unwrap();
+        let result = ltx::decode_to_db(cursor, &restored_path).unwrap();
 
         // Verify byte-for-byte
         let restored_data = tokio::fs::read(&restored_path).await.unwrap();
@@ -7019,7 +7126,7 @@ mod tests {
             );
         }
 
-        assert_eq!(header.max_txid.into_inner(), 100);
+        assert_eq!(result.header.max_txid.into_inner(), 100);
     }
 
     #[tokio::test]
@@ -7080,12 +7187,12 @@ mod tests {
 
         // This is exactly how restore() works with S3 data
         let cursor = std::io::Cursor::new(ltx_buffer);
-        let header = ltx::decode_to_db(cursor, &restored_path).unwrap();
+        let result = ltx::decode_to_db(cursor, &restored_path).unwrap();
 
         let restored_data = tokio::fs::read(&restored_path).await.unwrap();
         assert_eq!(original_data, restored_data);
-        assert_eq!(header.min_txid.into_inner(), 1);
-        assert_eq!(header.max_txid.into_inner(), 50);
+        assert_eq!(result.header.min_txid.into_inner(), 1);
+        assert_eq!(result.header.max_txid.into_inner(), 50);
     }
 
     #[test]
@@ -7361,6 +7468,7 @@ mod tests {
         ];
 
         let pre_checksum = Checksum::new(0x123456789ABCDEF0);
+        let expected_post = Checksum::new(0xFEDCBA9876543210);
 
         let mut buffer = Vec::new();
         let post_checksum = ltx::encode_wal_changes(
@@ -7371,14 +7479,15 @@ mod tests {
             12,  // max_txid
             10,  // commit_page (db size)
             Some(pre_checksum),
+            expected_post,
         ).unwrap();
 
         // Verify we got a valid LTX file
         assert!(!buffer.is_empty());
         assert!(buffer.len() > 100); // At least header + some data
 
-        // Post checksum should be different from pre (pages were modified)
-        assert_ne!(post_checksum.into_inner(), pre_checksum.into_inner());
+        // Post checksum should match what we provided
+        assert_eq!(post_checksum.into_inner(), expected_post.into_inner());
     }
 
     #[test]
@@ -7427,9 +7536,13 @@ mod tests {
 
         // First incremental: modify page 1
         let pages1: Vec<(u32, Vec<u8>)> = vec![(1, vec![0xAA; page_size as usize])];
+
+        // Compute expected post_checksum after applying changes
+        let expected_post1 = ltx::compute_expected_post_checksum(&db_path, page_size, &pages1).unwrap();
+
         let mut buf1 = Vec::new();
         let _checksum1 = ltx::encode_wal_changes(
-            &mut buf1, &pages1, page_size, 2, 2, 3, Some(checksum0)
+            &mut buf1, &pages1, page_size, 2, 2, 3, Some(checksum0), expected_post1
         ).unwrap();
 
         // Apply first incremental
@@ -7438,14 +7551,18 @@ mod tests {
 
         // Verify checksum matches expected
         let actual_checksum1 = ltx::compute_checksum_from_file(&db_path).unwrap();
-        // Note: post_apply_checksum is computed from pages, not full db, so may differ
-        // The important thing is the chain is consistent
+        // Now the actual checksum should match expected_post1
+        assert_eq!(actual_checksum1.into_inner(), expected_post1.into_inner());
 
         // Second incremental: modify page 2, using actual db checksum as pre
         let pages2: Vec<(u32, Vec<u8>)> = vec![(2, vec![0xBB; page_size as usize])];
+
+        // Compute expected post_checksum after applying changes
+        let expected_post2 = ltx::compute_expected_post_checksum(&db_path, page_size, &pages2).unwrap();
+
         let mut buf2 = Vec::new();
         let _checksum2 = ltx::encode_wal_changes(
-            &mut buf2, &pages2, page_size, 3, 3, 3, Some(actual_checksum1)
+            &mut buf2, &pages2, page_size, 3, 3, 3, Some(actual_checksum1), expected_post2
         ).unwrap();
 
         // Apply second incremental
@@ -7454,10 +7571,16 @@ mod tests {
 
         // Third incremental: modify page 3
         let actual_checksum2 = ltx::compute_checksum_from_file(&db_path).unwrap();
+        assert_eq!(actual_checksum2.into_inner(), expected_post2.into_inner());
+
         let pages3: Vec<(u32, Vec<u8>)> = vec![(3, vec![0xCC; page_size as usize])];
+
+        // Compute expected post_checksum after applying changes
+        let expected_post3 = ltx::compute_expected_post_checksum(&db_path, page_size, &pages3).unwrap();
+
         let mut buf3 = Vec::new();
         let _checksum3 = ltx::encode_wal_changes(
-            &mut buf3, &pages3, page_size, 4, 4, 3, Some(actual_checksum2)
+            &mut buf3, &pages3, page_size, 4, 4, 3, Some(actual_checksum2), expected_post3
         ).unwrap();
 
         // Apply third incremental
@@ -7546,10 +7669,14 @@ mod tests {
         // Actually compute from original state
         std::fs::write(&original_path, &original_data).unwrap();
         let pre_check1 = ltx::compute_checksum_from_file(&original_path).unwrap();
+
+        // Compute expected post_checksum (from data1 state)
+        let post_check1 = ltx::compute_db_checksum(&data1);
+
         std::fs::write(&original_path, &data1).unwrap();
 
         ltx::encode_wal_changes(
-            &mut inc1_buf, &pages1, page_size, 2, 2, 5, Some(pre_check1)
+            &mut inc1_buf, &pages1, page_size, 2, 2, 5, Some(pre_check1), post_check1
         ).unwrap();
 
         // Incremental 2: change page 4
@@ -7559,12 +7686,16 @@ mod tests {
 
         std::fs::write(&original_path, &data1).unwrap();
         let pre_check2 = ltx::compute_checksum_from_file(&original_path).unwrap();
+
+        // Compute expected post_checksum (from data2 state)
+        let post_check2 = ltx::compute_db_checksum(&data2);
+
         std::fs::write(&original_path, &data2).unwrap();
 
         let pages2: Vec<(u32, Vec<u8>)> = vec![(4, vec![0xBB; page_size as usize])];
         let mut inc2_buf = Vec::new();
         ltx::encode_wal_changes(
-            &mut inc2_buf, &pages2, page_size, 3, 3, 5, Some(pre_check2)
+            &mut inc2_buf, &pages2, page_size, 3, 3, 5, Some(pre_check2), post_check2
         ).unwrap();
 
         // Now restore: first snapshot, then incrementals
@@ -7607,6 +7738,7 @@ mod tests {
             .collect();
 
         let pre_checksum = Checksum::new(0x123456789ABCDEF0);
+        let expected_post = Checksum::new(0xFEDCBA9876543210);
 
         let mut buffer = Vec::new();
         let result = ltx::encode_wal_changes(
@@ -7617,6 +7749,7 @@ mod tests {
             10 + num_pages as u64 - 1,
             num_pages,
             Some(pre_checksum),
+            expected_post,
         );
 
         assert!(result.is_ok());
@@ -7639,6 +7772,7 @@ mod tests {
         let pages: Vec<(u32, Vec<u8>)> = vec![(42, vec![0xFF; page_size as usize])];
 
         let pre_checksum = Checksum::new(0x123456789ABCDEF0);
+        let expected_post = Checksum::new(0xABCDEF1234567890);
 
         let mut buffer = Vec::new();
         let post_checksum = ltx::encode_wal_changes(
@@ -7649,9 +7783,10 @@ mod tests {
             100,  // min == max for single page
             100,
             Some(pre_checksum),
+            expected_post,
         ).unwrap();
 
-        assert!(post_checksum.into_inner() != 0);
+        assert_eq!(post_checksum.into_inner(), expected_post.into_inner());
 
         // Decode and verify
         let cursor = std::io::Cursor::new(&buffer);
@@ -7673,7 +7808,17 @@ mod tests {
             (100, vec![0xFF; page_size as usize]),
         ];
 
-        let pre_checksum = Checksum::new(0x123456789ABCDEF0);
+        // Apply to a database and verify
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+
+        // Create db with 100 pages
+        let db_data = vec![0x00u8; 100 * page_size as usize];
+        std::fs::write(&db_path, &db_data).unwrap();
+
+        // Compute real checksums
+        let pre_checksum = ltx::compute_checksum_from_file(&db_path).unwrap();
+        let expected_post = ltx::compute_expected_post_checksum(&db_path, page_size, &pages).unwrap();
 
         let mut buffer = Vec::new();
         let result = ltx::encode_wal_changes(
@@ -7684,17 +7829,10 @@ mod tests {
             53,
             100,
             Some(pre_checksum),
+            expected_post,
         );
 
         assert!(result.is_ok());
-
-        // Apply to a database and verify
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("test.db");
-
-        // Create db with 100 pages
-        let db_data = vec![0x00u8; 100 * page_size as usize];
-        std::fs::write(&db_path, &db_data).unwrap();
 
         let cursor = std::io::Cursor::new(&buffer);
         ltx::apply_ltx_to_db(cursor, &db_path).unwrap();
@@ -7822,6 +7960,7 @@ mod tests {
             ];
 
             let pre_checksum = Checksum::new(0x123456789ABCDEF0);
+            let expected_post = Checksum::new(0xFEDCBA9876543210);
 
             let mut buffer = Vec::new();
             let result = ltx::encode_wal_changes(
@@ -7832,6 +7971,7 @@ mod tests {
                 11,
                 10,
                 Some(pre_checksum),
+                expected_post,
             );
 
             assert!(result.is_ok(), "Failed for page_size={}", page_size);

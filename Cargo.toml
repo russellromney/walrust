@@ -64,11 +64,11 @@ reqwest = { version = "0.12", features = ["json"] }
 hmac = "0.12"
 hex = "0.4"
 
-# LTX format (Litestream-compatible)
-litetx = "0.1"
+# LTX format (Litestream-compatible) - local fork with NO_CHECKSUM flag support
+litetx = { path = "crates/litetx" }
 
 # SQLite for checkpointing
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.35", features = ["bundled"] }
 
 # Directory traversal (for shadow WAL size calculation)
 walkdir = "2"
