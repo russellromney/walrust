@@ -19,6 +19,7 @@ docs/node_modules/
 .pnpm-debug.log*
 lerna-debug.log*
 package-lock.json
+!docs/package-lock.json
 npm-debug.log
 yarn-error.log
 pnpm-lock.yaml
@@ -100,3 +101,6 @@ yarn-error.log*
 # Development/Build artifacts
 benches/
 .astro/
+
+
+__pycache__
