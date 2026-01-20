@@ -25,10 +25,23 @@ export default defineConfig({
             { label: 'Why Walrust?', link: '/start/why-walrust/' },
           ],
         },
-        { label: 'Guides', autogenerate: { directory: 'guide' } },
+        {
+          label: 'Guides',
+          items: [
+            { label: 'CLI Reference', link: '/guide/cli/' },
+            { label: 'Python API', link: '/guide/python-api/' },
+            { label: 'Multi-Database Sync', link: '/guide/multi-database/' },
+            { label: 'Read Replicas', link: '/guide/read-replicas/' },
+            { label: 'Deployment with App', link: '/guide/deployment-with-app/' },
+            { label: 'Migration from Litestream', link: '/guide/migration-from-litestream/' },
+            { label: 'FAQ', link: '/guide/faq/' },
+            { label: 'Troubleshooting', link: '/guide/troubleshooting/' },
+          ],
+        },
         {
           label: 'Configuration',
           items: [
+            { label: 'Configuration Reference', link: '/config/configuration-reference/' },
             { label: 'Environment Variables', link: '/config/environment/' },
             { label: 'S3 Providers', link: '/config/s3-providers/' },
             { label: 'Logging', link: '/config/logging/' },
@@ -36,6 +49,14 @@ export default defineConfig({
           ],
         },
         { label: 'How It Works', autogenerate: { directory: 'how-it-works' } },
+        {
+          label: 'Benchmarks',
+          items: [
+            { label: 'Overview', link: '/benchmarks/' },
+            { label: 'Methodology', link: '/benchmarks/methodology/' },
+            { label: 'Results', link: '/benchmarks/results/' },
+          ],
+        },
       ],
       customCss: ['./src/styles/custom.css'],
     }),
