@@ -4,6 +4,7 @@
 //! walrust's data safety guarantees.
 
 mod chaos;
+mod disk_queue_tests;
 mod invariants;
 pub mod metrics;
 pub mod mock_storage;

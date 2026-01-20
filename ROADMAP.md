@@ -2,11 +2,11 @@
 
 ## Vision
 
-Litestream-compatible SQLite sync in Rust. Optimized for multi-tenant deployments (Cinch, Tenement).
+Litestream-compatible SQLite sync in Rust. Optimized to use less memory than Litestream.
 
 **Core differentiators:**
-- LTX format (Litestream-compatible) with SHA256 verification on top
-- Lower memory footprint (~12MB vs ~33MB)
+- LTX format (Litestream-compatible) with SHA256 verification
+- Lower memory footprint (19 MB vs 37 MB for single DB, 92% reduction at 100 DBs)
 - Built-in dashboard + Prometheus metrics
 - Opinionated defaults (grandfather/father/son retention)
 

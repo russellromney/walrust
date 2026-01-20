@@ -19,10 +19,10 @@ export AWS_SECRET_ACCESS_KEY=tsec_xxxxxxxxxxxxx
 export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
 ```
 
-**Why Tigris?**
-- Zero egress fees
-- Global distribution
-- Native Fly.io integration
+**Characteristics:**
+- No egress fees
+- Global distribution (data replicated across regions)
+- Native Fly.io integration via `fly storage` CLI
 - S3-compatible API
 
 ## AWS S3

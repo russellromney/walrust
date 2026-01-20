@@ -7,36 +7,24 @@ Lightweight SQLite WAL sync to S3 in Rust.
 
 ## Why Walrust?
 
-Walrust is built for **curiosity**, **control**, **efficiency**, and **Rust-native integration**.
+Walrust is a SQLite replication tool optimized to use less memory than Litestream:
 
-### Curiosity
+| Databases | walrust | Litestream | Reduction |
+|-----------|---------|------------|-----------|
+| 1 | 19 MB | 37 MB | 49% |
+| 10 | 20 MB | 61 MB | 67% |
+| 100 | 19 MB | 228 MB | 92% |
 
-I built walrust because I was interested in it, and because I was doing silly things with millions of databases on a single server. Think a SaaS platform where every customer gets their own SQLite database - I needed the lowest memory overhead possible and the fastest sync possible (see [redlite](https://github.com/russellromney/redlite)).
+Walrust's memory remains ~19-20 MB regardless of database count.
 
-### Control
+### Implementation
 
-I wanted something I could configure and add features to as needed. When you own the code, you can tweak behavior, add features specific to your use case, and understand exactly what's happening under the hood.
-
-### Hubris
-
-I enjoy building my own tools.
-
-### Memory Efficiency
-
-Walrust's Rust implementation has a smaller memory footprint:
-
-**Measured overhead:**
-- **walrust:** ~12 MB baseline
-- **Litestream:** ~33 MB baseline
-
-For resource-constrained environments (small VMs, containers, edge deployments), this difference matters.
-
-### Rust-Native
-
-Walrust integrates naturally into Rust projects:
-- Native async/await with tokio
+- Written in Rust with async/await (tokio)
 - No CGO dependencies
-- Smaller binary size (~8 MB)
+- Uses the same [LTX file format](https://github.com/superfly/ltx) as Litestream
+- ~8 MB binary size
+
+See [Why Walrust?](/start/why-walrust/) for detailed comparisons and use cases.
 
 ---
 

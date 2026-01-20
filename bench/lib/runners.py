@@ -95,12 +95,16 @@ class WalrustRunner:
             cmd.extend(extra_args)
 
         # Start process
+        # Debug: print command and check env
+        print(f"  Command: {' '.join(cmd)}")
+        print(f"  AWS_ACCESS_KEY_ID: {os.environ.get('AWS_ACCESS_KEY_ID', 'NOT SET')[:20]}...")
+
         try:
+            # Don't capture output to avoid blocking on full pipe buffers
             self.proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
 
             # Wait for startup
@@ -108,11 +112,8 @@ class WalrustRunner:
 
             # Check if process is still alive
             if self.proc.poll() is not None:
-                stdout, stderr = self.proc.communicate()
                 raise RuntimeError(
-                    f"Walrust process died during startup:\n"
-                    f"stdout: {stdout}\n"
-                    f"stderr: {stderr}"
+                    f"Process died during startup (exit code: {self.proc.returncode})"
                 )
 
             return self.proc.pid
@@ -224,11 +225,11 @@ class LitestreamRunner:
 
         # Start process
         try:
+            # Don't capture output to avoid blocking on full pipe buffers
             self.proc = subprocess.Popen(
                 cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
 
             # Wait for startup

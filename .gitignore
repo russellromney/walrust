@@ -104,3 +104,6 @@ benches/
 
 
 __pycache__
+
+# Test result files
+*-results.json

@@ -3,7 +3,7 @@ title: Deploying with Your App
 description: Running walrust alongside your application
 ---
 
-Walrust runs as a sidecar process next to your app. Here's how to set that up without shooting yourself in the foot.
+Walrust runs as a sidecar process alongside your application.
 
 ## Basic Setup
 
@@ -87,11 +87,9 @@ If you need encryption:
 - Encrypt the volume/disk
 - Don't encrypt the SQLite file itself
 
-### Compression Will Also Break Everything
+### Compression Extensions Are Not Supported
 
-Same deal. If you're using a SQLite extension that compresses pages, the LTX format won't understand them.
-
-Just... don't. SQLite pages compress terribly anyway (lots of internal pointers and metadata). You won't save much space, and you'll break replication.
+SQLite extensions that compress pages are not compatible with walrust. The LTX format requires uncompressed page data. SQLite pages contain internal pointers and metadata that compress poorly, so the storage savings are minimal.
 
 ### File Permissions
 
@@ -103,7 +101,7 @@ Walrust is designed to work alongside busy databases. It reads the WAL file with
 
 ## Fly.io
 
-Walrust works great with [Fly.io](https://fly.io) and [Tigris](https://tigris.dev):
+Walrust supports [Fly.io](https://fly.io) with [Tigris](https://tigris.dev) storage:
 
 ```bash
 # Set secrets

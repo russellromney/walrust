@@ -111,6 +111,17 @@ class CheckpointImpactResult:
     checkpoint_duration_ms: float = 0.0
 
 
+@dataclass
+class CachedRestoreResult:
+    """Results for cached vs direct restore benchmark."""
+    name: str = "cached_restore"
+    db_size_mb: float = 0.0
+    s3_only_time_ms: float = 0.0
+    cache_time_ms: float = 0.0
+    speedup_factor: float = 0.0
+    cache_hit_rate: float = 0.0  # % of files read from cache
+
+
 def create_s3_client(endpoint: Optional[str] = None):
     """Create S3 client with optional endpoint."""
     session = boto3.Session(
@@ -642,6 +653,164 @@ def benchmark_checkpoint_impact(
         )
 
 
+def benchmark_cached_vs_direct_restore(
+    bucket: str,
+    endpoint: Optional[str] = None,
+    db_sizes_mb: List[int] = [1, 10, 50],
+    num_incrementals: int = 10,
+) -> List[CachedRestoreResult]:
+    """
+    Compare restore performance: S3-only vs cache-first.
+
+    Strategy:
+    1. Create test database and write incrementals
+    2. Run walrust watch with cache enabled to populate cache
+    3. Measure restore time WITHOUT cache (S3 only)
+    4. Measure restore time WITH cache (--cache-dir)
+    5. Calculate speedup factor
+
+    This tests Phase 5: Fast Local Restore.
+    """
+    print(f"\nBenchmarking cached vs direct restore (sizes: {db_sizes_mb}MB, {num_incrementals} incrementals)...")
+    results = []
+
+    walrust_bin = Path(__file__).parent.parent / "target" / "release" / "walrust"
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        tmpdir = Path(tmpdir)
+
+        for size_mb in db_sizes_mb:
+            print(f"\n  Testing {size_mb}MB database with {num_incrementals} incrementals...")
+
+            db_path = tmpdir / f"cached_test_{size_mb}mb.db"
+            db_name = f"cached_test_{size_mb}mb"
+
+            # Create database
+            conn = sqlite3.connect(str(db_path))
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("CREATE TABLE data (id INTEGER PRIMARY KEY, value BLOB, ts REAL)")
+
+            # Insert initial data to reach target size
+            chunk = b"x" * (1024 * 10)  # 10KB chunks
+            num_rows = (size_mb * 1024) // 10
+
+            for i in range(num_rows):
+                conn.execute("INSERT INTO data (value, ts) VALUES (?, ?)", (chunk, time.time()))
+                if i % 100 == 0:
+                    conn.commit()
+            conn.commit()
+
+            actual_size_mb = db_path.stat().st_size / (1024 * 1024)
+            print(f"    Created {actual_size_mb:.1f}MB database")
+
+            # Take initial snapshot
+            cmd = [str(walrust_bin), "snapshot", str(db_path), "-b", bucket]
+            if endpoint:
+                cmd += ["--endpoint", endpoint]
+            subprocess.run(cmd, check=True, capture_output=True)
+            print(f"    Snapshot complete")
+
+            # Start walrust watch with cache enabled to build up cache
+            cache_dir = tmpdir / f".{db_name}-walrust"
+            watch_cmd = [
+                str(walrust_bin), "watch", str(db_path),
+                "-b", bucket,
+                "--enable-cache",
+                "--wal-sync-interval", "1",
+            ]
+            if endpoint:
+                watch_cmd += ["--endpoint", endpoint]
+
+            proc = subprocess.Popen(watch_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            time.sleep(2)
+
+            # Write incrementals
+            print(f"    Writing {num_incrementals} incrementals...")
+            for i in range(num_incrementals):
+                for _ in range(10):  # 10 rows per incremental
+                    conn.execute("INSERT INTO data (value, ts) VALUES (?, ?)", (chunk, time.time()))
+                conn.commit()
+                time.sleep(0.5)  # Let walrust sync each one
+
+            conn.close()
+
+            # Wait for uploads to complete
+            time.sleep(3)
+            proc.terminate()
+            proc.wait()
+
+            # Check cache was populated
+            cache_ltx_dir = cache_dir / "ltx"
+            cache_files = list(cache_ltx_dir.glob("*.ltx")) if cache_ltx_dir.exists() else []
+            print(f"    Cache contains {len(cache_files)} LTX files")
+
+            # --- Benchmark 1: S3-only restore ---
+            restore_s3_path = tmpdir / f"restored_s3_{size_mb}mb.db"
+
+            cmd = [str(walrust_bin), "restore", db_name, "-o", str(restore_s3_path), "-b", bucket]
+            if endpoint:
+                cmd += ["--endpoint", endpoint]
+
+            start = time.time()
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            s3_only_time = (time.time() - start) * 1000
+
+            if result.returncode != 0:
+                print(f"    S3-only restore failed: {result.stderr[:200]}")
+                continue
+
+            print(f"    S3-only restore: {s3_only_time:.0f}ms")
+
+            # --- Benchmark 2: Cache-first restore ---
+            restore_cache_path = tmpdir / f"restored_cache_{size_mb}mb.db"
+
+            cmd = [
+                str(walrust_bin), "restore", db_name,
+                "-o", str(restore_cache_path),
+                "-b", bucket,
+                "--cache-dir", str(cache_dir),
+            ]
+            if endpoint:
+                cmd += ["--endpoint", endpoint]
+
+            start = time.time()
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            cache_time = (time.time() - start) * 1000
+
+            if result.returncode != 0:
+                print(f"    Cache restore failed: {result.stderr[:200]}")
+                continue
+
+            print(f"    Cache-first restore: {cache_time:.0f}ms")
+
+            # Calculate speedup
+            speedup = s3_only_time / cache_time if cache_time > 0 else 0
+            cache_hit_rate = (len(cache_files) / (num_incrementals + 1)) * 100 if num_incrementals > 0 else 0
+
+            print(f"    Speedup: {speedup:.1f}x")
+
+            results.append(CachedRestoreResult(
+                db_size_mb=actual_size_mb,
+                s3_only_time_ms=s3_only_time,
+                cache_time_ms=cache_time,
+                speedup_factor=speedup,
+                cache_hit_rate=min(cache_hit_rate, 100),
+            ))
+
+            # Cleanup
+            for f in [db_path, restore_s3_path, restore_cache_path]:
+                if f.exists():
+                    f.unlink()
+            wal_path = Path(str(db_path) + "-wal")
+            if wal_path.exists():
+                wal_path.unlink()
+            shm_path = Path(str(db_path) + "-shm")
+            if shm_path.exists():
+                shm_path.unlink()
+
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Real-world performance benchmarks for walrust",
@@ -649,7 +818,7 @@ def main():
     )
     parser.add_argument(
         "--test",
-        choices=["sync", "restore", "multi-db", "network", "throughput", "checkpoint"],
+        choices=["sync", "restore", "multi-db", "network", "throughput", "checkpoint", "cached"],
         help="Run specific test only",
     )
     parser.add_argument(
@@ -693,6 +862,10 @@ def main():
 
     if not args.test or args.test == "checkpoint":
         results["checkpoint_impact"] = asdict(benchmark_checkpoint_impact(args.bucket, args.endpoint))
+
+    if not args.test or args.test == "cached":
+        cached_results = benchmark_cached_vs_direct_restore(args.bucket, args.endpoint)
+        results["cached_restore"] = [asdict(r) for r in cached_results]
 
     # Output results
     if args.json:
@@ -746,6 +919,13 @@ def main():
             print(f"  Normal latency:     {r['normal_sync_latency_ms']:.2f} ms")
             print(f"  Post-checkpoint:    {r['during_checkpoint_latency_ms']:.2f} ms")
             print(f"  Checkpoint duration:{r['checkpoint_duration_ms']:.0f} ms")
+
+        if "cached_restore" in results:
+            print(f"\nCached vs Direct Restore (Phase 5):")
+            print(f"  {'Size (MB)':>10} {'S3 Only (ms)':>14} {'Cache (ms)':>12} {'Speedup':>10} {'Cache Hit':>12}")
+            print(f"  {'-' * 10} {'-' * 14} {'-' * 12} {'-' * 10} {'-' * 12}")
+            for r in results["cached_restore"]:
+                print(f"  {r['db_size_mb']:>10.1f} {r['s3_only_time_ms']:>14.0f} {r['cache_time_ms']:>12.0f} {r['speedup_factor']:>9.1f}x {r['cache_hit_rate']:>11.0f}%")
 
 
 if __name__ == "__main__":

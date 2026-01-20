@@ -14,7 +14,7 @@ tools:
   - litestream
 
 storage:
-  bucket: "s3://walrust-bench"
+  bucket: "s3://walrust-bench-storage"
   endpoint: "https://fly.storage.tigris.dev"
 
 metrics:

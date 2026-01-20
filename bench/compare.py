@@ -233,8 +233,8 @@ def benchmark_walrust(
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     startup_time = (time.time() - start_time) * 1000
 
-    # Wait for process to stabilize
-    time.sleep(1)
+    # Wait for initial snapshot upload to complete (5 seconds should be enough for small DBs)
+    time.sleep(5)
 
     # Check if process is still running
     if proc.poll() is not None:
@@ -277,6 +277,7 @@ def benchmark_walrust(
 def benchmark_litestream(
     databases: list[Path],
     bucket: str,
+    endpoint: Optional[str] = None,
     duration: float = 5.0,
     writes_per_sec: float = 0,
 ) -> BenchmarkResult:
@@ -298,9 +299,10 @@ def benchmark_litestream(
     # Create single litestream config with all databases
     db_configs = []
     for db in databases:
+        endpoint_line = f"\n        endpoint: {endpoint}\n        force-path-style: true" if endpoint else ""
         db_configs.append(f"""  - path: {db}
     replicas:
-      - url: {bucket}/{db.stem}""")
+      - url: {bucket}/{db.stem}{endpoint_line}""")
 
     config = "dbs:\n" + "\n".join(db_configs)
     config_file = databases[0].parent / "litestream.yml"
@@ -316,8 +318,31 @@ def benchmark_litestream(
 
     startup_time = (time.time() - start_time) * 1000
 
-    # Wait for process to stabilize
-    time.sleep(1)
+    # Wait for initial snapshot upload to complete (5 seconds should be enough for small DBs)
+    time.sleep(5)
+
+    # Check if process is still running
+    if proc.poll() is not None:
+        stdout, stderr = proc.communicate()
+        print(f"    Warning: litestream exited early (exit code: {proc.returncode})")
+        if stderr:
+            print(f"    stderr: {stderr.decode()[:500]}")
+        if stdout:
+            print(f"    stdout: {stdout.decode()[:500]}")
+        print(f"    config file: {config_file}")
+        try:
+            print(f"    config content:\n{config_file.read_text()[:800]}")
+        except:
+            pass
+        return BenchmarkResult(
+            name="litestream",
+            num_databases=len(databases),
+            num_processes=0,
+            peak_memory_mb=0,
+            avg_memory_mb=0,
+            cpu_percent=0,
+            startup_time_ms=startup_time,
+        )
 
     # Start write load if specified
     writer = DatabaseWriter(databases, writes_per_sec)
@@ -388,7 +413,7 @@ def run_comparison(
             if not walrust_only:
                 if not quiet:
                     print("Benchmarking litestream...")
-                litestream_result = benchmark_litestream(databases, bucket, duration, writes_per_sec)
+                litestream_result = benchmark_litestream(databases, bucket, endpoint, duration, writes_per_sec)
                 result["litestream"] = asdict(litestream_result)
 
             results.append(result)

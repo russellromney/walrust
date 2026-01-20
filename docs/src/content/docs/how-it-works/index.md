@@ -11,7 +11,7 @@ SQLite stores everything in fixed-size pages (usually 4KB). Your database is jus
 
 ## WAL Mode
 
-In WAL (Write-Ahead Logging) mode, SQLite doesn't modify the main database file directly. Instead, it appends changes to a separate `-wal` file. This is great for replication because we can watch the WAL file and capture every change before it gets folded back into the main database.
+In WAL (Write-Ahead Logging) mode, SQLite doesn't modify the main database file directly. Instead, it appends changes to a separate `-wal` file. This enables replication: walrust watches the WAL file and captures changes before they get folded back into the main database.
 
 ```
 app.db      ← main database (pages)
@@ -22,17 +22,20 @@ app.db-shm  ← shared memory (ignore this)
 ## The Sync Flow
 
 ```
-┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  Your App   │───▶│   WAL File  │───▶│   Walrust   │───▶ S3
-│  (writes)   │    │  (changes)  │    │  (uploads)  │
-└─────────────┘    └─────────────┘    └─────────────┘
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│  Your App   │───▶│   WAL File  │───▶│ Shadow WAL  │───▶│   Walrust   │───▶ S3
+│  (writes)   │    │  (changes)  │    │   (copy)    │    │  (uploads)  │
+└─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
 ```
 
 1. Your app writes to SQLite
 2. SQLite appends to the WAL file
 3. Walrust detects the change (via inotify/kqueue)
-4. Walrust packages changed pages into an LTX file
-5. LTX file uploads to S3
+4. Walrust copies frames to a shadow WAL file (decouples from SQLite)
+5. Walrust packages changed pages into an LTX file
+6. LTX file uploads to S3
+
+The shadow WAL ensures that S3 upload latency doesn't block SQLite checkpoints or writes.
 
 ## LTX Format
 
@@ -56,7 +59,7 @@ The format comes from [Litestream](https://litestream.io) via the [litetx crate]
 
 ## Checksums
 
-Every LTX file includes a checksum computed from SHA256, truncated to 64 bits. On restore, walrust verifies checksums to catch corruption. If something's wrong, you'll know before your data is toast.
+Every LTX file includes a checksum computed from SHA256, truncated to 64 bits. On restore, walrust verifies checksums. If verification fails, the restore aborts with an integrity error (exit code 5).
 
 ## GFS Retention
 
@@ -84,4 +87,4 @@ Point-in-time restore works by stopping at a specific transaction ID or timestam
 
 ---
 
-That's it. WAL changes go in, LTX files come out, S3 stores them, GFS keeps it tidy.
+**Summary:** Walrust monitors SQLite WAL files, encodes changes as LTX files, uploads them to S3, and manages storage with GFS retention policies.

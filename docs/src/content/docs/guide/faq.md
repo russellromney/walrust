@@ -13,25 +13,29 @@ Walrust is a lightweight SQLite replication tool written in Rust. It continuousl
 
 ### How is walrust different from Litestream?
 
-Both tools solve the same problem, but walrust prioritizes:
+Both tools use WAL-based replication with the LTX file format. Key differences:
 
-- **Lower memory footprint** - ~12 MB baseline vs Litestream's ~33 MB
-- **Multi-database efficiency** - Shared S3 client and file watcher across all databases
-- **Rust-native** - Better integration with Rust projects, smaller binary
-- **Simplicity** - Fewer features, easier to understand and modify
+| Aspect | walrust | Litestream |
+|--------|---------|------------|
+| Memory (1 DB) | 19 MB | 37 MB |
+| Memory (100 DBs) | 19 MB | 228 MB |
+| Language | Rust | Go |
+| Cloud service | No | Litestream Cloud |
+| Config format | TOML | YAML |
 
-See [Migration from Litestream](/guide/migration-from-litestream/) for a detailed comparison.
+See [Migration from Litestream](/guide/migration-from-litestream/) for detailed comparison.
 
 ### Is walrust production-ready?
 
-Walrust is actively developed and used in production. It has:
+Walrust is actively developed and used in production environments. Testing includes:
 
-- 173+ tests including chaos testing and property-based testing
-- Battle-tested LTX format from Litestream
-- SHA256 checksums for data integrity
-- Comprehensive benchmark suite
+- Unit and integration tests for core functionality
+- Chaos testing with fault injection (walrust-dst)
+- Property-based testing for invariants
+- Uses the same LTX format as Litestream
+- SHA256 checksums for data integrity verification
 
-That said, always test your backups and have a disaster recovery plan.
+As with any backup tool, test restores regularly and maintain a disaster recovery plan.
 
 ### What databases does walrust support?
 
@@ -251,10 +255,11 @@ Walrust doesn't do client-side encryption (yet). Use your S3 provider's encrypti
 
 ### How much memory does walrust use?
 
-- **Baseline:** ~12 MB (single database)
-- **Multi-database:** ~12-20 MB (10-500 databases)
+- **Single database:** ~19 MB
+- **10 databases:** ~20 MB
+- **100 databases:** ~19 MB
 
-Walrust shares S3 clients and file watchers, so adding databases has minimal memory impact.
+Walrust shares S3 clients and file watchers. Memory remains relatively constant regardless of database count.
 
 ### How much CPU does it use?
 

@@ -3,21 +3,21 @@ title: Performance Benchmarks
 description: Walrust performance characteristics and comparison with Litestream
 ---
 
-Walrust is designed for efficient multi-database SQLite replication. This page summarizes performance characteristics based on our benchmark suite.
+Walrust is optimized to use less memory than Litestream. This page summarizes performance characteristics based on our benchmark suite.
 
 ## Quick Results
 
 ### Memory Efficiency
 
-Walrust uses significantly less memory than Litestream, especially when watching multiple databases:
+Walrust uses less memory than Litestream, especially when watching multiple databases:
 
-| Databases | walrust | litestream | Savings |
-|-----------|---------|------------|---------|
-| 1         | ~8 MB   | ~25 MB     | ~68%    |
-| 10        | ~12 MB  | ~120 MB    | ~90%    |
-| 100       | ~45 MB  | ~1.1 GB    | ~96%    |
+| Databases | walrust | litestream | Reduction |
+|-----------|---------|------------|-----------|
+| 1         | 19 MB   | 37 MB      | 49%       |
+| 10        | 20 MB   | 61 MB      | 67%       |
+| 100       | 19 MB   | 228 MB     | 92%       |
 
-This efficiency comes from walrust's optimized memory management and buffer allocation strategies.
+Walrust's memory usage remains ~19-20 MB regardless of database count.
 
 ### Change Detection
 

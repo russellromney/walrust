@@ -1,35 +1,25 @@
 ---
 title: Why Walrust?
-description: Walrust was built for multi-tenant SQLite deployments
+description: Walrust uses less memory than Litestream
 ---
 
-Walrust exists for multi-tenant SQLite architectures - think a SaaS platform where every customer gets their own database. At scale, that's potentially millions of databases on a single server.
+Walrust is optimized to use less memory than Litestream for SQLite replication to S3.
 
-## The Problem
+## Memory Efficiency
 
-With multi-tenant SQLite, you might have hundreds, thousands, or even millions of databases on a single server. Each one needs backup and replication. Walrust is optimized for lower memory usage in multi-database scenarios:
+Walrust uses significantly less memory than Litestream, especially when watching multiple databases:
 
-### Idle Databases
+### Memory Usage
 
-| Databases | Litestream | Walrust | Savings |
-|-----------|------------|---------|---------|
-| 5 | 40 MB | 13 MB | 27 MB |
-| 10 | 50 MB | 14 MB | 36 MB |
-| 20 | 62 MB | 17 MB | 45 MB |
-| 50 | 71 MB | 17 MB | 54 MB |
+| Databases | Litestream | Walrust | Reduction |
+|-----------|------------|---------|-----------|
+| 1 | 37 MB | 19 MB | 49% |
+| 10 | 61 MB | 20 MB | 67% |
+| 100 | 228 MB | 19 MB | 92% |
 
-### Under Write Load
+*Measured with 100KB databases on macOS, syncing to Tigris S3.*
 
-The difference grows dramatically under active writes:
-
-| DBs | Writes/s/db | Litestream | Walrust | Savings |
-|-----|-------------|------------|---------|---------|
-| 20 | 10 | 80 MB | 19 MB | 61 MB |
-| 20 | 100 | 103 MB | 24 MB | 78 MB |
-| 50 | 10 | 266 MB | 21 MB | **245 MB** |
-| 50 | 100 | 285 MB | 45 MB | **240 MB** |
-
-Both tools run as a single process watching multiple databases. Walrust scales flat (17-45 MB regardless of DB count) while litestream scales linearly. At 50 databases with active writes, walrust uses **6x less memory**.
+Walrust's memory usage remains relatively constant (~19-20 MB) as database count increases, while Litestream's memory grows with each database.
 
 ## Usage
 
@@ -55,8 +45,14 @@ prefix = "tenants"
 
 ## Litestream
 
-[Litestream](https://litestream.io) is the inspiration for walrust. It's battle-tested and you should probably use it for most cases. Walrust now uses the same [LTX file format](https://github.com/superfly/ltx) (thanks, it's better than raw WAL pages).
+[Litestream](https://litestream.io) is the original SQLite replication tool and the inspiration for walrust. Walrust uses the same [LTX file format](https://github.com/superfly/ltx), which provides compatibility between the tools.
 
-Use walrust when you're running many databases on resource-constrained servers and need the lowest possible memory overhead.
+**When to use Litestream:**
+- Mature ecosystem and community support
+- Litestream Cloud integration
+- SFTP/Azure Blob storage backends
 
-Or just if you're curious. Or if you like to live on the edge. 
+**When to use walrust:**
+- Multi-database deployments (100+ databases)
+- Memory-constrained environments
+- Rust-native integration

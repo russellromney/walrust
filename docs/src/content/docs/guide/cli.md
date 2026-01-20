@@ -616,6 +616,90 @@ Note: 1 non-orphan issues found. These may require manual intervention:
 
 ---
 
+## pragma
+
+Output recommended SQLite PRAGMA settings for optimal walrust performance.
+
+```bash
+walrust pragma [OPTIONS]
+```
+
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `-o, --output <FILE>` | Write SQL to file instead of stdout |
+| `--comments <true\|false>` | Include explanatory comments (default: true) |
+| `-h, --help` | Print help |
+
+### Output
+
+The pragma command outputs SQL statements that:
+
+- Disable auto-checkpointing (walrust manages checkpoints)
+- Enable WAL mode
+- Optimize settings for replication workloads
+
+### Examples
+
+```bash
+# Print to stdout
+walrust pragma
+
+# Write to file
+walrust pragma -o pragma.sql
+
+# Without comments
+walrust pragma --comments false
+```
+
+---
+
+## Shadow WAL (Default Mode)
+
+Walrust uses shadow WAL by default. Shadow WAL decouples S3 uploads from SQLite's active WAL file by copying WAL frames to a separate shadow file. This matches Litestream's architecture and prevents upload latency from affecting SQLite write performance.
+
+Shadow directories are created at `.<database>-walrust/` next to each database file.
+
+---
+
+## Independent Per-DB Tasks
+
+```bash
+walrust watch db1.db db2.db --bucket my-bucket --independent-tasks
+```
+
+Each database gets its own task that independently watches for WAL changes and syncs to S3. CPU-bound LTX encoding is distributed across the thread pool.
+
+**When to use:** Multi-database deployments where you want maximum concurrency.
+
+---
+
+## Disk Cache
+
+```bash
+walrust watch mydb.db --bucket my-bucket \
+  --enable-cache \
+  --cache-retention 24h \
+  --cache-max-size 5368709120
+```
+
+When enabled, LTX files are written to disk before uploading to S3. This provides:
+
+- Crash recovery (resume uploads after restart)
+- Decoupled encoding from uploads
+- Fast local restore (if files still in cache)
+
+| Option | Description |
+|--------|-------------|
+| `--enable-cache` | Enable disk cache for uploads |
+| `--cache-dir <PATH>` | Override cache directory location |
+| `--cache-retention <DURATION>` | Cache retention duration (default: 24h) |
+| `--cache-max-size <BYTES>` | Maximum cache size (default: 5GB) |
+| `--no-cache` | Disable cache even if enabled in config |
+
+---
+
 ## Environment Variables
 
 Walrust reads these environment variables:
@@ -650,7 +734,25 @@ export AWS_ENDPOINT_URL_S3=http://localhost:9000
 
 ## Exit Codes
 
-| Code | Meaning |
-|------|---------|
-| 0 | Success |
-| 1 | Error (any failure) |
+| Code | Name | Meaning |
+|------|------|---------|
+| 0 | Success | Operation completed successfully |
+| 1 | General | Unknown or uncategorized error |
+| 2 | Config | Configuration error (invalid config file, missing CLI args) |
+| 3 | Database | Database error (file not found, WAL corruption, SQLite issues) |
+| 4 | S3 | S3 error (network, authentication, bucket access) |
+| 5 | Integrity | Integrity error (checksum mismatch, LTX verification failed) |
+| 6 | Restore | Restore error (no snapshot found, PITR unavailable) |
+
+**Example usage in scripts:**
+
+```bash
+walrust verify mydb -b s3://bucket
+case $? in
+  0) echo "Verification passed" ;;
+  2) echo "Config error - check arguments" ;;
+  4) echo "S3 error - check credentials/connectivity" ;;
+  5) echo "Integrity error - backup may be corrupted" ;;
+  *) echo "Other error: $?" ;;
+esac
+```

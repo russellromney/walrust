@@ -9,10 +9,10 @@ Walrust and Litestream solve the same problem using the same LTX file format. Th
 
 Consider walrust if:
 
-- **Memory-constrained environments** - walrust uses ~12 MB vs Litestream's ~33 MB
-- **Multi-database setups** - walrust scales better with many databases (500+ databases in 20 MB)
+- **Memory-constrained environments** - walrust uses 19 MB vs Litestream's 37 MB (49% reduction)
+- **Multi-database setups** - walrust uses 19 MB for 100 databases vs Litestream's 228 MB (92% reduction)
 - **Rust ecosystem** - native integration with Rust projects
-- **Simpler configuration** - fewer knobs, easier to reason about
+- **Simpler configuration** - TOML-based configuration
 
 Stay with Litestream if:
 
@@ -34,8 +34,8 @@ Both tools use the same:
 
 | Feature | Litestream | Walrust |
 |---------|-----------|---------|
-| Memory (1 DB) | ~33 MB | ~12 MB |
-| Memory (100 DBs) | ~3.3 GB | ~20 MB |
+| Memory (1 DB) | 37 MB | 19 MB |
+| Memory (100 DBs) | 228 MB | 19 MB |
 | Language | Go | Rust |
 | Config format | YAML | TOML |
 | Cloud service | Yes (Litestream Cloud) | No |
@@ -385,20 +385,18 @@ Both tools use the same LTX format, so they're fully interchangeable.
 
 ## Performance Comparison
 
-Based on our benchmarks:
+Based on benchmarks (100KB databases, syncing to Tigris S3):
 
-| Metric | Litestream | Walrust |
-|--------|-----------|---------|
-| Memory (1 DB) | 33 MB | 12 MB |
-| Memory (10 DBs) | 330 MB | 16 MB |
-| Memory (100 DBs) | ~3.3 GB | ~20 MB |
-| CPU (idle) | <1% | <1% |
-| CPU (active) | 2-5% | 2-5% |
-| Sync latency (P95) | ~1s | ~1s |
+| Metric | Litestream | Walrust | Reduction |
+|--------|-----------|---------|-----------|
+| Memory (1 DB) | 37 MB | 19 MB | 49% |
+| Memory (10 DBs) | 61 MB | 20 MB | 67% |
+| Memory (100 DBs) | 228 MB | 19 MB | 92% |
+| CPU (idle) | <1% | <1% | - |
+| CPU (active) | 2-5% | 2-5% | - |
+| Sync latency (P95) | ~1s | ~1s | - |
 
-**Winner for multi-database:** Walrust (9x-165x less memory)
-
-See [Benchmark Results](/benchmarks/results/) for full details.
+See [Benchmark Results](/benchmarks/results/) for methodology and detailed data.
 
 ## Getting Help
 
@@ -419,5 +417,3 @@ After migrating:
 2. **Set up monitoring** - Use Prometheus metrics endpoint
 3. **Enable validation** - Configure `validation_interval` to verify backups
 4. **Optimize retention** - Adjust retention policy based on your needs
-
-Welcome to walrust! 🦀

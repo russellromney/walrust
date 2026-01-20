@@ -87,7 +87,8 @@ test_walrust_to_litestream() {
     local db_name="walrust-source"
     local db_path="$TEST_DIR/$db_name.db"
     local restore_path="$TEST_DIR/$db_name-restored.db"
-    local s3_path="s3://$BUCKET/$TEST_PREFIX/$db_name"
+    # Note: walrust snapshot automatically appends db_name to the path
+    local s3_path="s3://$BUCKET/$TEST_PREFIX"
 
     # Create test database with data
     echo "Creating test database..."
@@ -122,9 +123,9 @@ EOF
     echo "Taking walrust snapshot..."
     "$WALRUST_BIN" snapshot "$db_path" -b "$s3_path" --endpoint "$ENDPOINT"
 
-    # List what walrust created
+    # List what walrust created (db_name is appended by walrust)
     echo "Files created by walrust:"
-    aws s3 ls "$s3_path/" --recursive --endpoint-url "$ENDPOINT" 2>/dev/null || true
+    aws s3 ls "$s3_path/$db_name/" --recursive --endpoint-url "$ENDPOINT" 2>/dev/null || true
 
     # Restore with litestream
     echo "Restoring with litestream..."

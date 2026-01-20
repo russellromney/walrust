@@ -3,7 +3,7 @@ title: Multi-Database Sync
 description: Backing up many SQLite databases with one process
 ---
 
-This is the whole point of walrust. One process, many databases, minimal memory.
+One process watches multiple SQLite databases with minimal memory overhead.
 
 ## Command Line
 
@@ -72,15 +72,13 @@ s3://my-bucket/
 
 ## Memory Usage
 
-Here's why you're here:
+| Databases | Litestream | Walrust | Reduction |
+|-----------|------------|---------|-----------|
+| 1 | 37 MB | 19 MB | 49% |
+| 10 | 61 MB | 20 MB | 67% |
+| 100 | 228 MB | 19 MB | 92% |
 
-| Databases | Litestream | Walrust |
-|-----------|-----------|---------|
-| 1 | 33 MB | 12 MB |
-| 10 | 330 MB | 12 MB |
-| 100 | 3.3 GB | ~15 MB |
-
-Walrust shares one S3 client and one file watcher across all databases. Each database adds ~500KB of state tracking. It's basically free.
+Walrust shares one S3 client and one file watcher across all databases. Memory remains ~19-20 MB regardless of database count.
 
 ## Restoring Individual Databases
 
@@ -117,6 +115,4 @@ path = "/data/tenants/*.db"
 prefix = "tenants"
 ```
 
-New tenant shows up? New database file appears? Walrust starts backing it up. No restart needed.
-
-(Okay, you might need to restart. But the config is ready for it.)
+New database files matching the pattern are detected and backed up. A restart is required for walrust to discover new files.

@@ -370,13 +370,13 @@ walrust watch app.db -b s3://bucket --compact-interval 3600
 
 | Databases | Litestream | Walrust | Reduction |
 |-----------|------------|---------|-----------|
-| 1 | 25 MB | 8 MB | 68% |
-| 10 | 118 MB | 12 MB | 90% |
-| 100 | 1,125 MB | 44 MB | 96% |
+| 1 | 37 MB | 19 MB | 49% |
+| 10 | 61 MB | 20 MB | 67% |
+| 100 | 228 MB | 19 MB | 92% |
 
-*Measured on GitHub Actions ubuntu-latest with MinIO. See [bench/BENCHMARK_FRAMEWORK.md](bench/BENCHMARK_FRAMEWORK.md) for methodology.*
+*Measured with 100KB databases on macOS, syncing to Tigris S3. See [bench/BENCHMARK_FRAMEWORK.md](bench/BENCHMARK_FRAMEWORK.md) for methodology.*
 
-Walrust optimizes memory usage through efficient buffer management and shared S3 connection pooling.
+Walrust's memory usage remains ~19-20 MB regardless of database count.
 
 ## Testing
 

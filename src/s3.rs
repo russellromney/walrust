@@ -3,10 +3,19 @@ use aws_sdk_s3::{primitives::ByteStream, Client};
 use std::path::Path;
 
 /// Parse bucket string like "s3://bucket-name/prefix" or just "bucket-name"
+/// Returns (bucket_name, prefix) where prefix includes trailing slash if non-empty
 pub fn parse_bucket(bucket: &str) -> (String, String) {
     let bucket = bucket.strip_prefix("s3://").unwrap_or(bucket);
     if let Some((bucket, prefix)) = bucket.split_once('/') {
-        (bucket.to_string(), prefix.to_string())
+        // Ensure prefix has trailing slash for consistent path construction
+        let prefix = if prefix.is_empty() {
+            String::new()
+        } else if prefix.ends_with('/') {
+            prefix.to_string()
+        } else {
+            format!("{}/", prefix)
+        };
+        (bucket.to_string(), prefix)
     } else {
         (bucket.to_string(), String::new())
     }
@@ -338,14 +347,14 @@ mod tests {
     fn test_parse_bucket_with_prefix() {
         let (bucket, prefix) = parse_bucket("my-bucket/some/prefix");
         assert_eq!(bucket, "my-bucket");
-        assert_eq!(prefix, "some/prefix");
+        assert_eq!(prefix, "some/prefix/"); // Trailing slash added
     }
 
     #[test]
     fn test_parse_bucket_s3_url() {
         let (bucket, prefix) = parse_bucket("s3://my-bucket/backups");
         assert_eq!(bucket, "my-bucket");
-        assert_eq!(prefix, "backups");
+        assert_eq!(prefix, "backups/"); // Trailing slash added
     }
 
     #[test]

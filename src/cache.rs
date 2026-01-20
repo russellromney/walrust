@@ -111,10 +111,73 @@ impl LocalCache {
     }
 
     /// Get cache directory path for a database
-    fn cache_dir_for_db(db_path: &Path) -> PathBuf {
+    pub fn cache_dir_for_db(db_path: &Path) -> PathBuf {
         let parent = db_path.parent().unwrap_or(Path::new("."));
         let db_name = db_path.file_name().unwrap().to_string_lossy();
         parent.join(format!(".{}-walrust", db_name))
+    }
+
+    /// Open an existing cache from a directory path (read-only, for restore)
+    ///
+    /// Unlike `new()`, this does not create the cache if it doesn't exist.
+    /// Returns None if the cache directory or manifest doesn't exist.
+    pub fn open(cache_dir: &Path) -> Result<Option<Self>> {
+        let manifest_path = cache_dir.join("manifest.json");
+
+        if !manifest_path.exists() {
+            return Ok(None);
+        }
+
+        let manifest = Self::load_manifest(&manifest_path)?;
+
+        Ok(Some(Self {
+            cache_dir: cache_dir.to_path_buf(),
+            manifest_path,
+            manifest: Arc::new(Mutex::new(manifest)),
+        }))
+    }
+
+    /// Get all available TXIDs in cache (sorted ascending)
+    pub fn available_txids(&self) -> Vec<u64> {
+        let manifest = self.manifest.lock().unwrap();
+        let mut txids: Vec<u64> = manifest.entries.keys().copied().collect();
+        txids.sort();
+        txids
+    }
+
+    /// Check if a specific TXID is available in cache
+    pub fn has_txid(&self, txid: u64) -> bool {
+        let manifest = self.manifest.lock().unwrap();
+        manifest.entries.contains_key(&txid)
+    }
+
+    /// Get the TXID range in cache (min, max)
+    ///
+    /// Returns None if cache is empty
+    pub fn txid_range(&self) -> Option<(u64, u64)> {
+        let manifest = self.manifest.lock().unwrap();
+        if manifest.entries.is_empty() {
+            return None;
+        }
+        let min = manifest.entries.keys().min().copied().unwrap();
+        let max = manifest.entries.keys().max().copied().unwrap();
+        Some((min, max))
+    }
+
+    /// Check if cache contains a continuous range of TXIDs from start to end (inclusive)
+    pub fn has_continuous_range(&self, start: u64, end: u64) -> bool {
+        let manifest = self.manifest.lock().unwrap();
+        for txid in start..=end {
+            if !manifest.entries.contains_key(&txid) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Get cache directory path
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
     }
 
     /// Load manifest from disk
@@ -730,5 +793,132 @@ mod tests {
 
         assert_eq!(cache.pending_uploads(), vec![large_txid]);
         assert_eq!(cache.read_ltx(large_txid).unwrap(), b"data");
+    }
+
+    // Phase 5: Fast Local Restore tests
+
+    #[test]
+    fn test_open_existing_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+
+        // Create cache and write some data
+        {
+            let cache = LocalCache::new(&db_path).unwrap();
+            cache.write_ltx(1, b"data1").unwrap();
+            cache.write_ltx(2, b"data2").unwrap();
+        }
+
+        // Open existing cache
+        let cache_dir = LocalCache::cache_dir_for_db(&db_path);
+        let cache = LocalCache::open(&cache_dir).unwrap();
+
+        assert!(cache.is_some());
+        let cache = cache.unwrap();
+        assert_eq!(cache.available_txids(), vec![1, 2]);
+    }
+
+    #[test]
+    fn test_open_nonexistent_cache() {
+        let temp_dir = TempDir::new().unwrap();
+        let cache_dir = temp_dir.path().join("nonexistent-walrust");
+
+        let cache = LocalCache::open(&cache_dir).unwrap();
+        assert!(cache.is_none());
+    }
+
+    #[test]
+    fn test_available_txids() {
+        let (cache, _temp) = setup_cache();
+
+        // Empty cache
+        assert_eq!(cache.available_txids(), Vec::<u64>::new());
+
+        // Add some TXIDs out of order
+        cache.write_ltx(5, b"data5").unwrap();
+        cache.write_ltx(2, b"data2").unwrap();
+        cache.write_ltx(10, b"data10").unwrap();
+
+        // Should return sorted
+        assert_eq!(cache.available_txids(), vec![2, 5, 10]);
+    }
+
+    #[test]
+    fn test_has_txid() {
+        let (cache, _temp) = setup_cache();
+
+        cache.write_ltx(1, b"data1").unwrap();
+        cache.write_ltx(3, b"data3").unwrap();
+
+        assert!(cache.has_txid(1));
+        assert!(!cache.has_txid(2));
+        assert!(cache.has_txid(3));
+        assert!(!cache.has_txid(4));
+    }
+
+    #[test]
+    fn test_txid_range() {
+        let (cache, _temp) = setup_cache();
+
+        // Empty cache
+        assert_eq!(cache.txid_range(), None);
+
+        // Single TXID
+        cache.write_ltx(5, b"data5").unwrap();
+        assert_eq!(cache.txid_range(), Some((5, 5)));
+
+        // Multiple TXIDs
+        cache.write_ltx(2, b"data2").unwrap();
+        cache.write_ltx(10, b"data10").unwrap();
+        assert_eq!(cache.txid_range(), Some((2, 10)));
+    }
+
+    #[test]
+    fn test_has_continuous_range() {
+        let (cache, _temp) = setup_cache();
+
+        // Write continuous range 1-5
+        for txid in 1..=5 {
+            cache.write_ltx(txid, b"data").unwrap();
+        }
+
+        // Should have continuous range
+        assert!(cache.has_continuous_range(1, 5));
+        assert!(cache.has_continuous_range(2, 4));
+        assert!(cache.has_continuous_range(1, 1));
+
+        // Should not have range including 6
+        assert!(!cache.has_continuous_range(1, 6));
+        assert!(!cache.has_continuous_range(5, 7));
+    }
+
+    #[test]
+    fn test_has_continuous_range_with_gaps() {
+        let (cache, _temp) = setup_cache();
+
+        // Write with gap: 1, 2, 4, 5 (missing 3)
+        cache.write_ltx(1, b"data1").unwrap();
+        cache.write_ltx(2, b"data2").unwrap();
+        cache.write_ltx(4, b"data4").unwrap();
+        cache.write_ltx(5, b"data5").unwrap();
+
+        // Ranges without gap
+        assert!(cache.has_continuous_range(1, 2));
+        assert!(cache.has_continuous_range(4, 5));
+
+        // Ranges with gap
+        assert!(!cache.has_continuous_range(1, 4));
+        assert!(!cache.has_continuous_range(2, 4));
+        assert!(!cache.has_continuous_range(1, 5));
+    }
+
+    #[test]
+    fn test_cache_dir_accessor() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let cache = LocalCache::new(&db_path).unwrap();
+
+        let expected = temp_dir.path().join(".test.db-walrust");
+        assert_eq!(cache.cache_dir(), expected);
     }
 }
