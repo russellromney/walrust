@@ -61,8 +61,19 @@ pub struct DecodeResult {
 /// Returns the header and post_apply_checksum for chain tracking.
 /// The post_apply_checksum should be used as the expected pre_apply_checksum
 /// for the next incremental LTX file.
+///
+/// Checksum verification is skipped when the NO_CHECKSUM flag is set (litestream compatibility).
 pub fn decode_to_db<R: Read>(reader: R, output_path: &Path) -> Result<DecodeResult> {
     let (mut decoder, header) = Decoder::new(reader)?;
+
+    // Check if this is a litestream file with NO_CHECKSUM flag
+    let skip_checksums = header.flags.contains(HeaderFlags::NO_CHECKSUM);
+
+    if skip_checksums {
+        tracing::debug!(
+            "Skipping checksum verification (NO_CHECKSUM flag set - litestream compatibility)"
+        );
+    }
 
     let page_size = header.page_size.into_inner() as usize;
     let num_pages = header.commit.into_inner() as usize;
@@ -82,22 +93,29 @@ pub fn decode_to_db<R: Read>(reader: R, output_path: &Path) -> Result<DecodeResu
     // Write database file
     std::fs::write(output_path, &db_data)?;
 
-    // Verify post_apply_checksum matches actual written DB
+    // Compute actual checksum from database
     let actual_checksum = compute_db_checksum(&db_data);
-    if trailer.post_apply_checksum != actual_checksum {
-        return Err(anyhow!(
-            "Post-apply checksum mismatch after decode: expected {:016x}, got {:016x}. \
-             This may indicate corruption in the LTX file.",
-            trailer.post_apply_checksum.into_inner(),
+
+    // Verify post_apply_checksum matches actual written DB (skip if NO_CHECKSUM)
+    if !skip_checksums {
+        if trailer.post_apply_checksum != actual_checksum {
+            return Err(anyhow!(
+                "Post-apply checksum mismatch after decode: expected {:016x}, got {:016x}. \
+                 This may indicate corruption in the LTX file.",
+                trailer.post_apply_checksum.into_inner(),
+                actual_checksum.into_inner()
+            ));
+        }
+        tracing::debug!(
+            "Post-apply checksum verified: {:016x}",
             actual_checksum.into_inner()
-        ));
+        );
     }
 
     tracing::debug!(
-        "Decoded snapshot (TXID {}-{}), post_checksum: {:016x}",
+        "Decoded snapshot (TXID {}-{})",
         header.min_txid.into_inner(),
-        header.max_txid.into_inner(),
-        actual_checksum.into_inner()
+        header.max_txid.into_inner()
     );
 
     Ok(DecodeResult {
@@ -119,6 +137,8 @@ pub struct ApplyResult {
 /// 1. Before applying: verifies pre_apply_checksum matches current DB state
 /// 2. After applying: verifies post_apply_checksum matches new DB state
 ///
+/// Checksum verification is skipped when the NO_CHECKSUM flag is set (litestream compatibility).
+///
 /// Returns the header and post_apply_checksum for chain tracking.
 pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult> {
     use std::fs::OpenOptions;
@@ -126,21 +146,32 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
 
     let (mut decoder, header) = Decoder::new(reader)?;
 
-    // Verify pre_apply_checksum matches current DB state (for incrementals)
-    if let Some(expected_pre) = header.pre_apply_checksum {
-        let actual_pre = compute_checksum_from_file(db_path)?;
-        if expected_pre != actual_pre {
-            return Err(anyhow!(
-                "Checksum chain broken: expected pre_apply {:016x}, got {:016x}. \
-                 This may indicate missing or out-of-order LTX files.",
-                expected_pre.into_inner(),
-                actual_pre.into_inner()
-            ));
-        }
+    // Check if this is a litestream file with NO_CHECKSUM flag
+    let skip_checksums = header.flags.contains(HeaderFlags::NO_CHECKSUM);
+
+    if skip_checksums {
         tracing::debug!(
-            "Pre-apply checksum verified: {:016x}",
-            expected_pre.into_inner()
+            "Skipping checksum verification (NO_CHECKSUM flag set - litestream compatibility)"
         );
+    }
+
+    // Verify pre_apply_checksum matches current DB state (for incrementals)
+    if !skip_checksums {
+        if let Some(expected_pre) = header.pre_apply_checksum {
+            let actual_pre = compute_checksum_from_file(db_path)?;
+            if expected_pre != actual_pre {
+                return Err(anyhow!(
+                    "Checksum chain broken: expected pre_apply {:016x}, got {:016x}. \
+                     This may indicate missing or out-of-order LTX files.",
+                    expected_pre.into_inner(),
+                    actual_pre.into_inner()
+                ));
+            }
+            tracing::debug!(
+                "Pre-apply checksum verified: {:016x}",
+                expected_pre.into_inner()
+            );
+        }
     }
 
     let page_size = header.page_size.into_inner() as usize;
@@ -168,23 +199,30 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
     // Verify file checksum (internal integrity)
     let trailer = decoder.finish()?;
 
-    // Verify post_apply_checksum matches actual DB state after apply
+    // Compute actual checksum from database
     let actual_post = compute_checksum_from_file(db_path)?;
-    if trailer.post_apply_checksum != actual_post {
-        return Err(anyhow!(
-            "Post-apply checksum mismatch: expected {:016x}, got {:016x}. \
-             This may indicate corruption during apply.",
-            trailer.post_apply_checksum.into_inner(),
+
+    // Verify post_apply_checksum matches actual DB state (skip if NO_CHECKSUM)
+    if !skip_checksums {
+        if trailer.post_apply_checksum != actual_post {
+            return Err(anyhow!(
+                "Post-apply checksum mismatch: expected {:016x}, got {:016x}. \
+                 This may indicate corruption during apply.",
+                trailer.post_apply_checksum.into_inner(),
+                actual_post.into_inner()
+            ));
+        }
+        tracing::debug!(
+            "Post-apply checksum verified: {:016x}",
             actual_post.into_inner()
-        ));
+        );
     }
 
     tracing::debug!(
-        "Applied {} pages in-place (TXID {}-{}), post_checksum: {:016x}",
+        "Applied {} pages in-place (TXID {}-{})",
         pages_applied,
         header.min_txid.into_inner(),
-        header.max_txid.into_inner(),
-        actual_post.into_inner()
+        header.max_txid.into_inner()
     );
 
     Ok(ApplyResult {
@@ -1032,6 +1070,166 @@ mod tests {
         // Verify restored content byte-for-byte
         let restored_data = std::fs::read(&restored_path).unwrap();
         assert_eq!(restored_data, db_data, "Restored data should match original exactly");
+    }
+
+    // ============================================
+    // NO_CHECKSUM Flag Tests (Litestream Compatibility)
+    // ============================================
+
+    #[test]
+    fn test_no_checksum_flag_decode() {
+        // Test that files with NO_CHECKSUM flag skip checksum verification
+        use litetx::Encoder;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let restored_path = dir.path().join("restored.db");
+        let page_size = 4096u32;
+
+        // Create source database
+        let db_data = vec![0x42u8; page_size as usize * 3];
+        std::fs::write(&db_path, &db_data).unwrap();
+
+        // Create LTX file with NO_CHECKSUM flag (litestream format)
+        let header = Header {
+            flags: HeaderFlags::NO_CHECKSUM | HeaderFlags::COMPRESS_LZ4,
+            page_size: PageSize::new(page_size).unwrap(),
+            commit: PageNum::new(3).unwrap(),
+            min_txid: TXID::ONE,
+            max_txid: TXID::ONE,
+            timestamp: SystemTime::now(),
+            pre_apply_checksum: None,
+        };
+
+        let mut ltx_buffer = Vec::new();
+        let mut encoder = Encoder::new(&mut ltx_buffer, &header).unwrap();
+
+        // Encode all 3 pages
+        for i in 0..3u32 {
+            encoder.encode_page(PageNum::new(i + 1).unwrap(), &db_data[(i as usize * page_size as usize)..(i as usize + 1) * page_size as usize]).unwrap();
+        }
+
+        // Use zero checksum (litestream doesn't track checksums)
+        encoder.finish(Checksum::new(0)).unwrap();
+
+        // Decode should succeed even though checksum is zero
+        let cursor = std::io::Cursor::new(&ltx_buffer);
+        let result = decode_to_db(cursor, &restored_path);
+
+        assert!(result.is_ok(), "Should decode successfully with NO_CHECKSUM flag");
+        let decode_result = result.unwrap();
+
+        // Walrust computes checksums internally even when NO_CHECKSUM is set (for tracking)
+        // But it doesn't verify them against the LTX file's checksums
+        assert!(decode_result.post_apply_checksum.into_inner() != 0, "Should compute actual checksum even with NO_CHECKSUM");
+
+        // Verify data was restored correctly
+        let restored_data = std::fs::read(&restored_path).unwrap();
+        assert_eq!(restored_data, db_data, "Data should be restored correctly even with NO_CHECKSUM");
+
+        // Verify the checksum matches the actual data
+        let expected_checksum = compute_db_checksum(&db_data);
+        assert_eq!(decode_result.post_apply_checksum.into_inner(), expected_checksum.into_inner());
+    }
+
+    #[test]
+    fn test_no_checksum_flag_apply() {
+        // Test that incremental LTX with NO_CHECKSUM flag skips checksum verification
+        use litetx::Encoder;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let page_size = 4096u32;
+
+        // Create initial database (3 pages of zeros)
+        let initial_data = vec![0x00u8; page_size as usize * 3];
+        std::fs::write(&db_path, &initial_data).unwrap();
+
+        // Create incremental LTX with NO_CHECKSUM flag (like litestream)
+        // This would normally require pre_apply_checksum, but NO_CHECKSUM skips that
+        let header = Header {
+            flags: HeaderFlags::NO_CHECKSUM | HeaderFlags::COMPRESS_LZ4,
+            page_size: PageSize::new(page_size).unwrap(),
+            commit: PageNum::new(3).unwrap(),
+            min_txid: TXID::new(2).unwrap(), // Incremental (not snapshot)
+            max_txid: TXID::new(2).unwrap(),
+            timestamp: SystemTime::now(),
+            pre_apply_checksum: Some(Checksum::new(0)), // Zero checksum (litestream doesn't track)
+        };
+
+        let mut ltx_buffer = Vec::new();
+        let mut encoder = Encoder::new(&mut ltx_buffer, &header).unwrap();
+
+        // Modify page 2
+        let modified_page = vec![0xAAu8; page_size as usize];
+        encoder.encode_page(PageNum::new(2).unwrap(), &modified_page).unwrap();
+
+        // Use zero checksum
+        encoder.finish(Checksum::new(0)).unwrap();
+
+        // Apply should succeed even with zero/wrong checksums
+        let cursor = std::io::Cursor::new(&ltx_buffer);
+        let result = apply_ltx_to_db(cursor, &db_path);
+
+        assert!(result.is_ok(), "Should apply successfully with NO_CHECKSUM flag");
+        let apply_result = result.unwrap();
+
+        // Walrust computes checksums internally even when NO_CHECKSUM is set (for tracking)
+        // But it doesn't verify them against the LTX file's checksums
+        assert!(apply_result.post_apply_checksum.into_inner() != 0, "Should compute actual checksum even with NO_CHECKSUM");
+
+        // Verify page 2 was modified
+        let result_data = std::fs::read(&db_path).unwrap();
+        assert_eq!(&result_data[page_size as usize..2 * page_size as usize], &modified_page[..]);
+        // Verify other pages unchanged
+        assert_eq!(&result_data[0..page_size as usize], &vec![0x00u8; page_size as usize][..]);
+        assert_eq!(&result_data[2 * page_size as usize..3 * page_size as usize], &vec![0x00u8; page_size as usize][..]);
+
+        // Verify the checksum matches the actual data
+        let expected_checksum = compute_checksum_from_file(&db_path).unwrap();
+        assert_eq!(apply_result.post_apply_checksum.into_inner(), expected_checksum.into_inner());
+    }
+
+    #[test]
+    fn test_no_checksum_flag_skips_verification() {
+        // Verify that NO_CHECKSUM truly skips verification by using intentionally wrong checksums
+        use litetx::Encoder;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let page_size = 4096u32;
+
+        // Create database
+        let db_data = vec![0x42u8; page_size as usize];
+        std::fs::write(&db_path, &db_data).unwrap();
+
+        // Create incremental with NO_CHECKSUM and WRONG pre_checksum
+        // This should still succeed because NO_CHECKSUM skips verification
+        let actual_checksum = compute_checksum_from_file(&db_path).unwrap();
+        let wrong_checksum = Checksum::new(0xDEADBEEF); // Intentionally wrong
+
+        assert_ne!(wrong_checksum.into_inner(), actual_checksum.into_inner(), "Checksums should be different");
+
+        let header = Header {
+            flags: HeaderFlags::NO_CHECKSUM | HeaderFlags::COMPRESS_LZ4,
+            page_size: PageSize::new(page_size).unwrap(),
+            commit: PageNum::new(1).unwrap(),
+            min_txid: TXID::new(2).unwrap(),
+            max_txid: TXID::new(2).unwrap(),
+            timestamp: SystemTime::now(),
+            pre_apply_checksum: Some(wrong_checksum), // WRONG on purpose!
+        };
+
+        let mut ltx_buffer = Vec::new();
+        let mut encoder = Encoder::new(&mut ltx_buffer, &header).unwrap();
+        encoder.encode_page(PageNum::new(1).unwrap(), &vec![0x99u8; page_size as usize]).unwrap();
+        encoder.finish(Checksum::new(0xBADC0FFEE)).unwrap(); // Also wrong!
+
+        // Should succeed because NO_CHECKSUM skips all verification
+        let cursor = std::io::Cursor::new(&ltx_buffer);
+        let result = apply_ltx_to_db(cursor, &db_path);
+
+        assert!(result.is_ok(), "Should succeed with wrong checksums when NO_CHECKSUM is set");
     }
 }
 
