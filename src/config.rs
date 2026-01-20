@@ -203,12 +203,6 @@ pub struct SyncConfig {
     #[serde(default = "default_truncate_threshold")]
     pub wal_truncate_threshold_pages: u64,
 
-    /// How often to check for WAL changes in seconds (default: 1)
-    /// Debounces file watcher events to reduce CPU usage on high-write workloads.
-    /// Higher values reduce CPU but increase sync latency.
-    #[serde(default = "default_monitor_interval")]
-    pub monitor_interval: u64,
-
     /// Automated validation interval in seconds (default: 0 = disabled)
     /// Periodically verifies backup integrity by checking LTX checksums and TXID continuity.
     /// Recommended: 86400 (daily) for production. Warning: downloads metadata from S3.
@@ -230,7 +224,6 @@ impl Default for SyncConfig {
             checkpoint_interval: 60,
             min_checkpoint_page_count: 1000,
             wal_truncate_threshold_pages: 121359,
-            monitor_interval: 1,
             validation_interval: 0,
         }
     }
@@ -253,9 +246,6 @@ fn default_min_checkpoint_pages() -> u64 {
 }
 fn default_truncate_threshold() -> u64 {
     121359
-}
-fn default_monitor_interval() -> u64 {
-    1
 }
 
 /// Retention policy configuration
@@ -329,9 +319,6 @@ pub struct DatabaseConfig {
 
     /// Override wal_truncate_threshold_pages for this database
     pub wal_truncate_threshold_pages: Option<u64>,
-
-    /// Override monitor_interval for this database
-    pub monitor_interval: Option<u64>,
 
     /// Override validation_interval for this database
     pub validation_interval: Option<u64>,
@@ -499,9 +486,6 @@ impl Config {
         if let Some(v) = db.wal_truncate_threshold_pages {
             sync.wal_truncate_threshold_pages = v;
         }
-        if let Some(v) = db.monitor_interval {
-            sync.monitor_interval = v;
-        }
         if let Some(v) = db.validation_interval {
             sync.validation_interval = v;
         }
@@ -638,7 +622,6 @@ mod tests {
         assert!(config.sync.on_startup);
         assert!(!config.sync.compact_after_snapshot);
         assert_eq!(config.sync.compact_interval, 0);
-        assert_eq!(config.sync.monitor_interval, 1);
         assert_eq!(config.sync.validation_interval, 0);
 
         // Check retention defaults
@@ -800,46 +783,40 @@ mod tests {
     }
 
     #[test]
-    fn test_monitor_interval_default() {
+    fn test_validation_interval_default() {
         let toml = r#"
             [[databases]]
             path = "/data/test.db"
         "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.sync.monitor_interval, 1);
         assert_eq!(config.sync.validation_interval, 0);
     }
 
     #[test]
-    fn test_monitor_validation_interval_override() {
+    fn test_validation_interval_override() {
         let toml = r#"
             [sync]
-            monitor_interval = 5
             validation_interval = 86400
 
             [[databases]]
             path = "/data/test.db"
         "#;
         let config: Config = toml::from_str(toml).unwrap();
-        assert_eq!(config.sync.monitor_interval, 5);
         assert_eq!(config.sync.validation_interval, 86400);
     }
 
     #[test]
-    fn test_per_db_monitor_interval() {
+    fn test_per_db_validation_interval() {
         let toml = r#"
             [sync]
-            monitor_interval = 1
             validation_interval = 0
 
             [[databases]]
             path = "/data/test.db"
-            monitor_interval = 10
             validation_interval = 3600
         "#;
         let config: Config = toml::from_str(toml).unwrap();
         let merged = config.merge_sync_config(&config.databases[0]);
-        assert_eq!(merged.monitor_interval, 10);
         assert_eq!(merged.validation_interval, 3600);
     }
 

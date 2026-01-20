@@ -284,16 +284,6 @@ path = "/custom/cache"  # Override default location
 - `src/main.rs` (MODIFIED) - CLI flags and initialization
 - `src/config.rs` (MODIFIED) - Cache configuration
 
-### Timeline Estimate
-
-- Phase 1 (Cache): 2-3 days
-- Phase 2 (Uploader): 2-3 days
-- Phase 3 (Integration): 1-2 days
-- Phase 4 (Recovery): 1 day
-- Phase 5 (Fast Restore): 1-2 days
-- Testing & Documentation: 2-3 days
-- **Total**: ~2 weeks
-
 ### References
 
 - Litestream source: `/Users/russellromney/Documents/Github/litestream`
@@ -376,7 +366,7 @@ path = "/custom/cache"  # Override default location
 
 ---
 
-## v0.1.6 Highlights (Current)
+## v0.1.6 Highlights (Previous)
 
 - ✅ **PITR Bug Fixed** - `testable::restore` now correctly parses point-in-time
   - Supports `txid:N` format (e.g., `txid:12345`)
@@ -409,7 +399,6 @@ path = "/custom/cache"  # Override default location
 
 ## v0.1.4 Highlights (Previous)
 
-- ✅ **Monitor Interval** (`monitor_interval`) - File watcher debouncing to reduce CPU usage
 - ✅ **Validation Interval** (`validation_interval`) - Automated periodic backup integrity verification
 - ✅ **Validation Metrics** - Prometheus metrics for backup validation
 - ✅ **132 tests** - Comprehensive test coverage including 20 integration tests on Tigris
@@ -1070,14 +1059,14 @@ walrust explain [--config file]         # ✅ Show config summary without runnin
 - No multi-writer support (use orchestration for HA)
 - Simpler failure modes
 
-### Shadow WAL (v0.1.9 - Complete) ✅
+### Shadow WAL (Default Mode) ✅
 
-**Status**: Fully integrated. Use `--shadow-wal` flag to enable.
+**Status**: Default mode as of v0.3.0. No flag needed.
 
 The shadow WAL architecture matches Litestream's approach for better performance at high write rates:
 
 1. **Read Transaction Blocker**: Holds open read transaction to prevent SQLite auto-checkpoint
-2. **Shadow Directory**: Copies WAL frames to `.walrust-{dbname}/` as they arrive
+2. **Shadow Directory**: Copies WAL frames to `.<dbname>-walrust/` as they arrive
 3. **Decoupled Uploads**: S3 uploads read from shadow (not active WAL)
 4. **Manual Checkpoint**: Walrust triggers checkpoints when ready
 
@@ -1087,9 +1076,9 @@ The shadow WAL architecture matches Litestream's approach for better performance
 - Preserved history (shadow keeps frames even after checkpoint)
 - Better throughput at 100+ databases
 
-**Implementation** (v0.1.9):
+**Implementation**:
 
-- `watch_with_shadow()` in `src/sync.rs` - Full shadow mode implementation
+- `watch_with_shadow()` in `src/sync.rs` - Default sync mode
 - `ShadowDbState`, `ShadowSyncInput`, `ShadowSyncOutput` - Shadow-specific types
 - `sync_shadow_concurrent_with_retry()` - Concurrent shadow sync with retry logic
 - WAL notification → `shadow.copy_frames()` (immediate frame copy)
@@ -1098,13 +1087,12 @@ The shadow WAL architecture matches Litestream's approach for better performance
 
 **Usage**:
 ```bash
-walrust watch mydb.db -b s3://bucket --shadow-wal
+walrust watch mydb.db -b s3://bucket
 ```
 
 **Key Files**:
 - `src/shadow.rs` - `ShadowWal` struct (checkpoint blocker, frame copier)
 - `src/sync.rs` - `watch_with_shadow()` function
-- `src/main.rs` - `--shadow-wal` CLI flag routing
 
 ### LTX vs Custom Format
 - Use `litetx` crate (Superfly/Fly.io maintained)
@@ -1143,18 +1131,18 @@ s3://bucket/prefix/
 
 ## Current Status
 
-### v0.1.4 (Current)
-- [x] **Monitor Interval** - File watcher debouncing for high-write workloads
-  - [x] Configurable via CLI (`--monitor-interval`) and config file
-  - [x] Per-database override support
-  - [x] Default: 1 second
+### v0.3.0 (Current)
+- [x] **Pure Polling Architecture** - Removed file watcher, uses interval-based polling
+  - [x] `wal_sync_interval` controls polling frequency (default: 1 second)
+  - [x] Simpler, more reliable than FSEvents/inotify (mmap writes not detected by file watchers)
+  - [x] Works consistently across all platforms
 - [x] **Validation Interval** - Automated backup integrity verification
   - [x] Periodic LTX checksum and TXID continuity verification
   - [x] Prometheus metrics: `walrust_validation_success_total`, `walrust_validation_failure_total`, `walrust_last_validation_timestamp`
   - [x] Configurable via CLI (`--validation-interval`) and config file
   - [x] Per-database override support
   - [x] Default: 0 (disabled), recommended: 86400 (daily) for production
-- [x] 132 total tests (all passing)
+- [x] 206 total tests (all passing)
 
 ### v0.1.3 (Previous)
 - [x] **LTX Format Integration**
@@ -1472,14 +1460,6 @@ Before declaring walrust production-ready:
 - [ ] **All critical invariants** verified in every test
 - [ ] **Recovery time** < 5 seconds for typical workloads
 - [ ] **Documentation** includes failure recovery guide
-
-### Timeline Estimate
-
-- **Phase 1 (Basic DST Framework)**: 1 week
-- **Phase 2 (Advanced Scenarios)**: 1 week
-- **Phase 3 (Continuous Chaos)**: 1 week
-- **CI Integration & Hardening**: 2 weeks nightly runs
-- **Total**: ~5 weeks to production-ready v1.0
 
 ### Dependencies
 

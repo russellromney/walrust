@@ -38,9 +38,6 @@ aws-config = { version = "1", features = ["behavior-version-latest"] }
 aws-sdk-s3 = "1"
 aws-smithy-runtime = { version = "1", features = ["client"] }
 
-# File watching
-notify = "6"
-
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 

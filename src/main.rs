@@ -1,3 +1,4 @@
+mod cache;
 mod config;
 mod dashboard;
 mod errors;
@@ -8,6 +9,7 @@ mod s3;
 mod shadow;
 mod storage;
 mod sync;
+mod uploader;
 mod wal;
 mod webhook;
 
@@ -98,11 +100,6 @@ enum Commands {
         #[arg(long)]
         wal_truncate_threshold: Option<u64>,
 
-        /// File watcher check interval in seconds (default: 1)
-        /// Debounces trigger checks to reduce CPU on high-write workloads
-        #[arg(long)]
-        monitor_interval: Option<u64>,
-
         /// Backup validation interval in seconds (0 = disabled)
         /// Periodically verifies backup integrity by checking LTX checksums
         #[arg(long)]
@@ -152,14 +149,6 @@ enum Commands {
         /// Failures before circuit breaker opens (default: 10)
         #[arg(long)]
         circuit_breaker_threshold: Option<u32>,
-
-        /// Enable shadow WAL mode (experimental)
-        ///
-        /// Shadow WAL decouples S3 uploads from SQLite's active WAL file,
-        /// providing better performance at high write rates. This matches
-        /// Litestream's architecture.
-        #[arg(long)]
-        shadow_wal: bool,
 
         /// Enable independent per-DB tasks (experimental)
         ///
@@ -224,6 +213,13 @@ enum Commands {
         /// Restore to specific point in time (ISO 8601)
         #[arg(long)]
         point_in_time: Option<String>,
+
+        /// Local cache directory for fast restore
+        ///
+        /// If provided, checks local cache first before fetching from S3.
+        /// Uses LTX files from cache when available, falling back to S3 for missing files.
+        #[arg(long)]
+        cache_dir: Option<PathBuf>,
     },
 
     /// List databases in S3 bucket
@@ -361,7 +357,6 @@ struct WatchArgs {
     checkpoint_interval: Option<u64>,
     min_checkpoint_pages: Option<u64>,
     wal_truncate_threshold: Option<u64>,
-    monitor_interval: Option<u64>,
     validation_interval: Option<u64>,
     retain_hourly: Option<usize>,
     retain_daily: Option<usize>,
@@ -375,8 +370,6 @@ struct WatchArgs {
     max_delay_ms: Option<u64>,
     no_circuit_breaker: bool,
     circuit_breaker_threshold: Option<u32>,
-    // Shadow WAL mode
-    shadow_wal: bool,
     // Independent per-DB tasks mode
     independent_tasks: bool,
     // Cache configuration
@@ -473,7 +466,6 @@ fn resolve_watch_config(
                 checkpoint_interval: cli.checkpoint_interval.unwrap_or(60),
                 min_checkpoint_page_count: cli.min_checkpoint_pages.unwrap_or(1000),
                 wal_truncate_threshold_pages: cli.wal_truncate_threshold.unwrap_or(121359),
-                monitor_interval: cli.monitor_interval.unwrap_or(1),
                 validation_interval: cli.validation_interval.unwrap_or(0),
             };
 
@@ -528,7 +520,6 @@ fn merge_cli_sync_overrides(base: &SyncConfig, cli: &WatchArgs) -> SyncConfig {
         checkpoint_interval: cli.checkpoint_interval.unwrap_or(base.checkpoint_interval),
         min_checkpoint_page_count: cli.min_checkpoint_pages.unwrap_or(base.min_checkpoint_page_count),
         wal_truncate_threshold_pages: cli.wal_truncate_threshold.unwrap_or(base.wal_truncate_threshold_pages),
-        monitor_interval: cli.monitor_interval.unwrap_or(base.monitor_interval),
         validation_interval: cli.validation_interval.unwrap_or(base.validation_interval),
     }
 }
@@ -664,7 +655,6 @@ async fn run() -> Result<()> {
             checkpoint_interval,
             min_checkpoint_pages,
             wal_truncate_threshold,
-            monitor_interval,
             validation_interval,
             retain_hourly,
             retain_daily,
@@ -677,7 +667,6 @@ async fn run() -> Result<()> {
             max_delay_ms,
             no_circuit_breaker,
             circuit_breaker_threshold,
-            shadow_wal,
             independent_tasks,
             enable_cache,
             cache_dir,
@@ -700,7 +689,6 @@ async fn run() -> Result<()> {
                 checkpoint_interval,
                 min_checkpoint_pages,
                 wal_truncate_threshold,
-                monitor_interval,
                 validation_interval,
                 retain_hourly,
                 retain_daily,
@@ -713,7 +701,6 @@ async fn run() -> Result<()> {
                 max_delay_ms,
                 no_circuit_breaker,
                 circuit_breaker_threshold,
-                shadow_wal,
                 independent_tasks,
                 enable_cache,
                 cache_dir,
@@ -735,21 +722,6 @@ async fn run() -> Result<()> {
                 );
             }
 
-            if shadow_wal {
-                tracing::info!("Shadow WAL mode enabled (experimental)");
-                tracing::warn!("Shadow WAL integration is in progress - using standard mode for now");
-                // TODO: Call watch_with_shadow when fully implemented
-                // For now, initialize shadow directories for each database
-                for db in &resolved_dbs {
-                    let shadow_dir = walrust::shadow::ShadowWal::shadow_dir_for(&db.path);
-                    if let Err(e) = std::fs::create_dir_all(&shadow_dir) {
-                        tracing::warn!("Could not create shadow dir {}: {}", shadow_dir.display(), e);
-                    } else {
-                        tracing::debug!("Shadow WAL directory: {}", shadow_dir.display());
-                    }
-                }
-            }
-
             let compact_policy =
                 if sync_config.compact_after_snapshot || sync_config.compact_interval > 0 {
                     Some(retention::RetentionPolicy::new(
@@ -764,7 +736,7 @@ async fn run() -> Result<()> {
 
             // Choose sync mode based on flags
             if independent_tasks {
-                tracing::info!("Independent tasks mode enabled (experimental)");
+                tracing::info!("Independent tasks mode enabled");
                 sync::watch_with_independent_tasks(
                     resolved_dbs,
                     &bucket,
@@ -779,7 +751,8 @@ async fn run() -> Result<()> {
                 )
                 .await?;
             } else {
-                sync::watch_with_config(
+                // Default: shadow WAL mode (decouples uploads from SQLite WAL)
+                sync::watch_with_shadow(
                     resolved_dbs,
                     &bucket,
                     endpoint.as_deref(),
@@ -789,7 +762,6 @@ async fn run() -> Result<()> {
                     watch_args.no_metrics,
                     retry_config,
                     webhooks,
-                    cache_config,
                 )
                 .await?;
             }
@@ -800,8 +772,9 @@ async fn run() -> Result<()> {
             bucket,
             endpoint,
             point_in_time,
+            cache_dir,
         } => {
-            sync::restore(&name, &output, &bucket, endpoint.as_deref(), point_in_time.as_deref()).await?;
+            sync::restore(&name, &output, &bucket, endpoint.as_deref(), point_in_time.as_deref(), cache_dir.as_deref()).await?;
         }
         Commands::List { bucket, endpoint } => {
             sync::list(&bucket, endpoint.as_deref()).await?;
@@ -930,7 +903,6 @@ mod tests {
             checkpoint_interval: None,
             min_checkpoint_pages: None,
             wal_truncate_threshold: None,
-            monitor_interval: None,
             validation_interval: None,
             retain_hourly: None,
             retain_daily: None,
@@ -943,7 +915,6 @@ mod tests {
             max_delay_ms: None,
             no_circuit_breaker: false,
             circuit_breaker_threshold: None,
-            shadow_wal: false,
             independent_tasks: false,
             enable_cache: false,
             cache_dir: None,

@@ -1,7 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use futures::future::join_all;
-use notify::{Event, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -365,31 +364,6 @@ pub async fn watch(
         );
     }
 
-    // Set up file watcher
-    let (tx, mut rx) = mpsc::channel::<PathBuf>(100);
-
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        if let Ok(event) = res {
-            for path in event.paths {
-                // Only care about WAL files
-                if path.extension().map(|e| e == "db-wal").unwrap_or(false) {
-                    let _ = tx.blocking_send(path);
-                }
-            }
-        }
-    })?;
-
-    // Watch parent directories of all databases
-    let mut watched_dirs = std::collections::HashSet::new();
-    for db_path in &databases {
-        if let Some(parent) = db_path.parent() {
-            if watched_dirs.insert(parent.to_path_buf()) {
-                watcher.watch(parent, RecursiveMode::NonRecursive)?;
-                tracing::debug!("Watching directory: {}", parent.display());
-            }
-        }
-    }
-
     // Initial sync of any existing WAL data
     for state in db_states.values_mut() {
         if state.wal_path.exists() {
@@ -404,6 +378,10 @@ pub async fn watch(
 
     let snapshot_interval = Duration::from_secs(snapshot_interval);
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
+
+    // Set up WAL sync timer (poll every 1 second by default)
+    let mut wal_sync_timer = tokio::time::interval(Duration::from_secs(1));
+    wal_sync_timer.tick().await; // Skip first tick
 
     // Set up compaction timer (only if compact_interval > 0)
     let compact_interval_duration = if compact_interval > 0 {
@@ -432,14 +410,14 @@ pub async fn watch(
 
     loop {
         tokio::select! {
-            // WAL file changed
-            Some(wal_path) = rx.recv() => {
-                // Find the corresponding database
-                let db_path = wal_path.with_extension("db");
-                if let Some(state) = db_states.get_mut(&db_path) {
-                    match sync_wal(&client, &bucket_name, &prefix, state).await {
-                        Ok(_frame_count) => {}
-                        Err(e) => tracing::error!("Failed to sync WAL for {}: {}", state.name, e),
+            // Poll and sync WAL changes
+            _ = wal_sync_timer.tick() => {
+                for state in db_states.values_mut() {
+                    if state.wal_path.exists() {
+                        match sync_wal(&client, &bucket_name, &prefix, state).await {
+                            Ok(_frame_count) => {}
+                            Err(e) => tracing::error!("Failed to sync WAL for {}: {}", state.name, e),
+                        }
                     }
                 }
             }
@@ -628,31 +606,6 @@ pub async fn watch_with_config(
             .await;
     }
 
-    // Set up file watcher
-    let (tx, mut rx) = mpsc::channel::<PathBuf>(100);
-
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        if let Ok(event) = res {
-            for path in event.paths {
-                // Only care about WAL files
-                if path.extension().map(|e| e == "db-wal").unwrap_or(false) {
-                    let _ = tx.blocking_send(path);
-                }
-            }
-        }
-    })?;
-
-    // Watch parent directories of all databases
-    let mut watched_dirs = std::collections::HashSet::new();
-    for db_config in &databases {
-        if let Some(parent) = db_config.path.parent() {
-            if watched_dirs.insert(parent.to_path_buf()) {
-                watcher.watch(parent, RecursiveMode::NonRecursive)?;
-                tracing::debug!("Watching directory: {}", parent.display());
-            }
-        }
-    }
-
     // Take initial snapshots FIRST if on_startup is enabled.
     // This establishes the base state before any incremental WAL syncs.
     // The snapshot checkpoints WAL to main db, ensuring all committed data is captured.
@@ -727,9 +680,9 @@ pub async fn watch_with_config(
     let mut checkpoint_timer = tokio::time::interval(checkpoint_interval_duration);
     checkpoint_timer.tick().await; // Skip first tick
 
-    // Set up trigger check interval (configurable via monitor_interval)
-    let monitor_interval_duration = Duration::from_secs(global_sync.monitor_interval);
-    let mut trigger_timer = tokio::time::interval(monitor_interval_duration);
+    // Set up trigger check interval (uses wal_sync_interval for polling)
+    let trigger_interval_duration = Duration::from_secs(global_sync.wal_sync_interval);
+    let mut trigger_timer = tokio::time::interval(trigger_interval_duration);
 
     // Set up validation timer (periodic backup integrity check)
     let validation_interval_duration = if global_sync.validation_interval > 0 {
@@ -739,9 +692,6 @@ pub async fn watch_with_config(
     };
     let mut validation_timer = tokio::time::interval(validation_interval_duration);
     validation_timer.tick().await; // Skip first tick
-
-    // Track pending WAL syncs
-    let mut pending_wal_syncs = std::collections::HashSet::new();
 
     // Log startup info with sync trigger settings
     let triggers_enabled = global_sync.max_changes > 0
@@ -756,11 +706,10 @@ pub async fn watch_with_config(
 
     if triggers_enabled {
         tracing::info!(
-            "walrust running (snapshot: {}s, WAL sync: {}s, checkpoint: {}s, monitor: {}s, max_changes: {}, max_interval: {}s, on_idle: {}s{})",
+            "walrust running (snapshot: {}s, WAL sync: {}s, checkpoint: {}s, max_changes: {}, max_interval: {}s, on_idle: {}s{})",
             global_sync.snapshot_interval,
             global_sync.wal_sync_interval,
             global_sync.checkpoint_interval,
-            global_sync.monitor_interval,
             global_sync.max_changes,
             global_sync.max_interval,
             global_sync.on_idle,
@@ -768,11 +717,10 @@ pub async fn watch_with_config(
         );
     } else {
         tracing::info!(
-            "walrust running (snapshot: {}s, WAL sync: {}s, checkpoint: {}s, monitor: {}s{})",
+            "walrust running (snapshot: {}s, WAL sync: {}s, checkpoint: {}s{})",
             global_sync.snapshot_interval,
             global_sync.wal_sync_interval,
             global_sync.checkpoint_interval,
-            global_sync.monitor_interval,
             validation_info
         );
     }
@@ -805,22 +753,9 @@ pub async fn watch_with_config(
                 break;
             }
 
-            // WAL file changed - mark for sync instead of syncing immediately
-            Some(wal_path) = rx.recv() => {
-                let db_path = wal_path.with_extension("db");
-                if db_states.contains_key(&db_path) {
-                    pending_wal_syncs.insert(db_path);
-                }
-            }
-
-            // Batch sync WAL changes - CONCURRENT processing
-            // Check ALL databases on every tick, not just those from file watcher
-            // This ensures we detect changes even when FSEvents misses mmap writes (macOS)
+            // Poll and sync WAL changes at wal_sync_interval
             _ = wal_sync_timer.tick() => {
-                // Clear any pending from file watcher (we're checking everything anyway)
-                pending_wal_syncs.clear();
-
-                // Phase 1: Collect inputs for ALL databases that have WAL files
+                // Collect inputs for all databases that have WAL files
                 let sync_inputs: Vec<SyncInput> = db_states
                     .values()
                     .filter(|state| state.wal_path.exists())
@@ -1115,30 +1050,25 @@ pub async fn watch_with_config(
         }
     }
 
-    // Graceful shutdown: complete any pending WAL syncs (5s timeout per roadmap)
-    let pending_paths: Vec<_> = pending_wal_syncs.drain().collect();
-    let pending_count = pending_paths.len();
-
-    if pending_count > 0 {
-        tracing::info!("Completing {} in-flight uploads before shutdown...", pending_count);
-    } else {
-        tracing::info!("No pending uploads, shutting down...");
-    }
+    // Graceful shutdown: final sync for all databases with pending changes (5s timeout)
+    tracing::info!("Completing final syncs before shutdown...");
 
     let shutdown_start = std::time::Instant::now();
     let shutdown_timeout = Duration::from_secs(5);
     let mut synced_count = 0;
     let mut failed_count = 0;
-    let mut remaining_count = pending_count;
 
-    for db_path in pending_paths {
-        remaining_count -= 1;
+    let db_paths: Vec<_> = db_states.keys().cloned().collect();
+    for db_path in db_paths {
         if shutdown_start.elapsed() >= shutdown_timeout {
-            tracing::warn!("Shutdown timeout reached, {} syncs remaining", remaining_count + 1);
+            tracing::warn!("Shutdown timeout reached");
             break;
         }
 
         if let Some(state) = db_states.get_mut(&db_path) {
+            if !state.wal_path.exists() {
+                continue;
+            }
             let remaining = shutdown_timeout.saturating_sub(shutdown_start.elapsed());
             match tokio::time::timeout(
                 remaining,
@@ -1669,31 +1599,6 @@ pub async fn watch_with_shadow(
             .await;
     }
 
-    // Set up file watcher
-    let (tx, mut rx) = mpsc::channel::<PathBuf>(100);
-
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        if let Ok(event) = res {
-            for path in event.paths {
-                // Only care about WAL files
-                if path.extension().map(|e| e == "db-wal").unwrap_or(false) {
-                    let _ = tx.blocking_send(path);
-                }
-            }
-        }
-    })?;
-
-    // Watch parent directories of all databases
-    let mut watched_dirs = std::collections::HashSet::new();
-    for db_config in &databases {
-        if let Some(parent) = db_config.path.parent() {
-            if watched_dirs.insert(parent.to_path_buf()) {
-                watcher.watch(parent, RecursiveMode::NonRecursive)?;
-                tracing::debug!("Watching directory: {}", parent.display());
-            }
-        }
-    }
-
     // Initial copy of any existing WAL data to shadow
     for (_db_path, state) in db_states.iter_mut() {
         if state.wal_path.exists() {
@@ -1779,8 +1684,8 @@ pub async fn watch_with_shadow(
     let mut checkpoint_timer = tokio::time::interval(checkpoint_interval_duration);
     checkpoint_timer.tick().await;
 
-    let monitor_interval_duration = Duration::from_secs(global_sync.monitor_interval);
-    let mut trigger_timer = tokio::time::interval(monitor_interval_duration);
+    let trigger_interval_duration = Duration::from_secs(global_sync.wal_sync_interval);
+    let mut trigger_timer = tokio::time::interval(trigger_interval_duration);
 
     let validation_interval_duration = if global_sync.validation_interval > 0 {
         Duration::from_secs(global_sync.validation_interval)
@@ -1789,9 +1694,6 @@ pub async fn watch_with_shadow(
     };
     let mut validation_timer = tokio::time::interval(validation_interval_duration);
     validation_timer.tick().await;
-
-    // Track databases with pending shadow syncs
-    let mut pending_shadow_syncs = std::collections::HashSet::new();
 
     tracing::info!(
         "walrust shadow mode running (snapshot: {}s, WAL sync: {}s, checkpoint: {}s)",
@@ -1832,41 +1734,9 @@ pub async fn watch_with_shadow(
                 break;
             }
 
-            // WAL file changed - copy frames to shadow immediately
-            Some(wal_path) = rx.recv() => {
-                let db_path = wal_path.with_extension("db");
-                if let Some(state) = db_states.get_mut(&db_path) {
-                    // Copy frames to shadow directory immediately
-                    match state.shadow.copy_frames(state.wal_copy_offset).await {
-                        Ok((frames, new_offset)) => {
-                            if !frames.is_empty() {
-                                tracing::debug!(
-                                    "{}: Copied {} frames to shadow (offset {} -> {})",
-                                    state.name,
-                                    frames.len(),
-                                    state.wal_copy_offset,
-                                    new_offset
-                                );
-                                state.wal_copy_offset = new_offset;
-                                // Mark for upload
-                                pending_shadow_syncs.insert(db_path);
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!("{}: Shadow copy failed: {}", state.name, e);
-                        }
-                    }
-                }
-            }
-
-            // Sync timer - copy from WAL and upload from shadow segments
-            // Check ALL databases on every tick, not just those from file watcher
-            // This ensures we detect changes even when FSEvents misses mmap writes (macOS)
+            // Poll and sync at wal_sync_interval
             _ = wal_sync_timer.tick() => {
-                // Clear any pending from file watcher (we're checking everything anyway)
-                pending_shadow_syncs.clear();
-
-                // Phase 0: Copy any new WAL frames to shadow for all databases
+                // Copy any new WAL frames to shadow for all databases
                 for state in db_states.values_mut() {
                     if state.wal_path.exists() {
                         match state.shadow.copy_frames(state.wal_copy_offset).await {
@@ -2844,10 +2714,9 @@ struct CacheState {
 /// Run an independent task for a single database
 ///
 /// Each database gets its own task that:
-/// 1. Watches its WAL file for changes
-/// 2. Debounces rapid writes (configurable, default 100ms)
-/// 3. Syncs at max_interval even under continuous writes
-/// 4. Uses spawn_blocking for CPU-bound encoding
+/// 1. Polls WAL file size at wal_sync_interval
+/// 2. Syncs if WAL has grown since last sync
+/// 3. Uses spawn_blocking for CPU-bound encoding
 ///
 /// When cache_state is Some, writes go to local disk cache first,
 /// then a separate uploader task handles S3 uploads asynchronously.
@@ -2864,85 +2733,33 @@ async fn run_db_task(
 ) -> Result<()> {
     let db_name = state.db_state.name.clone();
     let wal_path = state.db_state.wal_path.clone();
-    let db_path = state.db_state.db_path.clone();
 
-    // Debounce delay: wait this long after a change before syncing
-    let debounce_ms = 100u64; // TODO: make configurable
-    let debounce_duration = Duration::from_millis(debounce_ms);
+    // Poll interval: check WAL size and sync every N seconds
+    let poll_interval = Duration::from_secs(state.sync_config.wal_sync_interval);
+    let mut poll_timer = tokio::time::interval(poll_interval);
+    poll_timer.tick().await; // Skip first immediate tick
 
-    // Max interval: sync at least this often even under continuous writes
-    let max_interval = Duration::from_secs(state.sync_config.wal_sync_interval);
+    // Track last synced WAL size to detect changes
+    let mut last_synced_wal_size: u64 = std::fs::metadata(&wal_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
 
-    // Set up file watcher for just this DB's WAL
-    let (tx, mut rx) = mpsc::channel::<()>(16);
-    let wal_path_for_watcher = wal_path.clone();
-
-    let db_name_for_watcher = db_name.clone();
-    let mut watcher = notify::recommended_watcher(move |res: Result<Event, notify::Error>| {
-        match res {
-            Ok(event) => {
-                for path in &event.paths {
-                    // Trigger on WAL or SHM changes - on macOS, SHM events arrive
-                    // before WAL events while connection is open
-                    let ext = path.extension().and_then(|e| e.to_str());
-                    let is_db_file = ext == Some("db-wal") || ext == Some("db-shm");
-                    let stem_matches = path.file_stem() == wal_path_for_watcher.file_stem();
-                    tracing::trace!(
-                        "{}: FS event: path={}, ext={:?}, is_db={}, stem_match={}",
-                        db_name_for_watcher, path.display(), ext, is_db_file, stem_matches
-                    );
-                    if is_db_file && stem_matches {
-                        tracing::debug!("{}: Change detected, triggering sync", db_name_for_watcher);
-                        let _ = tx.blocking_send(());
-                    }
-                }
-            }
-            Err(e) => {
-                tracing::warn!("Watcher error: {:?}", e);
-            }
-        }
-    })?;
-
-    // Watch the parent directory (required by notify)
-    if let Some(parent) = wal_path.parent() {
-        watcher.watch(parent, RecursiveMode::NonRecursive)?;
-    }
-
-    tracing::debug!("{}: Independent task started, watching {}", db_name, wal_path.display());
-
-    // Track when we last synced and when changes started
-    let mut last_sync = std::time::Instant::now();
-    let mut changes_pending = false;
-    let mut first_change_time: Option<std::time::Instant> = None;
+    tracing::debug!(
+        "{}: Task started, polling every {}s (WAL: {})",
+        db_name,
+        poll_interval.as_secs(),
+        wal_path.display()
+    );
 
     loop {
-        // Calculate timeout: either debounce or max_interval
-        let timeout = if changes_pending {
-            // If we have pending changes, use debounce delay
-            // But also respect max_interval
-            let since_first_change = first_change_time
-                .map(|t| t.elapsed())
-                .unwrap_or(Duration::ZERO);
-
-            if since_first_change >= max_interval {
-                // Max interval exceeded, sync immediately
-                Duration::ZERO
-            } else {
-                // Wait for debounce, but not longer than remaining max_interval
-                let remaining_max = max_interval.saturating_sub(since_first_change);
-                debounce_duration.min(remaining_max)
-            }
-        } else {
-            // No pending changes - poll at sync interval
-            // This ensures we detect changes even when FSEvents misses mmap writes (macOS)
-            max_interval
-        };
-
         tokio::select! {
             // Shutdown signal
             _ = shutdown_rx.recv() => {
                 // Final sync before shutdown
-                if changes_pending {
+                let current_wal_size = std::fs::metadata(&wal_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                if current_wal_size > last_synced_wal_size {
                     let _ = do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await;
                 }
                 // Signal uploader to shutdown if cache is enabled
@@ -2952,33 +2769,27 @@ async fn run_db_task(
                 break;
             }
 
-            // WAL file changed (from file watcher - may not fire on macOS for mmap writes)
-            Some(()) = rx.recv() => {
-                if !changes_pending {
-                    first_change_time = Some(std::time::Instant::now());
-                }
-                changes_pending = true;
-                // Don't sync yet, wait for debounce
-            }
+            // Poll timer - check WAL size and sync if changed
+            _ = poll_timer.tick() => {
+                let current_wal_size = std::fs::metadata(&wal_path)
+                    .map(|m| m.len())
+                    .unwrap_or(0);
 
-            // Timeout expired - always try to sync (handles both pending changes and polling)
-            _ = tokio::time::sleep(timeout) => {
-                // Time to sync
-                match do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await {
-                    Ok(frame_count) => {
-                        if frame_count > 0 {
-                            tracing::debug!("{}: Synced {} frames", db_name, frame_count);
+                // Only sync if WAL has grown
+                if current_wal_size > last_synced_wal_size {
+                    match do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await {
+                        Ok(frame_count) => {
+                            if frame_count > 0 {
+                                tracing::debug!("{}: Synced {} frames", db_name, frame_count);
+                            }
+                            last_synced_wal_size = current_wal_size;
+                        }
+                        Err(e) => {
+                            tracing::error!("{}: Sync failed: {}", db_name, e);
+                            // Don't update last_synced_wal_size on failure - will retry next tick
                         }
                     }
-                    Err(e) => {
-                        tracing::error!("{}: Sync failed: {}", db_name, e);
-                    }
                 }
-
-                // Reset state
-                changes_pending = false;
-                first_change_time = None;
-                last_sync = std::time::Instant::now();
             }
         }
     }
@@ -8015,7 +7826,6 @@ mod tests {
                 checkpoint_interval: 60,
                 min_checkpoint_page_count: 1000,
                 wal_truncate_threshold_pages: 121359,
-                monitor_interval: 1,
                 validation_interval: 0,
             },
             retention: RetentionConfig {

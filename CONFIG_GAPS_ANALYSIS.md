@@ -47,27 +47,22 @@ pub struct SyncConfig {
 
 ## CRITICAL GAPS (Missing Core Features)
 
-### 1. ❌ **Monitor Interval** (File Watcher Check Rate)
+### 1. ✅ **Monitor Interval** - RESOLVED (Removed)
 
-**What**: How often the file watcher checks for WAL changes
-**Litestream**: `monitor-interval: 1s` (default)
-**Walrust**: **MISSING** - relies entirely on OS file watcher events
+**Original**: File watcher check rate
+**Resolution**: File watcher removed entirely. Walrust now uses pure polling.
 
-**Impact**:
-- Cannot control CPU usage from file watching
-- No way to tune responsiveness vs resource usage
-- File watcher events are instant but may overwhelm system
+**New Approach** (as of 2026-01-20):
+- `wal_sync_interval` serves as the polling interval
+- No file watcher (FSEvents/inotify were unreliable for mmap writes anyway)
+- Check WAL size every `wal_sync_interval` seconds and sync if changed
+- Simple, predictable, works on all platforms
 
-**Should Add**:
-```rust
-pub monitor_interval: u64,  // Default: 1 (seconds)
-```
-
-**Use Case**: Slow down monitoring for low-priority databases to save CPU
+**Config**: Use `wal_sync_interval` to control poll frequency (default: 1 second)
 
 ---
 
-### 2. ❌ **Checkpoint Interval** (WAL Auto-Checkpointing)
+### 2. ✅ **Checkpoint Interval** (WAL Auto-Checkpointing)
 
 **What**: How often to trigger PASSIVE checkpoint on SQLite WAL
 **Litestream**: `checkpoint-interval: 1m` (default, non-blocking)
@@ -168,27 +163,27 @@ pub validation_interval: u64,  // Default: 0 (disabled), future: 86400 (24h)
 
 ## IMPLEMENTATION PRIORITY
 
-### Priority 1: MUST HAVE (v0.4)
+### Priority 1: MUST HAVE (v0.4) - ✅ COMPLETE
 
-1. **Checkpoint Interval** - Prevent unbounded WAL growth
+1. **Checkpoint Interval** - ✅ DONE
    ```rust
    pub checkpoint_interval: u64,         // Default: 60
    pub min_checkpoint_page_count: u64,   // Default: 1000
    ```
 
-2. **Truncate Threshold** - Emergency brake for runaway WAL
+2. **Truncate Threshold** - ✅ DONE
    ```rust
    pub wal_truncate_threshold_pages: u64,  // Default: 121359 (0 = disabled)
    ```
 
-### Priority 2: SHOULD HAVE (v0.5)
+### Priority 2: SHOULD HAVE (v0.5) - ✅ RESOLVED
 
-3. **Monitor Interval** - Control file watcher resource usage
-   ```rust
-   pub monitor_interval: u64,  // Default: 1
-   ```
+3. **Monitor Interval** - ✅ RESOLVED (removed)
+   - File watcher removed entirely
+   - Pure polling now controlled by `wal_sync_interval`
+   - Simpler and more reliable
 
-### Priority 3: NICE TO HAVE (v1.0+)
+### Priority 3: NICE TO HAVE (v1.0+) - ❌ TODO
 
 4. **Validation Interval** - Verify backup integrity
    ```rust
@@ -263,16 +258,16 @@ impl Default for SyncConfig {
 
 ---
 
-## CLI Flags to Add
+## CLI Flags (Current)
 
 ```bash
-# Checkpointing
+# Checkpointing (✅ implemented)
 --checkpoint-interval <SECS>           # Default: 60
 --min-checkpoint-pages <N>             # Default: 1000
 --wal-truncate-threshold <PAGES>       # Default: 121359 (0 = disabled)
 
-# Monitoring
---monitor-interval <SECS>              # Default: 1
+# Polling (✅ implemented - replaces file watcher)
+--wal-sync-interval <SECS>             # Default: 1 (poll and sync frequency)
 
 # Validation (future)
 --validation-interval <SECS>           # Default: 0 (disabled)
@@ -291,9 +286,8 @@ max_interval = 0              # disabled
 on_idle = 0                   # disabled
 on_startup = true
 
-# WAL syncing
-wal_sync_interval = 1         # Batch WAL syncs every 1 second
-monitor_interval = 1          # Check file changes every 1 second
+# WAL syncing (pure polling - no file watcher)
+wal_sync_interval = 1         # Poll and sync every 1 second
 
 # Checkpointing
 checkpoint_interval = 60      # Run PASSIVE checkpoint every 60 seconds
@@ -385,18 +379,21 @@ fn monitor_interval_controls_cpu() {
 
 ## Conclusion
 
-We were missing **4 critical configuration options**:
+Status as of 2026-01-20:
 
-1. ✅ `wal_sync_interval` - **FIXED TODAY**
-2. ❌ `checkpoint_interval` - **MUST ADD (v0.4)**
-3. ❌ `wal_truncate_threshold_pages` - **MUST ADD (v0.4)**
-4. ❌ `monitor_interval` - **SHOULD ADD (v0.5)**
-5. ❌ `validation_interval` - **NICE TO HAVE (v1.0)**
+| Config | Status | Notes |
+|--------|--------|-------|
+| `wal_sync_interval` | ✅ DONE | Added, serves as polling interval |
+| `checkpoint_interval` | ✅ DONE | PASSIVE checkpoint every 60s |
+| `min_checkpoint_page_count` | ✅ DONE | Min 1000 pages before checkpoint |
+| `wal_truncate_threshold_pages` | ✅ DONE | Emergency TRUNCATE at ~500MB |
+| `monitor_interval` | ✅ RESOLVED | **Removed** - file watcher dropped, pure polling now |
+| `validation_interval` | ❌ TODO | Nice to have for backup integrity verification |
 
-The fact that we missed `wal_sync_interval` suggests we need a systematic review of Litestream's config surface to ensure feature parity.
+**Architecture Change** (2026-01-20):
+- Removed file watcher (notify crate) entirely
+- Now uses pure interval-based polling controlled by `wal_sync_interval`
+- Simpler, more reliable, works on all platforms (FSEvents was missing mmap writes)
 
-**Next Steps**:
-1. Implement checkpoint interval + truncate threshold (v0.4)
-2. Add comprehensive tests for all timing/threshold configs
-3. Update documentation with all new options
-4. Consider adding "compatibility mode" that matches Litestream defaults exactly
+**Remaining Work**:
+1. ❌ `validation_interval` - periodic backup integrity checks (nice to have)

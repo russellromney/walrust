@@ -8,7 +8,7 @@
 
 Walrust continuously replicates SQLite databases to S3-compatible storage, ensuring **minimal data loss** on server crashes, power failures, or disk corruption. Like Litestream but with an emphasis on memory footprint and ease of configuration.
 
-> **v0.1.8:** Performance optimizations for high-throughput multi-DB deployments. Pre-allocated buffers, CPU parallelization via spawn_blocking, improved S3 connection pooling. Validated: 10K+ writes/sec at 500 concurrent DBs with 4% avg CPU. Memory: ~16-20 MB (optimized for multi-tenant workloads).
+> **v0.3.0:** Read replicas, disk cache for crash recovery, circuit breaker, and webhook notifications.
 
 ## Installation
 
@@ -77,10 +77,10 @@ Walrust wouldn't exist without [Litestream](https://litestream.io) and the work 
 Local:                          S3 (LTX format):
 app.db                          /app/00000001-00000001.ltx  (snapshot)
 app.db-wal  ────────────────►   /app/00000002-00000010.ltx  (incremental)
-           (file watcher)       /app/manifest.json
+           (polling)            /app/manifest.json
 ```
 
-1. **Watch** - Monitor WAL files for changes (inotify/kqueue)
+1. **Watch** - Poll WAL files for changes at configurable interval
 2. **Sync** - Upload new WAL frames as LTX files to S3
 3. **Snapshot** - Periodic full database snapshots (configurable interval)
 4. **Restore** - Download snapshot + apply incremental LTX files
@@ -104,8 +104,7 @@ Options:
   --min-checkpoint-pages <N>       Min pages before checkpoint (default: 1000, ~4MB)
   --wal-truncate-threshold <N>     Emergency truncate threshold (default: 121359, ~500MB)
 
-  # Monitoring & Validation
-  --monitor-interval <SECS>        File watcher check interval (default: 1)
+  # Validation
   --validation-interval <SECS>     Backup validation interval (default: 0, disabled)
 
   # Compaction
@@ -197,6 +196,30 @@ Options:
 
 Checks: file existence, header validity, checksums, TXID continuity.
 
+### `walrust replicate`
+
+Create a read replica that polls S3 for updates.
+
+```bash
+walrust replicate <SOURCE> --local <PATH> [OPTIONS]
+
+Options:
+  --interval <DURATION>  Poll interval (default: 5s)
+  --endpoint <URL>       S3 endpoint
+```
+
+### `walrust pragma`
+
+Output SQLite PRAGMA settings for optimal walrust compatibility.
+
+```bash
+walrust pragma [OPTIONS]
+
+Options:
+  -o, --output <FILE>    Write to SQL file
+  --comments <bool>      Include explanatory comments (default: true)
+```
+
 ## Exit Codes
 
 Walrust uses structured exit codes for scripting and automation:
@@ -244,7 +267,6 @@ wal_sync_interval = 1           # Batch WAL syncs every 1 second
 checkpoint_interval = 60        # Checkpoint every 60 seconds
 min_checkpoint_page_count = 1000  # Only checkpoint if WAL >= 1000 pages (~4MB)
 wal_truncate_threshold_pages = 121359  # Emergency truncate at 500MB
-monitor_interval = 1            # File watcher check interval (debounce)
 validation_interval = 86400     # Backup validation every 24 hours (0 = disabled)
 
 max_changes = 1000              # Snapshot after 1000 WAL frames
@@ -283,7 +305,6 @@ prefix = "production"
 path = "/data/analytics.db"
 checkpoint_interval = 30        # Override: checkpoint more frequently
 wal_truncate_threshold_pages = 50000  # Override: lower emergency threshold
-monitor_interval = 5            # Override: debounce every 5 seconds
 validation_interval = 3600      # Override: validate hourly for this DB
 ```
 
@@ -347,20 +368,19 @@ walrust watch app.db -b s3://bucket --compact-interval 3600
 
 ### Multi-Database Scalability
 
-| Databases | Litestream | Walrust | Savings |
-|-----------|-----------|---------|---------|
-| 1 | 33 MB | 12 MB | **21 MB** |
-| 10 | 156 MB | 16 MB | **140 MB** |
-| 50 | TBD | 19 MB | TBD |
-| 100 | TBD | 20 MB | TBD |
+| Databases | Litestream | Walrust | Reduction |
+|-----------|------------|---------|-----------|
+| 1 | 25 MB | 8 MB | 68% |
+| 10 | 118 MB | 12 MB | 90% |
+| 100 | 1,125 MB | 44 MB | 96% |
 
-*Measured on macOS with 100KB test databases. See [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) for full results.*
+*Measured on GitHub Actions ubuntu-latest with MinIO. See [bench/BENCHMARK_FRAMEWORK.md](bench/BENCHMARK_FRAMEWORK.md) for methodology.*
 
 Walrust optimizes memory usage through efficient buffer management and shared S3 connection pooling.
 
 ## Testing
 
-173 tests covering:
+Test suite includes:
 - ✅ Byte-for-byte data integrity (snapshot → restore → verify)
 - ✅ SHA256 checksum storage and verification
 - ✅ Multi-database concurrent snapshots
@@ -403,7 +423,7 @@ See [bench/BENCHMARK_FRAMEWORK.md](bench/BENCHMARK_FRAMEWORK.md) for full docume
 
 ## Use with Tenement/Slum
 
-Perfect for backing up tenant SQLite databases:
+Back up tenant SQLite databases with a single walrust process:
 
 ```bash
 # In your tenement deployment
@@ -415,15 +435,13 @@ walrust watch \
   --endpoint https://fly.storage.tigris.dev
 ```
 
-Walrust's optimized memory usage makes it ideal for multi-tenant deployments.
+Memory usage remains low when watching many databases (see Multi-Database Scalability above).
 
 ## Documentation
 
 - [Docs Site](https://walrust.dev) - Full documentation
 - [ROADMAP.md](ROADMAP.md) - Planned features and direction
-- [BENCHMARK_RESULTS.md](BENCHMARK_RESULTS.md) - Performance benchmark results
-- [TESTING.md](TESTING.md) - Comprehensive testing guide
-- [bench/](bench/) - Performance benchmarks (micro, comparison, real-world)
+- [bench/BENCHMARK_FRAMEWORK.md](bench/BENCHMARK_FRAMEWORK.md) - Benchmark methodology and results
 
 ## License
 

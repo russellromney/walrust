@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Pure Polling Architecture**: Removed file watcher (notify crate) entirely
+  - WAL changes now detected by polling WAL file size at `wal_sync_interval` intervals
+  - Simpler and more reliable than FSEvents/inotify (which miss mmap writes on macOS)
+  - Works consistently across all platforms
+  - Single config knob: `wal_sync_interval` controls both polling and sync frequency
+- Removed `monitor_interval` config option (no longer needed without file watcher)
+- Removed `notify` crate dependency
+
 ### Added
 - **Benchmark Framework (Phase 1)**: Comprehensive benchmarking for data loss verification
   - `bench/lib/workload.py`: DatabaseWriter with rate-limited writes and timestamp tracking
@@ -255,8 +264,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Phase 3: Property-based chaos testing (10K+ iterations)
   - Success criteria: Zero data loss under any failure scenario
 - **Documentation**:
-  - [CONFIG_VERIFICATION.md](./CONFIG_VERIFICATION.md) - Production readiness assessment
-  - [IMPLEMENTATION_PLAN.md](./IMPLEMENTATION_PLAN.md) - Detailed plan for missing features
   - [BATTLE_TESTING.md](./BATTLE_TESTING.md) - DST architecture and test scenarios
 
 ### Fixed
