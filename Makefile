@@ -1,4 +1,4 @@
-.PHONY: build release test test-integration test-all clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-realworld help
+.PHONY: build release test clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-realworld help
 
 # Default target
 all: build
@@ -15,22 +15,13 @@ release:
 build-python:
 	maturin build --release
 
-# Run unit tests
+# Run all tests (injects S3/Tigris credentials via soup)
 test:
-	cargo test
-
-# Run integration tests (requires S3/Tigris credentials)
-test-integration:
-	cargo test -- --ignored
-
-# Run all tests (unit + integration)
-test-all:
-	cargo test
-	cargo test -- --ignored
+	~/.soup/bin/soup run -p walrust -e development -- cargo test
 
 # Run tests with output
 test-verbose:
-	cargo test -- --nocapture
+	~/.soup/bin/soup run -p walrust -e development -- cargo test -- --nocapture
 
 # Run micro-benchmarks (cargo bench)
 bench:
@@ -109,9 +100,7 @@ help:
 	@echo "    make install-python - Install Python package for development"
 	@echo ""
 	@echo "  Test:"
-	@echo "    make test           - Run unit tests"
-	@echo "    make test-integration - Run integration tests (requires S3 credentials)"
-	@echo "    make test-all       - Run all tests"
+	@echo "    make test           - Run all tests (with S3 credentials via soup)"
 	@echo "    make test-verbose   - Run tests with output"
 	@echo ""
 	@echo "  Benchmark:"

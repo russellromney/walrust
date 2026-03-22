@@ -14,7 +14,7 @@ use crate::uploader::UploadMessage;
 use crate::wal;
 use crate::webhook::WebhookSender;
 
-use super::manifest::{build_ltx_key, discover_state_from_s3, save_state, GENERATION_LIVE};
+use super::manifest::{build_ltx_key, discover_state_from_s3, GENERATION_LIVE};
 use super::types::{DbState, DbTaskState, SyncInput, SyncOutput};
 
 // ============================================================================
@@ -564,66 +564,6 @@ pub(crate) async fn sync_wal_to_cache(
 // Retry-wrapped S3 operations for production use
 // ============================================================================
 
-/// Sync WAL changes with retry and webhook notifications
-pub(crate) async fn sync_wal_with_retry(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    prefix: &str,
-    state: &mut DbState,
-    retry_policy: &RetryPolicy,
-    webhook_sender: &Arc<WebhookSender>,
-) -> Result<u64> {
-    let db_name = state.name.clone();
-    let mut _last_error: Option<anyhow::Error> = None;
-    let mut attempts = 0u32;
-
-    // Try the sync operation with retries
-    loop {
-        attempts += 1;
-        match sync_wal(client, bucket, prefix, state).await {
-            Ok(frames) => return Ok(frames),
-            Err(e) => {
-                let error_kind = classify_error(&e);
-                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
-
-                // Handle auth errors immediately
-                if error_kind == ErrorKind::AuthError {
-                    tracing::error!("{}: Authentication error during WAL sync: {}", db_name, e);
-                    webhook_sender.notify_auth_failure(&db_name, &e.to_string()).await;
-                    return Err(e);
-                }
-
-                // If not retryable or exhausted retries, fail
-                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
-                    tracing::error!(
-                        "{}: WAL sync failed after {} attempts: {}",
-                        db_name,
-                        attempts,
-                        e
-                    );
-                    webhook_sender
-                        .notify_sync_failed(&db_name, &e.to_string(), attempts)
-                        .await;
-                    return Err(e);
-                }
-
-                // Calculate backoff and retry
-                let delay = retry_policy.calculate_delay(attempts - 1);
-                tracing::warn!(
-                    "{}: WAL sync attempt {}/{} failed, retrying in {:?}: {}",
-                    db_name,
-                    attempts,
-                    retry_policy.config().max_retries + 1,
-                    delay,
-                    e
-                );
-                tokio::time::sleep(delay).await;
-                _last_error = Some(e);
-            }
-        }
-    }
-}
-
 /// Take snapshot with retry and webhook notifications
 pub(crate) async fn take_snapshot_with_retry(
     client: &aws_sdk_s3::Client,
@@ -680,139 +620,6 @@ pub(crate) async fn take_snapshot_with_retry(
             }
         }
     }
-}
-
-/// Sync WAL changes to S3 as incremental LTX files
-///
-/// WAL frames are parsed, deduplicated (keeping latest version of each page),
-/// encoded as LTX with checksum chaining, and uploaded to S3.
-/// This provides:
-/// - Unified LTX format for both snapshots and incrementals
-/// - Built-in compression (LZ4)
-/// - Checksum chain for integrity verification
-/// - Litestream-compatible file format
-pub(crate) async fn sync_wal(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    prefix: &str,
-    state: &mut DbState,
-) -> Result<u64> {
-    use litepages::Checksum;
-
-    let header = match wal::read_header(&state.wal_path).await? {
-        Some(h) => h,
-        None => return Ok(0), // No WAL file
-    };
-
-    // Check if WAL was reset (checkpoint happened)
-    let current_size = wal::get_wal_size(&state.wal_path).await?;
-    if current_size < state.wal_offset {
-        // WAL was truncated, start fresh and recompute checksum
-        tracing::info!("{}: WAL checkpoint detected, resetting offset", state.name);
-        state.wal_offset = 0;
-        state.wal_generation += 1;
-
-        // Recompute checksum from current database state after checkpoint
-        match ltx::compute_checksum_from_file(&state.db_path) {
-            Ok(cs) => {
-                state.db_checksum = Some(cs.into_inner());
-                tracing::debug!("{}: Recomputed checksum after checkpoint: {:#x}", state.name, cs.into_inner());
-            }
-            Err(e) => {
-                tracing::warn!("{}: Could not recompute checksum: {}", state.name, e);
-            }
-        }
-    }
-
-    // Read WAL frames as parsed pages
-    let (frames, new_offset, max_db_size) =
-        wal::read_frames_as_pages(&state.wal_path, header.page_size, state.wal_offset).await?;
-
-    if frames.is_empty() {
-        return Ok(0);
-    }
-
-    // Deduplicate pages: keep only the latest version of each page
-    // WAL can have multiple writes to the same page; we want the final state
-    let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
-    for frame in &frames {
-        page_map.insert(frame.page_number, frame.data.clone());
-    }
-
-    // Convert to format expected by encode_wal_changes
-    let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
-    let frame_count = frames.len();
-
-    // Get pre_apply_checksum from state or compute from db
-    let pre_checksum = match state.db_checksum {
-        Some(cs) => Checksum::new(cs),
-        None => {
-            // Fallback: compute from database
-            tracing::debug!("{}: Computing checksum from database (no cached value)", state.name);
-            ltx::compute_checksum_from_file(&state.db_path)?
-        }
-    };
-
-    // Increment TXID for this incremental
-    let min_txid = state.current_txid + 1;
-    let max_txid = min_txid + pages.len() as u64 - 1;
-    let commit_page = if max_db_size > 0 { max_db_size } else {
-        // Estimate from database file size
-        let db_size = std::fs::metadata(&state.db_path)?.len();
-        (db_size / header.page_size as u64) as u32
-    };
-
-    // Encode as incremental LTX (CPU-bound, run in blocking thread pool)
-    // Pre-allocate buffer: estimate 2x pages * page_size for compression headroom
-    let estimated_size = pages.len().saturating_mul(header.page_size as usize).saturating_mul(2);
-    let page_size = header.page_size;
-    let db_name = state.name.clone();
-    let db_path_for_checksum = state.db_path.clone();
-    let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
-        // Compute expected post_checksum by simulating changes against current DB
-        let expected_post = ltx::compute_expected_post_checksum(&db_path_for_checksum, page_size, &pages)?;
-
-        let mut ltx_buffer = Vec::with_capacity(estimated_size);
-        let post_checksum = ltx::encode_wal_changes(
-            &mut ltx_buffer,
-            &pages,
-            page_size,
-            min_txid,
-            max_txid,
-            commit_page,
-            Some(pre_checksum),
-            expected_post,
-        )?;
-        Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
-    }).await??;
-
-    let ltx_size = ltx_buffer.len() as u64;
-
-    // Incrementals go to generation 0 (live folder, litestream format)
-    let ltx_key = build_ltx_key(prefix, &db_name, GENERATION_LIVE, min_txid, max_txid);
-
-    // Upload incremental LTX file
-    s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
-
-    tracing::info!(
-        "{}: Synced {} WAL frames as incremental LTX ({} bytes, TXID {}-{}) -> {}",
-        state.name,
-        frame_count,
-        ltx_size,
-        min_txid,
-        max_txid,
-        ltx_key
-    );
-
-    // Update state
-    state.wal_offset = new_offset;
-    state.current_txid = max_txid;
-    state.db_checksum = Some(post_checksum.into_inner());
-
-    // Save legacy state for backwards compat
-    save_state(client, bucket, prefix, state).await?;
-
-    Ok(frame_count as u64)
 }
 
 /// Take a full database snapshot as LTX

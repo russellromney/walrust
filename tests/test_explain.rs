@@ -344,7 +344,6 @@ fn test_explain_with_no_webhooks() -> Result<()> {
 // ============================================================================
 
 #[test]
-#[ignore] // Run with: cargo test --test test_explain -- --ignored
 fn test_explain_cli_integration() -> Result<()> {
     use std::process::Command;
 
@@ -387,7 +386,7 @@ secret = "test-secret"
     fs::write(&config_path, config_content)?;
 
     // Run walrust explain command
-    let output = Command::new("target/release/walrust")
+    let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("explain")
         .arg("--config")
         .arg(config_path.to_str().unwrap())

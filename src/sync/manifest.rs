@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::s3;
-use super::types::{DbState, Manifest};
+use super::types::Manifest;
 
 // ============================================
 // Litestream-compatible format helpers
@@ -176,32 +176,6 @@ pub(crate) async fn list_generation_files(
     // Sort by min_txid
     files.sort_by_key(|(_, min, _)| *min);
     Ok(files)
-}
-
-/// Save legacy state.json file to S3
-pub(crate) async fn save_state(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    prefix: &str,
-    state: &DbState,
-) -> Result<()> {
-    let state_key = format!("{}{}/state.json", prefix, state.name);
-    let state_json = serde_json::json!({
-        "wal_offset": state.wal_offset,
-        "wal_generation": state.wal_generation,
-        "current_txid": state.current_txid,
-        "last_snapshot": state.last_snapshot,
-    });
-
-    s3::upload_bytes(
-        client,
-        bucket,
-        &state_key,
-        serde_json::to_vec_pretty(&state_json)?,
-    )
-    .await?;
-
-    Ok(())
 }
 
 /// Load manifest from S3

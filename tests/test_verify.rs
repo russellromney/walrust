@@ -1,8 +1,7 @@
 // Comprehensive tests for `walrust verify` command
 //
 // Tests cover: positive cases, negative cases, edge cases, and integration tests
-// Note: Most tests require S3/Tigris credentials and are marked with #[ignore]
-
+// Requires S3/Tigris credentials (run with: soup run -p walrust -e development -- cargo test)
 use anyhow::Result;
 use std::process::Command;
 use tempfile::TempDir;
@@ -30,7 +29,6 @@ fn test_bucket_config() -> (String, String) {
 // ============================================================================
 
 #[test]
-#[ignore] // Run with: cargo test --test test_verify -- --ignored
 fn test_verify_valid_backup() -> Result<()> {
     let (bucket, endpoint) = test_bucket_config();
     let tempdir = TempDir::new()?;
@@ -40,7 +38,7 @@ fn test_verify_valid_backup() -> Result<()> {
     create_test_db(db_path.to_str().unwrap())?;
 
     // Take snapshot
-    let snapshot_output = Command::new("target/release/walrust")
+    let snapshot_output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("snapshot")
         .arg(db_path.to_str().unwrap())
         .arg("-b")
@@ -52,7 +50,7 @@ fn test_verify_valid_backup() -> Result<()> {
     assert!(snapshot_output.status.success(), "Snapshot should succeed");
 
     // Verify the backup
-    let verify_output = Command::new("target/release/walrust")
+    let verify_output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("verify")
         .arg("verify-test")
         .arg("-b")
@@ -68,15 +66,14 @@ fn test_verify_valid_backup() -> Result<()> {
 
     // Check output format
     assert!(stdout.contains("Verifying backup:"), "Output should have header");
-    assert!(stdout.contains("✅ Snapshot:"), "Output should confirm snapshot exists");
-    assert!(stdout.contains("✅ All checks passed"), "Output should show success");
+    assert!(stdout.contains("Snapshot: Found generation"), "Output should confirm snapshot exists");
+    assert!(stdout.contains("All checks passed"), "Output should show success");
     assert!(stdout.contains("Exit code: 0"), "Output should show exit code 0");
 
     Ok(())
 }
 
 #[test]
-#[ignore]
 fn test_verify_with_incrementals() -> Result<()> {
     let (bucket, endpoint) = test_bucket_config();
     let tempdir = TempDir::new()?;
@@ -86,7 +83,7 @@ fn test_verify_with_incrementals() -> Result<()> {
     create_test_db(db_path.to_str().unwrap())?;
 
     // Take initial snapshot
-    Command::new("target/release/walrust")
+    Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("snapshot")
         .arg(db_path.to_str().unwrap())
         .arg("-b")
@@ -103,7 +100,7 @@ fn test_verify_with_incrementals() -> Result<()> {
     drop(conn);
 
     // Start watch mode briefly to create incrementals
-    let mut watch_cmd = Command::new("target/release/walrust")
+    let mut watch_cmd = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("watch")
         .arg(db_path.to_str().unwrap())
         .arg("-b")
@@ -120,7 +117,7 @@ fn test_verify_with_incrementals() -> Result<()> {
     watch_cmd.kill()?;
 
     // Verify the backup
-    let verify_output = Command::new("target/release/walrust")
+    let verify_output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("verify")
         .arg("verify-incremental")
         .arg("-b")
@@ -131,20 +128,19 @@ fn test_verify_with_incrementals() -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&verify_output.stdout);
 
-    assert!(verify_output.status.success(), "Verify with incrementals should succeed");
-    assert!(stdout.contains("✅"), "Should have checkmarks for verified files");
+    assert!(verify_output.status.success(), "Verify with incrementals should succeed: {}", stdout);
+    assert!(stdout.contains("OK"), "Should have OK for verified files");
     assert!(stdout.contains("files"), "Should show file count");
 
     Ok(())
 }
 
 #[test]
-#[ignore]
 fn test_verify_no_backup_found() -> Result<()> {
     let (bucket, endpoint) = test_bucket_config();
 
     // Try to verify non-existent database
-    let verify_output = Command::new("target/release/walrust")
+    let verify_output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("verify")
         .arg("nonexistent-database-12345")
         .arg("-b")
@@ -162,7 +158,6 @@ fn test_verify_no_backup_found() -> Result<()> {
 }
 
 #[test]
-#[ignore]
 fn test_verify_exit_codes() -> Result<()> {
     let (bucket, endpoint) = test_bucket_config();
     let tempdir = TempDir::new()?;
@@ -171,7 +166,7 @@ fn test_verify_exit_codes() -> Result<()> {
     create_test_db(db_path.to_str().unwrap())?;
 
     // Create valid backup
-    Command::new("target/release/walrust")
+    Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("snapshot")
         .arg(db_path.to_str().unwrap())
         .arg("-b")
@@ -181,7 +176,7 @@ fn test_verify_exit_codes() -> Result<()> {
         .output()?;
 
     // Verify should return exit code 0 for valid backup
-    let output = Command::new("target/release/walrust")
+    let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("verify")
         .arg("exit-code-test")
         .arg("-b")
@@ -198,7 +193,6 @@ fn test_verify_exit_codes() -> Result<()> {
 }
 
 #[test]
-#[ignore]
 fn test_verify_continuity_check() -> Result<()> {
     let (bucket, endpoint) = test_bucket_config();
     let tempdir = TempDir::new()?;
@@ -207,7 +201,7 @@ fn test_verify_continuity_check() -> Result<()> {
     create_test_db(db_path.to_str().unwrap())?;
 
     // Create snapshot
-    Command::new("target/release/walrust")
+    Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("snapshot")
         .arg(db_path.to_str().unwrap())
         .arg("-b")
@@ -217,7 +211,7 @@ fn test_verify_continuity_check() -> Result<()> {
         .output()?;
 
     // Verify should check TXID continuity
-    let output = Command::new("target/release/walrust")
+    let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("verify")
         .arg("continuity-test")
         .arg("-b")
@@ -245,7 +239,7 @@ fn test_verify_continuity_check() -> Result<()> {
 #[test]
 fn test_verify_requires_database_name() {
     // Verify command requires a database name argument
-    let output = Command::new("target/release/walrust")
+    let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("verify")
         .arg("-b")
         .arg("test-bucket")
@@ -259,7 +253,7 @@ fn test_verify_requires_database_name() {
 #[test]
 fn test_verify_requires_bucket() {
     // Verify command requires a bucket argument
-    let output = Command::new("target/release/walrust")
+    let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("verify")
         .arg("test-db")
         .output()
@@ -271,7 +265,7 @@ fn test_verify_requires_bucket() {
 
 #[test]
 fn test_verify_help_output() {
-    let output = Command::new("target/release/walrust")
+    let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("verify")
         .arg("--help")
         .output()
@@ -290,7 +284,6 @@ fn test_verify_help_output() {
 // ============================================================================
 
 #[test]
-#[ignore]
 fn test_verify_doesnt_double_count_file_sizes() -> Result<()> {
     // Regression test for the bug where total_size was counted twice
     let (bucket, endpoint) = test_bucket_config();
@@ -309,7 +302,7 @@ fn test_verify_doesnt_double_count_file_sizes() -> Result<()> {
     }
     drop(conn);
 
-    Command::new("target/release/walrust")
+    Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("snapshot")
         .arg(db_path.to_str().unwrap())
         .arg("-b")
@@ -318,7 +311,7 @@ fn test_verify_doesnt_double_count_file_sizes() -> Result<()> {
         .arg(&endpoint)
         .output()?;
 
-    let output = Command::new("target/release/walrust")
+    let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
         .arg("verify")
         .arg("size-test")
         .arg("-b")

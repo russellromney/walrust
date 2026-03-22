@@ -366,8 +366,6 @@ struct WatchArgs {
     max_delay_ms: Option<u64>,
     no_circuit_breaker: bool,
     circuit_breaker_threshold: Option<u32>,
-    // Independent per-DB tasks mode
-    independent_tasks: bool,
     // Cache configuration
     enable_cache: bool,
     cache_dir: Option<PathBuf>,
@@ -697,7 +695,6 @@ async fn run() -> Result<()> {
                 max_delay_ms,
                 no_circuit_breaker,
                 circuit_breaker_threshold,
-                independent_tasks,
                 enable_cache,
                 cache_dir,
                 cache_retention,
@@ -910,7 +907,6 @@ mod tests {
             max_delay_ms: None,
             no_circuit_breaker: false,
             circuit_breaker_threshold: None,
-            independent_tasks: false,
             enable_cache: false,
             cache_dir: None,
             cache_retention: "24h".to_string(),

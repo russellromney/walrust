@@ -1,11 +1,9 @@
 // Integration test: Verify walrust can decode litestream-created LTX files
-// Run with: cargo test --test test_litestream_ltx_decode
 
 use std::process::Command;
 use tempfile::tempdir;
 
 #[test]
-#[ignore] // Requires litestream to be installed
 fn test_decode_litestream_ltx() {
     // Check if litestream is available
     if Command::new("litestream")
