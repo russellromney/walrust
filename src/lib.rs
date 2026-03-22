@@ -23,8 +23,8 @@ pub use storage::{S3Backend, StorageBackend};
 // Re-export retry types for DST
 pub use retry::{RetryConfig, RetryPolicy};
 
-// Re-export testable sync module for DST
-pub use sync::testable;
+// Re-export walrust-core for library consumers
+pub use walrust_core;
 
 #[cfg(feature = "python")]
 mod python;

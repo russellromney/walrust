@@ -1,6 +1,6 @@
 [package]
 name = "walrust"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = "Lightweight SQLite WAL sync to S3/Tigris"
 authors = ["Russell Romney <russellromney@gmail.com>"]
@@ -61,8 +61,11 @@ reqwest = { version = "0.12", features = ["json"] }
 hmac = "0.12"
 hex = "0.4"
 
+# Core library (embeddable sync primitives)
+walrust-core = { path = "crates/walrust-core", package = "walrust" }
+
 # LTX format (Litestream-compatible) - local fork with NO_CHECKSUM flag support
-litetx = { path = "crates/litetx" }
+litepages = { path = "crates/litetx", package = "litepages" }
 
 # SQLite for checkpointing
 rusqlite = { version = "0.35", features = ["bundled"] }

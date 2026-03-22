@@ -376,7 +376,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_integration_upload_download_bytes() {
         let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
@@ -406,7 +405,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_integration_list_objects() {
         let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();
@@ -440,7 +438,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore]
     async fn test_integration_exists() {
         let bucket = get_test_bucket().expect("WALRUST_TEST_BUCKET not set");
         let endpoint = get_test_endpoint();

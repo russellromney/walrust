@@ -1723,8 +1723,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6373607a59f0be73a39b6fe456b8192fcc3585f602af20751600e974dd455e77"
 
 [[package]]
-name = "litetx"
-version = "0.1.1"
+name = "litepages"
+version = "0.1.0"
+dependencies = [
+ "bitflags",
+ "crc",
+ "lz4_flex",
+ "serde",
+ "thiserror",
+]
+
+[[package]]
+name = "litepages"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f47037021fef1e7cf4d506970647944a33f6c75f83eb5ca3989df5a2948f82d5"
 dependencies = [
  "bitflags",
  "crc",
@@ -3213,7 +3226,30 @@ dependencies = [
 
 [[package]]
 name = "walrust"
-version = "0.3.0"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-smithy-runtime",
+ "chrono",
+ "futures",
+ "litepages 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
+ "rand 0.8.5",
+ "rayon",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+ "walkdir",
+]
+
+[[package]]
+name = "walrust"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3228,7 +3264,7 @@ dependencies = [
  "glob",
  "hex",
  "hmac",
- "litetx",
+ "litepages 0.1.0",
  "prometheus",
  "pyo3",
  "rand 0.8.5",
@@ -3246,6 +3282,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
+ "walrust 0.1.0",
 ]
 
 [[package]]
