@@ -3,30 +3,21 @@ title: Migration from Litestream
 description: How to migrate from Litestream to walrust
 ---
 
-Walrust and Litestream solve the same problem using the same LTX file format. This guide helps you migrate from Litestream to walrust.
-
-## Why Migrate?
-
-Consider walrust if:
-
-- **Memory-constrained environments** - walrust uses 19 MB vs Litestream's 36 MB (47% reduction)
-- **Multi-database setups** - walrust uses 20 MB for 100 databases vs Litestream's 160 MB (88% reduction)
-- **Simpler configuration** - TOML-based configuration
-
-Stay with Litestream if:
-
-- You need its mature ecosystem and community
-- You need SFTP or Azure Blob storage backends
+Walrust and Litestream solve the same problem (SQLite WAL replication to S3) but their backups are not interchangeable. This guide helps you migrate from Litestream to walrust.
 
 ## Compatibility
 
-### What's Compatible
+:::caution[Not Interchangeable]
+Walrust's LTX files cannot be restored by Litestream (walrust enables checksums that Litestream doesn't expect). This is a one-way migration — once you switch, you can't restore walrust backups with Litestream.
+:::
 
-Both tools use the same:
-- **LTX file format** - walrust can read Litestream backups
+### What's Similar
+
+Both tools use:
 - **WAL-based replication** - same underlying mechanism
 - **S3 storage layout** - similar directory structure
 - **GFS retention** - same retention policy model
+- **LTX-derived format** - same origin, but walrust's checksums break Litestream compatibility
 
 ### What's Different
 
@@ -40,28 +31,11 @@ Both tools use the same:
 
 ## Feature Comparison
 
-### Supported in Both
+**Both tools support:** WAL-based continuous replication, S3-compatible storage (AWS, Tigris, R2, MinIO), point-in-time recovery, GFS retention, multiple databases per process, checksum verification, Prometheus metrics.
 
-- ✅ WAL-based continuous replication
-- ✅ S3-compatible storage (AWS, Tigris, R2, MinIO)
-- ✅ Point-in-time recovery (PITR)
-- ✅ GFS retention policy
-- ✅ Multiple databases per process
-- ✅ Checksum verification (SHA256)
-- ✅ Prometheus metrics
+**Litestream only:** SFTP and Azure Blob storage backends.
 
-### Litestream Only
-
-- ❌ SFTP/Azure Blob storage backends
-
-### Walrust Only
-
-- ✅ Python API (`pip install walrust`)
-- ✅ Read replicas with polling (`walrust replicate`)
-- ✅ Disk cache for upload queue (optional)
-- ✅ Webhook notifications for failures
-- ✅ Circuit breaker for S3 failures
-- ✅ Structured exit codes (0-6)
+**Walrust only:** Python API, read replicas with polling, disk cache for upload queue, webhook notifications, circuit breaker, structured exit codes (0-6).
 
 ## Migration Steps
 
@@ -147,18 +121,17 @@ export AWS_SECRET_ACCESS_KEY=your-secret
 export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev  # for Tigris
 ```
 
-### 5. Test Restore (Optional)
+### 5. Take a Fresh Snapshot
 
-Before switching, test that walrust can read your Litestream backups:
+Since walrust backups are not compatible with Litestream, start fresh:
 
 ```bash
-walrust restore app.db \
+walrust snapshot /data/app.db \
   --bucket my-backups \
-  -o /tmp/test.db \
   --endpoint https://fly.storage.tigris.dev
 ```
 
-If this works, walrust is compatible with your existing backups.
+This creates a new walrust-format snapshot. Your old Litestream backups remain in S3 if you need to roll back.
 
 ### 6. Start Walrust
 
@@ -372,41 +345,12 @@ sudo systemctl stop walrust
 sudo systemctl start litestream
 ```
 
-3. Your existing backups are unchanged - Litestream will continue from the last TXID
+3. Your existing Litestream backups are still in S3 — Litestream will continue from the last TXID
 
-Both tools use the same LTX format, so they're fully interchangeable.
+Note: Walrust backups cannot be restored by Litestream, so rolling back means losing any backups taken while using walrust.
 
-## Performance Comparison
+## See Also
 
-Based on benchmarks (100KB databases, syncing to Tigris S3):
-
-| Metric | Litestream | Walrust | Reduction |
-|--------|-----------|---------|-----------|
-| Memory (1 DB) | 36 MB | 19 MB | 47% |
-| Memory (10 DBs) | 55 MB | 19 MB | 65% |
-| Memory (100 DBs) | 160 MB | 20 MB | 88% |
-| CPU (idle) | <1% | <1% | - |
-| CPU (active) | 2-5% | 2-5% | - |
-| Sync latency (P95) | ~1s | ~1s | - |
-
-See [Benchmark Results](/benchmarks/results/) for methodology and detailed data.
-
-## Getting Help
-
-**Litestream resources:**
-- [Litestream docs](https://litestream.io/reference/)
-- [Litestream Discord](https://discord.gg/Wh5F2RM)
-
-**Walrust resources:**
-- [Walrust docs](https://walrust.dev)
-- [GitHub Issues](https://github.com/russellromney/walrust/issues)
-- [Configuration Reference](/config/configuration-reference/)
-
-## What's Next?
-
-After migrating:
-
-1. **Test your backups** - Run periodic test restores
-2. **Set up monitoring** - Use Prometheus metrics endpoint
-3. **Enable validation** - Configure `validation_interval` to verify backups
-4. **Optimize retention** - Adjust retention policy based on your needs
+- [Benchmark Results](/benchmarks/results/) — memory/latency comparison data
+- [Configuration Reference](/config/configuration-reference/) — all config options
+- [Litestream docs](https://litestream.io/reference/) — if you need to switch back

@@ -78,7 +78,7 @@ s3://my-bucket/
 | 10 | 55 MB | 19 MB | 65% |
 | 100 | 160 MB | 20 MB | 88% |
 
-Walrust shares one S3 client and one file watcher across all databases. Memory remains ~19-20 MB regardless of database count.
+Walrust shares one S3 client (with connection pooling) across all databases. Each database gets its own upload task for concurrency. Memory remains ~19-20 MB regardless of database count.
 
 ## Restoring Individual Databases
 

@@ -1,56 +1,43 @@
 ---
 title: Why Walrust?
-description: Walrust uses less memory than Litestream
+description: When walrust makes sense over alternatives
 ---
 
-Walrust is optimized to use less memory than Litestream for SQLite replication to S3.
+:::caution[Alpha Software]
+Walrust is alpha. It works, but APIs may change.
+:::
 
-## Memory Efficiency
+Walrust replicates SQLite databases to S3-compatible storage. It does the same thing as [Litestream](https://litestream.io) with a different set of tradeoffs.
 
-Walrust uses significantly less memory than Litestream, especially when watching multiple databases:
+## Memory
 
-### Memory Usage
+Walrust uses less memory than Litestream when watching multiple databases:
 
-| Databases | Litestream | Walrust | Reduction |
-|-----------|------------|---------|-----------|
-| 1 | 36 MB | 19 MB | 47% |
-| 10 | 55 MB | 19 MB | 65% |
-| 100 | 160 MB | 20 MB | 88% |
+| Databases | Litestream | Walrust |
+|-----------|------------|---------|
+| 1 | 36 MB | 19 MB |
+| 10 | 55 MB | 19 MB |
+| 100 | 160 MB | 20 MB |
 
-*Measured with 100KB databases on macOS, syncing to Tigris S3.*
+*Measured with 100KB databases, syncing to Tigris S3 on macOS.*
 
-Walrust's memory usage remains relatively constant (~19-20 MB) as database count increases, while Litestream's memory grows with each database.
+Memory stays flat because walrust shares one S3 client (with connection pooling) across all databases and uses WAL polling instead of per-database file watchers.
 
-## Usage
+## When to use walrust
 
-One walrust process watches all databases:
+- You're watching many SQLite databases (10+) and memory matters
+- You want TOML config instead of YAML
+- You want a Python API for scripting backups
 
-```bash
-walrust watch \
-  /var/lib/data/tenant-*.db \
-  -b s3://backups
-```
+## When to use Litestream
 
-Or with a config file:
+- You need SFTP or Azure Blob storage backends
+- You want a mature tool with community support
+- Walrust's alpha status is a problem for your use case
 
-```toml
-[s3]
-bucket = "backups"
-endpoint = "https://fly.storage.tigris.dev"
+## Implementation
 
-[[databases]]
-path = "/var/lib/data/*.db"
-prefix = "tenants"
-```
-
-## Litestream
-
-[Litestream](https://litestream.io) is the original SQLite replication tool and the inspiration for walrust. Walrust uses the same [LTX file format](https://github.com/superfly/ltx), which provides compatibility between the tools.
-
-**When to use Litestream:**
-- Mature ecosystem and community support
-- SFTP/Azure Blob storage backends
-
-**When to use walrust:**
-- Multi-database deployments (100+ databases)
-- Memory-constrained environments
+- Written in Rust (async/await on tokio)
+- Uses the [LTX file format](https://github.com/superfly/ltx) (derived from Litestream, but not compatible with Litestream restores)
+- One shared S3 client with connection pooling; each database gets its own upload task for concurrency
+- ~8 MB binary

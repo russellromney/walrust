@@ -30,7 +30,7 @@ app.db-shm  ← shared memory (ignore this)
 
 1. Your app writes to SQLite
 2. SQLite appends to the WAL file
-3. Walrust detects the change (via inotify/kqueue)
+3. Walrust detects the change (via polling at `wal_sync_interval`)
 4. Walrust copies frames to a shadow WAL file (decouples from SQLite)
 5. Walrust packages changed pages into an LTX file
 6. LTX file uploads to S3
@@ -55,7 +55,7 @@ s3://bucket/mydb/
 └── manifest.json           ← index of all LTX files
 ```
 
-The format comes from [Litestream](https://litestream.io) via the [litetx crate](https://github.com/superfly/ltx). Walrust uses it because it's well-designed and battle-tested.
+The format originates from [Litestream](https://litestream.io) via the [litepages crate](https://github.com/superfly/ltx). Walrust's LTX files are not compatible with Litestream (walrust enables checksums that Litestream doesn't expect).
 
 ## Checksums
 

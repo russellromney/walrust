@@ -26,15 +26,7 @@ See [Migration from Litestream](/guide/migration-from-litestream/) for detailed 
 
 ### Is walrust production-ready?
 
-Walrust is actively developed and used in production environments. Testing includes:
-
-- Unit and integration tests for core functionality
-- Chaos testing with fault injection (walrust-dst)
-- Property-based testing for invariants
-- Uses the same LTX format as Litestream
-- SHA256 checksums for data integrity verification
-
-As with any backup tool, test restores regularly and maintain a disaster recovery plan.
+No. Walrust is alpha software — a hobby project that hasn't been used intensively in production. It works, but APIs and behavior may change. Test restores regularly if you use it.
 
 ### What databases does walrust support?
 
@@ -258,7 +250,7 @@ Walrust doesn't do client-side encryption (yet). Use your S3 provider's encrypti
 - **10 databases:** ~20 MB
 - **100 databases:** ~19 MB
 
-Walrust shares S3 clients and file watchers. Memory remains relatively constant regardless of database count.
+Walrust shares one S3 client (with connection pooling) across all databases and uses polling instead of file watchers.
 
 ### How much CPU does it use?
 
@@ -266,21 +258,13 @@ Walrust shares S3 clients and file watchers. Memory remains relatively constant 
 - **Active syncing:** 2-5% on modern hardware
 - **High write rate (10K+ writes/sec):** 10-20%
 
-If CPU is high, increase `monitor_interval` or `wal_sync_interval`.
+If CPU is high, increase `wal_sync_interval`.
 
 ### Can walrust keep up with high write rates?
 
-Yes. Benchmarks show walrust handles:
+Walrust reads the WAL file externally and doesn't block SQLite writes. Sync latency depends on `wal_sync_interval` and your S3 provider. If you're seeing issues, increase `wal_sync_interval` or enable the disk cache.
 
-- 10K+ writes/sec with 500 concurrent databases
-- 4% average CPU usage
-- <1 second sync latency (P95)
-
-See [Benchmark Results](/benchmarks/results/) for details.
-
-### Does walrust slow down my application?
-
-No. Walrust watches the WAL file externally and doesn't interfere with SQLite operations. Your app continues writing normally.
+See [Benchmark Results](/benchmarks/results/) for measured latencies.
 
 ## Read Replicas
 

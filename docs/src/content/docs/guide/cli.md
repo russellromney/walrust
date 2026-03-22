@@ -100,6 +100,7 @@ walrust watch [OPTIONS] --bucket <BUCKET> <DATABASES>...
 |--------|-------------|
 | `-b, --bucket <BUCKET>` | S3 bucket (required) |
 | `--snapshot-interval <SECONDS>` | Full snapshot interval in seconds (default: 3600 = 1 hour) |
+| `--wal-sync-interval <SECONDS>` | WAL sync batching interval in seconds (default: 1) |
 | `--endpoint <ENDPOINT>` | S3 endpoint URL for Tigris/MinIO/etc. Also reads from `AWS_ENDPOINT_URL_S3` |
 | `--max-changes <N>` | Take snapshot after N WAL frames (0 = disabled) |
 | `--max-interval <SECONDS>` | Maximum seconds between snapshots when changes detected |
@@ -107,6 +108,10 @@ walrust watch [OPTIONS] --bucket <BUCKET> <DATABASES>...
 | `--on-startup <true\|false>` | Take snapshot immediately on watch start |
 | `--compact-after-snapshot` | Run compaction after each snapshot |
 | `--compact-interval <SECONDS>` | Compaction interval in seconds (0 = disabled) |
+| `--checkpoint-interval <SECONDS>` | PASSIVE checkpoint interval (default: 60) |
+| `--min-checkpoint-pages <N>` | Min WAL pages before checkpoint (default: 1000, ~4MB) |
+| `--wal-truncate-threshold <N>` | Emergency truncate threshold in pages (default: 121359, ~500MB) |
+| `--validation-interval <SECONDS>` | Backup validation interval (default: 0, disabled) |
 | `--retain-hourly <N>` | Hourly snapshots to retain (default: 24) |
 | `--retain-daily <N>` | Daily snapshots to retain (default: 7) |
 | `--retain-weekly <N>` | Weekly snapshots to retain (default: 12) |
@@ -555,64 +560,54 @@ walrust verify [OPTIONS] --bucket <BUCKET> <NAME>
 |--------|-------------|
 | `-b, --bucket <BUCKET>` | S3 bucket (required) |
 | `--endpoint <ENDPOINT>` | S3 endpoint URL for Tigris/MinIO/etc. Also reads from `AWS_ENDPOINT_URL_S3` |
-| `--fix` | Remove orphaned entries from manifest |
 | `-h, --help` | Print help |
 
 ### What It Checks
 
-1. **File Existence**: Each LTX file in the manifest exists in S3
-2. **Header Validity**: LTX headers can be decoded successfully
-3. **Checksum Verification**: LTX internal checksums match the data
-4. **TXID Continuity**: No gaps in the transaction ID chain
-5. **Manifest Consistency**: Header TXIDs match manifest entries
+1. **Snapshot Existence**: Verifies at least one snapshot exists (critical)
+2. **File Existence**: Each LTX file in the manifest exists in S3
+3. **Header Validity**: LTX headers can be decoded successfully
+4. **Checksum Verification**: LTX internal checksums match the data
+5. **TXID Continuity**: No gaps in the transaction ID chain
 
 ### Examples
 
 ```bash
-# Verify a database (read-only check)
+# Verify a database
 walrust verify myapp.db --bucket my-backups
 
 # Verify with Tigris endpoint
 walrust verify myapp.db \
   --bucket my-backups \
   --endpoint https://fly.storage.tigris.dev
-
-# Fix orphaned manifest entries
-walrust verify myapp.db --bucket my-backups --fix
 ```
 
 ### Output
 
 ```
-Verifying integrity of 'myapp.db' in s3://my-backups/myapp.db...
+Verifying backup: myapp.db in s3://my-backups...
 
-Found 47 LTX files in manifest
-Current TXID: 1523
-Page size: 4096 bytes
+Snapshot: Found generation 1 (TXID 1-1, 4096 bytes)
 
-Verification Results
-====================
-Verified:  45 files (12.34 MB)
-Issues:    2
+Incremental files: 47 files
+  OK 0000000000000002-0000000000000010.ltx (9 TXIDs, 36KB)
+  OK 0000000000000011-0000000000000050.ltx (40 TXIDs, 160KB)
+  ...
 
-Issues Found:
-  [ORPHAN] 00000100-00000105.ltx: File missing from S3
-  [ERROR] 00000200-00000210.ltx: Checksum verification failed
+Verified: 48/48 files (12.34 MB total)
+Continuity: No gaps detected (TXID 1-1523)
 
-Run with --fix to remove 1 orphaned manifest entries.
-
-Note: 1 non-orphan issues found. These may require manual intervention:
-  - Checksum failures indicate corrupted files
-  - TXID gaps may require restoring from an earlier snapshot
+All checks passed - backup integrity verified
+Exit code: 0 (success)
 ```
 
 ### Issue Types
 
-| Type | Description | Fix |
-|------|-------------|-----|
-| `[ORPHAN]` | Manifest entry exists but S3 file is missing | Use `--fix` to remove from manifest |
-| `[ERROR]` | Checksum failure or corrupted file | Restore from backup, investigate cause |
-| `TXID gap` | Missing transactions in the chain | May need point-in-time restore |
+| Type | Description | Resolution |
+|------|-------------|------------|
+| Missing snapshot | No snapshot found in S3 | Take a new snapshot with `walrust snapshot` |
+| Checksum failure | Corrupted LTX file | Restore from backup, investigate cause |
+| TXID gap | Missing transactions in the chain | May need point-in-time restore |
 
 ---
 

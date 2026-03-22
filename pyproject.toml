@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "walrust"
-version = "0.3.0"
+version = "0.4.0"
 description = "Lightweight SQLite WAL sync to S3/Tigris - Production-grade database backup with explicit data integrity verification"
 readme = "README.md"
 license = { text = "Apache-2.0" }

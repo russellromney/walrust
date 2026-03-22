@@ -333,21 +333,14 @@ walrust restore mydb -o restored.db --bucket my-backups
 - walrust consuming 30%+ CPU continuously
 
 **Solutions:**
-1. Increase `monitor_interval` to reduce file watcher checks:
-
-```toml
-[sync]
-monitor_interval = 5  # Check every 5 seconds instead of 1
-```
-
-2. Increase `wal_sync_interval` to batch WAL syncs:
+1. Increase `wal_sync_interval` to batch WAL syncs:
 
 ```toml
 [sync]
 wal_sync_interval = 5  # Sync every 5 seconds
 ```
 
-3. Check for extremely high write rates (10K+ writes/sec per DB)
+2. Check for extremely high write rates (10K+ writes/sec per DB)
 
 ### High Memory Usage
 

@@ -97,7 +97,7 @@ Both your app and walrust need read access to the database and WAL files. If you
 
 ### Busy Databases
 
-Walrust is designed to work alongside busy databases. It reads the WAL file without blocking your app's writes. However, if your WAL file grows very large (gigabytes), consider tuning SQLite's `wal_autocheckpoint` to checkpoint more frequently.
+Walrust reads the WAL file without blocking your app's writes. If your WAL file grows very large (gigabytes), consider tuning SQLite's `wal_autocheckpoint` to checkpoint more frequently.
 
 ## Fly.io
 

@@ -59,7 +59,7 @@ compact_interval = 0
 checkpoint_interval = 60
 min_checkpoint_page_count = 1000
 wal_truncate_threshold_pages = 121359
-monitor_interval = 1
+
 validation_interval = 86400
 
 # Retention policy (GFS)
@@ -148,7 +148,6 @@ Global sync and snapshot triggers.
 | `checkpoint_interval` | integer | 60 | Run PRAGMA wal_checkpoint(PASSIVE) every N seconds |
 | `min_checkpoint_page_count` | integer | 1000 | Min WAL pages before checkpoint (1000 pages ≈ 4 MB) |
 | `wal_truncate_threshold_pages` | integer | 121359 | Emergency truncate at N WAL pages (121359 ≈ 500 MB) |
-| `monitor_interval` | integer | 1 | File watcher check interval in seconds (debounce) |
 | `validation_interval` | integer | 0 | Automated backup verification interval in seconds (0 = disabled) |
 
 **Snapshot Triggers:**
@@ -426,7 +425,6 @@ Per-database configuration (array of databases).
 | `checkpoint_interval` | integer | (global) | Override checkpoint_interval |
 | `min_checkpoint_page_count` | integer | (global) | Override min_checkpoint_page_count |
 | `wal_truncate_threshold_pages` | integer | (global) | Override wal_truncate_threshold_pages |
-| `monitor_interval` | integer | (global) | Override monitor_interval |
 | `validation_interval` | integer | (global) | Override validation_interval |
 | `retention` | table | (global) | Override retention policy |
 
@@ -639,10 +637,9 @@ endpoint = "https://fly.storage.tigris.dev"
 
 [sync]
 snapshot_interval = 3600
-wal_sync_interval = 1
+wal_sync_interval = 5  # Higher interval to reduce CPU on high-write workloads
 checkpoint_interval = 30
 min_checkpoint_page_count = 2000
-monitor_interval = 5  # Reduce CPU on high-write workload
 
 [cache]
 enabled = true

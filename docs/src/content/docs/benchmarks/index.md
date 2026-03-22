@@ -3,13 +3,13 @@ title: Performance Benchmarks
 description: Walrust performance characteristics and comparison with Litestream
 ---
 
-Walrust is optimized to use less memory than Litestream. This page summarizes performance characteristics based on our benchmark suite.
+Memory and latency measurements from the walrust benchmark suite.
 
 ## Quick Results
 
-### Memory Efficiency
+### Memory
 
-Walrust uses less memory than Litestream, especially when watching multiple databases:
+Memory usage (RSS) when watching multiple databases:
 
 | Databases | walrust | litestream | Reduction |
 |-----------|---------|------------|-----------|
@@ -17,11 +17,7 @@ Walrust uses less memory than Litestream, especially when watching multiple data
 | 10        | 19 MB   | 55 MB      | 65%       |
 | 100       | 20 MB   | 160 MB     | 88%       |
 
-Walrust's memory usage remains ~19-20 MB regardless of database count.
-
 ### Change Detection
-
-Walrust detects SQLite changes with low latency:
 
 | Databases | p50 Latency | p99 Latency |
 |-----------|-------------|-------------|
@@ -29,8 +25,6 @@ Walrust detects SQLite changes with low latency:
 | 100       | < 10ms      | < 50ms      |
 
 ### Startup Time
-
-Walrust starts quickly even with many databases:
 
 | Databases | Startup Time |
 |-----------|--------------|

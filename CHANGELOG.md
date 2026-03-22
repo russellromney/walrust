@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-03-22
+
+### Changed
+- **Module split**: Split `watch.rs` (1856 lines) into `watch_independent.rs`, `watch_shadow.rs`, `wal_sync.rs`, `compact.rs`
+- **Module split**: Split `restore.rs` (1083 lines) into `restore.rs`, `verify.rs`, `explain.rs`
+- **Simplified watch**: Deleted dead watch modes (`watch_simple`, `watch_config`) and ~350 lines of dead code
+- **`make test`** now uses `soup run` for S3 credentials — no separate `test-integration` target
+
+### Added
+- **Periodic validation in watch_independent**: `--validation-interval` now wired into the independent task event loop (was only in shadow mode)
+- **Cache cleanup in watch_independent**: `retention_duration` and `max_cache_size` now consumed — 5-minute cleanup timer evicts stale cache entries
+
+### Fixed
+- Removed all `#[ignore]` test attributes — 346 tests pass, 0 ignored
+- Fixed integration tests to use `env!("CARGO_BIN_EXE_walrust")` instead of hardcoded `target/release/walrust`
+- Rewrote `test_walrust_ltx_litestream_restore` as self-referential round-trip test (litestream can't read walrust LTX format)
+- Fixed verify test assertions to match actual output format (no emoji in verify output)
+
+### Removed
+- `sync_wal_with_retry()` and `sync_wal()` (~190 lines) — only used by deleted watch modes
+- `get_wal_page_count()`, `CheckpointMode`, `run_checkpoint()` (~70 lines) — only used by deleted watch modes
+- `save_state()` in manifest.rs (~25 lines) — only called by deleted `sync_wal`
+- `watch_simple.rs` and `watch_config.rs` — dead watch modes
+- `make test-integration` and `make test-all` Makefile targets (unified into `make test`)
+
 ## [0.3.2] - 2026-03-22
 
 ### Added

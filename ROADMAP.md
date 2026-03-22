@@ -12,42 +12,7 @@ Core differentiators:
 
 ---
 
-## v0.4.0 - Production Polish (Future)
-
-**Deferred features (good goals, lower priority):**
-
-### 1. Periodic Validation
-```bash
-walrust watch app.db -b s3://bucket --validation-interval 3600
-# Auto-verify every hour
-```
-
-**Effort:** 2 hours
-**Value:** Catch corruption early
-
-### 2. Cache Cleanup
-```rust
-// Use CacheState fields:
-retention_duration: chrono::Duration
-max_cache_size: u64
-```
-
-**Effort:** 2 hours
-**Value:** Prevent disk-full
-
-### 3. Simplify Watch
-- Merge watch() variants into one function
-- Auto-detect: config file vs CLI flags
-- **Effort:** 1 hour
-
-### 4. Split Large Files
-- watch.rs (1856 lines) and restore.rs (1083 lines) exceed 1000-line limit
-- Split watch.rs into watch modes (simple, config, independent, shadow)
-- Split restore.rs into restore, verify, explain modules
-
----
-
-## Current Capabilities (v0.3.2)
+## Current Capabilities (v0.4.0)
 
 **Core features that work:**
 - `walrust watch` - Watch and sync multiple databases
@@ -65,7 +30,7 @@ max_cache_size: u64
 - Webhook notifications (corruption, circuit breaker)
 - Retry logic with circuit breaker
 - Shadow WAL mode
-- 148+ tests passing
+- 346 tests passing, 0 ignored
 
 ---
 
@@ -104,6 +69,13 @@ max_cache_size: u64
 
 ## Completed Features (see CHANGELOG.md)
 
+**v0.4.0:**
+- Split watch.rs (1856 lines) and restore.rs (1083 lines) into focused modules
+- Wired periodic validation into watch_independent mode
+- Wired cache cleanup (retention_duration, max_cache_size) into watch_independent
+- Deleted dead watch modes (watch_simple, watch_config) and ~350 lines of dead code
+- Removed all `#[ignore]` tests — 346 tests pass, 0 ignored
+
 **v0.3.2:**
 - `walrust explain` command with cost estimation
 - `walrust verify` with exit codes, continuity checks, webhook integration
@@ -113,7 +85,6 @@ max_cache_size: u64
 **v0.3.1:**
 - Refactored sync.rs into focused modules
 - Extracted litepages to separate repo
-- All 148 tests passing
 
 **v0.3.0 and earlier:**
 - LTX format integration

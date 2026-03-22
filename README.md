@@ -8,7 +8,7 @@
 
 Walrust continuously replicates SQLite databases to S3-compatible storage, ensuring **minimal data loss** on server crashes, power failures, or disk corruption. Like Litestream but with an emphasis on memory footprint and ease of configuration.
 
-> **v0.3.0:** Read replicas, disk cache for crash recovery, circuit breaker, and webhook notifications.
+> **v0.4.0:** Module split, periodic validation, cache cleanup, 346 tests passing.
 
 ## Installation
 
@@ -214,15 +214,14 @@ walrust verify <NAME> -b <BUCKET> [OPTIONS]
 
 Options:
   --endpoint <URL>  S3 endpoint
-  --fix             Remove orphaned manifest entries
 ```
 
 **Checks:**
-- ✅ Snapshot existence (critical - prevents incomplete backups)
-- ✅ File existence (all manifest entries have S3 objects)
-- ✅ Header validity (LTX headers parse correctly)
-- ✅ Checksums (SHA256 verification)
-- ✅ TXID continuity (no gaps in transaction sequence)
+- Snapshot existence (critical - prevents incomplete backups)
+- File existence (all manifest entries have S3 objects)
+- Header validity (LTX headers parse correctly)
+- Checksums (SHA256 verification)
+- TXID continuity (no gaps in transaction sequence)
 
 **Exit codes:**
 - `0` = All checks passed
@@ -233,15 +232,16 @@ Options:
 ```
 Verifying backup: mydb in s3://my-bucket/backups...
 
-✅ Snapshot: Found generation 1 (TXID 1-1, 4096 bytes)
+Snapshot: Found generation 1 (TXID 1-1, 4096 bytes)
 
 Incremental files: 15 files
-  ✅ 0000000000000002-0000000000000005.ltx (4 TXIDs, 12KB)
-  ✅ 0000000000000006-0000000000000010.ltx (5 TXIDs, 16KB)
+  OK 0000000000000002-0000000000000005.ltx (4 TXIDs, 12KB)
+  OK 0000000000000006-0000000000000010.ltx (5 TXIDs, 16KB)
 
-Continuity: ✅ No gaps detected (TXID 1-100)
+Verified: 17/17 files (28.0 KB total)
+Continuity: No gaps detected (TXID 1-100)
 
-✅ All checks passed - backup integrity verified
+All checks passed - backup integrity verified
 Exit code: 0 (success)
 ```
 
@@ -441,7 +441,7 @@ Test suite includes:
 - ✅ Core invariants (transaction recovery, WAL batching, snapshot atomicity)
 - ✅ Continuous chaos testing with MTBF tracking
 
-Run tests: `./run_tests.sh` (requires Tigris credentials in `.env`)
+Run tests: `make test` (injects S3/Tigris credentials via [Soup](https://getsoup.dev))
 
 ## Benchmarking
 

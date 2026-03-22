@@ -23,7 +23,7 @@ This ensures consistent results regardless of network conditions.
 GitHub Actions runs benchmarks on each release with:
 - **Runner**: `ubuntu-latest` (2-core CPU, 7 GB RAM)
 - **Storage**: MinIO service container
-- **Litestream**: v0.3.13 for comparison
+- **Litestream**: v0.5.2 for comparison
 
 ## Benchmark Categories
 
@@ -148,8 +148,8 @@ All benchmarks output JSON with this schema:
   "environment": {
     "platform": "linux",
     "python_version": "3.12.0",
-    "walrust_version": "0.3.0",
-    "litestream_version": "0.3.13",
+    "walrust_version": "0.4.0",
+    "litestream_version": "0.5.2",
     "storage_backend": "minio",
     "timestamp": "2024-01-15T12:00:00Z"
   },

@@ -75,7 +75,7 @@ These results were collected on:
 - **Platform**: macOS (Apple Silicon)
 - **Storage**: Tigris S3
 - **Database size**: 100KB each
-- **walrust**: v0.3.0
+- **walrust**: v0.4.0
 - **litestream**: v0.5.2
 
 ## Running Your Own Benchmarks
