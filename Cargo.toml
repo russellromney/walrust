@@ -9,6 +9,12 @@ repository = "https://github.com/russellromney/walrust"
 homepage = "https://github.com/russellromney/walrust"
 keywords = ["sqlite", "wal", "s3", "backup", "sync"]
 categories = ["database", "command-line-utilities"]
+exclude = [
+    "crates/*/target/",
+    "bench/",
+    "experiments/",
+    ".github/",
+]
 
 [lib]
 name = "walrust"
