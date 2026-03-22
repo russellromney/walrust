@@ -64,8 +64,8 @@ hex = "0.4"
 # Core library (embeddable sync primitives)
 walrust-core = { version = "0.1.0", path = "crates/walrust-core", package = "walrust" }
 
-# LTX format (Litestream-compatible) - local fork with NO_CHECKSUM flag support
-litepages = { version = "0.1.0", path = "crates/litetx", package = "litepages" }
+# LTX format (Litestream-compatible) - see https://github.com/russellromney/litepages
+litepages = "0.1.0"
 
 # SQLite for checkpointing
 rusqlite = { version = "0.35", features = ["bundled"] }
