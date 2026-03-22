@@ -31,17 +31,6 @@ impl WalHeader {
     }
 }
 
-/// WAL frame header (24 bytes per frame)
-#[derive(Debug, Clone)]
-pub struct FrameHeader {
-    pub page_number: u32,
-    pub db_size: u32, // Size of database in pages after commit (0 if not commit frame)
-    pub salt1: u32,
-    pub salt2: u32,
-    pub checksum1: u32,
-    pub checksum2: u32,
-}
-
 pub const WAL_HEADER_SIZE: u64 = 32;
 pub const FRAME_HEADER_SIZE: u64 = 24;
 

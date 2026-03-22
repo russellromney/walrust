@@ -78,7 +78,7 @@ impl Walrust {
         let pit = point_in_time.map(|s| s.to_string());
         
         self.runtime.block_on(async move {
-            sync::restore(&name, &output, &bucket, endpoint.as_deref(), pit.as_deref()).await
+            sync::restore(&name, &output, &bucket, endpoint.as_deref(), pit.as_deref(), None, None).await
         })
         .map_err(|e| PyRuntimeError::new_err(format!("Restore failed: {}", e)))
     }
@@ -144,7 +144,7 @@ fn restore(name: &str, output: &str, bucket: &str, endpoint: Option<&str>, point
     let pit = point_in_time.map(|s| s.to_string());
     
     runtime.block_on(async move {
-        sync::restore(&name, &output, &bucket, endpoint.as_deref(), pit.as_deref()).await
+        sync::restore(&name, &output, &bucket, endpoint.as_deref(), pit.as_deref(), None, None).await
     })
     .map_err(|e| PyRuntimeError::new_err(format!("Restore failed: {}", e)))
 }

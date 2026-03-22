@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-03-22
+
+### Polish & Cleanup (v0.3.3)
+- **Test improvements**: All 15 webhook tests now run without `#[ignore]` - created real axum HTTP test servers
+- **Code cleanup**: Removed 280+ lines of unused code (RetryOutcome, FrameHeader, CompactionConfig, CompactionStats, compact_incrementals(), should_compact())
+- **Clippy fixes**: Fixed 17 clippy warnings (unused imports, variables, doc formatting)
+
+## [0.3.2] - 2026-03-22 (Core Features)
+
+### Added
+- **`walrust explain` command**: Preview configuration before running watch mode
+  - Shows validation intervals, webhook notifications, and cost estimation
+  - Displays database list, S3 destination, snapshot schedule, and GFS retention policy
+  - Estimates monthly storage costs for Tigris ($0.02/GB) and S3 ($0.023/GB)
+- **`walrust verify` command enhancements**:
+  - Better output format with ✅/⚠️ symbols for visual clarity
+  - Exit codes: 0 (success), 1 (issues found), 2 (critical errors)
+  - Explicit snapshot existence check to prevent incomplete backups
+  - Per-file verification output with TXID counts and sizes
+  - Always reports continuity status (including "Snapshot only" for backups without incrementals)
+- **Webhook notifications** for production alerting:
+  - `notify_corruption()` called on LTX decode failures and checksum mismatches
+  - `notify_circuit_breaker_open()` called when retry circuit breaker trips
+  - Fire-and-forget delivery (spawned tasks don't block operations)
+  - Integrated into `verify()` and `restore()` commands
+- **Comprehensive test coverage**:
+  - 15 tests for `explain()` (valid configs, edge cases, CLI integration)
+  - 9 tests for `verify()` (6 integration + 3 unit tests)
+  - 11 unit tests + 4 integration tests for webhooks
+  - Regression tests for webhook blocking and size double-counting bugs
+
+### Fixed
+- **Webhook blocking bug**: `verify()` now spawns webhook tasks instead of awaiting inline (prevented slow endpoints from blocking verification)
+- **Double-counting file sizes**: Removed duplicate size addition in `verify()` (line 1048)
+- **Continuity reporting**: Now always shows status even for snapshot-only backups
+- Missing `std::sync::Arc` import in restore.rs
+- Test type errors with `rusqlite::params!` macro
+
+### Removed
+- `restore_legacy()` function (66 lines) - unused legacy restore path
+- Duplicate `CheckpointMode` enum and unused WAL functions (74 lines)
+- Total: 140 lines of dead code removed
+
+## [0.3.1] - Previous
+
 ### Changed
 - **Pure Polling Architecture**: Removed file watcher (notify crate) entirely
   - WAL changes now detected by polling WAL file size at `wal_sync_interval` intervals

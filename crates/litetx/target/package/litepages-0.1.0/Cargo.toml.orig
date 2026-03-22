@@ -1,0 +1,26 @@
+[package]
+name = "litepages"
+version = "0.1.0"
+edition = "2021"
+description = "Lite Transaction File (LTX) encoding/decoding for SQLite page-level replication"
+authors = ["Russell Romney <russellromney@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/russellromney/walrust"
+readme = "README.md"
+# Local fork of https://github.com/superfly/ltx-rs with NO_CHECKSUM flag support
+
+[dependencies]
+bitflags = "2.3"
+crc = "3.0"
+lz4_flex = { version = "0.11", features = ["frame"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "1.0"
+
+[dev-dependencies]
+rand = "0.8"
+rusqlite = { version = "0.29", features = ["bundled"] }
+serde_test = "1.0"
+uuid = { version = "1.4", features = ["v4"] }
+
+[features]
+compat = []

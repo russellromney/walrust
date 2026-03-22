@@ -3,6 +3,10 @@ title: Quick Start
 description: Get started with walrust in 5 minutes
 ---
 
+:::caution[Alpha Software]
+Walrust is alpha software. APIs and behavior may change without notice. Not recommended for production use.
+:::
+
 Lightweight SQLite WAL sync to S3 in Rust.
 
 ## Why Walrust?
@@ -11,9 +15,9 @@ Walrust is a SQLite replication tool optimized to use less memory than Litestrea
 
 | Databases | walrust | Litestream | Reduction |
 |-----------|---------|------------|-----------|
-| 1 | 19 MB | 37 MB | 49% |
-| 10 | 20 MB | 61 MB | 67% |
-| 100 | 19 MB | 228 MB | 92% |
+| 1 | 19 MB | 36 MB | 47% |
+| 10 | 19 MB | 55 MB | 65% |
+| 100 | 20 MB | 160 MB | 88% |
 
 Walrust's memory remains ~19-20 MB regardless of database count.
 
@@ -21,7 +25,6 @@ Walrust's memory remains ~19-20 MB regardless of database count.
 
 - Written in Rust with async/await (tokio)
 - No CGO dependencies
-- Uses the same [LTX file format](https://github.com/superfly/ltx) as Litestream
 - ~8 MB binary size
 
 See [Why Walrust?](/start/why-walrust/) for detailed comparisons and use cases.

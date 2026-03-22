@@ -13,9 +13,9 @@ Walrust uses less memory than Litestream, especially when watching multiple data
 
 | Databases | walrust | litestream | Reduction |
 |-----------|---------|------------|-----------|
-| 1         | 19 MB   | 37 MB      | 49%       |
-| 10        | 20 MB   | 61 MB      | 67%       |
-| 100       | 19 MB   | 228 MB     | 92%       |
+| 1         | 19 MB   | 36 MB      | 47%       |
+| 10        | 19 MB   | 55 MB      | 65%       |
+| 100       | 20 MB   | 160 MB     | 88%       |
 
 Walrust's memory usage remains ~19-20 MB regardless of database count.
 

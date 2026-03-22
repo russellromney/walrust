@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::cache::LocalCache;
@@ -9,8 +9,7 @@ use crate::config::Config;
 use crate::ltx;
 use crate::s3::{self, create_client, parse_bucket};
 
-use super::compact::compute_file_sha256;
-use super::manifest::{build_ltx_key, discover_state_from_s3, find_latest_snapshot, list_generation_files, load_manifest, parse_ltx_filename, GENERATION_LIVE};
+use super::manifest::{discover_state_from_s3, find_latest_snapshot, list_generation_files, load_manifest, GENERATION_LIVE};
 use super::types::{Manifest, ReplicaState};
 
 pub async fn restore(
@@ -20,6 +19,7 @@ pub async fn restore(
     endpoint: Option<&str>,
     point_in_time: Option<&str>,
     cache_dir: Option<&Path>,
+    webhook: Option<std::sync::Arc<crate::webhook::WebhookSender>>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint).await?;
@@ -87,7 +87,17 @@ pub async fn restore(
     };
 
     let cursor = std::io::Cursor::new(ltx_data);
-    let decode_result = ltx::decode_to_db(cursor, output)?;
+    let decode_result = ltx::decode_to_db(cursor, output).map_err(|e| {
+        if let Some(webhook) = webhook {
+            let error_msg = format!("LTX decode failed for snapshot: {}", e);
+            let webhook = webhook.clone();
+            let name = name.to_string();
+            tokio::spawn(async move {
+                webhook.notify_corruption(&name, &error_msg).await;
+            });
+        }
+        e
+    })?;
 
     tracing::info!(
         "Restored {} from LTX (page_size: {}, pages: {}, TXID: {}-{}, checksum: {:016x})",
@@ -117,7 +127,7 @@ pub async fn restore(
         let mut cache_hits = 0;
         let mut s3_fetches = 0;
 
-        for (key, min_txid, max_txid) in &applicable {
+        for (key, _min_txid, max_txid) in &applicable {
             // Try to read from cache first using max_txid as the key
             let ltx_data = if let Some(ref cache) = cache {
                 if cache.has_txid(*max_txid) {
@@ -176,74 +186,6 @@ pub async fn restore(
 }
 
 /// Legacy restore for backwards compatibility with raw .db snapshots
-async fn restore_legacy(
-    name: &str,
-    output: &Path,
-    bucket: &str,
-    endpoint: Option<&str>,
-    point_in_time: Option<&str>,
-) -> Result<()> {
-    let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint).await?;
-
-    // Find legacy snapshots
-    let snapshots_prefix = format!("{}{}/snapshots/", prefix, name);
-    let snapshots = s3::list_objects(&client, &bucket_name, &snapshots_prefix).await?;
-
-    if snapshots.is_empty() {
-        return Err(anyhow!("No snapshots found for database: {}", name));
-    }
-
-    let pit = point_in_time
-        .map(|s| chrono::DateTime::parse_from_rfc3339(s))
-        .transpose()?
-        .map(|dt| dt.with_timezone(&Utc));
-
-    let snapshot_key = if let Some(pit) = pit {
-        snapshots
-            .iter()
-            .filter(|k| {
-                if let Some(ts) = k
-                    .strip_prefix(&snapshots_prefix)
-                    .and_then(|s| s.strip_suffix(".db"))
-                {
-                    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts, "%Y%m%d%H%M%S") {
-                        return dt.and_utc() <= pit;
-                    }
-                }
-                false
-            })
-            .max()
-            .ok_or_else(|| anyhow!("No snapshot found before {}", pit))?
-            .clone()
-    } else {
-        snapshots
-            .last()
-            .cloned()
-            .ok_or_else(|| anyhow!("No snapshots"))?
-    };
-
-    tracing::info!("Restoring from legacy snapshot: {}", snapshot_key);
-    s3::download_file(&client, &bucket_name, &snapshot_key, output).await?;
-
-    if let Ok(Some(stored_checksum)) =
-        s3::get_checksum(&client, &bucket_name, &snapshot_key).await
-    {
-        let restored_checksum = compute_file_sha256(output).await?;
-        if stored_checksum != restored_checksum {
-            return Err(anyhow!(
-                "Checksum mismatch! Stored: {}, Restored: {}",
-                stored_checksum,
-                restored_checksum
-            ));
-        }
-        tracing::info!("Checksum verified: {}", restored_checksum);
-    }
-
-    tracing::info!("Restored {} to {}", name, output.display());
-    Ok(())
-}
-
 /// List databases in bucket
 pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
@@ -270,7 +212,7 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
         println!("Databases in s3://{}/{}:", bucket_name, prefix);
         for db in &dbs {
             // Discover state from S3 (litestream format)
-            let (current_txid, max_gen, _) =
+            let (current_txid, _max_gen, _) =
                 discover_state_from_s3(&client, &bucket_name, &prefix, db).await?;
 
             // Count files in generation 0 (live incrementals)
@@ -401,7 +343,6 @@ pub async fn replicate(
 }
 
 /// State tracking for replica
-
 /// Single poll iteration for replication
 async fn replicate_poll(
     client: &aws_sdk_s3::Client,
@@ -701,7 +642,35 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
             }
             println!();
 
-            // Summary
+            // Validation
+            println!("Validation:");
+            if cfg.sync.validation_interval > 0 {
+                println!("  Interval: {} seconds ({} hours)",
+                    cfg.sync.validation_interval,
+                    cfg.sync.validation_interval / 3600
+                );
+                println!("  Checks: File existence, header validity, checksums, TXID continuity");
+            } else {
+                println!("  Disabled (recommended: enable with --validation-interval 86400 for daily checks)");
+            }
+            println!();
+
+            // Webhooks
+            println!("Webhook Notifications:");
+            if cfg.webhooks.is_empty() {
+                println!("  None configured");
+            } else {
+                for (i, webhook) in cfg.webhooks.iter().enumerate() {
+                    println!("  {}. {}", i + 1, webhook.url);
+                    println!("     Events: {}", webhook.events.join(", "));
+                    if webhook.secret.is_some() {
+                        println!("     HMAC:   enabled (X-Walrust-Signature header)");
+                    }
+                }
+            }
+            println!();
+
+            // Summary with cost estimation
             let total_snapshots = cfg.retention.hourly + cfg.retention.daily
                 + cfg.retention.weekly + cfg.retention.monthly;
             println!("Summary:");
@@ -710,6 +679,37 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
                 println!("  Automatic compaction: enabled");
             } else {
                 println!("  Automatic compaction: disabled (run 'walrust compact' manually)");
+            }
+
+            // Cost estimation
+            match cfg.resolve_databases() {
+                Ok(resolved) if !resolved.is_empty() => {
+                    println!();
+                    println!("Estimated Storage Costs:");
+                    println!("  Note: Assumes average database size of 1GB per database");
+                    println!();
+
+                    let db_count = resolved.len();
+                    let avg_db_size_gb = 1.0; // Conservative estimate
+                    let snapshots_per_db = total_snapshots as f64;
+
+                    // Tigris/S3 pricing (Tigris: ~$0.02/GB/month)
+                    let storage_gb = db_count as f64 * avg_db_size_gb * snapshots_per_db;
+                    let cost_tigris = storage_gb * 0.02;
+                    let cost_s3 = storage_gb * 0.023; // S3 Standard pricing
+
+                    println!("  Total snapshots: {} databases × {} snapshots = {} snapshots",
+                        db_count, snapshots_per_db, db_count as f64 * snapshots_per_db);
+                    println!("  Estimated storage: {:.1} GB", storage_gb);
+                    println!("  Monthly cost (Tigris): ~${:.2}", cost_tigris);
+                    println!("  Monthly cost (S3 Standard): ~${:.2}", cost_s3);
+                    println!();
+                    println!("  Actual costs depend on:");
+                    println!("  - Real database sizes (current estimate: {}GB per DB)", avg_db_size_gb);
+                    println!("  - Compression ratio (LTX typically compresses well)");
+                    println!("  - Incremental file sizes between snapshots");
+                }
+                _ => {}
             }
         }
     }
@@ -870,6 +870,7 @@ pub async fn verify(
     bucket: &str,
     endpoint: Option<&str>,
     _fix: bool, // No longer used - files are source of truth in litestream format
+    webhook: Option<std::sync::Arc<crate::webhook::WebhookSender>>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint).await?;
@@ -904,18 +905,36 @@ pub async fn verify(
         }
     }
 
-    println!("Found {} LTX files across {} generations", all_files.len(), max_gen + 1);
-    println!("Current TXID: {}", current_txid);
+    println!("Verifying backup: {} in s3://{}/{}{}", name, bucket_name, prefix, name);
+    println!("================================================");
+    println!();
+
+    // Check for snapshot existence (critical requirement)
+    let has_snapshot = all_files.iter().any(|(_, gen, min, max)| *gen > 0 || (*min == 1 && *max == 1));
+
+    if !has_snapshot {
+        println!("❌ CRITICAL: No snapshot found (generation file)");
+        println!();
+        println!("Cannot verify backup without a base snapshot.");
+        println!("Recommendation: Run 'walrust snapshot' to create initial snapshot.");
+        anyhow::bail!("No snapshot found - backup is incomplete");
+    }
+
+    println!("✅ Snapshot: Found generation {} (TXID range covered)", max_gen);
     println!();
 
     let mut issues: Vec<VerifyIssue> = Vec::new();
-    let mut verified_count = 0;
-    let mut total_size: u64 = 0;
+    let mut _verified_count = 0;
+    let mut _total_size: u64 = 0;
+
+    println!("Incremental files: {} files", all_files.len());
 
     // Verify each file
     for (key, _gen, expected_min, expected_max) in &all_files {
+        let filename = key.split('/').last().unwrap_or(key);
         match s3::download_bytes(&client, &bucket_name, key).await {
             Ok(data) => {
+                let size_kb = data.len() / 1024;
                 let cursor = std::io::Cursor::new(&data);
                 match ltx::verify_ltx(cursor) {
                     Ok(header) => {
@@ -924,6 +943,9 @@ pub async fn verify(
 
                         // Verify header matches filename
                         if header_min != *expected_min || header_max != *expected_max {
+                            let txid_count = expected_max - expected_min + 1;
+                            println!("  ⚠️  {} ({} TXIDs, {}KB) - TXID mismatch!",
+                                filename, txid_count, size_kb);
                             issues.push(VerifyIssue {
                                 filename: key.clone(),
                                 issue: format!(
@@ -934,20 +956,35 @@ pub async fn verify(
                                 is_orphan: false,
                             });
                         } else {
-                            verified_count += 1;
-                            total_size += data.len() as u64;
+                            let txid_count = expected_max - expected_min + 1;
+                            println!("  ✅ {} ({} TXIDs, {}KB)",
+                                filename, txid_count, size_kb);
+                            _verified_count += 1;
+                            _total_size += data.len() as u64;
                         }
                     }
                     Err(e) => {
+                        println!("  ⚠️  {} - checksum verification failed!", filename);
+                        let error_msg = format!("Checksum verification failed: {}", e);
                         issues.push(VerifyIssue {
                             filename: key.clone(),
-                            issue: format!("Checksum verification failed: {}", e),
+                            issue: error_msg.clone(),
                             is_orphan: false,
                         });
+                        // Notify webhook of corruption (fire-and-forget)
+                        if let Some(ref webhook) = webhook {
+                            let webhook = Arc::clone(webhook);
+                            let name = name.to_string();
+                            let error_msg = error_msg.clone();
+                            tokio::spawn(async move {
+                                webhook.notify_corruption(&name, &error_msg).await;
+                            });
+                        }
                     }
                 }
             }
             Err(e) => {
+                println!("  ⚠️  {} - download failed!", filename);
                 issues.push(VerifyIssue {
                     filename: key.clone(),
                     issue: format!("Download failed: {}", e),
@@ -982,107 +1019,62 @@ pub async fn verify(
         expected_next_txid = Some(max_txid + 1);
     }
 
-    // Report results
-    println!("Verification Results");
-    println!("====================");
-    println!("Verified:  {} files ({:.2} MB)", verified_count, total_size as f64 / (1024.0 * 1024.0));
-    println!("Issues:    {}", issues.len());
     println!();
 
-    if issues.is_empty() {
-        println!("All LTX files verified successfully.");
-        return Ok(());
-    }
+    // Check TXID continuity and report
+    let mut has_critical_gap = false;
+    if !live_files.is_empty() {
+        let _first_txid = live_files.first().map(|(_, _, min, _)| *min).unwrap_or(1);
+        let last_txid = live_files.last().map(|(_, _, _, max)| *max).unwrap_or(0);
 
-    // Report issues
-    println!("Issues Found:");
-    for issue in &issues {
-        println!("  [ERROR] {}: {}", issue.filename, issue.issue);
-    }
-    println!();
+        // Check for gaps in continuity
+        let gap_issues: Vec<_> = issues.iter()
+            .filter(|i| i.issue.contains("TXID gap"))
+            .collect();
 
-    if !issues.is_empty() {
-        println!("Note: Issues may require manual intervention:");
-        println!("  - Checksum failures indicate corrupted files");
-        println!("  - TXID gaps may require restoring from an earlier snapshot");
-    }
-
-    Ok(())
-}
-
-/// Checkpoint mode for SQLite WAL
-#[derive(Debug, Clone, Copy)]
-enum CheckpointMode {
-    /// Non-blocking, best effort checkpoint
-    Passive,
-    /// Blocking checkpoint that ensures WAL is reset
-    Truncate,
-}
-
-/// Get WAL page count for size checking
-async fn get_wal_page_count(wal_path: &Path) -> Result<u64> {
-    if !wal_path.exists() {
-        return Ok(0);
-    }
-
-    // WAL file size / page size (4096 bytes typically)
-    let metadata = tokio::fs::metadata(wal_path).await?;
-    let file_size = metadata.len();
-
-    if file_size < 32 {
-        // WAL file too small to have a valid header
-        return Ok(0);
-    }
-
-    // Read page size from WAL header (bytes 8-11)
-    let mut file = tokio::fs::File::open(wal_path).await?;
-    let mut header = vec![0u8; 32];
-    use tokio::io::AsyncReadExt;
-    file.read_exact(&mut header).await?;
-
-    let page_size = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as u64;
-
-    // Account for WAL header (32 bytes) + frame headers (24 bytes each)
-    // Approximate: (file_size - 32) / (page_size + 24)
-    let approx_pages = if page_size > 0 {
-        (file_size.saturating_sub(32)) / (page_size + 24)
-    } else {
-        0
-    };
-
-    Ok(approx_pages)
-}
-
-/// Run SQLite checkpoint on database
-async fn run_checkpoint(db_path: &Path, mode: CheckpointMode) -> Result<()> {
-    // Use blocking task since SQLite operations are synchronous
-    let db_path = db_path.to_path_buf();
-
-    tokio::task::spawn_blocking(move || {
-        let conn = rusqlite::Connection::open(&db_path)?;
-
-        let pragma = match mode {
-            CheckpointMode::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
-            CheckpointMode::Truncate => "PRAGMA wal_checkpoint(TRUNCATE)",
-        };
-
-        // Returns (busy, checkpointed_frames, log_size)
-        let (busy, frames, log_size): (i32, i32, i32) = conn.query_row(pragma, [], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-        })?;
-
-        if busy != 0 {
-            tracing::debug!("Checkpoint was busy (concurrent writers)");
+        if gap_issues.is_empty() {
+            println!("Continuity: ✅ No gaps detected (TXID 1-{})", last_txid);
+        } else {
+            println!("Continuity: ⚠️  Gaps detected:");
+            for issue in gap_issues {
+                println!("  - {}", issue.issue);
+                has_critical_gap = true;
+            }
         }
+    } else {
+        // Snapshot-only backup with no incrementals
+        println!("Continuity: ✅ Snapshot only (no incrementals to check)");
+    }
 
-        tracing::debug!(
-            "Checkpointed {} frames (log size: {})",
-            frames,
-            log_size
-        );
+    println!();
+
+    // Summary of issues
+    if !issues.is_empty() {
+        println!("Issues found: {}", issues.len());
+        for issue in &issues {
+            let filename = issue.filename.split('/').last().unwrap_or(&issue.filename);
+            println!("  - {} in {}", issue.issue, filename);
+        }
+        println!();
+    }
+
+    // Exit with appropriate code
+    if issues.is_empty() {
+        println!("✅ All checks passed - backup integrity verified");
+        println!();
+        println!("Exit code: 0 (success)");
         Ok(())
-    })
-    .await?
+    } else if has_critical_gap {
+        println!("Recommendation: Re-snapshot database to repair backup chain");
+        println!();
+        println!("Exit code: 2 (critical errors - data may be unrecoverable)");
+        anyhow::bail!("Critical integrity issues detected")
+    } else {
+        println!("Recommendation: Investigate checksum failures or re-upload affected files");
+        println!();
+        println!("Exit code: 1 (issues found)");
+        anyhow::bail!("Integrity issues detected")
+    }
 }
 
 // ============================================================================

@@ -1,0 +1,274 @@
+//! Multi-database WAL replicator.
+//!
+//! High-level API for replicating multiple SQLite databases to S3.
+//! The caller adds/removes databases dynamically; the Replicator handles
+//! sync scheduling, snapshots, and retry internally.
+//!
+//! Works both embedded (inside another process) and standalone (as a sidecar).
+//!
+//! ```ignore
+//! let replicator = Replicator::new(storage, config);
+//! replicator.add("tenant-1", Path::new("/data/tenant-1.db")).await?;
+//! replicator.add("tenant-2", Path::new("/data/tenant-2.db")).await?;
+//! // ... background loop syncs both every tick ...
+//! replicator.remove("tenant-1").await;  // final sync, then drop
+//! ```
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::RwLock;
+use tokio::task::JoinSet;
+
+use crate::storage::StorageBackend;
+use crate::sync::{self, ReplicationConfig, SyncState};
+
+/// Per-database replication state.
+struct DbState {
+    state: SyncState,
+    prefix: String,
+}
+
+/// Multi-database WAL replicator.
+///
+/// Owns a shared S3 backend and a set of databases being replicated.
+/// Spawns a background task that syncs all registered databases every
+/// `config.sync_interval` and takes snapshots every `config.snapshot_interval`.
+///
+/// **Caller responsibilities:**
+/// - Set `PRAGMA wal_autocheckpoint=0` on all databases before adding them.
+/// - Call `remove()` before checkpointing/closing a database.
+pub struct Replicator {
+    storage: Arc<dyn StorageBackend>,
+    config: ReplicationConfig,
+    /// S3 prefix for all databases (e.g., "wal/" or "ha-test/").
+    /// Each database is stored under `{prefix}{db_name}/`.
+    prefix: String,
+    databases: Arc<RwLock<HashMap<String, Arc<AsyncMutex<DbState>>>>>,
+}
+
+impl Replicator {
+    /// Create a new Replicator and start its background sync loop.
+    ///
+    /// `prefix` is the S3 key prefix for all databases (e.g., "wal/" or "ha-test/").
+    /// Each database added via `add()` is stored under `{prefix}{db_name}/`.
+    pub fn new(storage: Arc<dyn StorageBackend>, prefix: &str, config: ReplicationConfig) -> Arc<Self> {
+        let replicator = Arc::new(Self {
+            storage,
+            config,
+            prefix: prefix.to_string(),
+            databases: Arc::new(RwLock::new(HashMap::new())),
+        });
+
+        tracing::info!("Replicator started (sync={}ms, snapshot={}s)",
+            replicator.config.sync_interval.as_millis(),
+            replicator.config.snapshot_interval.as_secs(),
+        );
+
+        let r = replicator.clone();
+        tokio::spawn(async move { r.run_loop().await });
+
+        replicator
+    }
+
+    /// Add a database to replication.
+    ///
+    /// Takes an initial snapshot (blocks until uploaded). Returns error if the
+    /// snapshot fails after retries — the database is NOT added in that case.
+    pub async fn add(&self, name: &str, db_path: &Path) -> Result<()> {
+        let prefix = self.prefix.clone();
+
+        // Build state and take initial snapshot OUTSIDE the map lock
+        let mut state = SyncState::new(db_path.to_path_buf())?;
+        state.name = name.to_string();
+
+        if db_path.exists() {
+            state.init_checksum()?;
+        }
+
+        sync::take_snapshot_with_retry(
+            self.storage.as_ref(),
+            &prefix,
+            &mut state,
+            &self.config.retry_policy,
+        )
+        .await?;
+
+        let db_state = Arc::new(AsyncMutex::new(DbState {
+            state,
+            prefix,
+        }));
+
+        self.databases
+            .write()
+            .await
+            .insert(name.to_string(), db_state);
+
+        tracing::info!("Replicator: added '{}' ({})", name, db_path.display());
+        Ok(())
+    }
+
+    /// Remove a database from replication.
+    ///
+    /// Does a final sync before removing — blocks until the sync completes
+    /// (or fails). The caller should checkpoint/close the database AFTER this returns.
+    pub async fn remove(&self, name: &str) {
+        let entry = self.databases.write().await.remove(name);
+
+        if let Some(db_state) = entry {
+            let mut s = db_state.lock().await;
+            let prefix = s.prefix.clone();
+            match sync::sync_wal(
+                self.storage.as_ref(),
+                &prefix,
+                &mut s.state,
+            )
+            .await
+            {
+                Ok(frames) if frames > 0 => {
+                    tracing::info!(
+                        "Replicator: final sync for '{}' captured {} frames",
+                        name,
+                        frames
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Replicator: final sync for '{}' failed: {}", name, e);
+                }
+                _ => {}
+            }
+            tracing::info!("Replicator: removed '{}'", name);
+        }
+    }
+
+    /// Restore a database from S3.
+    ///
+    /// Returns `Ok(Some(txid))` if data was found and restored,
+    /// `Ok(None)` if no WAL data exists for this name.
+    pub async fn restore(&self, name: &str, output_path: &Path) -> Result<Option<u64>> {
+        let prefix = self.prefix.clone();
+
+        if let Some(parent) = output_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let txid = match sync::restore(self.storage.as_ref(), &prefix, name, output_path, None).await {
+            Ok(txid) => txid,
+            Err(e) if e.to_string().contains("No LTX files found") => return Ok(None),
+            Err(e) => return Err(e),
+        };
+
+        tracing::info!(
+            "Replicator: restored '{}' to TXID {} ({})",
+            name,
+            txid,
+            output_path.display()
+        );
+        Ok(Some(txid))
+    }
+
+    /// Number of databases currently being replicated.
+    pub async fn database_count(&self) -> usize {
+        self.databases.read().await.len()
+    }
+
+    /// Check if a specific database is being replicated.
+    pub async fn contains(&self, name: &str) -> bool {
+        self.databases.read().await.contains_key(name)
+    }
+
+    // ========================================================================
+    // Background loop
+    // ========================================================================
+
+    async fn run_loop(&self) {
+        let mut sync_timer = tokio::time::interval(self.config.sync_interval);
+        let mut snapshot_timer = tokio::time::interval(self.config.snapshot_interval);
+        // Skip first snapshot tick — databases take snapshots on add()
+        snapshot_timer.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = sync_timer.tick() => self.sync_all().await,
+                _ = snapshot_timer.tick() => self.snapshot_all().await,
+            }
+        }
+    }
+
+    /// Sync all registered databases in parallel.
+    async fn sync_all(&self) {
+        let entries: Vec<(String, Arc<AsyncMutex<DbState>>)> = {
+            let dbs = self.databases.read().await;
+            if dbs.is_empty() {
+                return;
+            }
+            dbs.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+
+        let mut set = JoinSet::new();
+        for (name, db_state) in entries {
+            let storage = self.storage.clone();
+            set.spawn(async move {
+                let mut s = db_state.lock().await;
+                let prefix = s.prefix.clone();
+                match sync::sync_wal(
+                    storage.as_ref(),
+                    &prefix,
+                    &mut s.state,
+                )
+                .await
+                {
+                    Ok(frames) if frames > 0 => {
+                        tracing::debug!(
+                            "Replicator: synced '{}' ({} frames, TXID {})",
+                            name,
+                            frames,
+                            s.state.current_txid
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!("Replicator: sync failed for '{}': {}", name, e);
+                    }
+                    _ => {}
+                }
+            });
+        }
+
+        while set.join_next().await.is_some() {}
+    }
+
+    /// Take snapshots for all registered databases (sequential — snapshots are heavy).
+    async fn snapshot_all(&self) {
+        let entries: Vec<(String, Arc<AsyncMutex<DbState>>)> = {
+            let dbs = self.databases.read().await;
+            dbs.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+        };
+
+        for (name, db_state) in entries {
+            let mut s = db_state.lock().await;
+            let prefix = s.prefix.clone();
+            match sync::take_snapshot_with_retry(
+                self.storage.as_ref(),
+                &prefix,
+                &mut s.state,
+                &self.config.retry_policy,
+            )
+            .await
+            {
+                Ok(()) => {
+                    tracing::info!(
+                        "Replicator: snapshot for '{}' (TXID {})",
+                        name,
+                        s.state.current_txid
+                    );
+                }
+                Err(e) => {
+                    tracing::error!("Replicator: snapshot failed for '{}': {}", name, e);
+                }
+            }
+        }
+    }
+}

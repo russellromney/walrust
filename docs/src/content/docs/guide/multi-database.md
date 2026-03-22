@@ -74,9 +74,9 @@ s3://my-bucket/
 
 | Databases | Litestream | Walrust | Reduction |
 |-----------|------------|---------|-----------|
-| 1 | 37 MB | 19 MB | 49% |
-| 10 | 61 MB | 20 MB | 67% |
-| 100 | 228 MB | 19 MB | 92% |
+| 1 | 36 MB | 19 MB | 47% |
+| 10 | 55 MB | 19 MB | 65% |
+| 100 | 160 MB | 20 MB | 88% |
 
 Walrust shares one S3 client and one file watcher across all databases. Memory remains ~19-20 MB regardless of database count.
 

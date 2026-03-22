@@ -13,9 +13,9 @@ Walrust uses significantly less memory than Litestream, especially when watching
 
 | Databases | Litestream | Walrust | Reduction |
 |-----------|------------|---------|-----------|
-| 1 | 37 MB | 19 MB | 49% |
-| 10 | 61 MB | 20 MB | 67% |
-| 100 | 228 MB | 19 MB | 92% |
+| 1 | 36 MB | 19 MB | 47% |
+| 10 | 55 MB | 19 MB | 65% |
+| 100 | 160 MB | 20 MB | 88% |
 
 *Measured with 100KB databases on macOS, syncing to Tigris S3.*
 
@@ -49,10 +49,8 @@ prefix = "tenants"
 
 **When to use Litestream:**
 - Mature ecosystem and community support
-- Litestream Cloud integration
 - SFTP/Azure Blob storage backends
 
 **When to use walrust:**
 - Multi-database deployments (100+ databases)
 - Memory-constrained environments
-- Rust-native integration

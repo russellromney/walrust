@@ -774,7 +774,7 @@ async fn run() -> Result<()> {
             point_in_time,
             cache_dir,
         } => {
-            sync::restore(&name, &output, &bucket, endpoint.as_deref(), point_in_time.as_deref(), cache_dir.as_deref()).await?;
+            sync::restore(&name, &output, &bucket, endpoint.as_deref(), point_in_time.as_deref(), cache_dir.as_deref(), None).await?;
         }
         Commands::List { bucket, endpoint } => {
             sync::list(&bucket, endpoint.as_deref()).await?;
@@ -820,7 +820,7 @@ async fn run() -> Result<()> {
             endpoint,
             fix,
         } => {
-            sync::verify(&name, &bucket, endpoint.as_deref(), fix).await?;
+            sync::verify(&name, &bucket, endpoint.as_deref(), fix, None).await?;
         }
 
         Commands::Pragma { output, comments } => {

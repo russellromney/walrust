@@ -1,0 +1,49 @@
+[package]
+name = "walrust"
+version = "0.1.0"
+edition = "2021"
+description = "SQLite WAL sync to S3-compatible storage — continuous replication, point-in-time restore"
+authors = ["Russell Romney <russellromney@gmail.com>"]
+license = "Apache-2.0"
+repository = "https://github.com/russellromney/walrust"
+readme = "README.md"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Async trait support
+async-trait = "0.1"
+
+# S3
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-s3 = "1"
+aws-smithy-runtime = { version = "1", features = ["client"] }
+
+# LTX format
+litepages = "0.1.0"
+
+# SQLite for checkpointing (shadow WAL)
+rusqlite = { version = "0.35", features = ["bundled"] }
+
+# Parallelization for LTX encoding
+rayon = "1.10"
+
+# Concurrent async streams
+futures = "0.3"
+
+# Utilities
+anyhow = "1"
+tracing = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+rand = "0.8"
+
+# Directory traversal (shadow WAL size)
+walkdir = "2"
+
+[dev-dependencies]
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"

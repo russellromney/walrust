@@ -17,10 +17,9 @@ Both tools use WAL-based replication with the LTX file format. Key differences:
 
 | Aspect | walrust | Litestream |
 |--------|---------|------------|
-| Memory (1 DB) | 19 MB | 37 MB |
-| Memory (100 DBs) | 19 MB | 228 MB |
+| Memory (1 DB) | 19 MB | 36 MB |
+| Memory (100 DBs) | 20 MB | 160 MB |
 | Language | Rust | Go |
-| Cloud service | No | Litestream Cloud |
 | Config format | TOML | YAML |
 
 See [Migration from Litestream](/guide/migration-from-litestream/) for detailed comparison.

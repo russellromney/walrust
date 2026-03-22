@@ -46,6 +46,38 @@ except ImportError:
     boto3 = None  # Cleanup will be skipped
 
 
+def wait_for_snapshot(bucket: str, db_name: str, endpoint: Optional[str] = None, timeout: float = 30.0) -> bool:
+    """Wait for a snapshot to appear in S3. Returns True if found within timeout."""
+    if not boto3:
+        # Fall back to sleep if boto3 not available
+        time.sleep(10)
+        return True
+
+    session = boto3.Session()
+    config_kwargs = {}
+    if endpoint:
+        config_kwargs["endpoint_url"] = endpoint
+
+    s3 = session.client("s3", **config_kwargs)
+    bucket_name = bucket.replace("s3://", "").split("/")[0]
+    prefix = f"{db_name}/"
+
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            response = s3.list_objects_v2(Bucket=bucket_name, Prefix=prefix, MaxKeys=10)
+            if "Contents" in response and len(response["Contents"]) > 0:
+                # Check for .ltx file (snapshot)
+                for obj in response["Contents"]:
+                    if obj["Key"].endswith(".ltx"):
+                        return True
+        except Exception:
+            pass
+        time.sleep(0.5)
+
+    return False
+
+
 def check_s3_credentials(bucket: str, endpoint: Optional[str] = None) -> None:
     """Verify S3 credentials work before running benchmarks."""
     if not boto3:
@@ -233,8 +265,12 @@ def benchmark_walrust(
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
     startup_time = (time.time() - start_time) * 1000
 
-    # Wait for initial snapshot upload to complete (5 seconds should be enough for small DBs)
-    time.sleep(5)
+    # Wait for initial snapshot upload to S3 before measuring steady-state memory
+    # Check the first database to confirm walrust is uploading
+    first_db_name = databases[0].stem
+    snapshot_found = wait_for_snapshot(bucket, first_db_name, endpoint, timeout=30.0)
+    if not snapshot_found:
+        print(f"    Warning: No snapshot found for {first_db_name} after 30s")
 
     # Check if process is still running
     if proc.poll() is not None:
@@ -318,8 +354,12 @@ def benchmark_litestream(
 
     startup_time = (time.time() - start_time) * 1000
 
-    # Wait for initial snapshot upload to complete (5 seconds should be enough for small DBs)
-    time.sleep(5)
+    # Wait for initial snapshot upload to S3 before measuring steady-state memory
+    # Check the first database to confirm litestream is uploading
+    first_db_name = databases[0].stem
+    snapshot_found = wait_for_snapshot(bucket, first_db_name, endpoint, timeout=30.0)
+    if not snapshot_found:
+        print(f"    Warning: No snapshot found for {first_db_name} after 30s")
 
     # Check if process is still running
     if proc.poll() is not None:
@@ -522,8 +562,8 @@ Examples:
     parser.add_argument(
         "--duration",
         type=float,
-        default=5.0,
-        help="Duration in seconds to measure each benchmark (default: 5)",
+        default=10.0,
+        help="Duration in seconds to measure each benchmark (default: 10)",
     )
     parser.add_argument(
         "--db-size",

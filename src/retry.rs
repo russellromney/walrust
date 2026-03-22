@@ -13,7 +13,8 @@ use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use crate::webhook::WebhookSender;
 
 /// Configuration for retry behavior
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -177,26 +178,57 @@ pub enum CircuitState {
 }
 
 /// Circuit breaker for preventing cascading failures
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct CircuitBreaker {
     /// Number of consecutive failures
-    consecutive_failures: AtomicU32,
+    consecutive_failures: Arc<AtomicU32>,
     /// Threshold before opening
     threshold: u32,
     /// Time when circuit opened (milliseconds since UNIX epoch, 0 = not open)
-    opened_at_ms: AtomicU64,
+    opened_at_ms: Arc<AtomicU64>,
     /// Cooldown period in milliseconds
     cooldown_ms: u64,
+    /// Optional webhook sender for notifications
+    webhook: Option<Arc<WebhookSender>>,
+    /// Database name for webhook notifications
+    database_name: String,
+}
+
+impl std::fmt::Debug for CircuitBreaker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CircuitBreaker")
+            .field("consecutive_failures", &self.consecutive_failures.load(Ordering::Relaxed))
+            .field("threshold", &self.threshold)
+            .field("opened_at_ms", &self.opened_at_ms.load(Ordering::Relaxed))
+            .field("cooldown_ms", &self.cooldown_ms)
+            .field("has_webhook", &self.webhook.is_some())
+            .field("database_name", &self.database_name)
+            .finish()
+    }
 }
 
 impl CircuitBreaker {
     /// Create a new circuit breaker
     pub fn new(threshold: u32, cooldown_ms: u64) -> Self {
         Self {
-            consecutive_failures: AtomicU32::new(0),
+            consecutive_failures: Arc::new(AtomicU32::new(0)),
             threshold,
-            opened_at_ms: AtomicU64::new(0),
+            opened_at_ms: Arc::new(AtomicU64::new(0)),
             cooldown_ms,
+            webhook: None,
+            database_name: String::new(),
+        }
+    }
+
+    /// Create a circuit breaker with webhook notifications
+    pub fn with_webhook(threshold: u32, cooldown_ms: u64, webhook: Arc<WebhookSender>, database: &str) -> Self {
+        Self {
+            consecutive_failures: Arc::new(AtomicU32::new(0)),
+            threshold,
+            opened_at_ms: Arc::new(AtomicU64::new(0)),
+            cooldown_ms,
+            webhook: Some(webhook),
+            database_name: database.to_string(),
         }
     }
 
@@ -245,6 +277,15 @@ impl CircuitBreaker {
                 "Circuit breaker opened after {} consecutive failures",
                 failures
             );
+
+            // Send webhook notification
+            if let Some(webhook) = &self.webhook {
+                let webhook = Arc::clone(webhook);
+                let database = self.database_name.clone();
+                tokio::spawn(async move {
+                    webhook.notify_circuit_breaker_open(&database, failures).await;
+                });
+            }
         }
     }
 
@@ -396,23 +437,6 @@ impl RetryPolicy {
             .await
             .map_err(|e| anyhow!("{}: {}", context, e))
     }
-}
-
-/// Outcome of a retry attempt (for webhooks/logging)
-#[derive(Debug, Clone)]
-pub struct RetryOutcome {
-    /// Operation name
-    pub operation: String,
-    /// Whether it ultimately succeeded
-    pub success: bool,
-    /// Number of attempts made
-    pub attempts: u32,
-    /// Total time spent retrying
-    pub total_duration: Duration,
-    /// Final error if failed
-    pub error: Option<String>,
-    /// Error classification if failed
-    pub error_kind: Option<ErrorKind>,
 }
 
 #[cfg(test)]

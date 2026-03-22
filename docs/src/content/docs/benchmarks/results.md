@@ -11,9 +11,9 @@ Memory usage (RSS) when watching multiple SQLite databases:
 
 | Databases | walrust (MB) | litestream (MB) | Reduction |
 |-----------|--------------|-----------------|-----------|
-| 1         | 19           | 37              | 49%       |
-| 10        | 20           | 61              | 67%       |
-| 100       | 19           | 228             | 92%       |
+| 1         | 19           | 36              | 47%       |
+| 10        | 19           | 55              | 65%       |
+| 100       | 20           | 160             | 88%       |
 
 *Measured with 100KB databases, syncing to Tigris S3 on macOS.*
 

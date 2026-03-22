@@ -9,16 +9,14 @@ Walrust and Litestream solve the same problem using the same LTX file format. Th
 
 Consider walrust if:
 
-- **Memory-constrained environments** - walrust uses 19 MB vs Litestream's 37 MB (49% reduction)
-- **Multi-database setups** - walrust uses 19 MB for 100 databases vs Litestream's 228 MB (92% reduction)
-- **Rust ecosystem** - native integration with Rust projects
+- **Memory-constrained environments** - walrust uses 19 MB vs Litestream's 36 MB (47% reduction)
+- **Multi-database setups** - walrust uses 20 MB for 100 databases vs Litestream's 160 MB (88% reduction)
 - **Simpler configuration** - TOML-based configuration
 
 Stay with Litestream if:
 
 - You need its mature ecosystem and community
-- You use Litestream Cloud
-- You need features walrust doesn't have yet (e.g., restore commands with automatic download from cloud)
+- You need SFTP or Azure Blob storage backends
 
 ## Compatibility
 
@@ -34,13 +32,11 @@ Both tools use the same:
 
 | Feature | Litestream | Walrust |
 |---------|-----------|---------|
-| Memory (1 DB) | 37 MB | 19 MB |
-| Memory (100 DBs) | 228 MB | 19 MB |
+| Memory (1 DB) | 36 MB | 19 MB |
+| Memory (100 DBs) | 160 MB | 20 MB |
 | Language | Go | Rust |
 | Config format | YAML | TOML |
-| Cloud service | Yes (Litestream Cloud) | No |
 | Metrics | Prometheus | Prometheus |
-| Restore command | Downloads automatically | Explicit --bucket required |
 
 ## Feature Comparison
 
@@ -56,10 +52,7 @@ Both tools use the same:
 
 ### Litestream Only
 
-- ❌ Litestream Cloud integration
 - ❌ SFTP/Azure Blob storage backends
-- ❌ Consul integration
-- ❌ PostgreSQL-like streaming replication
 
 ### Walrust Only
 
@@ -389,9 +382,9 @@ Based on benchmarks (100KB databases, syncing to Tigris S3):
 
 | Metric | Litestream | Walrust | Reduction |
 |--------|-----------|---------|-----------|
-| Memory (1 DB) | 37 MB | 19 MB | 49% |
-| Memory (10 DBs) | 61 MB | 20 MB | 67% |
-| Memory (100 DBs) | 228 MB | 19 MB | 92% |
+| Memory (1 DB) | 36 MB | 19 MB | 47% |
+| Memory (10 DBs) | 55 MB | 19 MB | 65% |
+| Memory (100 DBs) | 160 MB | 20 MB | 88% |
 | CPU (idle) | <1% | <1% | - |
 | CPU (active) | 2-5% | 2-5% | - |
 | Sync latency (P95) | ~1s | ~1s | - |

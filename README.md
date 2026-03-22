@@ -174,17 +174,40 @@ walrust list -b <BUCKET>
 
 ### `walrust explain`
 
-Show what the current configuration will do without running.
+Preview configuration before running watch mode - see what walrust will do without starting it.
 
 ```bash
 walrust explain [--config <CONFIG>]
 ```
 
-Displays: S3 settings, snapshot triggers, compaction settings, retention policy, and resolved database paths.
+**Displays:**
+- Database list and S3 destination
+- Snapshot schedule and retention policy (GFS)
+- Validation intervals
+- Webhook notifications
+- **Estimated monthly storage costs** (Tigris: $0.02/GB, S3: $0.023/GB)
+
+**Example output:**
+```
+Configuration Summary
+=====================
+
+Databases:
+  - /path/to/app.db → s3://my-bucket/backups/app
+
+Retention Policy (GFS):
+  Hourly: 24 snapshots (last 24 hours)
+  Daily: 7 snapshots (last week)
+  Total: 55 snapshots per database
+
+Estimated Storage Costs:
+  Per 1GB database: ~$1.10/month (Tigris)
+  Per 10GB database: ~$11/month
+```
 
 ### `walrust verify`
 
-Verify integrity of LTX files in S3.
+Verify backup integrity without doing a full restore - fast integrity checking.
 
 ```bash
 walrust verify <NAME> -b <BUCKET> [OPTIONS]
@@ -194,7 +217,33 @@ Options:
   --fix             Remove orphaned manifest entries
 ```
 
-Checks: file existence, header validity, checksums, TXID continuity.
+**Checks:**
+- ✅ Snapshot existence (critical - prevents incomplete backups)
+- ✅ File existence (all manifest entries have S3 objects)
+- ✅ Header validity (LTX headers parse correctly)
+- ✅ Checksums (SHA256 verification)
+- ✅ TXID continuity (no gaps in transaction sequence)
+
+**Exit codes:**
+- `0` = All checks passed
+- `1` = Issues found (warnings)
+- `2` = Critical errors (no snapshot, major gaps)
+
+**Example output:**
+```
+Verifying backup: mydb in s3://my-bucket/backups...
+
+✅ Snapshot: Found generation 1 (TXID 1-1, 4096 bytes)
+
+Incremental files: 15 files
+  ✅ 0000000000000002-0000000000000005.ltx (4 TXIDs, 12KB)
+  ✅ 0000000000000006-0000000000000010.ltx (5 TXIDs, 16KB)
+
+Continuity: ✅ No gaps detected (TXID 1-100)
+
+✅ All checks passed - backup integrity verified
+Exit code: 0 (success)
+```
 
 ### `walrust replicate`
 
@@ -370,9 +419,9 @@ walrust watch app.db -b s3://bucket --compact-interval 3600
 
 | Databases | Litestream | Walrust | Reduction |
 |-----------|------------|---------|-----------|
-| 1 | 37 MB | 19 MB | 49% |
-| 10 | 61 MB | 20 MB | 67% |
-| 100 | 228 MB | 19 MB | 92% |
+| 1 | 36 MB | 19 MB | 47% |
+| 10 | 55 MB | 19 MB | 65% |
+| 100 | 160 MB | 20 MB | 88% |
 
 *Measured with 100KB databases on macOS, syncing to Tigris S3. See [bench/BENCHMARK_FRAMEWORK.md](bench/BENCHMARK_FRAMEWORK.md) for methodology.*
 

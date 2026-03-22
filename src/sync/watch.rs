@@ -1,5 +1,4 @@
 use anyhow::{anyhow, Result};
-use chrono::Utc;
 use futures::future::join_all;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -17,7 +16,7 @@ use crate::s3::{self, create_client, parse_bucket};
 use crate::shadow::ShadowWal;
 use crate::storage::{S3Backend, StorageBackend};
 use crate::uploader::{spawn_uploader, UploadMessage, Uploader};
-use crate::webhook::{WebhookEvent, WebhookSender};
+use crate::webhook::WebhookSender;
 
 use super::compact::{get_wal_page_count, run_checkpoint, CheckpointMode};
 use super::manifest::discover_state_from_s3;
@@ -835,7 +834,7 @@ pub async fn watch_with_independent_tasks(
     bucket: &str,
     endpoint: Option<&str>,
     global_sync: SyncConfig,
-    compact_policy: Option<RetentionPolicy>,
+    _compact_policy: Option<RetentionPolicy>,
     metrics_port: u16,
     no_metrics: bool,
     retry_config: RetryConfig,
