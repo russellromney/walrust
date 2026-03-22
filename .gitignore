@@ -107,3 +107,5 @@ __pycache__
 
 # Test result files
 *-results.json
+tests/*-results.json
+tests/*.log
