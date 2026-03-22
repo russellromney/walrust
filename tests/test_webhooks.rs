@@ -372,21 +372,24 @@ async fn test_webhook_with_invalid_url() {
 
 #[tokio::test]
 async fn test_webhook_with_no_secret() {
-    // Test webhook without HMAC secret
+    // Test webhook without HMAC secret - should NOT include X-Walrust-Signature header
+    let (url, server, _handle) = start_test_server().await;
 
     let configs = vec![WebhookConfig {
-        url: std::env::var("TEST_WEBHOOK_URL")
-            .unwrap_or_else(|_| "https://webhook.site/unique-id".to_string()),
+        url,
         events: vec!["corruption_detected".to_string()],
         secret: None, // No HMAC
     }];
 
     let sender = WebhookSender::new(configs);
-
-    // Should send without X-Walrust-Signature header
     sender.notify_corruption("no-secret-db", "No HMAC test").await;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let received = server.get_received();
+    assert_eq!(received.len(), 1, "Should receive exactly one webhook");
+    assert!(received[0].signature.is_none(), "Should NOT have signature header when no secret configured");
+    assert!(received[0].body.contains("no-secret-db"));
 }
 
 #[tokio::test]
@@ -486,23 +489,26 @@ async fn test_circuit_breaker_webhook_does_not_block() {
 #[tokio::test]
 async fn test_webhook_with_special_characters() {
     // Test payload with special characters, unicode, etc.
+    let (url, server, _handle) = start_test_server().await;
 
     let configs = vec![WebhookConfig {
-        url: std::env::var("TEST_WEBHOOK_URL")
-            .unwrap_or_else(|_| "https://webhook.site/unique-id".to_string()),
+        url,
         events: vec!["corruption_detected".to_string()],
         secret: Some("secret".to_string()),
     }];
 
     let sender = WebhookSender::new(configs);
-
-    // Test with special characters
     sender.notify_corruption(
-        "test-db-with-unicode-测试",
-        "Error with special chars: <>&\"' and emoji 🔥",
+        "test-db-with-unicode-\u{6D4B}\u{8BD5}",
+        "Error with special chars: <>&\"' and emoji",
     ).await;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
+    let received = server.get_received();
+    assert_eq!(received.len(), 1, "Should receive exactly one webhook");
+    assert!(received[0].body.contains("test-db-with-unicode"), "Body should contain unicode database name");
+    assert!(received[0].signature.is_some(), "Should have HMAC signature");
 }
 
 #[test]

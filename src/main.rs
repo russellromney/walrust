@@ -308,7 +308,7 @@ enum Commands {
     /// Verify integrity of backed-up LTX files in S3
     ///
     /// Checks that each LTX file exists, has valid checksums, and maintains
-    /// TXID continuity. Use --fix to remove orphaned manifest entries.
+    /// TXID continuity.
     Verify {
         /// Database name (as registered in S3)
         name: String,
@@ -320,10 +320,6 @@ enum Commands {
         /// S3 endpoint URL
         #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
         endpoint: Option<String>,
-
-        /// Fix issues by removing orphaned manifest entries
-        #[arg(long)]
-        fix: bool,
     },
 
     /// Output recommended SQLite PRAGMA settings for optimal walrust performance
@@ -818,9 +814,8 @@ async fn run() -> Result<()> {
             name,
             bucket,
             endpoint,
-            fix,
         } => {
-            sync::verify(&name, &bucket, endpoint.as_deref(), fix, None).await?;
+            sync::verify(&name, &bucket, endpoint.as_deref(), None).await?;
         }
 
         Commands::Pragma { output, comments } => {

@@ -9,13 +9,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.2] - 2026-03-22
 
-### Polish & Cleanup (v0.3.3)
-- **Test improvements**: All 15 webhook tests now run without `#[ignore]` - created real axum HTTP test servers
-- **Code cleanup**: Removed 280+ lines of unused code (RetryOutcome, FrameHeader, CompactionConfig, CompactionStats, compact_incrementals(), should_compact())
-- **Clippy fixes**: Fixed 17 clippy warnings (unused imports, variables, doc formatting)
-
-## [0.3.2] - 2026-03-22 (Core Features)
-
 ### Added
 - **`walrust explain` command**: Preview configuration before running watch mode
   - Shows validation intervals, webhook notifications, and cost estimation
@@ -49,6 +42,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `restore_legacy()` function (66 lines) - unused legacy restore path
 - Duplicate `CheckpointMode` enum and unused WAL functions (74 lines)
 - Total: 140 lines of dead code removed
+
+### Polish
+- All 15 webhook tests now run without `#[ignore]` - created real axum HTTP test servers
+- Removed 280+ lines of unused code (RetryOutcome, FrameHeader, CompactionConfig, CompactionStats, compact_incrementals(), should_compact())
+- Fixed 17 clippy warnings (unused imports, variables, doc formatting)
+- Removed ~450 lines of duplicated code from sync module split (explain, verify types, validate_backup_integrity)
+- Wired up verify() summary output (verified_count, total_size were tracked but never printed)
+- Removed silently-ignored `--fix` flag from verify command
+- Removed 213 build artifacts from git tracking (crates/litetx/target/)
 
 ## [0.3.1] - Previous
 

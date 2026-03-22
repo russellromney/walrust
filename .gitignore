@@ -1,5 +1,5 @@
 # Rust
-/target/
+**/target/
 *.o
 *.a
 *.so

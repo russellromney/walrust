@@ -863,13 +863,10 @@ pub(crate) async fn validate_backup_integrity(
 /// - LTX headers can be decoded
 /// - LTX internal checksums are valid
 /// - TXID continuity (no gaps in the chain)
-///
-/// With --fix, removes orphaned entries from manifest
 pub async fn verify(
     name: &str,
     bucket: &str,
     endpoint: Option<&str>,
-    _fix: bool, // No longer used - files are source of truth in litestream format
     webhook: Option<std::sync::Arc<crate::webhook::WebhookSender>>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
@@ -924,8 +921,8 @@ pub async fn verify(
     println!();
 
     let mut issues: Vec<VerifyIssue> = Vec::new();
-    let mut _verified_count = 0;
-    let mut _total_size: u64 = 0;
+    let mut verified_count = 0;
+    let mut total_size: u64 = 0;
 
     println!("Incremental files: {} files", all_files.len());
 
@@ -959,8 +956,8 @@ pub async fn verify(
                             let txid_count = expected_max - expected_min + 1;
                             println!("  ✅ {} ({} TXIDs, {}KB)",
                                 filename, txid_count, size_kb);
-                            _verified_count += 1;
-                            _total_size += data.len() as u64;
+                            verified_count += 1;
+                            total_size += data.len() as u64;
                         }
                     }
                     Err(e) => {
@@ -1024,7 +1021,6 @@ pub async fn verify(
     // Check TXID continuity and report
     let mut has_critical_gap = false;
     if !live_files.is_empty() {
-        let _first_txid = live_files.first().map(|(_, _, min, _)| *min).unwrap_or(1);
         let last_txid = live_files.last().map(|(_, _, _, max)| *max).unwrap_or(0);
 
         // Check for gaps in continuity
@@ -1057,6 +1053,9 @@ pub async fn verify(
         }
         println!();
     }
+
+    println!("Verified: {}/{} files ({:.1} KB total)", verified_count, all_files.len(), total_size as f64 / 1024.0);
+    println!();
 
     // Exit with appropriate code
     if issues.is_empty() {
