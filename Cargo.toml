@@ -62,10 +62,10 @@ hmac = "0.12"
 hex = "0.4"
 
 # Core library (embeddable sync primitives)
-walrust-core = { path = "crates/walrust-core", package = "walrust" }
+walrust-core = { version = "0.1.0", path = "crates/walrust-core", package = "walrust" }
 
 # LTX format (Litestream-compatible) - local fork with NO_CHECKSUM flag support
-litepages = { path = "crates/litetx", package = "litepages" }
+litepages = { version = "0.1.0", path = "crates/litetx", package = "litepages" }
 
 # SQLite for checkpointing
 rusqlite = { version = "0.35", features = ["bundled"] }
