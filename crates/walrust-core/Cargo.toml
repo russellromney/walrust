@@ -47,3 +47,4 @@ walkdir = "2"
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
+hadb-io = { path = "../../../../hadb/hadb-io" }
