@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-03-23
+
+### Fixed
+- **Memory accumulation under load**: RSS was scaling linearly with write throughput (67MB at 100 w/s → 361MB at 6700 w/s on 50MB DB). Now constant at ~70MB regardless of throughput.
+  - `apply_ltx_to_db()` accumulated decoded pages in `Vec<(u32, Vec<u8>)>` for chain checksum verification — replaced with streaming `ChainHasher` that computes incrementally during decode
+  - `read_frames_as_pages()` read ALL WAL frames into memory before dedup — replaced with `read_frames_as_page_map()` that deduplicates into HashMap during read (peak memory = unique pages only)
+  - Shadow WAL `sync_shadow_concurrent()` accumulated frames then deduplicated — now reads directly into HashMap
+  - Retry wrappers cloned LTX buffers per attempt — now use `Arc<Vec<u8>>` for zero-copy sharing
+
+### Added
+- `ChainHasher` struct for streaming chain checksum computation
+- `read_frames_as_page_map()` in both walrust-core and CLI WAL modules
+- Regression tests: `test_chain_hasher_matches_chain_checksum`, `test_chain_hasher_page_count`, `test_apply_ltx_no_memory_accumulation`, `test_read_frames_as_page_map_deduplicates`, `test_read_frames_as_page_map_matches_old_api`
+
+### Removed
+- `wal_page_overlay` from `SyncState` (walrust-core)
+- `compute_expected_post_with_overlay()` — the full-DB-read bottleneck function
+- `crates/walrust-core/target/` from git tracking (was committed despite .gitignore)
+
+## [0.5.0] - 2026-03-22
+
+### Changed
+- **Chained page checksums**: Incremental LTX files now use chained page hash instead of full-DB hash
+  - `post_checksum = SHA-256(pre_checksum || page1_num || page1_data || ...)` — pages sorted by number
+  - Snapshots keep full-DB hash (data already in memory during encode)
+  - Eliminates full database read from sync hot path entirely
+- **Page clone elimination**: Move frame data instead of cloning during dedup; index-based sorting in `encode_wal_changes()` instead of `pages.to_vec()`
+
+### Performance
+- Before: 50MB disk read + 50MB hash = ~100MB I/O per sync cycle (every 1s)
+- After: 10 dirty pages x 4KB = 40KB hash per sync cycle
+
 ## [0.4.0] - 2026-03-22
 
 ### Changed

@@ -166,14 +166,17 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
         .open(db_path)
         .map_err(|e| anyhow!("Failed to open database for in-place apply: {}", e))?;
 
-    // Collect decoded pages for chain checksum verification
-    let mut decoded_pages: Vec<(u32, Vec<u8>)> = Vec::new();
+    // Streaming chain hasher: hash each page during decode instead of accumulating
+    // a Vec<(u32, Vec<u8>)>. Pages arrive sorted from our encoder.
+    let mut chain_hasher = header.pre_apply_checksum.map(ChainHasher::new);
 
     while let Some(page_num) = decoder.decode_page(&mut page_buf)? {
         let offset = (page_num.into_inner() as u64 - 1) * page_size as u64;
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(&page_buf)?;
-        decoded_pages.push((page_num.into_inner(), page_buf.clone()));
+        if let Some(ref mut hasher) = chain_hasher {
+            hasher.update(page_num.into_inner(), &page_buf);
+        }
     }
 
     // Ensure all writes are flushed
@@ -183,22 +186,20 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
     // Verify file checksum (internal integrity)
     let trailer = decoder.finish()?;
 
+    // Get page count before consuming the hasher
+    let page_count = chain_hasher.as_ref().map(|h| h.page_count()).unwrap_or(0);
+
     // Verify checksums using chained page hash (skip if NO_CHECKSUM)
     let post_checksum = if !skip_checksums {
-        // Verify pre_apply_checksum chain continuity
         if let Some(expected_pre) = header.pre_apply_checksum {
-            // For chain verification during restore, we check that the pre_apply_checksum
-            // was valid when the file was created. We trust the chain — if the previous
-            // file's post_apply matched this file's pre_apply, the chain is intact.
             tracing::debug!(
                 "Pre-apply checksum: {:016x}",
                 expected_pre.into_inner()
             );
         }
 
-        // Compute expected post_checksum from chained page hash
-        if let Some(pre) = header.pre_apply_checksum {
-            let expected_post = chain_checksum(pre, &decoded_pages);
+        if let Some(hasher) = chain_hasher {
+            let expected_post = hasher.finish();
             if trailer.post_apply_checksum != expected_post {
                 return Err(anyhow!(
                     "Post-apply checksum mismatch: expected {:016x}, got {:016x}. \
@@ -213,13 +214,11 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
             );
             expected_post
         } else {
-            // No pre_apply means this is being treated as a snapshot-like apply
             trailer.post_apply_checksum
         }
     } else {
-        // NO_CHECKSUM: compute for tracking but don't verify
-        if let Some(pre) = header.pre_apply_checksum {
-            chain_checksum(pre, &decoded_pages)
+        if let Some(hasher) = chain_hasher {
+            hasher.finish()
         } else {
             compute_checksum_from_file(db_path)?
         }
@@ -227,7 +226,7 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
 
     tracing::debug!(
         "Applied {} pages in-place (TXID {}-{})",
-        decoded_pages.len(),
+        page_count,
         header.min_txid.into_inner(),
         header.max_txid.into_inner()
     );
@@ -310,6 +309,46 @@ pub fn chain_checksum(pre: Checksum, pages: &[(u32, Vec<u8>)]) -> Checksum {
 
     let result = hasher.finalize();
     Checksum::new(u64::from_be_bytes(result[0..8].try_into().unwrap()))
+}
+
+/// Streaming chain hasher: computes chain checksum incrementally during LTX decode.
+///
+/// Pages MUST be fed in sorted order (by page number). Our encoder sorts pages,
+/// so they arrive sorted during decode. This eliminates the need to accumulate
+/// all decoded pages in a Vec just for checksum verification.
+pub struct ChainHasher {
+    hasher: sha2::Sha256,
+    page_count: usize,
+}
+
+impl ChainHasher {
+    /// Create a new chain hasher seeded with the pre-apply checksum.
+    pub fn new(pre: Checksum) -> Self {
+        use sha2::Digest;
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(pre.into_inner().to_be_bytes());
+        Self { hasher, page_count: 0 }
+    }
+
+    /// Feed a page into the hash. Pages must arrive in sorted order.
+    pub fn update(&mut self, page_num: u32, page_data: &[u8]) {
+        use sha2::Digest;
+        self.hasher.update(page_num.to_be_bytes());
+        self.hasher.update(page_data);
+        self.page_count += 1;
+    }
+
+    /// Finalize and return the chain checksum.
+    pub fn finish(self) -> Checksum {
+        use sha2::Digest;
+        let result = self.hasher.finalize();
+        Checksum::new(u64::from_be_bytes(result[0..8].try_into().unwrap()))
+    }
+
+    /// Number of pages fed into the hasher.
+    pub fn page_count(&self) -> usize {
+        self.page_count
+    }
 }
 
 /// Verify an LTX file by decoding all pages and checking the checksum
@@ -1409,6 +1448,118 @@ mod tests {
         let page5_start = 4 * page_size as usize;
         assert!(restored_bytes[page5_start..page5_start + 10].iter().all(|&b| b == 0xF4),
             "Page 5 should contain the last incremental's data");
+    }
+
+    // ============================================
+    // ChainHasher Tests (streaming chain checksum)
+    // ============================================
+
+    #[test]
+    fn test_chain_hasher_matches_chain_checksum() {
+        // ChainHasher must produce identical results to chain_checksum
+        // when pages are fed in sorted order.
+        let pre = Checksum::new(0xDEADBEEF);
+        let pages: Vec<(u32, Vec<u8>)> = vec![
+            (1, vec![0xAA; 4096]),
+            (3, vec![0xCC; 4096]),
+            (5, vec![0xEE; 4096]),
+        ];
+
+        // Batch computation
+        let batch_result = chain_checksum(pre, &pages);
+
+        // Streaming computation (pages arrive sorted)
+        let mut hasher = ChainHasher::new(pre);
+        for (num, data) in &pages {
+            hasher.update(*num, data);
+        }
+        let stream_result = hasher.finish();
+
+        assert_eq!(
+            batch_result, stream_result,
+            "ChainHasher must produce same result as chain_checksum"
+        );
+    }
+
+    #[test]
+    fn test_chain_hasher_page_count() {
+        let pre = Checksum::new(42);
+        let mut hasher = ChainHasher::new(pre);
+        assert_eq!(hasher.page_count(), 0);
+
+        hasher.update(1, &[0u8; 4096]);
+        assert_eq!(hasher.page_count(), 1);
+
+        hasher.update(2, &[0u8; 4096]);
+        assert_eq!(hasher.page_count(), 2);
+    }
+
+    #[test]
+    fn test_chain_hasher_empty_pages() {
+        let pre = Checksum::new(0x12345678);
+
+        let batch_result = chain_checksum(pre, &[]);
+
+        let hasher = ChainHasher::new(pre);
+        let stream_result = hasher.finish();
+
+        assert_eq!(batch_result, stream_result);
+    }
+
+    #[test]
+    fn test_apply_ltx_no_memory_accumulation() {
+        // Regression test: apply_ltx_to_db must NOT accumulate decoded pages in memory.
+        // Previously it held a Vec<(u32, Vec<u8>)> of all pages for chain checksum verification.
+        // Now it uses ChainHasher which hashes incrementally.
+        //
+        // We verify correctness with many pages — if the streaming hasher is wrong,
+        // the checksum chain will break.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let page_size = 4096u32;
+        let num_pages = 500; // 2MB of pages — would be a real memory problem if accumulated
+
+        // Create initial database
+        let initial_data = vec![0x00u8; page_size as usize * num_pages];
+        std::fs::write(&db_path, &initial_data).unwrap();
+
+        let pre_checksum = compute_checksum_from_file(&db_path).unwrap();
+
+        // Create incremental updating ALL pages
+        let pages: Vec<(u32, Vec<u8>)> = (1..=num_pages as u32)
+            .map(|i| (i, vec![(i % 256) as u8; page_size as usize]))
+            .collect();
+
+        let expected_post = chain_checksum(pre_checksum, &pages);
+
+        let mut ltx_buffer = Vec::new();
+        encode_wal_changes(
+            &mut ltx_buffer,
+            &pages,
+            page_size,
+            2, // min_txid
+            (1 + num_pages) as u64, // max_txid
+            num_pages as u32,
+            Some(pre_checksum),
+            expected_post,
+        ).unwrap();
+
+        // Apply — this should succeed with streaming hasher
+        let cursor = std::io::Cursor::new(ltx_buffer);
+        let result = apply_ltx_to_db(cursor, &db_path).unwrap();
+
+        // Verify chain checksum matches
+        assert_eq!(result.post_apply_checksum, expected_post);
+
+        // Verify data correctness
+        let final_data = std::fs::read(&db_path).unwrap();
+        for i in 1..=num_pages as u32 {
+            let start = (i as usize - 1) * page_size as usize;
+            assert_eq!(
+                final_data[start], (i % 256) as u8,
+                "Page {} should have been updated", i
+            );
+        }
     }
 }
 

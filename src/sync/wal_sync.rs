@@ -115,11 +115,11 @@ pub(crate) async fn sync_wal_concurrent(
         // Chain continues through checkpoints — no need to recompute from file
     }
 
-    // Read WAL frames as parsed pages
-    let (frames, new_offset, max_db_size) =
-        wal::read_frames_as_pages(&input.wal_path, header.page_size, wal_offset).await?;
+    // Read WAL frames with streaming dedup (peak memory = unique pages, not total frames)
+    let (page_map, frame_count, new_offset, max_db_size): (std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32) =
+        wal::read_frames_as_page_map(&input.wal_path, header.page_size, wal_offset).await?;
 
-    if frames.is_empty() {
+    if page_map.is_empty() {
         return Ok(SyncOutput {
             db_path: input.db_path,
             frame_count: 0,
@@ -129,13 +129,6 @@ pub(crate) async fn sync_wal_concurrent(
             checkpoint_detected,
             new_wal_generation: wal_generation,
         });
-    }
-
-    // Deduplicate pages (move, not clone)
-    let frame_count = frames.len();
-    let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
-    for frame in frames {
-        page_map.insert(frame.page_number, frame.data);
     }
 
     let page_size = header.page_size;
@@ -432,9 +425,6 @@ pub(crate) async fn sync_wal_to_cache(
 
     drop(shadow_guard); // Release lock before CPU-bound encoding
 
-    // Get max_db_size from last commit frame (or 0 if none)
-    let max_db_size = frames.iter().filter(|f| f.db_size > 0).map(|f| f.db_size).max().unwrap_or(0);
-
     if frames.is_empty() {
         return Ok(SyncOutput {
             db_path: input.db_path.clone(),
@@ -447,10 +437,14 @@ pub(crate) async fn sync_wal_to_cache(
         });
     }
 
-    // Deduplicate pages (move, not clone)
+    // Deduplicate pages and extract max_db_size in one pass (move, not clone)
     let frame_count = frames.len();
+    let mut max_db_size = 0u32;
     let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
     for frame in frames {
+        if frame.db_size > max_db_size {
+            max_db_size = frame.db_size;
+        }
         page_map.insert(frame.page_number, frame.data);
     }
 

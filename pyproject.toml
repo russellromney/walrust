@@ -32,6 +32,7 @@ keywords = ["sqlite", "wal", "s3", "backup", "sync", "tigris", "database"]
 dependencies = [
     "boto3>=1.37.38",
     "psutil>=7.2.1",
+    "pyyaml>=6.0",
 ]
 
 [project.urls]

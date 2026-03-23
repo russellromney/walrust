@@ -7,7 +7,6 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::ltx;
@@ -372,18 +371,11 @@ pub async fn sync_wal(
         // Chain continues through checkpoints — no need to recompute from file
     }
 
-    let (frames, new_offset, max_db_size) =
-        wal::read_frames_as_pages(&state.wal_path, header.page_size, state.wal_offset).await?;
+    let (page_map, frame_count, new_offset, max_db_size) =
+        wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
 
-    if frames.is_empty() {
+    if page_map.is_empty() {
         return Ok(0);
-    }
-
-    // Deduplicate pages (move, not clone)
-    let frame_count = frames.len();
-    let mut page_map: HashMap<u32, Vec<u8>> = HashMap::new();
-    for frame in frames {
-        page_map.insert(frame.page_number, frame.data);
     }
 
     let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
@@ -579,13 +571,14 @@ pub async fn take_snapshot_with_retry(
 
     let ltx_size = ltx_buffer.len() as u64;
 
-    let upload_buffer = ltx_buffer.clone();
+    // Share buffer across retry attempts via Arc to avoid per-attempt clones
+    let upload_buffer = std::sync::Arc::new(ltx_buffer);
     let upload_key = ltx_key.clone();
     retry_policy
         .execute_with_context("upload snapshot", || {
-            let data = upload_buffer.clone();
+            let data_arc = std::sync::Arc::clone(&upload_buffer);
             let key = upload_key.clone();
-            async move { storage.upload_bytes(&key, data).await }
+            async move { storage.upload_bytes(&key, (*data_arc).clone()).await }
         })
         .await?;
 
@@ -628,18 +621,11 @@ pub async fn sync_wal_with_retry(
         // Chain continues through checkpoints — no need to recompute from file
     }
 
-    let (frames, new_offset, max_db_size) =
-        wal::read_frames_as_pages(&state.wal_path, header.page_size, state.wal_offset).await?;
+    let (page_map, frame_count, new_offset, max_db_size) =
+        wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
 
-    if frames.is_empty() {
+    if page_map.is_empty() {
         return Ok(0);
-    }
-
-    // Deduplicate pages (move, not clone)
-    let frame_count = frames.len();
-    let mut page_map: HashMap<u32, Vec<u8>> = HashMap::new();
-    for frame in frames {
-        page_map.insert(frame.page_number, frame.data);
     }
 
     let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
@@ -681,13 +667,14 @@ pub async fn sync_wal_with_retry(
     let ltx_size = ltx_buffer.len() as u64;
     let ltx_key = build_ltx_key(prefix, &state.name, GENERATION_LIVE, min_txid, max_txid);
 
-    let upload_buffer = ltx_buffer.clone();
+    // Share buffer across retry attempts via Arc to avoid cloning
+    let upload_buffer = std::sync::Arc::new(ltx_buffer);
     let upload_key = ltx_key.clone();
     retry_policy
         .execute_with_context("upload WAL changes", || {
-            let data = upload_buffer.clone();
+            let data_arc = std::sync::Arc::clone(&upload_buffer);
             let key = upload_key.clone();
-            async move { storage.upload_bytes(&key, data).await }
+            async move { storage.upload_bytes(&key, (*data_arc).clone()).await }
         })
         .await?;
 

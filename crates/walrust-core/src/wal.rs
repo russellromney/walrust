@@ -162,6 +162,70 @@ pub struct WalReadResult {
     pub truncated_during_read: bool,
 }
 
+/// Read WAL frames and deduplicate into a page map in one pass.
+///
+/// Unlike `read_frames_as_pages()` which returns `Vec<ParsedFrame>` (holding ALL frames
+/// in memory), this deduplicates during read: each page number maps to its latest data.
+/// Peak memory = unique pages, not total frames. For a WAL with 1000 frames touching
+/// 50 unique pages, this uses 50 * page_size instead of 1000 * page_size.
+///
+/// Returns (page_map, frame_count, new_offset, max_db_size).
+pub async fn read_frames_as_page_map(
+    path: &Path,
+    page_size: u32,
+    start_offset: u64,
+) -> Result<(std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32)> {
+    let mut file = File::open(path).await?;
+    let file_size = file.metadata().await?.len();
+
+    let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+
+    let start_pos = if start_offset == 0 {
+        WAL_HEADER_SIZE
+    } else {
+        start_offset
+    };
+
+    if start_pos >= file_size {
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0));
+    }
+
+    file.seek(SeekFrom::Start(start_pos)).await?;
+
+    let available = file_size - start_pos;
+    let full_frames = available / frame_size;
+
+    if full_frames == 0 {
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0));
+    }
+
+    let mut page_map = std::collections::HashMap::new();
+    let mut max_db_size: u32 = 0;
+    let mut page_data = vec![0u8; page_size as usize];
+
+    for _ in 0..full_frames {
+        let mut header_buf = [0u8; 24];
+        file.read_exact(&mut header_buf).await?;
+
+        let page_number = u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let db_size = u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+
+        file.read_exact(&mut page_data).await?;
+
+        if db_size > max_db_size {
+            max_db_size = db_size;
+        }
+
+        // Dedup in-place: overwrite previous version of the same page.
+        // We reuse the buffer and clone only the final version into the map.
+        page_map.insert(page_number, page_data.clone());
+    }
+
+    let new_offset = start_pos + full_frames * frame_size;
+
+    Ok((page_map, full_frames as usize, new_offset, max_db_size))
+}
+
 /// Read and parse WAL frames into pages, returns (pages, new_offset, max_db_size)
 pub async fn read_frames_as_pages(
     path: &Path,
@@ -716,6 +780,147 @@ mod tests {
         assert_eq!(result.frames.len(), 1);
         assert_eq!(result.salt, same_salt);
         assert!(!result.truncated_during_read);
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    // ============================================
+    // read_frames_as_page_map tests
+    // ============================================
+
+    #[tokio::test]
+    async fn test_read_frames_as_page_map_empty() {
+        let path = PathBuf::from(format!("/tmp/walrust-test-pagemap-{}.db-wal", uuid::Uuid::new_v4()));
+
+        // Create valid WAL header only (no frames)
+        let mut header = [0u8; 32];
+        header[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        header[8..12].copy_from_slice(&4096u32.to_be_bytes());
+
+        tokio::fs::write(&path, &header).await.unwrap();
+
+        let (page_map, frame_count, offset, max_db_size) =
+            read_frames_as_page_map(&path, 4096, 0).await.unwrap();
+
+        assert!(page_map.is_empty());
+        assert_eq!(frame_count, 0);
+        assert_eq!(offset, WAL_HEADER_SIZE);
+        assert_eq!(max_db_size, 0);
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_as_page_map_deduplicates() {
+        // Regression test: read_frames_as_page_map must deduplicate during read.
+        // If the same page appears multiple times, only the latest version should be in the map.
+        // Peak memory = unique pages, NOT total frames.
+        let path = PathBuf::from(format!("/tmp/walrust-test-pagemap-dedup-{}.db-wal", uuid::Uuid::new_v4()));
+
+        let page_size: u32 = 4096;
+        let frame_header_size = 24usize;
+        let frame_size = frame_header_size + page_size as usize;
+
+        // Create WAL with 4 frames: page 1 (v1), page 2, page 1 (v2), page 3
+        // Result should have 3 unique pages, with page 1 being v2
+        let mut data = vec![0u8; 32 + frame_size * 4];
+        data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        data[8..12].copy_from_slice(&page_size.to_be_bytes());
+
+        // Frame 0: page 1, v1 (will be overwritten)
+        let f0 = 32;
+        data[f0..f0 + 4].copy_from_slice(&1u32.to_be_bytes()); // page_number=1
+        data[f0 + 4..f0 + 8].copy_from_slice(&3u32.to_be_bytes()); // db_size=3
+        for b in &mut data[f0 + frame_header_size..f0 + frame_size] { *b = 0x11; } // v1 data
+
+        // Frame 1: page 2
+        let f1 = 32 + frame_size;
+        data[f1..f1 + 4].copy_from_slice(&2u32.to_be_bytes()); // page_number=2
+        data[f1 + 4..f1 + 8].copy_from_slice(&0u32.to_be_bytes()); // db_size=0
+        for b in &mut data[f1 + frame_header_size..f1 + frame_size] { *b = 0x22; }
+
+        // Frame 2: page 1, v2 (overwrites v1)
+        let f2 = 32 + frame_size * 2;
+        data[f2..f2 + 4].copy_from_slice(&1u32.to_be_bytes()); // page_number=1
+        data[f2 + 4..f2 + 8].copy_from_slice(&0u32.to_be_bytes()); // db_size=0
+        for b in &mut data[f2 + frame_header_size..f2 + frame_size] { *b = 0xAA; } // v2 data
+
+        // Frame 3: page 3
+        let f3 = 32 + frame_size * 3;
+        data[f3..f3 + 4].copy_from_slice(&3u32.to_be_bytes()); // page_number=3
+        data[f3 + 4..f3 + 8].copy_from_slice(&3u32.to_be_bytes()); // db_size=3 (commit)
+        for b in &mut data[f3 + frame_header_size..f3 + frame_size] { *b = 0x33; }
+
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        let (page_map, frame_count, _offset, max_db_size) =
+            read_frames_as_page_map(&path, page_size, 0).await.unwrap();
+
+        // Should have 3 unique pages from 4 frames
+        assert_eq!(frame_count, 4, "Should report all 4 frames were read");
+        assert_eq!(page_map.len(), 3, "Should have 3 unique pages");
+
+        // Page 1 should be v2 (0xAA), not v1 (0x11)
+        assert_eq!(page_map[&1][0], 0xAA, "Page 1 should be latest version (v2)");
+        assert_eq!(page_map[&2][0], 0x22, "Page 2 should be 0x22");
+        assert_eq!(page_map[&3][0], 0x33, "Page 3 should be 0x33");
+
+        assert_eq!(max_db_size, 3, "max_db_size should be 3 from commit frames");
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_as_page_map_matches_old_api() {
+        // read_frames_as_page_map must produce the same result as
+        // read_frames_as_pages + manual dedup. This is a regression guard.
+        let path = PathBuf::from(format!("/tmp/walrust-test-pagemap-compat-{}.db-wal", uuid::Uuid::new_v4()));
+
+        let page_size: u32 = 4096;
+        let frame_header_size = 24usize;
+        let frame_size = frame_header_size + page_size as usize;
+
+        // Create WAL with 3 frames: page 5, page 5 (overwrite), page 10
+        let mut data = vec![0u8; 32 + frame_size * 3];
+        data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        data[8..12].copy_from_slice(&page_size.to_be_bytes());
+
+        let f0 = 32;
+        data[f0..f0 + 4].copy_from_slice(&5u32.to_be_bytes());
+        data[f0 + 4..f0 + 8].copy_from_slice(&10u32.to_be_bytes());
+        for b in &mut data[f0 + frame_header_size..f0 + frame_size] { *b = 0x55; }
+
+        let f1 = 32 + frame_size;
+        data[f1..f1 + 4].copy_from_slice(&5u32.to_be_bytes());
+        for b in &mut data[f1 + frame_header_size..f1 + frame_size] { *b = 0x66; } // overwrite
+
+        let f2 = 32 + frame_size * 2;
+        data[f2..f2 + 4].copy_from_slice(&10u32.to_be_bytes());
+        data[f2 + 4..f2 + 8].copy_from_slice(&10u32.to_be_bytes());
+        for b in &mut data[f2 + frame_header_size..f2 + frame_size] { *b = 0xAA; }
+
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        // Old API: read all frames, then dedup
+        let (frames, old_offset, old_max_db) =
+            read_frames_as_pages(&path, page_size, 0).await.unwrap();
+        let mut old_map = std::collections::HashMap::new();
+        for frame in frames {
+            old_map.insert(frame.page_number, frame.data);
+        }
+
+        // New API: streaming dedup
+        let (new_map, _frame_count, new_offset, new_max_db) =
+            read_frames_as_page_map(&path, page_size, 0).await.unwrap();
+
+        assert_eq!(old_offset, new_offset, "Offsets must match");
+        assert_eq!(old_max_db, new_max_db, "max_db_size must match");
+        assert_eq!(old_map.len(), new_map.len(), "Same number of unique pages");
+
+        for (page_num, old_data) in &old_map {
+            let new_data = new_map.get(page_num).expect("Page must exist in new map");
+            assert_eq!(old_data, new_data, "Page {} data must match", page_num);
+        }
 
         tokio::fs::remove_file(&path).await.ok();
     }

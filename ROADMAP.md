@@ -12,7 +12,7 @@ Core differentiators:
 
 ---
 
-## Current Capabilities (v0.4.0)
+## Current Capabilities (v0.5.1)
 
 **Core features that work:**
 - `walrust watch` - Watch and sync multiple databases
@@ -24,33 +24,14 @@ Core differentiators:
 - `walrust explain` - Configuration preview with cost estimation
 - `walrust verify` - Backup integrity verification with exit codes
 - LTX format with SHA256 verification
+- Chained page checksums (O(changed pages) not O(entire DB))
 - Point-in-time restore (by TXID or timestamp)
 - Multi-database support
 - Prometheus metrics + dashboard
 - Webhook notifications (corruption, circuit breaker)
 - Retry logic with circuit breaker
 - Shadow WAL mode
-
----
-
-## v0.5.0 — Chained Checksums + Performance
-
-The #1 bottleneck: `compute_expected_post_with_overlay()` reads the entire database from disk and SHA-256 hashes it on every sync cycle (default: 1 second). For a 50MB DB, that's ~100MB I/O per second just for checksumming.
-
-### Chained page checksums
-- Switch incremental LTX checksums from full-DB hash to chained page hash
-- `post_checksum = SHA-256(pre_checksum || page1_num || page1_data || ...)` — pages sorted by number
-- Snapshots keep full-DB hash (data already in memory)
-- Eliminates full DB read from hot path entirely
-- Removes `wal_page_overlay` HashMap (only existed for full-DB checksum)
-
-### Page clone elimination
-- Move frame data instead of cloning during dedup (`for frame in frames` not `&frames`)
-- Index-based sorting in `encode_wal_changes()` instead of `pages.to_vec()`
-
-### Result
-- Before: 50MB disk read + 50MB hash = ~100MB I/O per sync cycle
-- After: 10 dirty pages × 4KB = 40KB hash per sync cycle
+- Constant RSS regardless of write throughput (~70MB for 50MB DB)
 
 ---
 
@@ -78,6 +59,17 @@ The #1 bottleneck: `compute_expected_post_with_overlay()` reads the entire datab
 ---
 
 ## Completed Features (see CHANGELOG.md)
+
+**v0.5.1:**
+- Fixed RSS scaling linearly with write throughput (67MB→361MB) — now constant ~70MB
+- Streaming `ChainHasher` for incremental checksum verification during LTX decode
+- `read_frames_as_page_map()` — streaming WAL dedup (peak memory = unique pages)
+- Shadow WAL streaming dedup, retry buffer sharing via `Arc<Vec<u8>>`
+
+**v0.5.0:**
+- Chained page checksums — eliminated full-DB read from sync hot path
+- `wal_page_overlay` HashMap removed
+- Page clone elimination in dedup and encode paths
 
 **v0.4.0:**
 - Split watch.rs (1856 lines) and restore.rs (1083 lines) into focused modules

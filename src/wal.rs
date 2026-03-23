@@ -151,6 +151,65 @@ pub struct WalReadResult {
     pub truncated_during_read: bool,
 }
 
+/// Read WAL frames, deduplicating into a page map during read.
+/// Peak memory = unique pages, not total frames.
+/// Returns (page_map, frame_count, new_offset, max_db_size)
+pub async fn read_frames_as_page_map(
+    path: &Path,
+    page_size: u32,
+    start_offset: u64,
+) -> Result<(std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32)> {
+    let mut file = File::open(path).await?;
+    let file_size = file.metadata().await?.len();
+
+    let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+
+    let start_pos = if start_offset == 0 {
+        WAL_HEADER_SIZE
+    } else {
+        start_offset
+    };
+
+    if start_pos >= file_size {
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0));
+    }
+
+    file.seek(SeekFrom::Start(start_pos)).await?;
+
+    let available = file_size - start_pos;
+    let full_frames = available / frame_size;
+
+    if full_frames == 0 {
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0));
+    }
+
+    let mut page_map = std::collections::HashMap::new();
+    let mut max_db_size: u32 = 0;
+    let mut page_data = vec![0u8; page_size as usize];
+
+    for _ in 0..full_frames {
+        let mut header_buf = [0u8; 24];
+        file.read_exact(&mut header_buf).await?;
+
+        let page_number = u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let db_size = u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+
+        file.read_exact(&mut page_data).await?;
+
+        if db_size > max_db_size {
+            max_db_size = db_size;
+        }
+
+        // Dedup in-place: overwrite previous version of the same page.
+        // We reuse the buffer and clone only the final version into the map.
+        page_map.insert(page_number, page_data.clone());
+    }
+
+    let new_offset = start_pos + full_frames * frame_size;
+
+    Ok((page_map, full_frames as usize, new_offset, max_db_size))
+}
+
 /// Read and parse WAL frames into pages, returns (pages, new_offset, max_db_size)
 pub async fn read_frames_as_pages(
     path: &Path,

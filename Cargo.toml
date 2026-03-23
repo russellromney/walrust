@@ -1,6 +1,6 @@
 [package]
 name = "walrust"
-version = "0.4.0"
+version = "0.5.1"
 edition = "2021"
 description = "Lightweight SQLite WAL sync to S3/Tigris"
 authors = ["Russell Romney <russellromney@gmail.com>"]
@@ -68,7 +68,7 @@ hmac = "0.12"
 hex = "0.4"
 
 # Core library (embeddable sync primitives)
-walrust-core = { version = "0.1.0", path = "crates/walrust-core", package = "walrust" }
+walrust-core = { version = "0.2.0", path = "crates/walrust-core", package = "walrust" }
 
 # LTX format (Litestream-compatible) - see https://github.com/russellromney/litepages
 litepages = "0.1.0"

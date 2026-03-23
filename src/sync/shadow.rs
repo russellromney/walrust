@@ -6,7 +6,6 @@ use crate::ltx;
 use crate::retention::{analyze_retention, RetentionPolicy, SnapshotEntry};
 use crate::retry::{classify_error, ErrorKind, RetryPolicy};
 use crate::s3;
-use crate::wal;
 use crate::webhook::WebhookSender;
 
 use super::manifest::{build_ltx_key, load_manifest, save_manifest, GENERATION_LIVE};
@@ -21,9 +20,12 @@ pub(crate) async fn sync_shadow_concurrent(
 ) -> Result<ShadowSyncOutput> {
     use litepages::Checksum;
 
-    // Read frames from shadow segments
+    // Read frames from shadow segments, deduplicating into page_map during read.
+    // Peak memory = unique pages, not total frames.
     let shadow_dir = &input.shadow_dir;
-    let mut frames = Vec::new();
+    let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    let mut max_db_size = 0u32;
+    let mut frame_count = 0usize;
     let mut total_offset = 0u64;
     let frame_size = 24u64 + input.page_size as u64;
 
@@ -60,7 +62,7 @@ pub(crate) async fn sync_shadow_concurrent(
             continue;
         }
 
-        // Read frames from this segment
+        // Read frames from this segment directly into page_map
         let mut file = std::fs::File::open(&path)?;
         use std::io::{Read, Seek, SeekFrom};
 
@@ -73,29 +75,27 @@ pub(crate) async fn sync_shadow_concurrent(
         file.seek(SeekFrom::Start(relative_offset))?;
 
         let bytes_to_read = segment_size - relative_offset;
-        let frame_count = bytes_to_read / frame_size;
+        let segment_frames = bytes_to_read / frame_size;
 
-        for _ in 0..frame_count {
+        let mut page_data = vec![0u8; input.page_size as usize];
+        for _ in 0..segment_frames {
             let mut header = [0u8; 24];
             file.read_exact(&mut header)?;
 
             let page_number = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
             let db_size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
 
-            let mut data = vec![0u8; input.page_size as usize];
-            file.read_exact(&mut data)?;
+            file.read_exact(&mut page_data)?;
 
-            frames.push(wal::ParsedFrame {
-                page_number,
-                db_size,
-                data,
-            });
+            max_db_size = max_db_size.max(db_size);
+            page_map.insert(page_number, page_data.clone());
+            frame_count += 1;
         }
 
         total_offset = segment_end;
     }
 
-    if frames.is_empty() {
+    if page_map.is_empty() {
         return Ok(ShadowSyncOutput {
             db_path: input.db_path,
             frame_count: 0,
@@ -103,15 +103,6 @@ pub(crate) async fn sync_shadow_concurrent(
             new_current_txid: input.current_txid,
             new_db_checksum: input.db_checksum,
         });
-    }
-
-    // Deduplicate pages (keep only latest version of each page)
-    let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
-    let mut max_db_size = 0u32;
-    let frame_count = frames.len();
-    for frame in frames {
-        max_db_size = max_db_size.max(frame.db_size);
-        page_map.insert(frame.page_number, frame.data);
     }
 
     // Convert to format expected by encode_wal_changes
