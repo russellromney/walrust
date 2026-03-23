@@ -9,16 +9,24 @@ use std::io::{Read, Write};
 use std::path::Path;
 use std::time::SystemTime;
 
-/// Create an LTX file from a SQLite database snapshot
+/// Create an LTX file from a SQLite database snapshot.
+///
+/// Streams the DB page-by-page — peak memory is ~1MB (BufReader) + one page buffer,
+/// not the entire database.
 pub fn encode_snapshot<W: Write>(
     writer: W,
     db_path: &Path,
     page_size: u32,
     txid: u64,
 ) -> Result<()> {
-    let db_data = std::fs::read(db_path)?;
+    use sha2::{Digest, Sha256};
+    use std::io::BufReader;
+
+    let file = std::fs::File::open(db_path)
+        .map_err(|e| anyhow!("Failed to open database for snapshot: {}", e))?;
+    let file_size = file.metadata()?.len() as usize;
     let page_size_val = PageSize::new(page_size).map_err(|e| anyhow!("Invalid page size: {}", e))?;
-    let num_pages = db_data.len() / page_size as usize;
+    let num_pages = file_size / page_size as usize;
 
     let header = Header {
         flags: HeaderFlags::COMPRESS_LZ4,
@@ -31,19 +39,21 @@ pub fn encode_snapshot<W: Write>(
     };
 
     let mut encoder = Encoder::new(writer, &header)?;
+    // 1MB read-ahead buffer — OS reads in large chunks, read_exact just copies from buffer
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut page_buf = vec![0u8; page_size as usize];
+    let mut hasher = Sha256::new();
 
-    // Encode each page
+    // Stream page-by-page: encode + hash incrementally
     for i in 0..num_pages {
+        reader.read_exact(&mut page_buf)?;
         let page_num = PageNum::new((i + 1) as u32).map_err(|e| anyhow!("Invalid page num: {}", e))?;
-        let start = i * page_size as usize;
-        let end = start + page_size as usize;
-        let page_data = &db_data[start..end];
-
-        encoder.encode_page(page_num, page_data)?;
+        encoder.encode_page(page_num, &page_buf)?;
+        hasher.update(&page_buf);
     }
 
-    // Compute final checksum and finish
-    let checksum = compute_db_checksum(&db_data);
+    let result = hasher.finalize();
+    let checksum = Checksum::new(u64::from_be_bytes(result[0..8].try_into().unwrap()));
     encoder.finish(checksum)?;
 
     Ok(())
@@ -237,10 +247,25 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
     })
 }
 
-/// Compute checksum from database file (for checksum tracking)
+/// Compute checksum from database file (streaming, no full-DB read).
 pub fn compute_checksum_from_file(db_path: &Path) -> Result<Checksum> {
-    let data = std::fs::read(db_path)?;
-    Ok(compute_db_checksum(&data))
+    use sha2::{Digest, Sha256};
+    use std::io::BufReader;
+
+    let file = std::fs::File::open(db_path)
+        .map_err(|e| anyhow!("Failed to open database for checksum: {}", e))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 65536]; // 64KB read chunks (BufReader handles 1MB read-ahead)
+
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+
+    let result = hasher.finalize();
+    Ok(Checksum::new(u64::from_be_bytes(result[0..8].try_into().unwrap())))
 }
 
 /// Encode WAL changes as an LTX file (incremental, not snapshot)
