@@ -239,7 +239,7 @@ pub(crate) async fn sync_wal_concurrent_with_retry(
                         e
                     );
                     webhook_sender
-                        .notify_sync_failed(&db_name, &e.to_string(), attempts)
+                        .notify_upload_failed(&db_name, &e.to_string(), attempts)
                         .await;
                     return Err(e);
                 }
@@ -564,7 +564,7 @@ pub(crate) async fn take_snapshot_with_retry(
                         e
                     );
                     webhook_sender
-                        .notify_sync_failed(&db_name, &e.to_string(), attempts)
+                        .notify_upload_failed(&db_name, &e.to_string(), attempts)
                         .await;
                     return Err(e);
                 }

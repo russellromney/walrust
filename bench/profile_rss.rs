@@ -29,13 +29,8 @@ async fn main() {
     let base = rss_mb();
     println!("{:>55}: {:6.1} MB", "tokio runtime", base);
 
-    let config = aws_config::from_env().load().await;
-    stage("aws_config load", base);
-
-    use aws_smithy_runtime::client::http::hyper_014::HyperClientBuilder;
-    let _http = HyperClientBuilder::new().build_https();
-    let _s3 = aws_sdk_s3::Client::new(&config);
-    stage("S3 Client", base);
+    let _s3 = walrust::s3::create_client(None).await.unwrap();
+    stage("S3 Client (via create_client)", base);
 
     let tmp = std::env::temp_dir().join("profile_rss_test.db");
     let _ = std::fs::remove_file(&tmp);

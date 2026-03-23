@@ -48,7 +48,7 @@ async fn webhook_handler(
     body: String,
 ) -> impl IntoResponse {
     let signature = headers
-        .get("X-Walrust-Signature")
+        .get("X-Hadb-Signature")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
@@ -123,7 +123,7 @@ fn test_webhook_sender_creation() {
     let configs = vec![
         WebhookConfig {
             url: "https://hook1.com".to_string(),
-            events: vec!["sync_failed".to_string()],
+            events: vec!["upload_failed".to_string()],
             secret: None,
         },
         WebhookConfig {
@@ -174,7 +174,7 @@ fn test_webhook_event_conversion() {
     // Test as_str()
     assert_eq!(WebhookEvent::CorruptionDetected.as_str(), "corruption_detected");
     assert_eq!(WebhookEvent::CircuitBreakerOpen.as_str(), "circuit_breaker_open");
-    assert_eq!(WebhookEvent::SyncFailed.as_str(), "sync_failed");
+    assert_eq!(WebhookEvent::UploadFailed.as_str(), "upload_failed");
     assert_eq!(WebhookEvent::AuthFailure.as_str(), "auth_failure");
 }
 
@@ -372,7 +372,7 @@ async fn test_webhook_with_invalid_url() {
 
 #[tokio::test]
 async fn test_webhook_with_no_secret() {
-    // Test webhook without HMAC secret - should NOT include X-Walrust-Signature header
+    // Test webhook without HMAC secret - should NOT include X-Hadb-Signature header
     let (url, server, _handle) = start_test_server().await;
 
     let configs = vec![WebhookConfig {
@@ -518,7 +518,7 @@ fn test_webhook_config_validation() {
     // Valid config
     let config = WebhookConfig {
         url: "https://hooks.example.com/walrust".to_string(),
-        events: vec!["sync_failed".to_string(), "corruption_detected".to_string()],
+        events: vec!["upload_failed".to_string(), "corruption_detected".to_string()],
         secret: Some("my-secret".to_string()),
     };
     assert!(!config.url.is_empty());
@@ -536,7 +536,7 @@ fn test_webhook_config_validation() {
     let config = WebhookConfig {
         url: "https://hooks.example.com".to_string(),
         events: vec![
-            "sync_failed".to_string(),
+            "upload_failed".to_string(),
             "auth_failure".to_string(),
             "corruption_detected".to_string(),
             "circuit_breaker_open".to_string(),

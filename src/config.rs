@@ -6,6 +6,9 @@ use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+// Re-export shared config types from hadb-io
+pub use hadb_io::config::{CacheConfig, S3Config, WebhookConfig, parse_duration_string};
+
 /// Root configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
 #[serde(deny_unknown_fields)]
@@ -37,127 +40,6 @@ pub struct Config {
     /// Database-specific configurations
     #[serde(default)]
     pub databases: Vec<DatabaseConfig>,
-}
-
-/// Cache configuration for disk-based upload queue
-///
-/// When enabled, LTX files are written to disk cache before uploading to S3.
-/// This provides crash recovery, decouples encoding from uploads, and enables
-/// fast local restore.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CacheConfig {
-    /// Enable disk cache (default: false, opt-in for v0.1.9)
-    #[serde(default)]
-    pub enabled: bool,
-
-    /// How long to keep uploaded files in cache (default: "24h")
-    /// Supports: "1h", "24h", "7d", etc.
-    #[serde(default = "default_cache_retention")]
-    pub retention: String,
-
-    /// Maximum cache size in bytes before cleanup (default: 5GB)
-    #[serde(default = "default_cache_max_size")]
-    pub max_size: u64,
-
-    /// Override default cache location
-    /// Default: .{db_name}-walrust/ next to database file
-    pub path: Option<String>,
-
-    /// Max concurrent S3 uploads per database (default: 4)
-    #[serde(default = "default_uploader_concurrency")]
-    pub uploader_concurrency: usize,
-}
-
-impl Default for CacheConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            retention: "24h".to_string(),
-            max_size: 5 * 1024 * 1024 * 1024, // 5GB
-            path: None,
-            uploader_concurrency: 4,
-        }
-    }
-}
-
-fn default_uploader_concurrency() -> usize {
-    4
-}
-
-fn default_cache_retention() -> String {
-    "24h".to_string()
-}
-
-fn default_cache_max_size() -> u64 {
-    5 * 1024 * 1024 * 1024 // 5GB
-}
-
-/// Parse duration string like "24h", "7d", "30m" into chrono::Duration
-pub fn parse_duration_string(s: &str) -> Result<chrono::Duration> {
-    let s = s.trim();
-    if s.is_empty() {
-        return Err(anyhow!("Empty duration string"));
-    }
-
-    let (num_str, unit) = if s.ends_with('h') {
-        (&s[..s.len() - 1], 'h')
-    } else if s.ends_with('d') {
-        (&s[..s.len() - 1], 'd')
-    } else if s.ends_with('m') {
-        (&s[..s.len() - 1], 'm')
-    } else if s.ends_with('s') {
-        (&s[..s.len() - 1], 's')
-    } else {
-        return Err(anyhow!("Invalid duration format '{}': must end with h, d, m, or s", s));
-    };
-
-    let num: i64 = num_str.parse()
-        .map_err(|_| anyhow!("Invalid duration number '{}' in '{}'", num_str, s))?;
-
-    match unit {
-        'h' => Ok(chrono::Duration::hours(num)),
-        'd' => Ok(chrono::Duration::days(num)),
-        'm' => Ok(chrono::Duration::minutes(num)),
-        's' => Ok(chrono::Duration::seconds(num)),
-        _ => unreachable!(),
-    }
-}
-
-/// Webhook configuration for failure notifications
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct WebhookConfig {
-    /// URL to POST notifications to
-    pub url: String,
-
-    /// Events to notify on (default: all)
-    /// Valid events: sync_failed, auth_failure, corruption_detected, circuit_breaker_open
-    #[serde(default = "default_webhook_events")]
-    pub events: Vec<String>,
-
-    /// Optional secret for HMAC signing (header: X-Walrust-Signature)
-    pub secret: Option<String>,
-}
-
-fn default_webhook_events() -> Vec<String> {
-    vec![
-        "sync_failed".to_string(),
-        "auth_failure".to_string(),
-        "corruption_detected".to_string(),
-        "circuit_breaker_open".to_string(),
-    ]
-}
-
-/// S3 storage configuration
-#[derive(Debug, Clone, Deserialize, Serialize, Default)]
-#[serde(deny_unknown_fields)]
-pub struct S3Config {
-    /// S3 bucket URL (e.g., "s3://backups/prod")
-    pub bucket: Option<String>,
-
-    /// S3 endpoint URL (for Tigris/MinIO)
-    pub endpoint: Option<String>,
 }
 
 /// Sync trigger configuration
@@ -689,11 +571,13 @@ mod tests {
     }
 
     #[test]
-    fn test_deny_unknown_fields() {
+    fn test_deny_unknown_fields_top_level() {
+        // Root Config has deny_unknown_fields — top-level unknowns rejected
         let toml = r#"
-            [s3]
-            bucket = "s3://test"
-            unknown_field = "should fail"
+            unknown_section = "should fail"
+
+            [[databases]]
+            path = "/data/test.db"
         "#;
         let result: Result<Config, _> = toml::from_str(toml);
         assert!(result.is_err());
@@ -866,34 +750,9 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_duration_string_hours() {
+    fn test_parse_duration_reexport_works() {
+        // Verify re-exported parse_duration_string is usable
         let duration = parse_duration_string("24h").unwrap();
         assert_eq!(duration.num_hours(), 24);
-    }
-
-    #[test]
-    fn test_parse_duration_string_days() {
-        let duration = parse_duration_string("7d").unwrap();
-        assert_eq!(duration.num_days(), 7);
-    }
-
-    #[test]
-    fn test_parse_duration_string_minutes() {
-        let duration = parse_duration_string("30m").unwrap();
-        assert_eq!(duration.num_minutes(), 30);
-    }
-
-    #[test]
-    fn test_parse_duration_string_seconds() {
-        let duration = parse_duration_string("60s").unwrap();
-        assert_eq!(duration.num_seconds(), 60);
-    }
-
-    #[test]
-    fn test_parse_duration_string_invalid() {
-        assert!(parse_duration_string("").is_err());
-        assert!(parse_duration_string("24").is_err());
-        assert!(parse_duration_string("abc").is_err());
-        assert!(parse_duration_string("24x").is_err());
     }
 }

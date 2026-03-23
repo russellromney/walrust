@@ -39,11 +39,6 @@ futures = "0.3"
 # Parallelization for LTX encoding (CPU-bound compression)
 rayon = "1.10"
 
-# S3
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
-aws-smithy-runtime = { version = "1", features = ["client"] }
-
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 
@@ -60,7 +55,6 @@ serde_json = "1"
 toml = "0.8"
 glob = "0.3"
 sha2 = "0.10"
-rand = "0.8"
 
 # Webhooks
 reqwest = { version = "0.12", features = ["json"] }
@@ -69,6 +63,12 @@ hex = "0.4"
 
 # Core library (embeddable sync primitives)
 walrust-core = { version = "0.2.0", path = "crates/walrust-core", package = "walrust" }
+
+# Shared S3/retry/upload infrastructure
+hadb-io = { path = "../../hadb/hadb-io" }
+
+# S3 client type (shared with hadb-io, needed for function signatures)
+aws-sdk-s3 = "1"
 
 # LTX format (Litestream-compatible) - see https://github.com/russellromney/litepages
 litepages = "0.1.0"

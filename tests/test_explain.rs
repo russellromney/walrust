@@ -103,7 +103,7 @@ fn test_explain_with_valid_config() -> Result<()> {
         webhooks: vec![WebhookConfig {
             url: "https://hooks.example.com/walrust".to_string(),
             events: vec![
-                "sync_failed".to_string(),
+                "upload_failed".to_string(),
                 "auth_failure".to_string(),
                 "corruption_detected".to_string(),
             ],
@@ -136,7 +136,7 @@ fn test_explain_with_webhooks_configured() -> Result<()> {
     config.webhooks = vec![
         WebhookConfig {
             url: "https://webhook1.com".to_string(),
-            events: vec!["sync_failed".to_string()],
+            events: vec!["upload_failed".to_string()],
             secret: Some("secret1".to_string()),
         },
         WebhookConfig {
@@ -377,7 +377,7 @@ prefix = "integration-test"
 
 [[webhooks]]
 url = "https://hooks.example.com/test"
-events = ["sync_failed", "corruption_detected"]
+events = ["upload_failed", "corruption_detected"]
 secret = "test-secret"
 "#,
         db_path.display()

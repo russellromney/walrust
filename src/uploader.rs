@@ -138,7 +138,7 @@ impl UploadTaskContext {
                             self.db_name, txid, attempts, e
                         );
                         self.webhook_sender
-                            .notify_sync_failed(&self.db_name, &e.to_string(), attempts)
+                            .notify_upload_failed(&self.db_name, &e.to_string(), attempts)
                             .await;
 
                         let mut stats = self.stats.lock().await;
@@ -416,6 +416,13 @@ mod tests {
 
         async fn list_objects(&self, _prefix: &str) -> Result<Vec<String>> {
             Ok(self.objects.lock().unwrap().keys().cloned().collect())
+        }
+
+        async fn list_objects_after(&self, prefix: &str, start_after: &str) -> Result<Vec<String>> {
+            Ok(self.objects.lock().unwrap().keys()
+                .filter(|k| k.starts_with(prefix) && k.as_str() > start_after)
+                .cloned()
+                .collect())
         }
 
         async fn exists(&self, key: &str) -> Result<bool> {

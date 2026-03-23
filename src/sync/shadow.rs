@@ -287,7 +287,7 @@ pub(crate) async fn sync_shadow_to_cache_with_retry(
                         e
                     );
                     webhook_sender
-                        .notify_sync_failed(&db_name, &e.to_string(), attempts)
+                        .notify_upload_failed(&db_name, &e.to_string(), attempts)
                         .await;
                     return Err(e);
                 }
@@ -343,7 +343,7 @@ pub(crate) async fn sync_shadow_concurrent_with_retry(
                         e
                     );
                     webhook_sender
-                        .notify_sync_failed(&db_name, &e.to_string(), attempts)
+                        .notify_upload_failed(&db_name, &e.to_string(), attempts)
                         .await;
                     return Err(e);
                 }
@@ -387,9 +387,9 @@ pub(crate) async fn run_compaction(
             chrono::DateTime::parse_from_rfc3339(&f.created_at)
                 .ok()
                 .map(|dt| SnapshotEntry {
-                    filename: f.filename.clone(),
+                    key: f.filename.clone(),
                     created_at: dt.with_timezone(&Utc),
-                    max_txid: f.max_txid,
+                    sequence: f.max_txid,
                     size: f.size,
                 })
         })
@@ -418,19 +418,19 @@ pub(crate) async fn run_compaction(
     let keys_to_delete: Vec<String> = plan
         .delete
         .iter()
-        .map(|e| format!("{}{}/{}", prefix, name, e.filename))
+        .map(|e| format!("{}{}/{}", prefix, name, e.key))
         .collect();
 
     let deleted_count = s3::delete_objects(client, bucket, &keys_to_delete).await?;
 
     // Update manifest to remove deleted entries
-    let kept_filenames: std::collections::HashSet<_> =
-        plan.keep.iter().map(|e| e.filename.as_str()).collect();
+    let kept_keys: std::collections::HashSet<_> =
+        plan.keep.iter().map(|e| e.key.as_str()).collect();
 
     let updated_files: Vec<LtxEntry> = manifest
         .files
         .into_iter()
-        .filter(|f| !f.is_snapshot || kept_filenames.contains(f.filename.as_str()))
+        .filter(|f| !f.is_snapshot || kept_keys.contains(f.filename.as_str()))
         .collect();
 
     let updated_manifest = Manifest {

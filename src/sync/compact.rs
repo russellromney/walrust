@@ -37,9 +37,9 @@ pub async fn compact(
             chrono::DateTime::parse_from_rfc3339(&f.created_at)
                 .ok()
                 .map(|dt| SnapshotEntry {
-                    filename: f.filename.clone(),
+                    key: f.filename.clone(),
                     created_at: dt.with_timezone(&Utc),
-                    max_txid: f.max_txid,
+                    sequence: f.max_txid,
                     size: f.size,
                 })
         })
@@ -68,8 +68,8 @@ pub async fn compact(
     for entry in &plan.keep {
         println!(
             "  {} (TXID: {}, {})",
-            entry.filename,
-            entry.max_txid,
+            entry.key,
+            entry.sequence,
             format_age(now, entry.created_at)
         );
     }
@@ -80,8 +80,8 @@ pub async fn compact(
     for entry in &plan.delete {
         println!(
             "  {} (TXID: {}, {})",
-            entry.filename,
-            entry.max_txid,
+            entry.key,
+            entry.sequence,
             format_age(now, entry.created_at)
         );
     }
@@ -98,7 +98,7 @@ pub async fn compact(
     let keys_to_delete: Vec<String> = plan
         .delete
         .iter()
-        .map(|e| format!("{}{}/{}", prefix, name, e.filename))
+        .map(|e| format!("{}{}/{}", prefix, name, e.key))
         .collect();
 
     let deleted_count = s3::delete_objects(&client, &bucket_name, &keys_to_delete).await?;
@@ -106,13 +106,13 @@ pub async fn compact(
     tracing::info!("Deleted {} snapshot files", deleted_count);
 
     // Update manifest to remove deleted entries
-    let kept_filenames: std::collections::HashSet<_> =
-        plan.keep.iter().map(|e| e.filename.as_str()).collect();
+    let kept_keys: std::collections::HashSet<_> =
+        plan.keep.iter().map(|e| e.key.as_str()).collect();
 
     let updated_files: Vec<LtxEntry> = manifest
         .files
         .into_iter()
-        .filter(|f| !f.is_snapshot || kept_filenames.contains(f.filename.as_str()))
+        .filter(|f| !f.is_snapshot || kept_keys.contains(f.filename.as_str()))
         .collect();
 
     let updated_manifest = Manifest {

@@ -23,7 +23,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
-use crate::storage::StorageBackend;
+use hadb_io::ObjectStore as StorageBackend;
 use crate::sync::{self, ReplicationConfig, SyncState};
 
 /// Per-database replication state.

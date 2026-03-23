@@ -159,7 +159,7 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
                     println!("  {}. {}", i + 1, webhook.url);
                     println!("     Events: {}", webhook.events.join(", "));
                     if webhook.secret.is_some() {
-                        println!("     HMAC:   enabled (X-Walrust-Signature header)");
+                        println!("     HMAC:   enabled (X-Hadb-Signature header)");
                     }
                 }
             }

@@ -10,9 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::ltx;
-use crate::retry::RetryPolicy;
-use crate::storage::StorageBackend;
 use crate::wal;
+use hadb_io::ObjectStore as StorageBackend;
+use hadb_io::RetryPolicy;
 
 // ============================================================================
 // Types

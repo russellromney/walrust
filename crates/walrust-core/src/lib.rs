@@ -13,15 +13,18 @@
 pub mod errors;
 pub mod ltx;
 pub mod replicator;
-pub mod retry;
-pub mod s3;
 pub mod shadow;
-pub mod storage;
 pub mod sync;
 pub mod wal;
 
-// Re-export key types for convenience
-pub use storage::{S3Backend, StorageBackend};
+// Shared infrastructure from hadb-io (retry, S3, storage)
+pub use hadb_io;
+pub use hadb_io::s3;
+pub use hadb_io::ObjectStore as StorageBackend;
+pub use hadb_io::S3Backend;
+pub use hadb_io::{RetryConfig, RetryPolicy};
+pub use hadb_io::{CircuitBreaker, CircuitState, ErrorKind, classify_error, is_retryable};
+
+// Re-export walrust-specific types
 pub use sync::{LtxEntry, Manifest, ReplicationConfig, SyncState};
 pub use replicator::Replicator;
-pub use retry::{RetryConfig, RetryPolicy};

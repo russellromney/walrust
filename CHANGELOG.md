@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Phase 1b: Migrate walrust + walrust-core to hadb-io** — eliminated ~3,200 lines of duplicate retry/S3/storage/webhook/retention/config code
+  - walrust-core: deleted `retry.rs`, `s3.rs`, `storage.rs`; re-exports from hadb-io (88 tests passing)
+  - walrust CLI: replaced `retry.rs` (642→2), `s3.rs` (471→2), `storage.rs` (182→5), `webhook.rs` (288→2), `retention.rs` (547→2) with thin re-export wrappers
+  - `config.rs`: removed shared types (S3Config, WebhookConfig, CacheConfig, parse_duration_string), re-exported from hadb-io
+  - Type renames applied: `SyncFailed`→`UploadFailed`, `X-Walrust-Signature`→`X-Hadb-Signature`, SnapshotEntry `filename`→`key` / `max_txid`→`sequence`
+  - hadb-io now re-exports `aws_sdk_s3` crate for consumer type access
+  - 303 tests passing, 0 failures
+
 ## [0.6.0] - 2026-03-23
 
 ### Added

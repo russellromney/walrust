@@ -1260,6 +1260,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hadb-io"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-smithy-types",
+ "chrono",
+ "hex",
+ "hmac",
+ "rand 0.8.5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "hashbrown"
 version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3238,13 +3259,10 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "aws-config",
- "aws-sdk-s3",
- "aws-smithy-runtime",
  "chrono",
  "futures",
+ "hadb-io",
  "litepages",
- "rand 0.8.5",
  "rayon",
  "rusqlite",
  "serde",
@@ -3261,22 +3279,20 @@ version = "0.5.1"
 dependencies = [
  "anyhow",
  "async-trait",
- "aws-config",
  "aws-sdk-s3",
- "aws-smithy-runtime",
  "axum",
  "brunch",
  "chrono",
  "clap",
  "futures",
  "glob",
+ "hadb-io",
  "hex",
  "hmac",
  "litepages",
  "mimalloc",
  "prometheus",
  "pyo3",
- "rand 0.8.5",
  "rayon",
  "reqwest",
  "rusqlite",
