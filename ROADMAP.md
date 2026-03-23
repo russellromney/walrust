@@ -31,19 +31,15 @@ Core differentiators:
 - Webhook notifications (corruption, circuit breaker)
 - Retry logic with circuit breaker
 - Shadow WAL mode
-- Constant RSS regardless of write throughput (~70MB for 50MB DB)
+- Constant RSS regardless of write throughput (~20MB with streaming + mimalloc)
+
+---
 
 ---
 
 ## Future Considerations (v1.0+)
 
 **Not planning yet, but might be useful:**
-
-### Disk-Based Upload Queue
-- Litestream-style disk caching
-- Decoupled WAL encoding from S3 uploads
-- Crash recovery
-- Local cache for fast restore
 
 ### Push-Based Read Replicas
 - Push-based replication (requires network)
@@ -52,13 +48,26 @@ Core differentiators:
 ### Additional Features
 - Multi-region replication
 - Encryption at rest
-- Concurrent S3 uploads in uploader
 
 **Philosophy:** Ship working features, not roadmaps. Only add features when users ask for them.
 
 ---
 
 ## Completed Features (see CHANGELOG.md)
+
+**v0.6.0:**
+- Concurrent S3 uploads via JoinSet (max_concurrent configurable, default 4)
+- Shadow mode cache integration (disk-based upload queue + crash recovery)
+- Cache cleanup timer in shadow mode (every 5min)
+- Proper shutdown drain via JoinHandle for spawned uploader tasks
+- 31 new tests (18 uploader + 13 shadow cache)
+
+**v0.5.2:**
+- Streaming snapshot encoding — BufReader(1MB) + page-by-page instead of std::fs::read()
+- Streaming compute_checksum_from_file — same pattern
+- mimalloc global allocator — returns freed memory to OS
+- RSS profiling bench tools (profile_rss.rs, measure_rss.py, measure_rss_s3.py)
+- RSS: 70MB → 20MB
 
 **v0.5.1:**
 - Fixed RSS scaling linearly with write throughput (67MB→361MB) — now constant ~70MB

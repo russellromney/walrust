@@ -1,14 +1,13 @@
-//! Independent S3 uploader task.
+//! Concurrent S3 uploader task.
 //!
 //! Decouples WAL encoding from S3 uploads:
 //! - WAL monitor writes LTX to disk cache → sends TXID to channel
-//! - Uploader task reads LTX from cache → uploads to S3
-//! - Sequential TXID processing preserves ordering
+//! - Uploader task reads LTX from cache → uploads to S3 (up to N concurrently)
 //! - Crash recovery: pending uploads resume on restart
 //!
 //! Architecture:
 //! ```text
-//! WAL Monitor Task          Uploader Task
+//! WAL Monitor Task          Uploader Task (JoinSet, max N concurrent)
 //!       |                        |
 //!   encode_wal()                 |
 //!       |                        |
@@ -16,11 +15,14 @@
 //!       |                        |
 //!   tx.send(txid) -------->  rx.recv(txid)
 //!       |                        |
-//!   continue                 cache.read_ltx()
+//!   continue                 spawn upload task ──┐
+//!                            spawn upload task ──┤ (up to max_concurrent)
+//!                            spawn upload task ──┘
 //!                                |
-//!                            upload_to_s3()
-//!                                |
-//!                          cache.mark_uploaded()
+//!                            reap completed:
+//!                              cache.read_ltx()
+//!                              upload_to_s3()
+//!                              cache.mark_uploaded()
 //! ```
 
 use crate::cache::LocalCache;
@@ -30,7 +32,7 @@ use crate::webhook::WebhookSender;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-// Duration imported via tokio::time::sleep
+use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
 /// Upload notification message
@@ -57,115 +59,37 @@ pub struct UploaderStats {
     pub last_uploaded_txid: u64,
 }
 
-/// Independent S3 uploader task
-pub struct Uploader {
-    /// Database name (for logging/metrics)
+/// Shared context for upload tasks spawned into JoinSet.
+/// Cloned into each spawned task to avoid &self lifetime issues.
+#[derive(Clone)]
+struct UploadTaskContext {
     db_name: String,
-    /// Local cache
     cache: Arc<LocalCache>,
-    /// Storage backend (S3)
     storage: Arc<dyn StorageBackend>,
-    /// S3 key prefix
     prefix: String,
-    /// Retry policy
     retry_policy: Arc<RetryPolicy>,
-    /// Webhook sender
     webhook_sender: Arc<WebhookSender>,
-    /// Upload statistics
     stats: Arc<tokio::sync::Mutex<UploaderStats>>,
 }
 
-impl Uploader {
-    /// Create a new uploader task
-    pub fn new(
-        db_name: String,
-        cache: Arc<LocalCache>,
-        storage: Arc<dyn StorageBackend>,
-        prefix: String,
-        retry_policy: Arc<RetryPolicy>,
-        webhook_sender: Arc<WebhookSender>,
-    ) -> Self {
-        Self {
-            db_name,
-            cache,
-            storage,
-            prefix,
-            retry_policy,
-            webhook_sender,
-            stats: Arc::new(tokio::sync::Mutex::new(UploaderStats::default())),
-        }
-    }
+/// Result of a single upload task
+struct UploadResult {
+    _txid: u64,
+}
 
-    /// Run uploader task (blocking, runs until Shutdown message)
-    ///
-    /// Processes upload messages from channel:
-    /// - Upload(txid): Read from cache, upload to S3, mark uploaded
-    /// - Shutdown: Complete pending uploads, then exit
-    pub async fn run(
-        &self,
-        mut rx: mpsc::Receiver<UploadMessage>,
-    ) -> Result<UploaderStats> {
-        info!("[{}] Uploader task started", self.db_name);
-
-        // Resume pending uploads on startup
-        self.resume_pending_uploads().await?;
-
-        // Process messages
-        loop {
-            match rx.recv().await {
-                Some(UploadMessage::Upload(txid)) => {
-                    if let Err(e) = self.upload_txid(txid).await {
-                        error!("[{}] Upload failed for TXID {}: {}", self.db_name, txid, e);
-                        // Webhook notification sent inside upload_txid
-                    }
-                }
-                Some(UploadMessage::Shutdown) => {
-                    info!("[{}] Uploader received shutdown signal", self.db_name);
-                    break;
-                }
-                None => {
-                    warn!("[{}] Upload channel closed, shutting down", self.db_name);
-                    break;
-                }
-            }
-        }
-
-        let stats = self.stats.lock().await.clone();
-        info!("[{}] Uploader task stopped. Stats: {:?}", self.db_name, stats);
-
-        Ok(stats)
-    }
-
-    /// Resume pending uploads from cache on startup
-    async fn resume_pending_uploads(&self) -> Result<()> {
-        let pending = self.cache.pending_uploads();
-
-        if pending.is_empty() {
-            info!("[{}] No pending uploads to resume", self.db_name);
-            return Ok(());
-        }
-
-        info!("[{}] Resuming {} pending uploads", self.db_name, pending.len());
-
-        for txid in pending {
-            if let Err(e) = self.upload_txid(txid).await {
-                error!("[{}] Failed to resume upload for TXID {}: {}", self.db_name, txid, e);
-                // Continue with other pending uploads
-            }
-        }
-
-        Ok(())
-    }
-
+impl UploadTaskContext {
     /// Upload a single TXID to S3 with retry logic
-    async fn upload_txid(&self, txid: u64) -> Result<()> {
-        let mut stats = self.stats.lock().await;
-        stats.uploads_attempted += 1;
-        drop(stats); // Release lock before I/O
+    async fn upload_txid(&self, txid: u64) -> Result<UploadResult> {
+        {
+            let mut stats = self.stats.lock().await;
+            stats.uploads_attempted += 1;
+        }
 
         // Read LTX from cache
         let data = self.cache.read_ltx(txid)
             .with_context(|| format!("Failed to read TXID {} from cache", txid))?;
+
+        let data_len = data.len() as u64;
 
         // Upload with retry loop
         let key = format!("{}/{:08}.ltx", self.prefix, txid);
@@ -177,19 +101,19 @@ impl Uploader {
 
             match self.storage.upload_bytes(&key, data.clone()).await {
                 Ok(_) => {
-                    // Upload succeeded!
                     self.cache.mark_uploaded(txid)
                         .context("Failed to mark TXID as uploaded")?;
 
-                    // Update stats
                     let mut stats = self.stats.lock().await;
                     stats.uploads_succeeded += 1;
-                    stats.bytes_uploaded += data.len() as u64;
-                    stats.last_uploaded_txid = txid;
+                    stats.bytes_uploaded += data_len;
+                    if txid > stats.last_uploaded_txid {
+                        stats.last_uploaded_txid = txid;
+                    }
 
-                    info!("[{}] Uploaded TXID {} ({} bytes)", self.db_name, txid, data.len());
+                    info!("[{}] Uploaded TXID {} ({} bytes)", self.db_name, txid, data_len);
 
-                    return Ok(());
+                    return Ok(UploadResult { _txid: txid });
                 }
                 Err(e) => {
                     let error_kind = crate::retry::classify_error(&e);
@@ -198,7 +122,6 @@ impl Uploader {
                         crate::retry::ErrorKind::Transient | crate::retry::ErrorKind::Unknown
                     );
 
-                    // Auth errors fail immediately
                     if error_kind == crate::retry::ErrorKind::AuthError {
                         error!("[{}] Auth error uploading TXID {}: {}", self.db_name, txid, e);
                         self.webhook_sender.notify_auth_failure(&self.db_name, &e.to_string()).await;
@@ -209,7 +132,6 @@ impl Uploader {
                         return Err(e).context(format!("Auth error uploading TXID {}", txid));
                     }
 
-                    // If not retryable or exhausted retries, fail
                     if !is_retryable || attempts > max_retries + 1 {
                         error!(
                             "[{}] Upload failed for TXID {} after {} attempts: {}",
@@ -225,7 +147,6 @@ impl Uploader {
                         return Err(e).context(format!("Failed to upload TXID {} after retries", txid));
                     }
 
-                    // Retry with exponential backoff
                     let delay = self.retry_policy.calculate_delay(attempts - 1);
                     warn!(
                         "[{}] Upload failed for TXID {}, attempt {}/{}, retrying in {:?}: {}",
@@ -236,26 +157,145 @@ impl Uploader {
             }
         }
     }
+}
+
+/// Concurrent S3 uploader task
+pub struct Uploader {
+    ctx: UploadTaskContext,
+    /// Max concurrent upload tasks
+    max_concurrent: usize,
+}
+
+impl Uploader {
+    /// Create a new uploader task
+    pub fn new(
+        db_name: String,
+        cache: Arc<LocalCache>,
+        storage: Arc<dyn StorageBackend>,
+        prefix: String,
+        retry_policy: Arc<RetryPolicy>,
+        webhook_sender: Arc<WebhookSender>,
+        max_concurrent: usize,
+    ) -> Self {
+        Self {
+            ctx: UploadTaskContext {
+                db_name,
+                cache,
+                storage,
+                prefix,
+                retry_policy,
+                webhook_sender,
+                stats: Arc::new(tokio::sync::Mutex::new(UploaderStats::default())),
+            },
+            max_concurrent: max_concurrent.max(1), // At least 1
+        }
+    }
+
+    /// Run uploader task (blocking, runs until Shutdown message or channel close)
+    ///
+    /// Processes upload messages from channel with up to max_concurrent
+    /// uploads in flight simultaneously via JoinSet.
+    pub async fn run(
+        &self,
+        mut rx: mpsc::Receiver<UploadMessage>,
+    ) -> Result<UploaderStats> {
+        info!("[{}] Uploader task started (max_concurrent={})", self.ctx.db_name, self.max_concurrent);
+
+        let mut in_flight: JoinSet<Result<UploadResult>> = JoinSet::new();
+
+        // Resume pending uploads on startup
+        let pending = self.ctx.cache.pending_uploads();
+        if !pending.is_empty() {
+            info!("[{}] Resuming {} pending uploads", self.ctx.db_name, pending.len());
+            for txid in pending {
+                // Wait for a slot if at capacity
+                while in_flight.len() >= self.max_concurrent {
+                    if let Some(result) = in_flight.join_next().await {
+                        Self::handle_join_result(&self.ctx.db_name, result);
+                    }
+                }
+                let ctx = self.ctx.clone();
+                in_flight.spawn(async move { ctx.upload_txid(txid).await });
+            }
+        } else {
+            info!("[{}] No pending uploads to resume", self.ctx.db_name);
+        }
+
+        // Process messages
+        loop {
+            tokio::select! {
+                // Accept new uploads when under concurrency limit
+                msg = rx.recv(), if in_flight.len() < self.max_concurrent => {
+                    match msg {
+                        Some(UploadMessage::Upload(txid)) => {
+                            let ctx = self.ctx.clone();
+                            in_flight.spawn(async move { ctx.upload_txid(txid).await });
+                        }
+                        Some(UploadMessage::Shutdown) => {
+                            info!("[{}] Uploader received shutdown signal, draining {} in-flight", self.ctx.db_name, in_flight.len());
+                            while let Some(result) = in_flight.join_next().await {
+                                Self::handle_join_result(&self.ctx.db_name, result);
+                            }
+                            break;
+                        }
+                        None => {
+                            info!("[{}] Upload channel closed, draining {} in-flight", self.ctx.db_name, in_flight.len());
+                            while let Some(result) = in_flight.join_next().await {
+                                Self::handle_join_result(&self.ctx.db_name, result);
+                            }
+                            break;
+                        }
+                    }
+                }
+                // Reap completed uploads when at capacity (or any time one finishes)
+                Some(result) = in_flight.join_next() => {
+                    Self::handle_join_result(&self.ctx.db_name, result);
+                }
+            }
+        }
+
+        let stats = self.ctx.stats.lock().await.clone();
+        info!("[{}] Uploader task stopped. Stats: {:?}", self.ctx.db_name, stats);
+
+        Ok(stats)
+    }
+
+    /// Handle a JoinSet result
+    fn handle_join_result(db_name: &str, result: Result<Result<UploadResult>, tokio::task::JoinError>) {
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
+                // Stats already updated inside upload_txid
+                error!("[{}] Upload task failed: {}", db_name, e);
+            }
+            Err(e) => {
+                error!("[{}] Upload task panicked: {}", db_name, e);
+            }
+        }
+    }
 
     /// Get current upload statistics
     pub async fn stats(&self) -> UploaderStats {
-        self.stats.lock().await.clone()
+        self.ctx.stats.lock().await.clone()
     }
 }
 
-/// Spawn uploader task and return channel sender
+/// Spawn uploader task and return channel sender + join handle.
+///
+/// The JoinHandle allows callers to await completion after sending Shutdown,
+/// ensuring in-flight uploads finish before the runtime exits.
 pub fn spawn_uploader(
     uploader: Arc<Uploader>,
-) -> mpsc::Sender<UploadMessage> {
+) -> (mpsc::Sender<UploadMessage>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::channel(1000); // Buffer 1000 upload notifications
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         if let Err(e) = uploader.run(rx).await {
             error!("Uploader task failed: {}", e);
         }
     });
 
-    tx
+    (tx, handle)
 }
 
 #[cfg(test)]
@@ -268,6 +308,7 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap;
     use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::TempDir;
     use tokio::time::{timeout, Duration};
@@ -277,6 +318,11 @@ mod tests {
         objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         fail_count: Arc<Mutex<usize>>,
         max_failures: usize,
+        /// Optional upload delay for concurrency testing
+        upload_delay: Option<Duration>,
+        /// Track peak concurrent uploads
+        active_uploads: Arc<AtomicUsize>,
+        peak_concurrent: Arc<AtomicUsize>,
     }
 
     impl MockStorage {
@@ -285,14 +331,23 @@ mod tests {
                 objects: Arc::new(Mutex::new(HashMap::new())),
                 fail_count: Arc::new(Mutex::new(0)),
                 max_failures: 0,
+                upload_delay: None,
+                active_uploads: Arc::new(AtomicUsize::new(0)),
+                peak_concurrent: Arc::new(AtomicUsize::new(0)),
             }
         }
 
         fn with_failures(max_failures: usize) -> Self {
             Self {
-                objects: Arc::new(Mutex::new(HashMap::new())),
-                fail_count: Arc::new(Mutex::new(0)),
                 max_failures,
+                ..Self::new()
+            }
+        }
+
+        fn with_delay(delay: Duration) -> Self {
+            Self {
+                upload_delay: Some(delay),
+                ..Self::new()
             }
         }
 
@@ -303,20 +358,37 @@ mod tests {
         fn object_count(&self) -> usize {
             self.objects.lock().unwrap().len()
         }
+
+        fn peak_concurrent(&self) -> usize {
+            self.peak_concurrent.load(Ordering::SeqCst)
+        }
     }
 
     #[async_trait]
     impl StorageBackend for MockStorage {
         async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()> {
-            let mut fail_count = self.fail_count.lock().unwrap();
+            // Track concurrency
+            let active = self.active_uploads.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_concurrent.fetch_max(active, Ordering::SeqCst);
 
-            if *fail_count < self.max_failures {
-                *fail_count += 1;
-                return Err(anyhow::anyhow!("Simulated S3 failure {}/{}", fail_count, self.max_failures));
+            // Simulate delay if configured
+            if let Some(delay) = self.upload_delay {
+                tokio::time::sleep(delay).await;
             }
 
-            self.objects.lock().unwrap().insert(key.to_string(), data);
-            Ok(())
+            let result = {
+                let mut fail_count = self.fail_count.lock().unwrap();
+                if *fail_count < self.max_failures {
+                    *fail_count += 1;
+                    Err(anyhow::anyhow!("Simulated S3 failure {}/{}", fail_count, self.max_failures))
+                } else {
+                    self.objects.lock().unwrap().insert(key.to_string(), data);
+                    Ok(())
+                }
+            };
+
+            self.active_uploads.fetch_sub(1, Ordering::SeqCst);
+            result
         }
 
         async fn upload_bytes_with_checksum(&self, key: &str, data: Vec<u8>, _checksum: &str) -> Result<()> {
@@ -375,96 +447,103 @@ mod tests {
         }
     }
 
+    fn make_retry_config() -> RetryConfig {
+        RetryConfig {
+            max_retries: 3,
+            base_delay_ms: 10,
+            max_delay_ms: 100,
+            ..Default::default()
+        }
+    }
+
     fn setup_uploader() -> (Arc<Uploader>, Arc<LocalCache>, Arc<MockStorage>, TempDir) {
+        setup_uploader_with_concurrency(4)
+    }
+
+    fn setup_uploader_with_concurrency(max_concurrent: usize) -> (Arc<Uploader>, Arc<LocalCache>, Arc<MockStorage>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
         let cache = Arc::new(LocalCache::new(&db_path).unwrap());
         let storage = Arc::new(MockStorage::new());
 
-        let retry_config = RetryConfig {
-            max_retries: 3,
-            base_delay_ms: 10,
-            max_delay_ms: 100,
-            ..Default::default()
-        };
-
         let uploader = Arc::new(Uploader::new(
             "test_db".to_string(),
             cache.clone(),
             storage.clone() as Arc<dyn StorageBackend>,
             "test-prefix".to_string(),
-            Arc::new(RetryPolicy::new(retry_config)),
+            Arc::new(RetryPolicy::new(make_retry_config())),
             Arc::new(WebhookSender::new(vec![])),
+            max_concurrent,
         ));
 
         (uploader, cache, storage, temp_dir)
     }
 
+    fn setup_uploader_with_storage(storage: Arc<MockStorage>, max_concurrent: usize) -> (Arc<Uploader>, Arc<LocalCache>, TempDir) {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+
+        let uploader = Arc::new(Uploader::new(
+            "test_db".to_string(),
+            cache.clone(),
+            storage as Arc<dyn StorageBackend>,
+            "test-prefix".to_string(),
+            Arc::new(RetryPolicy::new(make_retry_config())),
+            Arc::new(WebhookSender::new(vec![])),
+            max_concurrent,
+        ));
+
+        (uploader, cache, temp_dir)
+    }
+
+    // ============================================
+    // Basic upload tests (ported from sequential)
+    // ============================================
+
     #[tokio::test]
     async fn test_uploader_basic_upload() {
         let (uploader, cache, storage, _temp) = setup_uploader();
 
-        // Create channel
         let (tx, rx) = mpsc::channel(10);
-
-        // Spawn uploader task
         let uploader_clone = uploader.clone();
-        let task = tokio::spawn(async move {
-            uploader_clone.run(rx).await
-        });
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
 
-        // Wait for uploader to start and complete resume
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Write LTX to cache AFTER spawning (so resume doesn't upload it)
         cache.write_ltx(1, b"test data").unwrap();
-
-        // Send upload message
         tx.send(UploadMessage::Upload(1)).await.unwrap();
-
-        // Send shutdown
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
-        // Wait for completion
         let stats = task.await.unwrap().unwrap();
 
-        // Verify upload succeeded
         assert_eq!(stats.uploads_attempted, 1);
         assert_eq!(stats.uploads_succeeded, 1);
         assert_eq!(stats.uploads_failed, 0);
         assert_eq!(stats.last_uploaded_txid, 1);
 
-        // Verify S3 has the object
         assert_eq!(storage.object_count(), 1);
         let data = storage.get_object("test-prefix/00000001.ltx").unwrap();
         assert_eq!(data, b"test data");
 
-        // Verify cache marked as uploaded
         assert_eq!(cache.pending_uploads().len(), 0);
         assert_eq!(cache.last_uploaded_txid(), 1);
     }
 
     #[tokio::test]
-    async fn test_uploader_sequential_processing() {
+    async fn test_uploader_multiple_uploads() {
         let (uploader, cache, storage, _temp) = setup_uploader();
 
         let (tx, rx) = mpsc::channel(10);
-
         let uploader_clone = uploader.clone();
-        let task = tokio::spawn(async move {
-            uploader_clone.run(rx).await
-        });
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
 
-        // Wait for uploader to start
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Write multiple TXIDs AFTER spawning
         for i in 1..=5 {
             cache.write_ltx(i, format!("data{}", i).as_bytes()).unwrap();
         }
-
-        // Send upload messages
         for i in 1..=5 {
             tx.send(UploadMessage::Upload(i)).await.unwrap();
         }
@@ -472,14 +551,9 @@ mod tests {
 
         let stats = task.await.unwrap().unwrap();
 
-        // All should succeed
         assert_eq!(stats.uploads_succeeded, 5);
         assert_eq!(stats.last_uploaded_txid, 5);
-
-        // All objects in S3
         assert_eq!(storage.object_count(), 5);
-
-        // Cache should be empty of pending
         assert_eq!(cache.pending_uploads().len(), 0);
     }
 
@@ -491,45 +565,30 @@ mod tests {
         let cache = Arc::new(LocalCache::new(&db_path).unwrap());
         let storage = Arc::new(MockStorage::new());
 
-        // Simulate interrupted upload (written to cache but not uploaded)
+        // Simulate interrupted upload
         cache.write_ltx(1, b"data1").unwrap();
         cache.write_ltx(2, b"data2").unwrap();
         cache.write_ltx(3, b"data3").unwrap();
-
-        // Create uploader
-        let retry_config = RetryConfig {
-            max_retries: 3,
-            base_delay_ms: 10,
-            max_delay_ms: 100,
-            ..Default::default()
-        };
 
         let uploader = Arc::new(Uploader::new(
             "test_db".to_string(),
             cache.clone(),
             storage.clone() as Arc<dyn StorageBackend>,
             "test-prefix".to_string(),
-            Arc::new(RetryPolicy::new(retry_config)),
+            Arc::new(RetryPolicy::new(make_retry_config())),
             Arc::new(WebhookSender::new(vec![])),
+            4,
         ));
 
         let (tx, rx) = mpsc::channel(10);
-
-        // Spawn uploader (should auto-resume pending)
         let uploader_clone = uploader.clone();
-        let task = tokio::spawn(async move {
-            uploader_clone.run(rx).await
-        });
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
 
-        // Give it time to resume
         tokio::time::sleep(Duration::from_millis(100)).await;
-
-        // Shutdown
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
         let stats = task.await.unwrap().unwrap();
 
-        // Should have uploaded all 3 pending
         assert_eq!(stats.uploads_succeeded, 3);
         assert_eq!(storage.object_count(), 3);
         assert_eq!(cache.pending_uploads().len(), 0);
@@ -537,41 +596,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_uploader_retry_on_failure() {
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join("test.db");
-
-        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
-
-        // Storage that fails 2 times then succeeds
         let storage = Arc::new(MockStorage::with_failures(2));
-
-        let retry_config = RetryConfig {
-            max_retries: 5,
-            base_delay_ms: 10,
-            max_delay_ms: 100,
-            ..Default::default()
-        };
-
-        let uploader = Arc::new(Uploader::new(
-            "test_db".to_string(),
-            cache.clone(),
-            storage.clone() as Arc<dyn StorageBackend>,
-            "test-prefix".to_string(),
-            Arc::new(RetryPolicy::new(retry_config)),
-            Arc::new(WebhookSender::new(vec![])),
-        ));
+        let (uploader, cache, _temp) = setup_uploader_with_storage(storage.clone(), 4);
 
         let (tx, rx) = mpsc::channel(10);
-
         let uploader_clone = uploader.clone();
-        let task = tokio::spawn(async move {
-            uploader_clone.run(rx).await
-        });
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
 
-        // Wait for uploader to start
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Write and send upload message
         cache.write_ltx(1, b"data").unwrap();
         tx.send(UploadMessage::Upload(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
@@ -579,7 +612,6 @@ mod tests {
 
         let stats = task.await.unwrap().unwrap();
 
-        // Should eventually succeed after retries
         assert_eq!(stats.uploads_succeeded, 1);
         assert_eq!(stats.uploads_failed, 0);
     }
@@ -588,62 +620,45 @@ mod tests {
     async fn test_uploader_channel_buffer() {
         let (uploader, cache, _storage, _temp) = setup_uploader();
 
-        let (tx, rx) = mpsc::channel(10); // Small buffer
-
+        let (tx, rx) = mpsc::channel(10);
         let uploader_clone = uploader.clone();
-        let task = tokio::spawn(async move {
-            uploader_clone.run(rx).await
-        });
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
 
-        // Wait for uploader to start
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Write many TXIDs AFTER spawning
         for i in 1..=100 {
             cache.write_ltx(i, b"data").unwrap();
         }
-
-        // Send many messages (should not block due to buffering)
         for i in 1..=100 {
             tx.send(UploadMessage::Upload(i)).await.unwrap();
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
         let stats = task.await.unwrap().unwrap();
-
         assert_eq!(stats.uploads_succeeded, 100);
     }
 
     #[tokio::test]
     async fn test_uploader_graceful_shutdown() {
-        let (uploader, cache, storage, _temp) = setup_uploader();
+        let (uploader, cache, _storage, _temp) = setup_uploader();
 
         let (tx, rx) = mpsc::channel(10);
-
         let uploader_clone = uploader.clone();
-        let task = tokio::spawn(async move {
-            uploader_clone.run(rx).await
-        });
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
 
-        // Wait for uploader to start
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Write AFTER spawning
         cache.write_ltx(1, b"data1").unwrap();
         cache.write_ltx(2, b"data2").unwrap();
 
-        // Send uploads and immediate shutdown
         tx.send(UploadMessage::Upload(1)).await.unwrap();
         tx.send(UploadMessage::Upload(2)).await.unwrap();
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
-        // Should complete pending uploads before shutdown
         let result = timeout(Duration::from_secs(5), task).await;
         assert!(result.is_ok(), "Uploader should shutdown gracefully");
 
         let stats = result.unwrap().unwrap().unwrap();
-
-        // Both should be uploaded despite immediate shutdown
         assert_eq!(stats.uploads_succeeded, 2);
     }
 
@@ -652,16 +667,11 @@ mod tests {
         let (uploader, cache, _storage, _temp) = setup_uploader();
 
         let (tx, rx) = mpsc::channel(10);
-
         let uploader_clone = uploader.clone();
-        tokio::spawn(async move {
-            uploader_clone.run(rx).await
-        });
+        tokio::spawn(async move { uploader_clone.run(rx).await });
 
-        // Wait for uploader to start
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        // Write AFTER spawning
         cache.write_ltx(1, &vec![0u8; 100]).unwrap();
         cache.write_ltx(2, &vec![0u8; 200]).unwrap();
 
@@ -689,15 +699,308 @@ mod tests {
 
         cache.write_ltx(1, b"test").unwrap();
 
-        // Use helper function
-        let tx = spawn_uploader(uploader.clone());
+        let (tx, handle) = spawn_uploader(uploader.clone());
 
         tx.send(UploadMessage::Upload(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        // Verify upload succeeded
         assert_eq!(storage.object_count(), 1);
 
         tx.send(UploadMessage::Shutdown).await.unwrap();
+        handle.await.unwrap(); // Verify handle completes
+    }
+
+    // ============================================
+    // Concurrent upload tests
+    // ============================================
+
+    #[tokio::test]
+    async fn test_concurrent_uploads() {
+        // Send 10 uploads with max_concurrent=3, verify all complete
+        let storage = Arc::new(MockStorage::with_delay(Duration::from_millis(50)));
+        let (uploader, cache, _temp) = setup_uploader_with_storage(storage.clone(), 3);
+
+        let (tx, rx) = mpsc::channel(20);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        for i in 1..=10 {
+            cache.write_ltx(i, format!("data{}", i).as_bytes()).unwrap();
+        }
+        for i in 1..=10 {
+            tx.send(UploadMessage::Upload(i)).await.unwrap();
+        }
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        let stats = timeout(Duration::from_secs(5), task).await
+            .expect("should not timeout")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stats.uploads_succeeded, 10);
+        assert_eq!(storage.object_count(), 10);
+        assert_eq!(cache.pending_uploads().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_respects_limit() {
+        // With slow uploads and max_concurrent=2, peak should never exceed 2
+        let storage = Arc::new(MockStorage::with_delay(Duration::from_millis(100)));
+        let (uploader, cache, _temp) = setup_uploader_with_storage(storage.clone(), 2);
+
+        let (tx, rx) = mpsc::channel(20);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        for i in 1..=6 {
+            cache.write_ltx(i, b"data").unwrap();
+        }
+        for i in 1..=6 {
+            tx.send(UploadMessage::Upload(i)).await.unwrap();
+        }
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        let stats = timeout(Duration::from_secs(5), task).await
+            .expect("should not timeout")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stats.uploads_succeeded, 6);
+        assert!(storage.peak_concurrent() <= 2,
+            "peak concurrent {} should not exceed max_concurrent 2", storage.peak_concurrent());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_resume_pending() {
+        // 5 pending on startup, all resume concurrently
+        let storage = Arc::new(MockStorage::with_delay(Duration::from_millis(50)));
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+
+        for i in 1..=5 {
+            cache.write_ltx(i, format!("data{}", i).as_bytes()).unwrap();
+        }
+
+        let uploader = Arc::new(Uploader::new(
+            "test_db".to_string(),
+            cache.clone(),
+            storage.clone() as Arc<dyn StorageBackend>,
+            "test-prefix".to_string(),
+            Arc::new(RetryPolicy::new(make_retry_config())),
+            Arc::new(WebhookSender::new(vec![])),
+            3,
+        ));
+
+        let (tx, rx) = mpsc::channel(10);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        let stats = task.await.unwrap().unwrap();
+
+        assert_eq!(stats.uploads_succeeded, 5);
+        assert_eq!(cache.pending_uploads().len(), 0);
+        // Should have used concurrency (peak > 1)
+        assert!(storage.peak_concurrent() > 1,
+            "resume should use concurrency, got peak {}", storage.peak_concurrent());
+        assert!(storage.peak_concurrent() <= 3,
+            "resume should respect limit, got peak {}", storage.peak_concurrent());
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_shutdown_drains() {
+        // In-flight uploads complete before shutdown returns
+        let storage = Arc::new(MockStorage::with_delay(Duration::from_millis(200)));
+        let (uploader, cache, _temp) = setup_uploader_with_storage(storage.clone(), 4);
+
+        let (tx, rx) = mpsc::channel(10);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        for i in 1..=4 {
+            cache.write_ltx(i, b"data").unwrap();
+            tx.send(UploadMessage::Upload(i)).await.unwrap();
+        }
+
+        // Brief delay to let uploads start, then shutdown
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        let stats = timeout(Duration::from_secs(5), task).await
+            .expect("shutdown should drain in-flight")
+            .unwrap()
+            .unwrap();
+
+        // All 4 should complete even though shutdown was sent mid-flight
+        assert_eq!(stats.uploads_succeeded, 4);
+        assert_eq!(storage.object_count(), 4);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_failure_doesnt_block() {
+        // One failing upload doesn't prevent others from completing.
+        // Storage fails the first call, then succeeds for all subsequent.
+        // With concurrent uploads, one task retries while others proceed.
+        let storage = Arc::new(MockStorage::with_failures(1));
+        let (uploader, cache, _temp) = setup_uploader_with_storage(storage.clone(), 4);
+
+        let (tx, rx) = mpsc::channel(10);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        for i in 1..=5 {
+            cache.write_ltx(i, b"data").unwrap();
+            tx.send(UploadMessage::Upload(i)).await.unwrap();
+        }
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        let stats = timeout(Duration::from_secs(5), task).await
+            .expect("should not timeout")
+            .unwrap()
+            .unwrap();
+
+        // All 5 should succeed (first retries after 1 failure, rest succeed immediately)
+        assert_eq!(stats.uploads_succeeded, 5);
+        assert_eq!(stats.uploads_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_is_faster_than_sequential() {
+        // With slow uploads, concurrent should be measurably faster
+        let storage = Arc::new(MockStorage::with_delay(Duration::from_millis(100)));
+        let (uploader, cache, _temp) = setup_uploader_with_storage(storage.clone(), 4);
+
+        let (tx, rx) = mpsc::channel(20);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let n = 8;
+        for i in 1..=n {
+            cache.write_ltx(i, b"data").unwrap();
+            tx.send(UploadMessage::Upload(i)).await.unwrap();
+        }
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        let start = tokio::time::Instant::now();
+        let stats = task.await.unwrap().unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(stats.uploads_succeeded, n as u64);
+
+        // Sequential: 8 * 100ms = 800ms minimum
+        // Concurrent(4): 2 batches * 100ms = ~200ms
+        // Be generous: just check it's faster than sequential
+        assert!(elapsed < Duration::from_millis(600),
+            "concurrent should be faster than sequential, took {:?}", elapsed);
+    }
+
+    // ============================================
+    // Edge cases
+    // ============================================
+
+    #[tokio::test]
+    async fn test_max_concurrent_clamped_to_1() {
+        // max_concurrent=0 should be clamped to 1
+        let (uploader, cache, storage, _temp) = setup_uploader_with_concurrency(0);
+
+        let (tx, rx) = mpsc::channel(10);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        cache.write_ltx(1, b"data").unwrap();
+        tx.send(UploadMessage::Upload(1)).await.unwrap();
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        let stats = task.await.unwrap().unwrap();
+        assert_eq!(stats.uploads_succeeded, 1);
+        assert_eq!(storage.object_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_channel_close_drains_inflight() {
+        // Dropping the sender (channel close) should drain in-flight tasks
+        let storage = Arc::new(MockStorage::with_delay(Duration::from_millis(100)));
+        let (uploader, cache, _temp) = setup_uploader_with_storage(storage.clone(), 4);
+
+        let (tx, rx) = mpsc::channel(10);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        for i in 1..=3 {
+            cache.write_ltx(i, b"data").unwrap();
+            tx.send(UploadMessage::Upload(i)).await.unwrap();
+        }
+
+        // Drop sender instead of sending Shutdown
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        drop(tx);
+
+        let stats = timeout(Duration::from_secs(5), task).await
+            .expect("should drain on channel close")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stats.uploads_succeeded, 3);
+    }
+
+    #[tokio::test]
+    async fn test_last_uploaded_txid_tracks_highest() {
+        // With concurrent uploads completing out of order, last_uploaded_txid
+        // should track the highest seen, not the last to complete
+        let (uploader, cache, _storage, _temp) = setup_uploader();
+
+        let (tx, rx) = mpsc::channel(10);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        // Write in reverse order
+        for i in (1..=5).rev() {
+            cache.write_ltx(i, b"data").unwrap();
+            tx.send(UploadMessage::Upload(i)).await.unwrap();
+        }
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        let stats = task.await.unwrap().unwrap();
+        assert_eq!(stats.uploads_succeeded, 5);
+        assert_eq!(stats.last_uploaded_txid, 5);
+    }
+
+    #[tokio::test]
+    async fn test_empty_run_no_pending_no_messages() {
+        // Uploader with no pending and immediate shutdown
+        let (uploader, _cache, _storage, _temp) = setup_uploader();
+
+        let (tx, rx) = mpsc::channel(10);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        let stats = timeout(Duration::from_secs(2), task).await
+            .expect("should shutdown immediately")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(stats.uploads_attempted, 0);
+        assert_eq!(stats.uploads_succeeded, 0);
     }
 }

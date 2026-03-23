@@ -63,6 +63,10 @@ pub struct CacheConfig {
     /// Override default cache location
     /// Default: .{db_name}-walrust/ next to database file
     pub path: Option<String>,
+
+    /// Max concurrent S3 uploads per database (default: 4)
+    #[serde(default = "default_uploader_concurrency")]
+    pub uploader_concurrency: usize,
 }
 
 impl Default for CacheConfig {
@@ -72,8 +76,13 @@ impl Default for CacheConfig {
             retention: "24h".to_string(),
             max_size: 5 * 1024 * 1024 * 1024, // 5GB
             path: None,
+            uploader_concurrency: 4,
         }
     }
+}
+
+fn default_uploader_concurrency() -> usize {
+    4
 }
 
 fn default_cache_retention() -> String {

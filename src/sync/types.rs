@@ -152,6 +152,7 @@ pub(crate) struct ShadowSyncInput {
 }
 
 /// Output from concurrent shadow sync
+#[derive(Debug)]
 pub(crate) struct ShadowSyncOutput {
     pub(crate) db_path: PathBuf,
     pub(crate) frame_count: u64,

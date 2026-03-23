@@ -230,10 +230,14 @@ pub async fn watch_with_independent_tasks(
                 s3_prefix,
                 Arc::new(retry_policy.clone()),
                 Arc::clone(&webhook_sender),
+                cache_config.uploader_concurrency,
             ));
 
             // Spawn uploader task and get channel
-            let upload_tx = spawn_uploader(uploader);
+            // Note: JoinHandle is intentionally dropped here. Independent tasks
+            // outlive the uploader via the runtime's 10s shutdown timeout, giving
+            // uploaders time to drain after receiving Shutdown.
+            let (upload_tx, _uploader_handle) = spawn_uploader(uploader);
 
             Some(CacheState {
                 cache,

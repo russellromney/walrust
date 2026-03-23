@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-03-23
+
+### Added
+- **Concurrent S3 uploads**: Uploader rewrites sequential loop with `tokio::task::JoinSet` for bounded concurrency (default 4, configurable via `--uploader-concurrency`)
+  - `UploadTaskContext` pattern extracts shared `Arc` state into a `Clone` struct, avoiding `&self` lifetime issues with JoinSet
+  - `tokio::select!` with conditional guard (`if in_flight.len() < max_concurrent`) provides backpressure
+  - `resume_pending_uploads` also concurrent (respects max_concurrent)
+  - `last_uploaded_txid` tracks highest seen TXID (not last to complete)
+- **Shadow mode cache integration**: `sync_shadow_to_cache()` writes LTX to local disk cache + notifies uploader, giving shadow mode the same crash recovery as independent mode
+  - `sync_shadow_to_cache_with_retry()` retry wrapper matching existing `sync_shadow_concurrent_with_retry()` pattern
+  - Shared encoding extracted into `encode_shadow_to_ltx()` — eliminates ~100 lines of duplication between direct-S3 and cache paths
+  - `Box::pin()` with explicit type annotation for dynamic dispatch between cache/direct future types
+- **Cache cleanup timer in shadow mode**: Every 5 minutes, matching `watch_independent.rs` pattern
+- **Proper shutdown drain**: `spawn_uploader()` returns `(Sender, JoinHandle)` — shadow mode awaits handles with 10s timeout
+- **`--uploader-concurrency` CLI flag** (default 4), wired through `CacheConfig.uploader_concurrency`
+- **31 new tests**:
+  - 18 uploader tests (8 ported + 5 concurrent + 4 edge case + 1 performance)
+  - 13 shadow cache tests (7 encoding + 5 sync_shadow_to_cache + 1 build_output)
+  - `MockStorage` with `upload_delay`, `active_uploads` (AtomicUsize), `peak_concurrent` tracking
+
+### Changed
+- `Uploader::new()` takes `max_concurrent: usize` (7th param, clamped to `.max(1)`)
+- `watch_with_shadow()` accepts `CacheConfig` parameter
+- `ShadowSyncOutput` derives `Debug`
+
+## [0.5.2] - 2026-03-23
+
+### Fixed
+- **RSS 70MB → 20MB**: `encode_snapshot()` and `compute_checksum_from_file()` were reading entire DB into memory via `std::fs::read()`. macOS system allocator never returned freed pages — RSS permanently reflected peak snapshot allocation.
+  - Replaced with streaming via `BufReader::with_capacity(1MB, file)` — page-by-page encode + incremental SHA-256 hashing
+  - Peak memory is now ~1MB (BufReader) + 4KB (page buffer), not entire DB size
+  - Applied to both `src/ltx.rs` and `crates/walrust-core/src/ltx.rs`
+
+### Added
+- **mimalloc global allocator**: Returns freed memory to OS (macOS system allocator doesn't). One-line change in `src/main.rs`.
+- **RSS profiling tools**: `bench/profile_rss.rs` (component-level RSS measurement), `bench/measure_rss.py` (real walrust with dummy bucket), `bench/measure_rss_s3.py` (real walrust with S3 uploads)
+
+### Performance
+- Before: ~70MB RSS for 13MB database (snapshot peak retained by macOS allocator)
+- After: ~20MB RSS without S3, ~26MB with real S3 uploads
+- mimalloc actively returns freed pages — RSS trends down after peak load
+
 ## [0.5.1] - 2026-03-23
 
 ### Fixed

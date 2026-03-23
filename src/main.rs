@@ -189,6 +189,10 @@ enum Commands {
         #[arg(long)]
         cache_max_size: Option<u64>,
 
+        /// Max concurrent S3 uploads per database (default: 4)
+        #[arg(long, default_value = "4")]
+        uploader_concurrency: usize,
+
         /// Disable cache (direct S3 upload)
         ///
         /// Forces direct S3 upload even if cache is enabled in config file.
@@ -374,6 +378,7 @@ struct WatchArgs {
     cache_dir: Option<PathBuf>,
     cache_retention: String,
     cache_max_size: Option<u64>,
+    uploader_concurrency: usize,
     no_cache: bool,
 }
 
@@ -562,6 +567,7 @@ fn resolve_cache_config(config: &Option<Config>, cli: &WatchArgs) -> config::Cac
         retention: cli.cache_retention.clone(),
         max_size: cli.cache_max_size.unwrap_or(base.max_size),
         path: cli.cache_dir.as_ref().map(|p| p.display().to_string()).or(base.path),
+        uploader_concurrency: cli.uploader_concurrency,
     }
 }
 
@@ -669,6 +675,7 @@ async fn run() -> Result<()> {
             cache_dir,
             cache_retention,
             cache_max_size,
+            uploader_concurrency,
             no_cache,
         } => {
             let watch_args = WatchArgs {
@@ -702,6 +709,7 @@ async fn run() -> Result<()> {
                 cache_dir,
                 cache_retention,
                 cache_max_size,
+                uploader_concurrency,
                 no_cache,
             };
 
@@ -758,6 +766,7 @@ async fn run() -> Result<()> {
                     watch_args.no_metrics,
                     retry_config,
                     webhooks,
+                    cache_config,
                 )
                 .await?;
             }
@@ -914,6 +923,7 @@ mod tests {
             cache_dir: None,
             cache_retention: "24h".to_string(),
             cache_max_size: None,
+            uploader_concurrency: 4,
             no_cache: false,
         }
     }

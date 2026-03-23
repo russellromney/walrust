@@ -5,17 +5,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
+use tokio::sync::mpsc;
 
-use crate::config::{ResolvedDbConfig, SyncConfig, WebhookConfig};
+use crate::cache::LocalCache;
+use crate::config::{CacheConfig, ResolvedDbConfig, SyncConfig, WebhookConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::ltx;
 use crate::retention::RetentionPolicy;
 use crate::retry::{RetryConfig, RetryPolicy};
 use crate::s3::{self, create_client, parse_bucket};
 use crate::shadow::ShadowWal;
+use crate::storage::{S3Backend, StorageBackend};
+use crate::uploader::{spawn_uploader, UploadMessage, Uploader};
 use crate::webhook::WebhookSender;
 
-use super::shadow::{run_compaction, sync_shadow_concurrent_with_retry};
+use super::shadow::{run_compaction, sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry};
 use super::types::{DbState, Manifest, ShadowDbState, ShadowSyncInput, TriggerState};
 use super::verify::validate_backup_integrity;
 use super::wal_sync::take_snapshot_with_retry;
@@ -35,6 +39,7 @@ pub async fn watch_with_shadow(
     no_metrics: bool,
     retry_config: RetryConfig,
     webhooks: Vec<WebhookConfig>,
+    cache_config: CacheConfig,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(create_client(endpoint).await?);
@@ -62,6 +67,18 @@ pub async fn watch_with_shadow(
         tokio::spawn(async move {
             dashboard::start_server(metrics_port, state_clone).await;
         });
+    }
+
+    // Initialize cache + uploader per database (if cache enabled)
+    let mut cache_states: HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)> = HashMap::new();
+    let mut uploader_handles: Vec<(PathBuf, tokio::task::JoinHandle<()>)> = Vec::new();
+    if cache_config.enabled {
+        tracing::info!(
+            "Shadow mode cache enabled (concurrency={}, retention={}, max_size={})",
+            cache_config.uploader_concurrency,
+            cache_config.retention,
+            cache_config.max_size,
+        );
     }
 
     // Initialize shadow state for each database
@@ -128,6 +145,27 @@ pub async fn watch_with_shadow(
             shadow.generation(),
             shadow.shadow_dir().display()
         );
+
+        // Initialize cache + uploader for this database (if cache enabled)
+        if cache_config.enabled {
+            let cache = Arc::new(LocalCache::new(db_path)?);
+            let storage: Arc<dyn StorageBackend> = Arc::new(
+                S3Backend::new((*client).clone(), bucket_name.clone())
+            );
+            let s3_prefix = format!("{}{}", prefix, name);
+            let uploader = Arc::new(Uploader::new(
+                name.clone(),
+                Arc::clone(&cache),
+                storage,
+                s3_prefix,
+                Arc::new(retry_policy.clone()),
+                Arc::clone(&webhook_sender),
+                cache_config.uploader_concurrency,
+            ));
+            let (upload_tx, handle) = spawn_uploader(uploader);
+            cache_states.insert(db_path.clone(), (cache, upload_tx));
+            uploader_handles.push((db_path.clone(), handle));
+        }
 
         db_states.insert(
             db_path.clone(),
@@ -264,6 +302,18 @@ pub async fn watch_with_shadow(
     let mut validation_timer = tokio::time::interval(validation_interval_duration);
     validation_timer.tick().await;
 
+    // Cache cleanup timer (every 5 minutes when cache is enabled)
+    let cache_enabled = !cache_states.is_empty();
+    let mut cache_cleanup_timer = tokio::time::interval(Duration::from_secs(300));
+    cache_cleanup_timer.tick().await; // Skip first immediate tick
+
+    // Parse cache retention for cleanup
+    let cache_retention = if cache_config.enabled {
+        crate::config::parse_duration_string(&cache_config.retention).ok()
+    } else {
+        None
+    };
+
     tracing::info!(
         "walrust shadow mode running (snapshot: {}s, WAL sync: {}s, checkpoint: {}s)",
         global_sync.snapshot_interval,
@@ -347,16 +397,29 @@ pub async fn watch_with_shadow(
                     continue;
                 }
 
-                // Phase 2: Run all syncs concurrently
+                // Phase 2: Run all syncs concurrently (cache path or direct S3)
                 let sync_futures: Vec<_> = sync_inputs
                     .into_iter()
                     .map(|input| {
-                        let client = Arc::clone(&client);
-                        let bucket = bucket_name.clone();
-                        let pfx = prefix.clone();
                         let policy = retry_policy.clone();
                         let webhooks = Arc::clone(&webhook_sender);
-                        sync_shadow_concurrent_with_retry(client, bucket, pfx, input, policy, webhooks)
+
+                        if let Some((cache, upload_tx)) = cache_states.get(&input.db_path) {
+                            // Cache path: write to disk cache, uploader handles S3
+                            let cache = Arc::clone(cache);
+                            let upload_tx = upload_tx.clone();
+                            Box::pin(sync_shadow_to_cache_with_retry(
+                                cache, upload_tx, input, policy, webhooks,
+                            )) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<_>> + Send>>
+                        } else {
+                            // Direct S3 path (no cache)
+                            let client = Arc::clone(&client);
+                            let bucket = bucket_name.clone();
+                            let pfx = prefix.clone();
+                            Box::pin(sync_shadow_concurrent_with_retry(
+                                client, bucket, pfx, input, policy, webhooks,
+                            ))
+                        }
                     })
                     .collect();
 
@@ -618,6 +681,31 @@ pub async fn watch_with_shadow(
                 }
             }
 
+            // Cache cleanup timer
+            _ = cache_cleanup_timer.tick(), if cache_enabled => {
+                if let Some(ref retention) = cache_retention {
+                    for (db_path, (cache, _)) in cache_states.iter() {
+                        let name = db_states.get(db_path).map(|s| s.name.as_str()).unwrap_or("unknown");
+                        match cache.cleanup(*retention, cache_config.max_size) {
+                            Ok(stats) => {
+                                if stats.deleted_count > 0 {
+                                    tracing::info!(
+                                        "{}: Cache cleanup: deleted {} files ({:.2} MB), {:.2} MB remaining",
+                                        name,
+                                        stats.deleted_count,
+                                        stats.deleted_bytes as f64 / (1024.0 * 1024.0),
+                                        stats.remaining_bytes as f64 / (1024.0 * 1024.0)
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("{}: Cache cleanup failed: {}", name, e);
+                            }
+                        }
+                    }
+                }
+            }
+
             // Validation timer
             _ = validation_timer.tick(), if global_sync.validation_interval > 0 => {
                 for (_db_path, state) in db_states.iter() {
@@ -666,6 +754,26 @@ pub async fn watch_with_shadow(
             if !frames.is_empty() {
                 tracing::debug!("{}: Final shadow copy: {} frames", state.name, frames.len());
             }
+        }
+    }
+
+    // Shutdown uploaders (drain in-flight uploads)
+    for (db_path, (_, upload_tx)) in cache_states.iter() {
+        let name = db_states.get(db_path).map(|s| s.name.as_str()).unwrap_or("unknown");
+        tracing::debug!("{}: Sending shutdown to uploader", name);
+        if let Err(e) = upload_tx.send(UploadMessage::Shutdown).await {
+            tracing::error!("{}: Failed to send shutdown to uploader: {}", name, e);
+        }
+    }
+
+    // Wait for uploaders to finish draining (with timeout)
+    let drain_timeout = Duration::from_secs(10);
+    for (db_path, handle) in uploader_handles {
+        let name = db_states.get(&db_path).map(|s| s.name.as_str()).unwrap_or("unknown");
+        match tokio::time::timeout(drain_timeout, handle).await {
+            Ok(Ok(())) => tracing::debug!("{}: Uploader drained successfully", name),
+            Ok(Err(e)) => tracing::error!("{}: Uploader task panicked: {}", name, e),
+            Err(_) => tracing::warn!("{}: Uploader drain timed out after {:?}", name, drain_timeout),
         }
     }
 
