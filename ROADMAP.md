@@ -12,7 +12,7 @@ Core differentiators:
 
 ---
 
-## Current Capabilities (v0.5.1)
+## Current Capabilities (v0.6.0)
 
 **Core features that work:**
 - `walrust watch` - Watch and sync multiple databases
@@ -31,7 +31,8 @@ Core differentiators:
 - Webhook notifications (corruption, circuit breaker)
 - Retry logic with circuit breaker
 - Shadow WAL mode
-- Constant RSS regardless of write throughput (~20MB with streaming + mimalloc)
+- Constant RSS regardless of write throughput (~23-31MB with streaming + mimalloc)
+- Shared infrastructure via hadb-io (S3, retry, webhooks, retention)
 
 ---
 
@@ -54,6 +55,10 @@ Core differentiators:
 ---
 
 ## Completed Features (see CHANGELOG.md)
+
+**v0.7.0 (unreleased):**
+- Migrated to hadb-io for shared S3/retry/webhook/retention infrastructure (~4,275 lines deleted)
+- README rewritten with architecture diagrams, simplified config, read replica docs
 
 **v0.6.0:**
 - Concurrent S3 uploads via JoinSet (max_concurrent configurable, default 4)
