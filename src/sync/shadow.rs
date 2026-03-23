@@ -135,11 +135,16 @@ pub(crate) async fn sync_shadow_concurrent(
     let unique_pages = pages.len();
     let estimated_size = unique_pages.saturating_mul(input.page_size as usize).saturating_mul(2);
     let page_size = input.page_size;
-    let db_path_for_checksum = input.db_path.clone();
-    let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
-        // Compute expected post_checksum by simulating changes against current DB
-        let expected_post = ltx::compute_expected_post_checksum(&db_path_for_checksum, page_size, &pages)?;
 
+    // Chained page checksum: O(changed pages), no disk read
+    let expected_post = if let Some(pre) = pre_checksum {
+        ltx::chain_checksum(pre, &pages)
+    } else {
+        // First sync — no pre_checksum yet, compute from file
+        ltx::compute_checksum_from_file(&input.db_path)?
+    };
+
+    let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
         let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,

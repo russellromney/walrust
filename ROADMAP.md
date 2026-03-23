@@ -5,7 +5,7 @@
 **Simple, reliable SQLite backups to S3 with integrity verification.**
 
 Core differentiators:
-- LTX format (Litestream-compatible) with SHA256 verification
+- LTX format with SHA256 verification
 - Lower memory footprint than Litestream
 - Built for production: verify, explain, webhook alerting
 - Honest about what works (no vaporware)
@@ -23,14 +23,34 @@ Core differentiators:
 - `walrust replicate` - Poll-based read replica
 - `walrust explain` - Configuration preview with cost estimation
 - `walrust verify` - Backup integrity verification with exit codes
-- LTX format (Litestream-compatible)
+- LTX format with SHA256 verification
 - Point-in-time restore (by TXID or timestamp)
 - Multi-database support
 - Prometheus metrics + dashboard
 - Webhook notifications (corruption, circuit breaker)
 - Retry logic with circuit breaker
 - Shadow WAL mode
-- 346 tests passing, 0 ignored
+
+---
+
+## v0.5.0 — Chained Checksums + Performance
+
+The #1 bottleneck: `compute_expected_post_with_overlay()` reads the entire database from disk and SHA-256 hashes it on every sync cycle (default: 1 second). For a 50MB DB, that's ~100MB I/O per second just for checksumming.
+
+### Chained page checksums
+- Switch incremental LTX checksums from full-DB hash to chained page hash
+- `post_checksum = SHA-256(pre_checksum || page1_num || page1_data || ...)` — pages sorted by number
+- Snapshots keep full-DB hash (data already in memory)
+- Eliminates full DB read from hot path entirely
+- Removes `wal_page_overlay` HashMap (only existed for full-DB checksum)
+
+### Page clone elimination
+- Move frame data instead of cloning during dedup (`for frame in frames` not `&frames`)
+- Index-based sorting in `encode_wal_changes()` instead of `pages.to_vec()`
+
+### Result
+- Before: 50MB disk read + 50MB hash = ~100MB I/O per sync cycle
+- After: 10 dirty pages × 4KB = 40KB hash per sync cycle
 
 ---
 
@@ -43,25 +63,15 @@ Core differentiators:
 - Decoupled WAL encoding from S3 uploads
 - Crash recovery
 - Local cache for fast restore
-- **Effort:** ~2 weeks
 
-### Performance Optimization
-- Break the 5K w/s throughput ceiling
-- Achieve 10K+ w/s at 250 databases
-- CPU parallelization
-- Batch S3 uploads
-- **Effort:** ~1 week
-
-### Read Replicas
+### Push-Based Read Replicas
 - Push-based replication (requires network)
 - Lower latency than polling
-- **Effort:** ~3 days
 
 ### Additional Features
 - Multi-region replication
 - Encryption at rest
-- Python API expansion
-- Dashboard improvements
+- Concurrent S3 uploads in uploader
 
 **Philosophy:** Ship working features, not roadmaps. Only add features when users ask for them.
 

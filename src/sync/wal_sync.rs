@@ -102,28 +102,17 @@ pub(crate) async fn sync_wal_concurrent(
     // Track state changes locally
     let mut wal_offset = input.wal_offset;
     let mut wal_generation = input.wal_generation;
-    let mut db_checksum = input.db_checksum;
+    let db_checksum = input.db_checksum;
     let mut checkpoint_detected = false;
 
     // Check if WAL was reset (checkpoint happened)
     let current_size = wal::get_wal_size(&input.wal_path).await?;
     if current_size < wal_offset {
-        // WAL was truncated, start fresh and recompute checksum
         tracing::info!("{}: WAL checkpoint detected, resetting offset", input.name);
         wal_offset = 0;
         wal_generation += 1;
         checkpoint_detected = true;
-
-        // Recompute checksum from current database state after checkpoint
-        match ltx::compute_checksum_from_file(&input.db_path) {
-            Ok(cs) => {
-                db_checksum = Some(cs.into_inner());
-                tracing::debug!("{}: Recomputed checksum after checkpoint: {:#x}", input.name, cs.into_inner());
-            }
-            Err(e) => {
-                tracing::warn!("{}: Could not recompute checksum: {}", input.name, e);
-            }
-        }
+        // Chain continues through checkpoints — no need to recompute from file
     }
 
     // Read WAL frames as parsed pages
@@ -142,18 +131,14 @@ pub(crate) async fn sync_wal_concurrent(
         });
     }
 
-    // Deduplicate pages: keep only the latest version of each page
+    // Deduplicate pages (move, not clone)
+    let frame_count = frames.len();
     let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
-    for frame in &frames {
-        page_map.insert(frame.page_number, frame.data.clone());
+    for frame in frames {
+        page_map.insert(frame.page_number, frame.data);
     }
 
-    let frame_count = frames.len();
     let page_size = header.page_size;
-
-    // At this point, current_txid > 0 (initial sync handled earlier)
-    // Incremental sync
-    // Convert to format expected by encode_wal_changes
     let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
 
     // Get pre_apply_checksum from state or compute from db
@@ -173,17 +158,15 @@ pub(crate) async fn sync_wal_concurrent(
         (db_size / page_size as u64) as u32
     };
 
+    // Chained page checksum: O(changed pages), no disk read
+    let expected_post = ltx::chain_checksum(pre_checksum, &pages);
+
     // Encode as incremental LTX (CPU-bound, run in blocking thread pool)
-    // Pre-allocate buffer: estimate 2x pages * page_size for compression headroom
     let unique_pages = pages.len();
     let estimated_size = unique_pages.saturating_mul(page_size as usize).saturating_mul(2);
     let db_name_for_error = input.name.clone();
     let page_nums: Vec<u32> = pages.iter().map(|(n, _)| *n).collect();
-    let db_path_for_checksum = input.db_path.clone();
     let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
-        // Compute expected post_checksum by simulating changes against current DB
-        let expected_post = ltx::compute_expected_post_checksum(&db_path_for_checksum, page_size, &pages)?;
-
         let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,
@@ -444,21 +427,8 @@ pub(crate) async fn sync_wal_to_cache(
     let checkpoint_detected = shadow_gen > input.wal_generation;
     let wal_generation = shadow_gen;
 
-    // Recompute checksum if checkpoint occurred
-    let db_checksum = if checkpoint_detected {
-        match ltx::compute_checksum_from_file(&input.db_path) {
-            Ok(cs) => {
-                tracing::debug!("{}: Recomputed checksum after checkpoint: {:#x}", input.name, cs.into_inner());
-                Some(cs.into_inner())
-            }
-            Err(e) => {
-                tracing::warn!("{}: Could not recompute checksum: {}", input.name, e);
-                input.db_checksum
-            }
-        }
-    } else {
-        input.db_checksum
-    };
+    // Chain continues through checkpoints — no need to recompute from file
+    let db_checksum = input.db_checksum;
 
     drop(shadow_guard); // Release lock before CPU-bound encoding
 
@@ -477,13 +447,13 @@ pub(crate) async fn sync_wal_to_cache(
         });
     }
 
-    // Deduplicate pages: keep only the latest version of each page
+    // Deduplicate pages (move, not clone)
+    let frame_count = frames.len();
     let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
-    for frame in &frames {
-        page_map.insert(frame.page_number, frame.data.clone());
+    for frame in frames {
+        page_map.insert(frame.page_number, frame.data);
     }
 
-    let frame_count = frames.len();
     let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
 
     // Get pre_apply_checksum from state or compute from db
@@ -503,17 +473,16 @@ pub(crate) async fn sync_wal_to_cache(
         (db_size / page_size as u64) as u32
     };
 
+    // Chained page checksum: O(changed pages), no disk read
+    let expected_post = ltx::chain_checksum(pre_checksum, &pages);
+
     // Encode as incremental LTX
     let unique_pages = pages.len();
     let estimated_size = unique_pages.saturating_mul(page_size as usize).saturating_mul(2);
     let db_name_for_error = input.name.clone();
     let page_nums: Vec<u32> = pages.iter().map(|(n, _)| *n).collect();
-    let db_path_for_checksum = input.db_path.clone();
 
     let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
-        // Compute expected post_checksum by simulating changes against current DB
-        let expected_post = ltx::compute_expected_post_checksum(&db_path_for_checksum, page_size, &pages)?;
-
         let mut ltx_buffer = Vec::with_capacity(estimated_size);
         let post_checksum = ltx::encode_wal_changes(
             &mut ltx_buffer,

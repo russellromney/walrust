@@ -69,13 +69,8 @@ pub struct SyncState {
     pub current_txid: u64,
     /// Last snapshot time
     pub last_snapshot: Option<chrono::DateTime<Utc>>,
-    /// Current database checksum
+    /// Current database checksum (chained page hash for incrementals, full-DB hash after snapshots)
     pub db_checksum: Option<u64>,
-    /// Pages synced from WAL but not yet checkpointed to the DB file.
-    /// In WAL mode, the main DB file is only updated during checkpoint.
-    /// Between checkpoints, this overlay tracks what the DB "should" look like
-    /// so we can compute correct expected_post checksums for LTX encoding.
-    pub wal_page_overlay: HashMap<u32, Vec<u8>>,
 }
 
 impl SyncState {
@@ -96,7 +91,6 @@ impl SyncState {
             current_txid: 0,
             last_snapshot: None,
             db_checksum: None,
-            wal_page_overlay: HashMap::new(),
         })
     }
 
@@ -375,17 +369,7 @@ pub async fn sync_wal(
         tracing::info!("{}: WAL checkpoint detected, resetting offset", state.name);
         state.wal_offset = 0;
         state.wal_generation += 1;
-        // Checkpoint wrote all WAL pages to the DB file, so overlay is now stale
-        state.wal_page_overlay.clear();
-
-        match ltx::compute_checksum_from_file(&state.db_path) {
-            Ok(cs) => {
-                state.db_checksum = Some(cs.into_inner());
-            }
-            Err(e) => {
-                tracing::warn!("{}: Could not recompute checksum: {}", state.name, e);
-            }
-        }
+        // Chain continues through checkpoints — no need to recompute from file
     }
 
     let (frames, new_offset, max_db_size) =
@@ -395,14 +379,14 @@ pub async fn sync_wal(
         return Ok(0);
     }
 
-    // Deduplicate pages
+    // Deduplicate pages (move, not clone)
+    let frame_count = frames.len();
     let mut page_map: HashMap<u32, Vec<u8>> = HashMap::new();
-    for frame in &frames {
-        page_map.insert(frame.page_number, frame.data.clone());
+    for frame in frames {
+        page_map.insert(frame.page_number, frame.data);
     }
 
     let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
-    let frame_count = frames.len();
 
     let pre_checksum = match state.db_checksum {
         Some(cs) => Checksum::new(cs),
@@ -423,15 +407,8 @@ pub async fn sync_wal(
         .saturating_mul(header.page_size as usize)
         .saturating_mul(2);
 
-    // Compute expected_post using the page overlay to account for previously
-    // synced but un-checkpointed WAL pages. Without this, the DB file on disk
-    // is stale (only updated at checkpoint) and produces wrong checksums.
-    let expected_post = compute_expected_post_with_overlay(
-        &state.db_path,
-        header.page_size,
-        &state.wal_page_overlay,
-        &pages,
-    )?;
+    // Chained page checksum: O(changed pages), no disk read
+    let expected_post = ltx::chain_checksum(pre_checksum, &pages);
 
     let mut ltx_buffer = Vec::with_capacity(estimated_size);
     let post_checksum = ltx::encode_wal_changes(
@@ -459,11 +436,6 @@ pub async fn sync_wal(
         max_txid,
         ltx_key
     );
-
-    // Update overlay with newly synced pages
-    for (page_num, page_data) in &pages {
-        state.wal_page_overlay.insert(*page_num, page_data.clone());
-    }
 
     state.wal_offset = new_offset;
     state.current_txid = max_txid;
@@ -506,9 +478,6 @@ pub async fn take_snapshot(
     state.current_txid = new_txid;
     state.last_snapshot = Some(timestamp);
     state.db_checksum = Some(db_checksum.into_inner());
-    // Snapshot reads the DB file directly, so overlay is relative to current DB file state.
-    // Clear it since the snapshot checksum was computed from the raw DB file.
-    state.wal_page_overlay.clear();
 
     Ok(())
 }
@@ -559,10 +528,9 @@ pub async fn restore(
 
     let mut restored_txid = snapshot.max_txid;
 
-    // Apply incrementals in order. If an incremental's pre_apply checksum
-    // doesn't match the current DB state, it's from a previous lineage
-    // (e.g., a prior leader). Stop applying — the snapshot is the latest
-    // consistent state.
+    // Apply incrementals in order. If an incremental's checksum chain doesn't
+    // match, it's from a previous lineage (e.g., a prior leader). Stop applying —
+    // the snapshot is the latest consistent state.
     for inc in &incrementals {
         let data = storage.download_bytes(&inc.key).await?;
         match ltx::apply_ltx_to_db(Cursor::new(data), output) {
@@ -573,7 +541,7 @@ pub async fn restore(
                 );
                 restored_txid = inc.max_txid;
             }
-            Err(e) if e.to_string().contains("Checksum chain broken") => {
+            Err(e) if e.to_string().contains("checksum mismatch") || e.to_string().contains("Checksum chain broken") => {
                 tracing::info!(
                     "Skipping {} stale incrementals from previous lineage (TXID {}+)",
                     incrementals.len() - incrementals.iter().position(|f| f.key == inc.key).unwrap_or(0),
@@ -634,7 +602,6 @@ pub async fn take_snapshot_with_retry(
     state.current_txid = new_txid;
     state.last_snapshot = Some(timestamp);
     state.db_checksum = Some(db_checksum.into_inner());
-    state.wal_page_overlay.clear();
 
     Ok(())
 }
@@ -658,16 +625,7 @@ pub async fn sync_wal_with_retry(
         tracing::info!("{}: WAL checkpoint detected, resetting offset", state.name);
         state.wal_offset = 0;
         state.wal_generation += 1;
-        state.wal_page_overlay.clear();
-
-        match ltx::compute_checksum_from_file(&state.db_path) {
-            Ok(cs) => {
-                state.db_checksum = Some(cs.into_inner());
-            }
-            Err(e) => {
-                tracing::warn!("{}: Could not recompute checksum: {}", state.name, e);
-            }
-        }
+        // Chain continues through checkpoints — no need to recompute from file
     }
 
     let (frames, new_offset, max_db_size) =
@@ -677,13 +635,14 @@ pub async fn sync_wal_with_retry(
         return Ok(0);
     }
 
+    // Deduplicate pages (move, not clone)
+    let frame_count = frames.len();
     let mut page_map: HashMap<u32, Vec<u8>> = HashMap::new();
-    for frame in &frames {
-        page_map.insert(frame.page_number, frame.data.clone());
+    for frame in frames {
+        page_map.insert(frame.page_number, frame.data);
     }
 
     let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
-    let frame_count = frames.len();
 
     let pre_checksum = match state.db_checksum {
         Some(cs) => Checksum::new(cs),
@@ -703,12 +662,9 @@ pub async fn sync_wal_with_retry(
         .len()
         .saturating_mul(header.page_size as usize)
         .saturating_mul(2);
-    let expected_post = compute_expected_post_with_overlay(
-        &state.db_path,
-        header.page_size,
-        &state.wal_page_overlay,
-        &pages,
-    )?;
+
+    // Chained page checksum: O(changed pages), no disk read
+    let expected_post = ltx::chain_checksum(pre_checksum, &pages);
 
     let mut ltx_buffer = Vec::with_capacity(estimated_size);
     let post_checksum = ltx::encode_wal_changes(
@@ -745,10 +701,6 @@ pub async fn sync_wal_with_retry(
         ltx_key
     );
 
-    for (page_num, page_data) in &pages {
-        state.wal_page_overlay.insert(*page_num, page_data.clone());
-    }
-
     state.wal_offset = new_offset;
     state.current_txid = max_txid;
     state.db_checksum = Some(post_checksum.into_inner());
@@ -756,48 +708,6 @@ pub async fn sync_wal_with_retry(
     save_state(storage, prefix, state).await?;
 
     Ok(frame_count as u64)
-}
-
-// ============================================================================
-// Internal helpers
-// ============================================================================
-
-/// Compute expected post-apply checksum accounting for previously synced
-/// but un-checkpointed WAL pages.
-///
-/// In WAL mode, the main DB file is only updated during checkpoint. Between
-/// checkpoints, `wal_page_overlay` tracks pages we've already synced to S3.
-/// Without this overlay, `compute_expected_post_checksum` reads the stale DB
-/// file and produces wrong checksums on the 2nd+ sync cycle.
-fn compute_expected_post_with_overlay(
-    db_path: &Path,
-    page_size: u32,
-    overlay: &HashMap<u32, Vec<u8>>,
-    new_pages: &[(u32, Vec<u8>)],
-) -> Result<litepages::Checksum> {
-    let mut db_data = std::fs::read(db_path)?;
-
-    // First, apply the overlay (previously synced but un-checkpointed pages)
-    for (page_num, page_data) in overlay {
-        let offset = (*page_num as usize - 1) * page_size as usize;
-        let end = offset + page_size as usize;
-        if end > db_data.len() {
-            db_data.resize(end, 0);
-        }
-        db_data[offset..end].copy_from_slice(page_data);
-    }
-
-    // Then, apply the new pages from this sync cycle
-    for (page_num, page_data) in new_pages {
-        let offset = (*page_num as usize - 1) * page_size as usize;
-        let end = offset + page_size as usize;
-        if end > db_data.len() {
-            db_data.resize(end, 0);
-        }
-        db_data[offset..end].copy_from_slice(page_data);
-    }
-
-    Ok(ltx::compute_db_checksum(&db_data))
 }
 
 // ============================================================================

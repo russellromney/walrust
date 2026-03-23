@@ -133,9 +133,10 @@ pub struct ApplyResult {
 
 /// Apply an incremental LTX file to an existing database (in-place page writes)
 ///
-/// This verifies the checksum chain:
-/// 1. Before applying: verifies pre_apply_checksum matches current DB state
-/// 2. After applying: verifies post_apply_checksum matches new DB state
+/// This verifies the checksum chain using chained page checksums:
+/// 1. After applying: verifies post_apply_checksum matches chain_checksum(pre, decoded_pages)
+///
+/// No full-DB read is needed for verification — the chain is self-contained.
 ///
 /// Checksum verification is skipped when the NO_CHECKSUM flag is set (litestream compatibility).
 ///
@@ -155,25 +156,6 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
         );
     }
 
-    // Verify pre_apply_checksum matches current DB state (for incrementals)
-    if !skip_checksums {
-        if let Some(expected_pre) = header.pre_apply_checksum {
-            let actual_pre = compute_checksum_from_file(db_path)?;
-            if expected_pre != actual_pre {
-                return Err(anyhow!(
-                    "Checksum chain broken: expected pre_apply {:016x}, got {:016x}. \
-                     This may indicate missing or out-of-order LTX files.",
-                    expected_pre.into_inner(),
-                    actual_pre.into_inner()
-                ));
-            }
-            tracing::debug!(
-                "Pre-apply checksum verified: {:016x}",
-                expected_pre.into_inner()
-            );
-        }
-    }
-
     let page_size = header.page_size.into_inner() as usize;
     let mut page_buf = vec![0u8; page_size];
 
@@ -183,13 +165,14 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
         .open(db_path)
         .map_err(|e| anyhow!("Failed to open database for in-place apply: {}", e))?;
 
-    let mut pages_applied = 0u32;
+    // Collect decoded pages for chain checksum verification
+    let mut decoded_pages: Vec<(u32, Vec<u8>)> = Vec::new();
 
     while let Some(page_num) = decoder.decode_page(&mut page_buf)? {
         let offset = (page_num.into_inner() as u64 - 1) * page_size as u64;
         file.seek(SeekFrom::Start(offset))?;
         file.write_all(&page_buf)?;
-        pages_applied += 1;
+        decoded_pages.push((page_num.into_inner(), page_buf.clone()));
     }
 
     // Ensure all writes are flushed
@@ -199,35 +182,51 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
     // Verify file checksum (internal integrity)
     let trailer = decoder.finish()?;
 
-    // Compute actual checksum from database
-    let actual_post = compute_checksum_from_file(db_path)?;
-
-    // Verify post_apply_checksum matches actual DB state (skip if NO_CHECKSUM)
-    if !skip_checksums {
-        if trailer.post_apply_checksum != actual_post {
-            return Err(anyhow!(
-                "Post-apply checksum mismatch: expected {:016x}, got {:016x}. \
-                 This may indicate corruption during apply.",
-                trailer.post_apply_checksum.into_inner(),
-                actual_post.into_inner()
-            ));
+    // Verify checksums using chained page hash (skip if NO_CHECKSUM)
+    let post_checksum = if !skip_checksums {
+        if let Some(expected_pre) = header.pre_apply_checksum {
+            tracing::debug!(
+                "Pre-apply checksum: {:016x}",
+                expected_pre.into_inner()
+            );
         }
-        tracing::debug!(
-            "Post-apply checksum verified: {:016x}",
-            actual_post.into_inner()
-        );
-    }
+
+        if let Some(pre) = header.pre_apply_checksum {
+            let expected_post = chain_checksum(pre, &decoded_pages);
+            if trailer.post_apply_checksum != expected_post {
+                return Err(anyhow!(
+                    "Post-apply checksum mismatch: expected {:016x}, got {:016x}. \
+                     This may indicate corruption during apply.",
+                    trailer.post_apply_checksum.into_inner(),
+                    expected_post.into_inner()
+                ));
+            }
+            tracing::debug!(
+                "Post-apply checksum verified (chain): {:016x}",
+                expected_post.into_inner()
+            );
+            expected_post
+        } else {
+            trailer.post_apply_checksum
+        }
+    } else {
+        if let Some(pre) = header.pre_apply_checksum {
+            chain_checksum(pre, &decoded_pages)
+        } else {
+            compute_checksum_from_file(db_path)?
+        }
+    };
 
     tracing::debug!(
         "Applied {} pages in-place (TXID {}-{})",
-        pages_applied,
+        decoded_pages.len(),
         header.min_txid.into_inner(),
         header.max_txid.into_inner()
     );
 
     Ok(ApplyResult {
         header,
-        post_apply_checksum: actual_post,
+        post_apply_checksum: post_checksum,
     })
 }
 
@@ -267,13 +266,13 @@ pub fn encode_wal_changes<W: Write>(
 
     let mut encoder = Encoder::new(writer, &header)?;
 
-    // Sort pages by page number and encode
-    let mut sorted_pages = pages.to_vec();
-    sorted_pages.sort_by_key(|(num, _)| *num);
+    // Sort by index to avoid cloning all page data
+    let mut indices: Vec<usize> = (0..pages.len()).collect();
+    indices.sort_by_key(|&i| pages[i].0);
 
-    for (page_num, data) in &sorted_pages {
-        let pn = PageNum::new(*page_num).map_err(|e| anyhow!("Invalid page num: {}", e))?;
-        encoder.encode_page(pn, data)?;
+    for &i in &indices {
+        let pn = PageNum::new(pages[i].0).map_err(|e| anyhow!("Invalid page num: {}", e))?;
+        encoder.encode_page(pn, &pages[i].1)?;
     }
 
     let trailer = encoder.finish(post_checksum)?;
@@ -281,29 +280,25 @@ pub fn encode_wal_changes<W: Write>(
     Ok(trailer.post_apply_checksum)
 }
 
-/// Compute what a database checksum would be after applying page changes
+/// Chained page checksum: O(changed pages), not O(entire DB).
 ///
-/// Used by callers of encode_wal_changes to compute the expected post_checksum
-pub fn compute_expected_post_checksum(
-    db_path: &Path,
-    page_size: u32,
-    pages: &[(u32, Vec<u8>)],
-) -> Result<Checksum> {
-    // Read current database
-    let mut db_data = std::fs::read(db_path)?;
+/// Computes `SHA-256(pre_checksum_bytes || page1_num_be || page1_data || page2_num_be || page2_data || ...)`
+/// with pages sorted by page number for determinism.
+pub fn chain_checksum(pre: Checksum, pages: &[(u32, Vec<u8>)]) -> Checksum {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(pre.into_inner().to_be_bytes());
 
-    // Apply changes in memory
-    for (page_num, page_data) in pages {
-        let offset = (*page_num as usize - 1) * page_size as usize;
-        let end = offset + page_size as usize;
-        if end > db_data.len() {
-            // Extend database if needed
-            db_data.resize(end, 0);
-        }
-        db_data[offset..end].copy_from_slice(page_data);
+    let mut sorted_indices: Vec<usize> = (0..pages.len()).collect();
+    sorted_indices.sort_by_key(|&i| pages[i].0);
+
+    for &i in &sorted_indices {
+        hasher.update(pages[i].0.to_be_bytes());
+        hasher.update(&pages[i].1);
     }
 
-    Ok(compute_db_checksum(&db_data))
+    let result = hasher.finalize();
+    Checksum::new(u64::from_be_bytes(result[0..8].try_into().unwrap()))
 }
 
 /// Verify an LTX file by decoding all pages and checking the checksum
@@ -699,7 +694,7 @@ mod tests {
         let pre_checksum = compute_checksum_from_file(&db_path).unwrap();
 
         // Compute expected post_checksum after applying changes
-        let expected_post = compute_expected_post_checksum(&db_path, page_size, &pages).unwrap();
+        let expected_post = chain_checksum(pre_checksum, &pages);
 
         let mut ltx_buffer = Vec::new();
         encode_wal_changes(
@@ -762,7 +757,7 @@ mod tests {
         let pre_checksum = compute_checksum_from_file(&db_path).unwrap();
 
         // Compute expected post_checksum after applying changes
-        let expected_post = compute_expected_post_checksum(&db_path, page_size, &pages).unwrap();
+        let expected_post = chain_checksum(pre_checksum, &pages);
 
         let mut ltx_buffer = Vec::new();
         encode_wal_changes(&mut ltx_buffer, &pages, page_size, 10, 11, 4, Some(pre_checksum), expected_post).unwrap();
@@ -823,12 +818,10 @@ mod tests {
         // First incremental: update page 1 (TXID 2)
         let pre_checksum1 = compute_checksum_from_file(&db_path).unwrap();
         let pages1: Vec<(u32, Vec<u8>)> = vec![(1, vec![0xAA; page_size as usize])];
-
-        // Compute expected post_checksum after applying changes
-        let expected_post1 = compute_expected_post_checksum(&db_path, page_size, &pages1).unwrap();
+        let expected_post1 = chain_checksum(pre_checksum1, &pages1);
 
         let mut inc1_buffer = Vec::new();
-        let _post_checksum1 = encode_wal_changes(
+        let post_checksum1 = encode_wal_changes(
             &mut inc1_buffer,
             &pages1,
             page_size,
@@ -840,19 +833,14 @@ mod tests {
 
         // Apply first incremental
         let cursor1 = std::io::Cursor::new(inc1_buffer);
-        apply_ltx_to_db(cursor1, &db_path).unwrap();
+        let result1 = apply_ltx_to_db(cursor1, &db_path).unwrap();
 
-        // Verify checksum after apply matches post_apply_checksum
-        // (This is how the chain works - each file's post becomes next file's pre)
-        let current_checksum = compute_checksum_from_file(&db_path).unwrap();
+        // Chain continues: post_checksum1 becomes pre_checksum2
+        let pre_checksum2 = result1.post_apply_checksum;
 
         // Second incremental: update page 2 (TXID 3)
-        // pre_checksum should be current db state (which equals post_checksum1 conceptually)
-        let pre_checksum2 = current_checksum;
         let pages2: Vec<(u32, Vec<u8>)> = vec![(2, vec![0xBB; page_size as usize])];
-
-        // Compute expected post_checksum after applying changes
-        let expected_post2 = compute_expected_post_checksum(&db_path, page_size, &pages2).unwrap();
+        let expected_post2 = chain_checksum(pre_checksum2, &pages2);
 
         let mut inc2_buffer = Vec::new();
         encode_wal_changes(
@@ -881,25 +869,20 @@ mod tests {
     // ============================================
 
     #[test]
-    fn test_apply_ltx_pre_checksum_mismatch() {
-        // Test that apply_ltx_to_db rejects incremental when pre_checksum doesn't match DB state
+    fn test_apply_ltx_post_checksum_mismatch_via_wrong_pre() {
+        // With chained checksums, a wrong pre produces a self-consistent but different chain.
+        // The LTX is internally consistent, so apply succeeds. Chain breaks are detected
+        // at the file-linking level (previous file's post != this file's pre).
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let page_size = 4096u32;
 
-        // Create initial database (3 pages)
         let initial_data = vec![0x00u8; page_size as usize * 3];
         std::fs::write(&db_path, &initial_data).unwrap();
 
-        // Get actual checksum
-        let actual_checksum = compute_checksum_from_file(&db_path).unwrap();
-
-        // Create incremental with WRONG pre_checksum
         let pages: Vec<(u32, Vec<u8>)> = vec![(1, vec![0xAA; page_size as usize])];
-        let wrong_pre_checksum = Checksum::new(0xDEADBEEF); // Wrong!
-
-        // Compute correct post_checksum
-        let expected_post = compute_expected_post_checksum(&db_path, page_size, &pages).unwrap();
+        let wrong_pre_checksum = Checksum::new(0xDEADBEEF);
+        let wrong_post = chain_checksum(wrong_pre_checksum, &pages);
 
         let mut ltx_buffer = Vec::new();
         encode_wal_changes(
@@ -909,22 +892,13 @@ mod tests {
             2, 2,
             3,
             Some(wrong_pre_checksum),
-            expected_post,
+            wrong_post,
         ).unwrap();
 
-        // Applying should FAIL with checksum mismatch
+        // Self-consistent LTX applies successfully
         let cursor = std::io::Cursor::new(ltx_buffer);
         let result = apply_ltx_to_db(cursor, &db_path);
-
-        assert!(result.is_err(), "Should reject incremental with wrong pre_checksum");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Checksum chain broken"), "Error should mention broken chain: {}", err_msg);
-        assert!(err_msg.contains(&format!("{:016x}", wrong_pre_checksum.into_inner())), "Error should show expected checksum");
-        assert!(err_msg.contains(&format!("{:016x}", actual_checksum.into_inner())), "Error should show actual checksum");
-
-        // Database should be unchanged
-        let unchanged_data = std::fs::read(&db_path).unwrap();
-        assert_eq!(unchanged_data, initial_data, "DB should be unchanged after failed apply");
+        assert!(result.is_ok(), "Self-consistent LTX should apply successfully");
     }
 
     #[test]
@@ -969,60 +943,58 @@ mod tests {
 
     #[test]
     fn test_apply_ltx_out_of_order() {
-        // Test that applying incrementals out of order fails due to checksum mismatch
+        // With chained checksums, apply_ltx_to_db only verifies internal consistency
+        // (chain_checksum(pre, pages) == post). A self-consistent LTX applies successfully
+        // even to the "wrong" DB state. Out-of-order detection is the caller's job:
+        // each file's pre_checksum must equal the previous file's post_checksum.
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let page_size = 4096u32;
 
-        // Create initial database
         let initial_data = vec![0x00u8; page_size as usize * 3];
         std::fs::write(&db_path, &initial_data).unwrap();
 
         let checksum0 = compute_checksum_from_file(&db_path).unwrap();
 
-        // Create first incremental: modify page 1
+        // Create three chained incrementals
         let pages1: Vec<(u32, Vec<u8>)> = vec![(1, vec![0xAA; page_size as usize])];
-        let expected_post1 = compute_expected_post_checksum(&db_path, page_size, &pages1).unwrap();
-
+        let post1 = chain_checksum(checksum0, &pages1);
         let mut buf1 = Vec::new();
-        encode_wal_changes(&mut buf1, &pages1, page_size, 2, 2, 3, Some(checksum0), expected_post1).unwrap();
+        encode_wal_changes(&mut buf1, &pages1, page_size, 2, 2, 3, Some(checksum0), post1).unwrap();
 
-        // Apply first incremental
-        let cursor1 = std::io::Cursor::new(&buf1);
-        apply_ltx_to_db(cursor1, &db_path).unwrap();
-
-        let checksum1 = compute_checksum_from_file(&db_path).unwrap();
-
-        // Create second incremental: modify page 2
         let pages2: Vec<(u32, Vec<u8>)> = vec![(2, vec![0xBB; page_size as usize])];
-        let expected_post2 = compute_expected_post_checksum(&db_path, page_size, &pages2).unwrap();
-
+        let post2 = chain_checksum(post1, &pages2);
         let mut buf2 = Vec::new();
-        encode_wal_changes(&mut buf2, &pages2, page_size, 3, 3, 3, Some(checksum1), expected_post2).unwrap();
-
-        // Create third incremental: modify page 3
-        let cursor2_temp = std::io::Cursor::new(&buf2);
-        apply_ltx_to_db(cursor2_temp, &db_path).unwrap();
-
-        let checksum2 = compute_checksum_from_file(&db_path).unwrap();
+        encode_wal_changes(&mut buf2, &pages2, page_size, 3, 3, 3, Some(post1), post2).unwrap();
 
         let pages3: Vec<(u32, Vec<u8>)> = vec![(3, vec![0xCC; page_size as usize])];
-        let expected_post3 = compute_expected_post_checksum(&db_path, page_size, &pages3).unwrap();
-
+        let post3 = chain_checksum(post2, &pages3);
         let mut buf3 = Vec::new();
-        encode_wal_changes(&mut buf3, &pages3, page_size, 4, 4, 3, Some(checksum2), expected_post3).unwrap();
+        encode_wal_changes(&mut buf3, &pages3, page_size, 4, 4, 3, Some(post2), post3).unwrap();
 
-        // Now reset DB to initial state and try to apply 3rd incremental (skipping 2nd)
+        // Apply 1st only, then skip 2nd and apply 3rd
+        apply_ltx_to_db(std::io::Cursor::new(&buf1), &db_path).unwrap();
+        let result1 = apply_ltx_to_db(std::io::Cursor::new(&buf1), &db_path).unwrap();
+
+        // 3rd LTX applies successfully (internally self-consistent)
+        let result3 = apply_ltx_to_db(std::io::Cursor::new(&buf3), &db_path).unwrap();
+
+        // But the chain is broken: result1.post != buf3's pre (which is post2)
+        let buf3_pre = result3.header.pre_apply_checksum.unwrap();
+        assert_ne!(
+            result1.post_apply_checksum, buf3_pre,
+            "Chain should be broken when skipping an incremental"
+        );
+
+        // Correct chain: apply all three in order
         std::fs::write(&db_path, &initial_data).unwrap();
-        apply_ltx_to_db(std::io::Cursor::new(&buf1), &db_path).unwrap(); // Apply 1st
+        let r1 = apply_ltx_to_db(std::io::Cursor::new(&buf1), &db_path).unwrap();
+        let r2 = apply_ltx_to_db(std::io::Cursor::new(&buf2), &db_path).unwrap();
+        let r3 = apply_ltx_to_db(std::io::Cursor::new(&buf3), &db_path).unwrap();
 
-        // Try to apply 3rd incremental directly (skipping 2nd) - should FAIL
-        let cursor3 = std::io::Cursor::new(&buf3);
-        let result = apply_ltx_to_db(cursor3, &db_path);
-
-        assert!(result.is_err(), "Should fail when applying incrementals out of order (skipping one)");
-        let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Checksum chain broken"), "Error should mention broken chain: {}", err_msg);
+        // Chain links match
+        assert_eq!(r1.post_apply_checksum.into_inner(), r2.header.pre_apply_checksum.unwrap().into_inner());
+        assert_eq!(r2.post_apply_checksum.into_inner(), r3.header.pre_apply_checksum.unwrap().into_inner());
     }
 
     #[test]
@@ -1185,9 +1157,8 @@ mod tests {
         assert_eq!(&result_data[0..page_size as usize], &vec![0x00u8; page_size as usize][..]);
         assert_eq!(&result_data[2 * page_size as usize..3 * page_size as usize], &vec![0x00u8; page_size as usize][..]);
 
-        // Verify the checksum matches the actual data
-        let expected_checksum = compute_checksum_from_file(&db_path).unwrap();
-        assert_eq!(apply_result.post_apply_checksum.into_inner(), expected_checksum.into_inner());
+        // With NO_CHECKSUM and a zero pre_checksum, the chain checksum is computed
+        assert!(apply_result.post_apply_checksum.into_inner() != 0, "Should compute a chain checksum");
     }
 
     #[test]
