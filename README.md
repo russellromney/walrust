@@ -4,6 +4,8 @@
 
 # walrust
 
+> **Experimental.** walrust is under active development and not yet stable. APIs will change without notice.
+
 **Lightweight SQLite replication to S3 in Rust.**
 
 Walrust continuously replicates SQLite databases to any S3-compatible storage (AWS S3, Tigris, R2, MinIO, etc.), ensuring minimal data loss on server crashes, power failures, or disk corruption.
