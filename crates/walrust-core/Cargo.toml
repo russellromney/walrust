@@ -16,7 +16,7 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # Shared S3/retry/upload infrastructure
-hadb-io = { path = "../../../../hadb/hadb-io" }
+hadb-io = { path = "../../../hadb/hadb-io" }
 
 # LTX format
 litepages = "0.1.0"
