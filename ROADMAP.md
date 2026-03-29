@@ -38,6 +38,21 @@ Core differentiators:
 
 ---
 
+## SnapshotSource trait (turbolite integration)
+
+Pluggable snapshot source for restore/recovery. Instead of downloading an LTX snapshot,
+walrust calls a trait method to materialize the base DB. turbolite implements this using
+S3 page groups as the snapshot.
+
+- [ ] `SnapshotSource` trait in walrust-core with `materialize()` and `checkpoint_version()`
+- [ ] `restore()` accepts optional `SnapshotSource`, falls back to LTX snapshot if absent
+- [ ] `pull_and_apply_incrementals()` works with externally-materialized DB files
+
+## Rename to walsync (future)
+
+walrust is Rust-specific. For cross-language composability (Python/Node/Go SDKs), rename to
+walsync. The Rust crate stays walsync-core, packages are walsync-python, walsync-node, etc.
+
 ## Future Considerations (v1.0+)
 
 **Not planning yet, but might be useful:**
