@@ -548,6 +548,77 @@ pub async fn restore(
     Ok(restored_txid)
 }
 
+/// Restore using an external snapshot source (e.g., turbolite page groups).
+///
+/// Instead of downloading an LTX snapshot from S3, calls `snapshot_source.materialize()`
+/// to produce the base database file. Then applies WAL increments (LTX files) with
+/// txid > the materialized checkpoint version.
+///
+/// This enables composable recovery: turbolite provides the page snapshot,
+/// walrust provides WAL durability. The two layers are independent.
+///
+/// Returns the TXID that was actually restored to (may be higher than the
+/// snapshot version if WAL increments were applied).
+pub async fn restore_with_snapshot_source(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    output: &Path,
+    snapshot_source: &dyn crate::snapshot_source::SnapshotSource,
+) -> Result<u64> {
+    use std::io::Cursor;
+
+    // Step 1: materialize the base DB from the external snapshot source
+    let checkpoint_version = snapshot_source.materialize(output).await?;
+    tracing::info!(
+        "Materialized base DB from snapshot source (checkpoint version {})",
+        checkpoint_version,
+    );
+
+    // Step 2: discover WAL increments newer than the checkpoint version.
+    // The checkpoint version maps to a TXID in walrust's LTX world.
+    // We use it directly as the after_txid for incremental discovery.
+    let incrementals = discover_incrementals_after(
+        storage, prefix, db_name, checkpoint_version,
+    ).await?;
+
+    if incrementals.is_empty() {
+        tracing::info!("No WAL increments to apply (up to date at version {})", checkpoint_version);
+        return Ok(checkpoint_version);
+    }
+
+    tracing::info!(
+        "Applying {} WAL increments after checkpoint version {}",
+        incrementals.len(), checkpoint_version,
+    );
+
+    // Step 3: apply incrementals in order
+    let mut restored_txid = checkpoint_version;
+    for inc in &incrementals {
+        let data = storage.download_bytes(&inc.key).await?;
+        match ltx::apply_ltx_to_db(Cursor::new(data), output) {
+            Ok(result) => {
+                tracing::info!(
+                    "Applied incremental (TXID {}-{}, checksum: {:016x})",
+                    inc.min_txid, inc.max_txid, result.post_apply_checksum.into_inner()
+                );
+                restored_txid = inc.max_txid;
+            }
+            Err(e) if e.to_string().contains("checksum mismatch") || e.to_string().contains("Checksum chain broken") => {
+                tracing::info!(
+                    "Skipping {} stale incrementals from previous lineage (TXID {}+)",
+                    incrementals.len() - incrementals.iter().position(|f| f.key == inc.key).unwrap_or(0),
+                    inc.min_txid,
+                );
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    Ok(restored_txid)
+}
+
 // ============================================================================
 // Retry-wrapped versions
 // ============================================================================

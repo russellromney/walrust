@@ -14,6 +14,7 @@ pub mod errors;
 pub mod ltx;
 pub mod replicator;
 pub mod shadow;
+pub mod snapshot_source;
 pub mod sync;
 pub mod wal;
 
@@ -26,5 +27,6 @@ pub use hadb_io::{RetryConfig, RetryPolicy};
 pub use hadb_io::{CircuitBreaker, CircuitState, ErrorKind, classify_error, is_retryable};
 
 // Re-export walrust-specific types
-pub use sync::{LtxEntry, Manifest, ReplicationConfig, SyncState};
+pub use sync::{LtxEntry, Manifest, ReplicationConfig, SyncState, restore_with_snapshot_source};
 pub use replicator::Replicator;
+pub use snapshot_source::SnapshotSource;
