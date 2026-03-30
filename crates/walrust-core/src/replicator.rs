@@ -170,6 +170,33 @@ impl Replicator {
         Ok(Some(txid))
     }
 
+    /// Flush pending WAL frames for a specific database to S3.
+    ///
+    /// Blocks until the upload completes. Returns the number of frames
+    /// flushed (0 if nothing pending).
+    ///
+    /// This is the same code path that the background `sync_all()` loop uses,
+    /// but triggered on demand for a single named database.
+    pub async fn flush(&self, name: &str) -> Result<u64> {
+        let databases = self.databases.read().await;
+        let db_state = databases
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Database '{}' not registered", name))?
+            .clone();
+        drop(databases); // Release read lock before acquiring db mutex
+
+        let mut state = db_state.lock().await;
+        let prefix = state.prefix.clone();
+        let frame_count = sync::sync_wal(
+            self.storage.as_ref(),
+            &prefix,
+            &mut state.state,
+        )
+        .await?;
+
+        Ok(frame_count)
+    }
+
     /// Number of databases currently being replicated.
     pub async fn database_count(&self) -> usize {
         self.databases.read().await.len()
