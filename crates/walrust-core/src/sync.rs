@@ -15,6 +15,38 @@ use hadb_io::ObjectStore as StorageBackend;
 use hadb_io::RetryPolicy;
 
 // ============================================================================
+// Helpers
+// ============================================================================
+
+/// Extract SQLite's file change counter from WAL page data.
+///
+/// WAL uses 1-based page numbers. Page 0 of the database = page_number 1 in WAL.
+/// The change counter is at offset 24 (4 bytes BE) in the database header (page 0).
+///
+/// Phase Somme: both walrust and turbolite use this counter as their version/txid.
+fn change_counter_from_pages(pages: &[(u32, Vec<u8>)]) -> Option<u64> {
+    pages.iter()
+        .find(|(pn, _)| *pn == 1) // page_number 1 = DB page 0
+        .and_then(|(_, data)| {
+            if data.len() >= 28 {
+                let cc = u32::from_be_bytes([data[24], data[25], data[26], data[27]]) as u64;
+                if cc > 0 { Some(cc) } else { None }
+            } else {
+                None
+            }
+        })
+}
+
+/// Read the file change counter directly from a SQLite database file.
+fn change_counter_from_file(path: &Path) -> Result<u64> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let mut header = [0u8; 28];
+    f.read_exact(&mut header)?;
+    Ok(u32::from_be_bytes([header[24], header[25], header[26], header[27]]) as u64)
+}
+
+// ============================================================================
 // Types
 // ============================================================================
 
@@ -385,8 +417,11 @@ pub async fn sync_wal(
         None => ltx::compute_checksum_from_file(&state.db_path)?,
     };
 
+    // Phase Somme: derive txid from SQLite's file change counter when available.
     let min_txid = state.current_txid + 1;
-    let max_txid = min_txid + pages.len() as u64 - 1;
+    let max_txid = change_counter_from_pages(&pages)
+        .filter(|&cc| cc > state.current_txid)
+        .unwrap_or_else(|| min_txid + pages.len() as u64 - 1);
     let commit_page = if max_db_size > 0 {
         max_db_size
     } else {
@@ -446,7 +481,11 @@ pub async fn take_snapshot(
 ) -> Result<()> {
     let timestamp = Utc::now();
     let page_size = get_page_size(&state.db_path).await?;
-    let new_txid = state.current_txid + 1;
+    // Phase Somme: use file change counter as txid for snapshots.
+    let new_txid = change_counter_from_file(&state.db_path)
+        .ok()
+        .filter(|&cc| cc > state.current_txid)
+        .unwrap_or_else(|| state.current_txid + 1);
     let ltx_key = build_ltx_key(prefix, &state.name, 1, 1, new_txid);
 
     let db_size = std::fs::metadata(&state.db_path)?.len() as usize;
@@ -632,7 +671,11 @@ pub async fn take_snapshot_with_retry(
 ) -> Result<()> {
     let timestamp = Utc::now();
     let page_size = get_page_size(&state.db_path).await?;
-    let new_txid = state.current_txid + 1;
+    // Phase Somme: use file change counter as txid for snapshots.
+    let new_txid = change_counter_from_file(&state.db_path)
+        .ok()
+        .filter(|&cc| cc > state.current_txid)
+        .unwrap_or_else(|| state.current_txid + 1);
     let ltx_key = build_ltx_key(prefix, &state.name, 1, 1, new_txid);
 
     let db_size = std::fs::metadata(&state.db_path)?.len() as usize;
@@ -706,8 +749,11 @@ pub async fn sync_wal_with_retry(
         None => ltx::compute_checksum_from_file(&state.db_path)?,
     };
 
+    // Phase Somme: derive txid from SQLite's file change counter when available.
     let min_txid = state.current_txid + 1;
-    let max_txid = min_txid + pages.len() as u64 - 1;
+    let max_txid = change_counter_from_pages(&pages)
+        .filter(|&cc| cc > state.current_txid)
+        .unwrap_or_else(|| min_txid + pages.len() as u64 - 1);
     let commit_page = if max_db_size > 0 {
         max_db_size
     } else {
