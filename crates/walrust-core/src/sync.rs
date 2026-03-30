@@ -417,11 +417,13 @@ pub async fn sync_wal(
         None => ltx::compute_checksum_from_file(&state.db_path)?,
     };
 
-    // Phase Somme: derive txid from SQLite's file change counter when available.
+    // Phase Somme: derive txid from SQLite's file change counter.
+    // SQLite always writes page 0 (change counter) on every commit,
+    // so it must be in the WAL batch. If not, the WAL data is corrupt.
     let min_txid = state.current_txid + 1;
     let max_txid = change_counter_from_pages(&pages)
         .filter(|&cc| cc > state.current_txid)
-        .unwrap_or_else(|| min_txid + pages.len() as u64 - 1);
+        .expect("WAL batch must contain page 0 with file change counter > current_txid");
     let commit_page = if max_db_size > 0 {
         max_db_size
     } else {
@@ -485,7 +487,7 @@ pub async fn take_snapshot(
     let new_txid = change_counter_from_file(&state.db_path)
         .ok()
         .filter(|&cc| cc > state.current_txid)
-        .unwrap_or_else(|| state.current_txid + 1);
+        .expect("DB file must have file change counter > current_txid for snapshot");
     let ltx_key = build_ltx_key(prefix, &state.name, 1, 1, new_txid);
 
     let db_size = std::fs::metadata(&state.db_path)?.len() as usize;
@@ -675,7 +677,7 @@ pub async fn take_snapshot_with_retry(
     let new_txid = change_counter_from_file(&state.db_path)
         .ok()
         .filter(|&cc| cc > state.current_txid)
-        .unwrap_or_else(|| state.current_txid + 1);
+        .expect("DB file must have file change counter > current_txid for snapshot");
     let ltx_key = build_ltx_key(prefix, &state.name, 1, 1, new_txid);
 
     let db_size = std::fs::metadata(&state.db_path)?.len() as usize;
@@ -749,11 +751,11 @@ pub async fn sync_wal_with_retry(
         None => ltx::compute_checksum_from_file(&state.db_path)?,
     };
 
-    // Phase Somme: derive txid from SQLite's file change counter when available.
+    // Phase Somme: derive txid from SQLite's file change counter.
     let min_txid = state.current_txid + 1;
     let max_txid = change_counter_from_pages(&pages)
         .filter(|&cc| cc > state.current_txid)
-        .unwrap_or_else(|| min_txid + pages.len() as u64 - 1);
+        .expect("WAL batch must contain page 0 with file change counter > current_txid");
     let commit_page = if max_db_size > 0 {
         max_db_size
     } else {
