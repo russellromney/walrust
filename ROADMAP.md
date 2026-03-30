@@ -38,6 +38,37 @@ Core differentiators:
 
 ---
 
+## Phase Drain: Synchronous Flush for Graceful Shutdown
+
+> After: v0.7.0 (hadb-io migration) · Before: SnapshotSource trait
+
+`SqliteReplicator::sync()` (haqlite's `Replicator` impl) is currently a no-op. walrust syncs WAL frames to S3 on a background timer (1-2s). There is no "flush now and wait" API. This means `close()` in haqlite cannot guarantee that the last 1-2s of writes are in S3 before releasing the lease.
+
+### Drain-a: Add `flush()` to walrust-core Replicator
+
+Add a synchronous flush method that:
+1. Captures any pending WAL frames since the last background sync
+2. Encodes them as LTX
+3. Uploads to S3 (blocking until PUT completes)
+4. Returns only after S3 has confirmed receipt
+
+This is the internal API. The `shadow::ShadowReplicator` and `sync::SyncReplicator` both need it.
+
+Source: `walrust-core/src/sync.rs` (background sync loop has the encode+upload logic, extract into a callable `flush()`)
+
+### Drain-b: Wire into SqliteReplicator::sync()
+
+`haqlite/src/replicator.rs:69-76` -- replace the no-op with `self.inner.flush().await`. One-line change.
+
+### Drain-c: Tests
+
+- flush() uploads pending frames immediately (not on timer)
+- flush() returns only after S3 PUT succeeds
+- flush() is idempotent (no pending frames = no-op)
+- haqlite close() after flush() has zero data loss
+
+---
+
 ## SnapshotSource trait (turbolite integration)
 
 Pluggable snapshot source for restore/recovery. Instead of downloading an LTX snapshot,
