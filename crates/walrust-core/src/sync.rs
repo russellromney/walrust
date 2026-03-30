@@ -1094,6 +1094,74 @@ pub async fn run_replication(
     Ok(())
 }
 
+/// Run WAL-only replication without taking an initial snapshot.
+///
+/// For use with external snapshot sources (e.g., turbolite page groups).
+/// The caller provides the current checkpoint version as `initial_txid`;
+/// walrust starts syncing WAL frames from that point. No snapshot is taken.
+///
+/// `state.current_txid` is set to `initial_txid` before the loop starts.
+/// `state.db_checksum` must be initialized by the caller if incremental
+/// checksumming is desired (or left as None to compute from file on first sync).
+pub async fn run_wal_replication(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+    initial_txid: u64,
+    config: ReplicationConfig,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    state.current_txid = initial_txid;
+
+    // Initialize checksum from database file if not set
+    if state.db_checksum.is_none() && state.db_path.exists() {
+        state.init_checksum()?;
+    }
+
+    tracing::info!(
+        "{}: Starting WAL-only replication (no initial snapshot, txid={})",
+        state.name, initial_txid,
+    );
+
+    let mut sync_timer = tokio::time::interval(config.sync_interval);
+
+    loop {
+        tokio::select! {
+            _ = cancel.changed() => {
+                if *cancel.borrow() {
+                    match sync_wal(storage, prefix, state).await {
+                        Ok(frames) if frames > 0 => {
+                            tracing::info!("{}: Final sync captured {} frames before shutdown", state.name, frames);
+                        }
+                        Err(e) => {
+                            tracing::warn!("{}: Final sync failed: {}", state.name, e);
+                        }
+                        _ => {}
+                    }
+                    break;
+                }
+            }
+            _ = sync_timer.tick() => {
+                match sync_wal(storage, prefix, state).await {
+                    Ok(frames) => {
+                        if frames > 0 {
+                            tracing::info!(
+                                "{}: Synced {} frames (TXID {})",
+                                state.name, frames, state.current_txid
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("{}: WAL sync failed: {}", state.name, e);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 // ============================================================================
 // Tests
 // ============================================================================

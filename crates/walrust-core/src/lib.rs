@@ -27,6 +27,6 @@ pub use hadb_io::{RetryConfig, RetryPolicy};
 pub use hadb_io::{CircuitBreaker, CircuitState, ErrorKind, classify_error, is_retryable};
 
 // Re-export walrust-specific types
-pub use sync::{LtxEntry, Manifest, ReplicationConfig, SyncState, restore_with_snapshot_source};
+pub use sync::{LtxEntry, Manifest, ReplicationConfig, SyncState, restore_with_snapshot_source, run_wal_replication};
 pub use replicator::Replicator;
 pub use snapshot_source::SnapshotSource;
