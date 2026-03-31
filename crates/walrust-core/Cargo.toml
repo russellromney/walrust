@@ -1,6 +1,6 @@
 [package]
 name = "walrust"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "SQLite WAL sync to S3-compatible storage — continuous replication, point-in-time restore"
 authors = ["Russell Romney <russellromney@gmail.com>"]
