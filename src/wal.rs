@@ -158,7 +158,7 @@ pub async fn read_frames_as_page_map(
     path: &Path,
     page_size: u32,
     start_offset: u64,
-) -> Result<(std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32)> {
+) -> Result<(std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32, u64)> {
     let mut file = File::open(path).await?;
     let file_size = file.metadata().await?.len();
 
@@ -171,7 +171,7 @@ pub async fn read_frames_as_page_map(
     };
 
     if start_pos >= file_size {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0));
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
     }
 
     file.seek(SeekFrom::Start(start_pos)).await?;
@@ -180,11 +180,12 @@ pub async fn read_frames_as_page_map(
     let full_frames = available / frame_size;
 
     if full_frames == 0 {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0));
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
     }
 
     let mut page_map = std::collections::HashMap::new();
     let mut max_db_size: u32 = 0;
+    let mut commit_count: u64 = 0;
     let mut page_data = vec![0u8; page_size as usize];
 
     for _ in 0..full_frames {
@@ -196,6 +197,9 @@ pub async fn read_frames_as_page_map(
 
         file.read_exact(&mut page_data).await?;
 
+        if db_size > 0 {
+            commit_count += 1;
+        }
         if db_size > max_db_size {
             max_db_size = db_size;
         }
@@ -207,7 +211,7 @@ pub async fn read_frames_as_page_map(
 
     let new_offset = start_pos + full_frames * frame_size;
 
-    Ok((page_map, full_frames as usize, new_offset, max_db_size))
+    Ok((page_map, full_frames as usize, new_offset, max_db_size, commit_count))
 }
 
 /// Read and parse WAL frames into pages, returns (pages, new_offset, max_db_size)

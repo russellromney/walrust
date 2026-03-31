@@ -403,7 +403,7 @@ pub async fn sync_wal(
         // Chain continues through checkpoints — no need to recompute from file
     }
 
-    let (page_map, frame_count, new_offset, max_db_size) =
+    let (page_map, frame_count, new_offset, max_db_size, commit_count) =
         wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
 
     if page_map.is_empty() {
@@ -417,13 +417,16 @@ pub async fn sync_wal(
         None => ltx::compute_checksum_from_file(&state.db_path)?,
     };
 
-    // Phase Somme: derive txid from SQLite's file change counter.
-    // SQLite always writes page 0 (change counter) on every commit,
-    // so it must be in the WAL batch. If not, the WAL data is corrupt.
+    // Phase Somme: derive txid from SQLite's file change counter when available.
+    // In rollback journal mode, page 1 is always written with an incremented
+    // change counter. In WAL mode, the change counter is only updated during
+    // checkpoints, so page 1 may be absent or stale. Fall back to the number
+    // of committed transactions in the WAL batch (deterministic: same WAL
+    // bytes = same commit count, regardless of which process reads them).
     let min_txid = state.current_txid + 1;
     let max_txid = change_counter_from_pages(&pages)
         .filter(|&cc| cc > state.current_txid)
-        .expect("WAL batch must contain page 0 with file change counter > current_txid");
+        .unwrap_or(state.current_txid + commit_count.max(1));
     let commit_page = if max_db_size > 0 {
         max_db_size
     } else {
@@ -483,11 +486,21 @@ pub async fn take_snapshot(
 ) -> Result<()> {
     let timestamp = Utc::now();
     let page_size = get_page_size(&state.db_path).await?;
-    // Phase Somme: use file change counter as txid for snapshots.
-    let new_txid = change_counter_from_file(&state.db_path)
-        .ok()
-        .filter(|&cc| cc > state.current_txid)
-        .expect("DB file must have file change counter > current_txid for snapshot");
+    // Phase Somme: use file change counter as txid when available.
+    // In WAL mode, the change counter is only updated during checkpoints,
+    // so it may not have advanced since the last snapshot. Fall back to
+    // file_change_counter + wal_commit_count, which is deterministic: any
+    // process reading the same DB file + WAL computes the same TXID.
+    let cc = change_counter_from_file(&state.db_path).unwrap_or(0);
+    let wal_commits = wal::count_wal_commits(&state.wal_path, page_size).await?;
+    let new_txid = if cc + wal_commits > state.current_txid {
+        cc + wal_commits
+    } else {
+        // No new data since last snapshot (DB file + WAL unchanged).
+        // Use current_txid + 1 as a last resort -- this only happens when
+        // take_snapshot is called on an unmodified database (e.g. CLI ops tests).
+        state.current_txid + 1
+    };
     let ltx_key = build_ltx_key(prefix, &state.name, 1, 1, new_txid);
 
     let db_size = std::fs::metadata(&state.db_path)?.len() as usize;
@@ -673,11 +686,14 @@ pub async fn take_snapshot_with_retry(
 ) -> Result<()> {
     let timestamp = Utc::now();
     let page_size = get_page_size(&state.db_path).await?;
-    // Phase Somme: use file change counter as txid for snapshots.
-    let new_txid = change_counter_from_file(&state.db_path)
-        .ok()
-        .filter(|&cc| cc > state.current_txid)
-        .expect("DB file must have file change counter > current_txid for snapshot");
+    // Phase Somme: use file change counter + WAL commit count for deterministic TXID.
+    let cc = change_counter_from_file(&state.db_path).unwrap_or(0);
+    let wal_commits = wal::count_wal_commits(&state.wal_path, page_size).await?;
+    let new_txid = if cc + wal_commits > state.current_txid {
+        cc + wal_commits
+    } else {
+        state.current_txid + 1
+    };
     let ltx_key = build_ltx_key(prefix, &state.name, 1, 1, new_txid);
 
     let db_size = std::fs::metadata(&state.db_path)?.len() as usize;
@@ -737,7 +753,7 @@ pub async fn sync_wal_with_retry(
         // Chain continues through checkpoints — no need to recompute from file
     }
 
-    let (page_map, frame_count, new_offset, max_db_size) =
+    let (page_map, frame_count, new_offset, max_db_size, commit_count) =
         wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
 
     if page_map.is_empty() {
@@ -751,11 +767,11 @@ pub async fn sync_wal_with_retry(
         None => ltx::compute_checksum_from_file(&state.db_path)?,
     };
 
-    // Phase Somme: derive txid from SQLite's file change counter.
+    // Phase Somme: derive txid from file change counter or WAL commit count.
     let min_txid = state.current_txid + 1;
     let max_txid = change_counter_from_pages(&pages)
         .filter(|&cc| cc > state.current_txid)
-        .expect("WAL batch must contain page 0 with file change counter > current_txid");
+        .unwrap_or(state.current_txid + commit_count.max(1));
     let commit_page = if max_db_size > 0 {
         max_db_size
     } else {
@@ -1616,7 +1632,7 @@ mod tests {
             }
 
             // Read WAL to get changed page data
-            let (page_map, _frame_count, _new_offset, _max_db_size) =
+            let (page_map, _frame_count, _new_offset, _max_db_size, _commit_count) =
                 crate::wal::read_frames_as_page_map(
                     &dir.path().join("source.db-wal"),
                     4096,

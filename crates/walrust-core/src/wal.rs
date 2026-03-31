@@ -169,12 +169,15 @@ pub struct WalReadResult {
 /// Peak memory = unique pages, not total frames. For a WAL with 1000 frames touching
 /// 50 unique pages, this uses 50 * page_size instead of 1000 * page_size.
 ///
-/// Returns (page_map, frame_count, new_offset, max_db_size).
+/// Returns (page_map, frame_count, new_offset, max_db_size, commit_count).
+/// `commit_count` is the number of committed transactions in the batch (frames with
+/// non-zero db_size_after_commit). Used for deterministic TXID derivation in WAL mode
+/// where the file change counter is not incremented per-transaction.
 pub async fn read_frames_as_page_map(
     path: &Path,
     page_size: u32,
     start_offset: u64,
-) -> Result<(std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32)> {
+) -> Result<(std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32, u64)> {
     let mut file = File::open(path).await?;
     let file_size = file.metadata().await?.len();
 
@@ -187,7 +190,7 @@ pub async fn read_frames_as_page_map(
     };
 
     if start_pos >= file_size {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0));
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
     }
 
     file.seek(SeekFrom::Start(start_pos)).await?;
@@ -196,11 +199,12 @@ pub async fn read_frames_as_page_map(
     let full_frames = available / frame_size;
 
     if full_frames == 0 {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0));
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
     }
 
     let mut page_map = std::collections::HashMap::new();
     let mut max_db_size: u32 = 0;
+    let mut commit_count: u64 = 0;
     let mut page_data = vec![0u8; page_size as usize];
 
     for _ in 0..full_frames {
@@ -212,6 +216,9 @@ pub async fn read_frames_as_page_map(
 
         file.read_exact(&mut page_data).await?;
 
+        if db_size > 0 {
+            commit_count += 1;
+        }
         if db_size > max_db_size {
             max_db_size = db_size;
         }
@@ -223,7 +230,47 @@ pub async fn read_frames_as_page_map(
 
     let new_offset = start_pos + full_frames * frame_size;
 
-    Ok((page_map, full_frames as usize, new_offset, max_db_size))
+    Ok((page_map, full_frames as usize, new_offset, max_db_size, commit_count))
+}
+
+/// Count committed transactions in the entire WAL file.
+///
+/// Scans from the beginning (after the 32-byte header) and counts frames with
+/// non-zero db_size_after_commit. Used by take_snapshot to derive a deterministic
+/// TXID in WAL mode: TXID = file_change_counter + wal_commit_count.
+pub async fn count_wal_commits(path: &Path, page_size: u32) -> Result<u64> {
+    let mut file = match File::open(path).await {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let file_size = file.metadata().await?.len();
+    let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+
+    if file_size < WAL_HEADER_SIZE {
+        return Ok(0);
+    }
+
+    file.seek(SeekFrom::Start(WAL_HEADER_SIZE)).await?;
+
+    let available = file_size - WAL_HEADER_SIZE;
+    let full_frames = available / frame_size;
+    let mut commit_count: u64 = 0;
+
+    // Only need the 8-byte frame header prefix (page_number + db_size), skip page data
+    for _ in 0..full_frames {
+        let mut header_buf = [0u8; 8];
+        file.read_exact(&mut header_buf).await?;
+        let db_size = u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+        if db_size > 0 {
+            commit_count += 1;
+        }
+        // Skip remaining frame header (16 bytes) + page data
+        let skip = (FRAME_HEADER_SIZE - 8) + page_size as u64;
+        file.seek(SeekFrom::Current(skip as i64)).await?;
+    }
+
+    Ok(commit_count)
 }
 
 /// Read and parse WAL frames into pages, returns (pages, new_offset, max_db_size)
@@ -799,13 +846,14 @@ mod tests {
 
         tokio::fs::write(&path, &header).await.unwrap();
 
-        let (page_map, frame_count, offset, max_db_size) =
+        let (page_map, frame_count, offset, max_db_size, commit_count) =
             read_frames_as_page_map(&path, 4096, 0).await.unwrap();
 
         assert!(page_map.is_empty());
         assert_eq!(frame_count, 0);
         assert_eq!(offset, WAL_HEADER_SIZE);
         assert_eq!(max_db_size, 0);
+        assert_eq!(commit_count, 0);
 
         tokio::fs::remove_file(&path).await.ok();
     }
@@ -853,7 +901,7 @@ mod tests {
 
         tokio::fs::write(&path, &data).await.unwrap();
 
-        let (page_map, frame_count, _offset, max_db_size) =
+        let (page_map, frame_count, _offset, max_db_size, commit_count) =
             read_frames_as_page_map(&path, page_size, 0).await.unwrap();
 
         // Should have 3 unique pages from 4 frames
@@ -866,6 +914,8 @@ mod tests {
         assert_eq!(page_map[&3][0], 0x33, "Page 3 should be 0x33");
 
         assert_eq!(max_db_size, 3, "max_db_size should be 3 from commit frames");
+        // Frames 0 and 3 have db_size > 0 (commit frames)
+        assert_eq!(commit_count, 2, "Should count 2 committed transactions");
 
         tokio::fs::remove_file(&path).await.ok();
     }
@@ -910,7 +960,7 @@ mod tests {
         }
 
         // New API: streaming dedup
-        let (new_map, _frame_count, new_offset, new_max_db) =
+        let (new_map, _frame_count, new_offset, new_max_db, _commit_count) =
             read_frames_as_page_map(&path, page_size, 0).await.unwrap();
 
         assert_eq!(old_offset, new_offset, "Offsets must match");
@@ -921,6 +971,105 @@ mod tests {
             let new_data = new_map.get(page_num).expect("Page must exist in new map");
             assert_eq!(old_data, new_data, "Page {} data must match", page_num);
         }
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    // ============================================
+    // count_wal_commits tests
+    // ============================================
+
+    #[tokio::test]
+    async fn test_count_wal_commits_nonexistent_file() {
+        let path = PathBuf::from("/tmp/walrust-test-nonexistent.db-wal");
+        assert_eq!(count_wal_commits(&path, 4096).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_count_wal_commits_empty_wal() {
+        let path = PathBuf::from(format!("/tmp/walrust-test-commits-empty-{}.db-wal", uuid::Uuid::new_v4()));
+        let mut header = [0u8; 32];
+        header[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        header[8..12].copy_from_slice(&4096u32.to_be_bytes());
+        tokio::fs::write(&path, &header).await.unwrap();
+
+        assert_eq!(count_wal_commits(&path, 4096).await.unwrap(), 0);
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_count_wal_commits_counts_correctly() {
+        let path = PathBuf::from(format!("/tmp/walrust-test-commits-count-{}.db-wal", uuid::Uuid::new_v4()));
+
+        let page_size: u32 = 4096;
+        let frame_header_size = 24usize;
+        let frame_size = frame_header_size + page_size as usize;
+
+        // 4 frames: 2 commits (db_size > 0), 2 non-commits (db_size = 0)
+        let mut data = vec![0u8; 32 + frame_size * 4];
+        data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        data[8..12].copy_from_slice(&page_size.to_be_bytes());
+
+        // Frame 0: page 1, db_size=2 (commit)
+        let f0 = 32;
+        data[f0..f0 + 4].copy_from_slice(&1u32.to_be_bytes());
+        data[f0 + 4..f0 + 8].copy_from_slice(&2u32.to_be_bytes());
+
+        // Frame 1: page 2, db_size=0 (not a commit)
+        let f1 = 32 + frame_size;
+        data[f1..f1 + 4].copy_from_slice(&2u32.to_be_bytes());
+
+        // Frame 2: page 3, db_size=0 (not a commit)
+        let f2 = 32 + frame_size * 2;
+        data[f2..f2 + 4].copy_from_slice(&3u32.to_be_bytes());
+
+        // Frame 3: page 1, db_size=3 (commit)
+        let f3 = 32 + frame_size * 3;
+        data[f3..f3 + 4].copy_from_slice(&1u32.to_be_bytes());
+        data[f3 + 4..f3 + 8].copy_from_slice(&3u32.to_be_bytes());
+
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        assert_eq!(count_wal_commits(&path, page_size).await.unwrap(), 2);
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_commit_count_matches_page_map() {
+        // count_wal_commits and read_frames_as_page_map must agree on commit count
+        let path = PathBuf::from(format!("/tmp/walrust-test-commits-agree-{}.db-wal", uuid::Uuid::new_v4()));
+
+        let page_size: u32 = 4096;
+        let frame_header_size = 24usize;
+        let frame_size = frame_header_size + page_size as usize;
+
+        // 3 frames: commits at frame 0 and 2
+        let mut data = vec![0u8; 32 + frame_size * 3];
+        data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        data[8..12].copy_from_slice(&page_size.to_be_bytes());
+
+        let f0 = 32;
+        data[f0..f0 + 4].copy_from_slice(&1u32.to_be_bytes());
+        data[f0 + 4..f0 + 8].copy_from_slice(&1u32.to_be_bytes()); // commit
+
+        let f1 = 32 + frame_size;
+        data[f1..f1 + 4].copy_from_slice(&2u32.to_be_bytes());
+        // db_size=0 (no commit)
+
+        let f2 = 32 + frame_size * 2;
+        data[f2..f2 + 4].copy_from_slice(&3u32.to_be_bytes());
+        data[f2 + 4..f2 + 8].copy_from_slice(&3u32.to_be_bytes()); // commit
+
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        let standalone = count_wal_commits(&path, page_size).await.unwrap();
+        let (_, _, _, _, from_page_map) =
+            read_frames_as_page_map(&path, page_size, 0).await.unwrap();
+
+        assert_eq!(standalone, from_page_map);
+        assert_eq!(standalone, 2);
 
         tokio::fs::remove_file(&path).await.ok();
     }

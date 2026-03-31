@@ -116,7 +116,7 @@ pub(crate) async fn sync_wal_concurrent(
     }
 
     // Read WAL frames with streaming dedup (peak memory = unique pages, not total frames)
-    let (page_map, frame_count, new_offset, max_db_size): (std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32) =
+    let (page_map, frame_count, new_offset, max_db_size, _commit_count): (std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32, u64) =
         wal::read_frames_as_page_map(&input.wal_path, header.page_size, wal_offset).await?;
 
     if page_map.is_empty() {

@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Deterministic TXID in WAL mode**: Phase Somme assumed SQLite's file change counter increments on every transaction, but in WAL mode it only updates during checkpoints. `sync_wal` and `take_snapshot` now fall back to WAL commit counting (number of frames with non-zero `db_size_after_commit`) when the change counter hasn't advanced. This is deterministic from file content: any process reading the same WAL bytes computes the same TXID. `read_frames_as_page_map` returns `commit_count` as a 5th tuple element. New `count_wal_commits()` scans WAL frame headers without reading page data (for `take_snapshot`). 4 new tests.
+
 ### Changed
 - **Phase 1b: Migrate walrust + walrust-core to hadb-io** — eliminated ~3,200 lines of duplicate retry/S3/storage/webhook/retention/config code
   - walrust-core: deleted `retry.rs`, `s3.rs`, `storage.rs`; re-exports from hadb-io (88 tests passing)
