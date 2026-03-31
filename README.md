@@ -4,7 +4,7 @@
 
 # walrust
 
-> **Experimental.** walrust is under active development and not yet stable. APIs will change without notice.
+> **Pre-1.0.** APIs may change between minor versions. Published to [crates.io](https://crates.io/crates/walrust).
 
 **Lightweight SQLite replication to S3 in Rust.**
 
