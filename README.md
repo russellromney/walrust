@@ -47,7 +47,7 @@ Part of the [hadb](https://github.com/russellromney/hadb) ecosystem. Shared infr
 └─────────────────────────────────────┘            └──────────────────┘
 ```
 
-walrust polls the WAL, uploads new WAL frames as LTX files to S3, and takes periodic snapshots. Every LTX file carries an SHA256 checksum in S3 metadata, verified automatically on restore.
+walrust polls the WAL, uploads new WAL frames as HADBP changesets to S3, and takes periodic snapshots. Every changeset carries a SHA-256 checksum chain, verified automatically on restore. The format is provided by [hadb-changeset](https://github.com/russellromney/hadb-changeset).
 
 ## Quick start
 
@@ -96,7 +96,7 @@ Everything else (sync intervals, retention, retry, webhooks) has sensible defaul
 walrust replicate s3://my-bucket/app --local replica.db --interval 5s
 ```
 
-This polls S3 for new LTX files and applies them to a local database. The replica is a normal SQLite file — any application can open it read-only. Combine with `walrust watch` on the primary to get a continuously updated read replica on another machine.
+This polls S3 for new changesets and applies them to a local database. The replica is a normal SQLite file — any application can open it read-only. Combine with `walrust watch` on the primary to get a continuously updated read replica on another machine.
 
 ## Memory usage
 
@@ -110,7 +110,7 @@ This polls S3 for new LTX files and applies them to a local database. The replic
 
 ## Acknowledgments
 
-walrust is transparently inspired by and built on the ideas from [Litestream](https://litestream.io) by [Ben Johnson](https://github.com/benbjohnson), using a variation of the same [LTX file format](https://github.com/superfly/ltx). The [hadb](https://github.com/russellromney/hadb) project aims to generalize this pattern to any embedded database.
+walrust is transparently inspired by and built on the ideas from [Litestream](https://litestream.io) by [Ben Johnson](https://github.com/benbjohnson). The replication format has moved from Litestream's LTX to [HADBP](https://github.com/russellromney/hadb-changeset), a shared changeset format used across the [hadb](https://github.com/russellromney/hadb) ecosystem.
 
 ## License
 
