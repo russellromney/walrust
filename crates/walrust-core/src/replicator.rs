@@ -155,19 +155,19 @@ impl Replicator {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let txid = match sync::restore(self.storage.as_ref(), &prefix, name, output_path, None).await {
-            Ok(txid) => txid,
-            Err(e) if e.to_string().contains("No LTX files found") => return Ok(None),
+        let seq = match sync::restore(self.storage.as_ref(), &prefix, name, output_path, None).await {
+            Ok(seq) => seq,
+            Err(e) if e.to_string().contains("No snapshot found") => return Ok(None),
             Err(e) => return Err(e),
         };
 
         tracing::info!(
-            "Replicator: restored '{}' to TXID {} ({})",
+            "Replicator: restored '{}' to seq {} ({})",
             name,
-            txid,
+            seq,
             output_path.display()
         );
-        Ok(Some(txid))
+        Ok(Some(seq))
     }
 
     /// Flush pending WAL frames for a specific database to S3.
@@ -250,10 +250,10 @@ impl Replicator {
                 {
                     Ok(frames) if frames > 0 => {
                         tracing::debug!(
-                            "Replicator: synced '{}' ({} frames, TXID {})",
+                            "Replicator: synced '{}' ({} frames, seq {})",
                             name,
                             frames,
-                            s.state.current_txid
+                            s.state.current_seq
                         );
                     }
                     Err(e) => {
@@ -287,9 +287,9 @@ impl Replicator {
             {
                 Ok(()) => {
                     tracing::info!(
-                        "Replicator: snapshot for '{}' (TXID {})",
+                        "Replicator: snapshot for '{}' (seq {})",
                         name,
-                        s.state.current_txid
+                        s.state.current_seq
                     );
                 }
                 Err(e) => {

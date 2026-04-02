@@ -62,7 +62,7 @@ hmac = "0.12"
 hex = "0.4"
 
 # Core library (embeddable sync primitives)
-walrust-core = { version = "0.2.0", path = "crates/walrust-core", package = "walrust" }
+walrust-core = { version = "0.3.0", path = "crates/walrust-core", package = "walrust" }
 
 # Shared S3/retry/upload infrastructure
 hadb-io = { path = "../../hadb/hadb-io" }

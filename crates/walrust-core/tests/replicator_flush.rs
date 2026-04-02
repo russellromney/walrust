@@ -199,11 +199,11 @@ async fn test_flush_uploads_ltx() {
     let keys_after_flush = storage.keys();
     let ltx_keys: Vec<_> = keys_after_flush
         .iter()
-        .filter(|k| k.starts_with("wal/test/") && k.ends_with(".ltx"))
+        .filter(|k| k.starts_with("wal/test/") && k.ends_with(".hadbp"))
         .collect();
     assert!(
         ltx_keys.len() >= 2,
-        "Should have snapshot + at least one incremental LTX, got: {:?}",
+        "Should have snapshot + at least one incremental HADBP changeset, got: {:?}",
         ltx_keys
     );
 
@@ -271,19 +271,19 @@ async fn test_flush_multiple_rounds() {
     // Round 1: flush initial WAL frames
     let _frames1 = replicator.flush("multi").await.unwrap();
     let keys1 = storage.keys();
-    let ltx_count_1 = keys1.iter().filter(|k| k.ends_with(".ltx")).count();
+    let ltx_count_1 = keys1.iter().filter(|k| k.ends_with(".hadbp")).count();
 
     // Round 2: write more, flush again
     write_rows(&conn, 100, 10);
     let _frames2 = replicator.flush("multi").await.unwrap();
     let keys2 = storage.keys();
-    let ltx_count_2 = keys2.iter().filter(|k| k.ends_with(".ltx")).count();
+    let ltx_count_2 = keys2.iter().filter(|k| k.ends_with(".hadbp")).count();
 
     // The new WAL data should have produced additional LTX files
     // (either via flush() or the background sync loop)
     assert!(
         ltx_count_2 > ltx_count_1,
-        "Second round should produce more LTX files. Round 1: {} LTXs, Round 2: {} LTXs. Keys1: {:?}, Keys2: {:?}",
+        "Second round should produce more HADBP files. Round 1: {} changesets, Round 2: {} changesets. Keys1: {:?}, Keys2: {:?}",
         ltx_count_1,
         ltx_count_2,
         keys1,
@@ -353,7 +353,7 @@ async fn test_flush_returns_frame_count() {
     // Either flush caught them or the background loop did
     // At minimum, the data is in storage
     let ltx_keys: Vec<_> = storage.keys().iter()
-        .filter(|k| k.contains("0000/") && k.ends_with(".ltx"))
+        .filter(|k| k.contains("0000/") && k.ends_with(".hadbp"))
         .cloned()
         .collect();
     assert!(

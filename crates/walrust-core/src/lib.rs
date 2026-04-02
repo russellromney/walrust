@@ -2,7 +2,7 @@
 //!
 //! Provides the embeddable primitives for:
 //! - WAL parsing and frame extraction
-//! - LTX (Litestream Transaction) encoding/decoding
+//! - HADBP (hadb-changeset physical) encoding/decoding
 //! - S3-compatible storage backend
 //! - Shadow WAL for decoupled frame uploads
 //! - Sync operations: WAL sync, snapshots, restore
@@ -30,3 +30,6 @@ pub use hadb_io::{CircuitBreaker, CircuitState, ErrorKind, classify_error, is_re
 pub use sync::{LtxEntry, Manifest, ReplicationConfig, SyncState, restore_with_snapshot_source, run_wal_replication};
 pub use replicator::Replicator;
 pub use snapshot_source::SnapshotSource;
+
+// Re-export hadb-changeset for consumers
+pub use hadb_changeset;

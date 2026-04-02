@@ -16,16 +16,13 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # Shared S3/retry/upload infrastructure
-hadb-io = { path = "../../../../hadb/hadb-io", version = "0.2.0" }
+hadb-io = { path = "../../../hadb/hadb-io", version = "0.2.0" }
 
-# LTX format
-litepages = "0.1.0"
+# HADBP changeset format
+hadb-changeset = { path = "../../../hadb-changeset", version = "0.3.0" }
 
 # SQLite for checkpointing (shadow WAL)
 rusqlite = { version = "0.35", features = ["bundled"] }
-
-# Parallelization for LTX encoding
-rayon = "1.10"
 
 # Concurrent async streams
 futures = "0.3"
