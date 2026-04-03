@@ -16,7 +16,7 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # Shared S3/retry/upload infrastructure
-hadb-io = { path = "../../../hadb/hadb-io", version = "0.2.0" }
+hadb-io = { path = "../../../hadb/hadb-io", version = "0.3.0" }
 
 # HADBP changeset format
 hadb-changeset = { path = "../../../hadb-changeset", version = "0.3.0" }
