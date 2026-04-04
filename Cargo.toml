@@ -65,7 +65,7 @@ hex = "0.4"
 walrust-core = { version = "0.3.0", path = "crates/walrust-core", package = "walrust" }
 
 # Shared S3/retry/upload infrastructure
-hadb-io = { path = "../../hadb/hadb-io" }
+hadb-io = { path = "../hadb/hadb-io" }
 
 # S3 client type (shared with hadb-io, needed for function signatures)
 aws-sdk-s3 = "1"

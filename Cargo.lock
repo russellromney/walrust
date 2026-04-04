@@ -1261,7 +1261,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-changeset"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1274,7 +1274,7 @@ dependencies = [
 
 [[package]]
 name = "hadb-io"
-version = "0.2.0"
+version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3288,7 +3288,7 @@ dependencies = [
 
 [[package]]
 name = "walrust"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3339,7 +3339,7 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "walkdir",
- "walrust 0.3.0",
+ "walrust 0.3.1",
 ]
 
 [[package]]
