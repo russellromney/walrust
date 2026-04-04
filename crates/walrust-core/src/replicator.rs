@@ -207,6 +207,16 @@ impl Replicator {
         self.databases.read().await.contains_key(name)
     }
 
+    /// Get the current sequence number for a database.
+    /// Returns None if the database is not registered.
+    pub async fn current_seq(&self, name: &str) -> Option<u64> {
+        let databases = self.databases.read().await;
+        let db_state = databases.get(name)?.clone();
+        drop(databases);
+        let state = db_state.lock().await;
+        Some(state.state.current_seq)
+    }
+
     // ========================================================================
     // Background loop
     // ========================================================================
