@@ -111,6 +111,36 @@ impl Replicator {
         Ok(())
     }
 
+    /// Register a database without taking a snapshot.
+    /// Use after `restore()` when the database already has the latest state
+    /// from S3. Avoids uploading a redundant snapshot that could race with
+    /// other nodes' changesets.
+    pub async fn add_without_snapshot(&self, name: &str, db_path: &Path) -> Result<()> {
+        let prefix = self.prefix.clone();
+
+        let mut state = SyncState::new(db_path.to_path_buf())?;
+        state.name = name.to_string();
+
+        if db_path.exists() {
+            state.init_checksum()?;
+        }
+
+        // Skip take_snapshot -- the restored file is already the latest state.
+
+        let db_state = Arc::new(AsyncMutex::new(DbState {
+            state,
+            prefix,
+        }));
+
+        self.databases
+            .write()
+            .await
+            .insert(name.to_string(), db_state);
+
+        tracing::info!("Replicator: added '{}' without snapshot ({})", name, db_path.display());
+        Ok(())
+    }
+
     /// Remove a database from replication.
     ///
     /// Does a final sync before removing — blocks until the sync completes
