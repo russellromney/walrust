@@ -125,7 +125,26 @@ impl Replicator {
             state.init_checksum()?;
         }
 
-        // Skip take_snapshot -- the restored file is already the latest state.
+        // Load existing state from storage to get the correct current_seq.
+        // This ensures flush() starts at the right seq (after any existing changesets).
+        let state_key = format!("{}{}/state.json", prefix, name);
+        if let Ok(data) = self.storage.download_bytes(&state_key).await {
+            if let Ok(saved) = serde_json::from_slice::<serde_json::Value>(&data) {
+                if let Some(seq) = saved.get("current_seq").and_then(|v| v.as_u64()) {
+                    state.current_seq = seq;
+                }
+                if let Some(gen) = saved.get("wal_generation").and_then(|v| v.as_u64()) {
+                    state.wal_generation = gen;
+                }
+                if let Some(txid) = saved.get("current_txid").and_then(|v| v.as_u64()) {
+                    state.current_txid = txid;
+                }
+                tracing::info!(
+                    "Replicator: loaded state for '{}': seq={}, gen={}, txid={}",
+                    name, state.current_seq, state.wal_generation, state.current_txid,
+                );
+            }
+        }
 
         let db_state = Arc::new(AsyncMutex::new(DbState {
             state,
