@@ -51,6 +51,16 @@ pub struct Replicator {
 }
 
 impl Replicator {
+    /// Storage backend reference.
+    pub fn storage(&self) -> &Arc<dyn StorageBackend> {
+        &self.storage
+    }
+
+    /// S3 key prefix.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
+    }
+
     /// Create a new Replicator and start its background sync loop.
     ///
     /// `prefix` is the S3 key prefix for all databases (e.g., "wal/" or "ha-test/").
@@ -272,14 +282,25 @@ impl Replicator {
 
     async fn run_loop(&self) {
         let mut sync_timer = tokio::time::interval(self.config.sync_interval);
-        let mut snapshot_timer = tokio::time::interval(self.config.snapshot_interval);
-        // Skip first snapshot tick — databases take snapshots on add()
-        snapshot_timer.tick().await;
 
-        loop {
-            tokio::select! {
-                _ = sync_timer.tick() => self.sync_all().await,
-                _ = snapshot_timer.tick() => self.snapshot_all().await,
+        if !self.config.autonomous_snapshots {
+            // Multiwriter mode: only sync WAL, never take autonomous snapshots.
+            // Snapshot creation is coordinated externally (under a lease).
+            loop {
+                sync_timer.tick().await;
+                self.sync_all().await;
+            }
+        } else {
+            // Standalone mode: sync WAL + periodic snapshots.
+            let mut snapshot_timer = tokio::time::interval(self.config.snapshot_interval);
+            // Skip first snapshot tick -- databases take snapshots on add()
+            snapshot_timer.tick().await;
+
+            loop {
+                tokio::select! {
+                    _ = sync_timer.tick() => self.sync_all().await,
+                    _ = snapshot_timer.tick() => self.snapshot_all().await,
+                }
             }
         }
     }
