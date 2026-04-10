@@ -825,6 +825,11 @@ pub struct ReplicationConfig {
     pub retry_policy: RetryPolicy,
     /// Override the database name used in S3 paths (default: derived from db filename)
     pub db_name: Option<String>,
+    /// When false, the background loop skips periodic snapshots.
+    /// Use when embedded in a multiwriter coordinator (e.g. haqlite)
+    /// where snapshot creation must happen under a distributed lease
+    /// to prevent checksum chain breaks. Default: true.
+    pub autonomous_snapshots: bool,
 }
 
 impl Default for ReplicationConfig {
@@ -834,6 +839,7 @@ impl Default for ReplicationConfig {
             snapshot_interval: std::time::Duration::from_secs(3600),
             retry_policy: RetryPolicy::default_policy(),
             db_name: None,
+            autonomous_snapshots: true,
         }
     }
 }
