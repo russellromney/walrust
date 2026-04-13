@@ -1,6 +1,6 @@
 [package]
 name = "walrust"
-version = "0.5.1"
+version = "0.5.2"
 edition = "2021"
 description = "Lightweight SQLite WAL sync to S3/Tigris"
 authors = ["Russell Romney <russellromney@gmail.com>"]
