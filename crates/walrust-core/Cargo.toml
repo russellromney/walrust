@@ -44,3 +44,5 @@ walkdir = "2"
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
+# Integration tests use the S3 impl directly for compile-time usability checks.
+hadb-storage-s3 = { path = "../../../hadb/hadb-storage-s3" }

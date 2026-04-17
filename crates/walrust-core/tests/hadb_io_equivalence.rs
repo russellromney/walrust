@@ -89,13 +89,15 @@ fn test_reexport_s3_parse_bucket_simple() {
 #[allow(dead_code)]
 fn _assert_storage_backend_usable(_: &dyn walrust::StorageBackend) {}
 
-/// Compile-time check that walrust::S3Backend exists.
+/// Compile-time check that the canonical S3 impl implements the trait
+/// walrust re-exports. Before Phase Anvil f walrust bundled its own
+/// `S3Backend`; now consumers wire in `hadb_storage_s3::S3Storage`.
 #[allow(dead_code)]
-fn _assert_s3_backend_send_sync<T: walrust::StorageBackend>() {}
+fn _assert_s3_storage_usable<T: walrust::StorageBackend>() {}
 
 #[allow(dead_code)]
-fn _check_s3_backend_type() {
-    _assert_s3_backend_send_sync::<walrust::S3Backend>();
+fn _check_s3_storage_type() {
+    _assert_s3_storage_usable::<hadb_storage_s3::S3Storage>();
 }
 
 // ============================================================================

@@ -14,7 +14,8 @@ use async_trait::async_trait;
 use std::path::Path;
 use walrust::snapshot_source::SnapshotSource;
 use walrust::sync::restore_with_snapshot_source;
-use walrust::{S3Backend, StorageBackend, SyncState};
+use hadb_storage_s3::S3Storage;
+use walrust::{StorageBackend, SyncState};
 
 fn test_bucket() -> String {
     std::env::var("WALRUST_S3_TEST_BUCKET")
@@ -93,7 +94,7 @@ async fn test_s3_restore_snapshot_source_no_incrementals() {
     let endpoint = test_endpoint();
     let prefix = unique_prefix();
 
-    let storage = S3Backend::from_env(bucket, endpoint.as_deref())
+    let storage = S3Storage::from_env(bucket, endpoint.as_deref())
         .await
         .expect("S3 backend should initialize with env creds");
 
@@ -120,7 +121,7 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
     let endpoint = test_endpoint();
     let prefix = unique_prefix();
 
-    let storage = S3Backend::from_env(bucket, endpoint.as_deref())
+    let storage = S3Storage::from_env(bucket, endpoint.as_deref())
         .await
         .expect("S3 backend should initialize");
 
@@ -195,9 +196,9 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
     eprintln!("[test] final row count: {}", count);
 
     // Clean up S3 objects
-    let keys = storage.list_objects(&prefix).await.unwrap();
+    let keys = storage.list(&prefix, None).await.unwrap();
     if !keys.is_empty() {
-        let _ = storage.delete_objects(&keys).await;
+        let _ = storage.delete_many(&keys).await;
     }
 }
 
@@ -208,7 +209,7 @@ async fn test_s3_restore_snapshot_source_materialize_fails() {
     let endpoint = test_endpoint();
     let prefix = unique_prefix();
 
-    let storage = S3Backend::from_env(bucket, endpoint.as_deref())
+    let storage = S3Storage::from_env(bucket, endpoint.as_deref())
         .await
         .expect("S3 backend should initialize");
 

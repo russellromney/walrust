@@ -177,18 +177,21 @@ async fn get_page_size(db_path: &Path) -> Result<u32> {
 // ============================================================================
 
 /// Load manifest from storage.
+///
+/// A missing manifest (`Ok(None)` from the backend) is treated as a
+/// fresh database and returns an empty manifest. Transport errors and
+/// JSON parse errors propagate, so callers see real problems instead of
+/// silently resetting the replication position to zero.
 pub async fn load_manifest(
     storage: &dyn StorageBackend,
     prefix: &str,
     db_name: &str,
 ) -> Result<Manifest> {
     let manifest_key = format!("{}{}/manifest.json", prefix, db_name);
-    match storage.get(&manifest_key).await {
-        Ok(Some(data)) => Ok(serde_json::from_slice(&data)?),
-        // Missing key or transient error: return an empty manifest, matching
-        // the previous `download_bytes`-returns-error fallback path. The
-        // caller treats an empty manifest as "fresh database".
-        Ok(None) | Err(_) => Ok(Manifest {
+    match storage.get(&manifest_key).await? {
+        Some(data) => Ok(serde_json::from_slice(&data)
+            .map_err(|e| anyhow!("corrupt manifest at {manifest_key}: {e}"))?),
+        None => Ok(Manifest {
             name: db_name.to_string(),
             ..Default::default()
         }),
@@ -1035,7 +1038,9 @@ mod tests {
             }
         }
 
-        fn put(&mut self, key: &str, data: Vec<u8>) {
+        /// Seed a key directly. Named `insert` (not `put`) so it doesn't
+        /// collide with the trait's `put(&self, &[u8])` in method lookup.
+        fn insert(&mut self, key: &str, data: Vec<u8>) {
             self.objects.insert(key.to_string(), data);
         }
     }
@@ -1191,7 +1196,7 @@ mod tests {
     #[tokio::test]
     async fn test_download_parallel_single_file() {
         let mut storage = TestStorage::new();
-        storage.put("file1.hadbp", b"data1".to_vec());
+        storage.insert("file1.hadbp", b"data1".to_vec());
 
         let files = vec![make_discovered("file1.hadbp", 1)];
         let results = download_parallel(&storage, &files, 8).await;
@@ -1204,7 +1209,7 @@ mod tests {
     async fn test_download_parallel_preserves_order() {
         let mut storage = TestStorage::new();
         for i in 0..5 {
-            storage.put(
+            storage.insert(
                 &format!("file{}.hadbp", i),
                 format!("data{}", i).into_bytes(),
             );
@@ -1229,7 +1234,7 @@ mod tests {
     async fn test_download_parallel_concurrency_cap() {
         let mut storage = TestStorage::new();
         for i in 0..10 {
-            storage.put(&format!("f{:02}.hadbp", i), vec![i as u8; 100]);
+            storage.insert(&format!("f{:02}.hadbp", i), vec![i as u8; 100]);
         }
 
         let files: Vec<_> = (0..10)
@@ -1249,9 +1254,9 @@ mod tests {
     #[tokio::test]
     async fn test_download_parallel_error_propagation() {
         let mut inner = TestStorage::new();
-        inner.put("good1.hadbp", b"ok".to_vec());
-        inner.put("bad.hadbp", b"will_fail".to_vec());
-        inner.put("good2.hadbp", b"ok2".to_vec());
+        inner.insert("good1.hadbp", b"ok".to_vec());
+        inner.insert("bad.hadbp", b"will_fail".to_vec());
+        inner.insert("good2.hadbp", b"ok2".to_vec());
 
         let storage = FailOnKeyStorage {
             inner,
@@ -1281,7 +1286,7 @@ mod tests {
         let mut inner = TestStorage::new();
         let order = Arc::new(Mutex::new(Vec::new()));
         for i in 0..6 {
-            inner.put(&format!("dl{}.hadbp", i), vec![i as u8]);
+            inner.insert(&format!("dl{}.hadbp", i), vec![i as u8]);
         }
 
         let storage = OrderTrackingStorage {
@@ -1443,7 +1448,7 @@ mod tests {
         // Add changesets older than snapshot version 5
         for seq in 1..=4 {
             let key = build_changeset_key("test/", "mydb", GENERATION_LIVE, seq);
-            storage.put(&key, vec![0; 10]);
+            storage.insert(&key, vec![0; 10]);
         }
 
         let dir = tempfile::tempdir().unwrap();
@@ -1460,5 +1465,50 @@ mod tests {
                 .unwrap();
 
         assert_eq!(restored_seq, 5);
+    }
+
+    // ------------------------------------------------------------------
+    // load_manifest fail-fast semantics
+    //
+    // A missing manifest is a legitimate first-run case and must return
+    // an empty manifest; transport and parse errors are real problems
+    // and must propagate, not silently reset replication state.
+    // ------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn load_manifest_missing_returns_empty() {
+        let storage = TestStorage::new();
+        let m = load_manifest(&storage, "prefix/", "mydb").await.unwrap();
+        assert_eq!(m.name, "mydb");
+        assert_eq!(m.current_seq, 0);
+        assert!(m.files.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_manifest_transport_error_propagates() {
+        let storage = FailOnKeyStorage {
+            inner: TestStorage::new(),
+            fail_key: "prefix/mydb/manifest.json".to_string(),
+        };
+        let err = load_manifest(&storage, "prefix/", "mydb").await.unwrap_err();
+        // Previous behavior would have silently swallowed this and
+        // returned a fresh-DB manifest; the fix propagates.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("simulated download failure") || msg.contains("manifest.json"),
+            "expected propagated transport error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_manifest_corrupt_json_propagates() {
+        let mut storage = TestStorage::new();
+        let key = "prefix/mydb/manifest.json".to_string();
+        storage.insert(&key, b"{ this is not valid json".to_vec());
+        let err = load_manifest(&storage, "prefix/", "mydb").await.unwrap_err();
+        assert!(
+            err.to_string().contains("corrupt manifest"),
+            "expected corrupt-manifest error, got: {err}"
+        );
     }
 }
