@@ -23,7 +23,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
-use hadb_io::ObjectStore as StorageBackend;
+use hadb_storage::StorageBackend;
 use crate::sync::{self, ReplicationConfig, SyncState};
 
 /// Per-database replication state.
@@ -138,7 +138,7 @@ impl Replicator {
         // Load existing state from storage to get the correct current_seq.
         // This ensures flush() starts at the right seq (after any existing changesets).
         let state_key = format!("{}{}/state.json", prefix, name);
-        if let Ok(data) = self.storage.download_bytes(&state_key).await {
+        if let Ok(Some(data)) = self.storage.get(&state_key).await {
             if let Ok(saved) = serde_json::from_slice::<serde_json::Value>(&data) {
                 if let Some(seq) = saved.get("current_seq").and_then(|v| v.as_u64()) {
                     state.current_seq = seq;

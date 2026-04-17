@@ -15,7 +15,10 @@ tokio = { version = "1", features = ["full"] }
 # Async trait support
 async-trait = "0.1"
 
-# Shared S3/retry/upload infrastructure
+# Storage substrate (trait)
+hadb-storage = { path = "../../../hadb/hadb-storage", version = "0.4.0" }
+
+# Legacy retry/checksum helpers; replaced in step i.
 hadb-io = { path = "../../../hadb/hadb-io", version = "0.4.0" }
 
 # HADBP changeset format

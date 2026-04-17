@@ -1,6 +1,7 @@
-//! Re-export storage trait from hadb-io.
+//! Storage abstraction for walrust.
 //!
-//! `StorageBackend` is an alias for `hadb_io::ObjectStore` to preserve
-//! downstream import compatibility.
-pub use hadb_io::ObjectStore as StorageBackend;
-pub use hadb_io::S3Backend;
+//! Re-exports the byte-level `StorageBackend` trait from `hadb-storage`.
+//! Callers that need a concrete S3 implementation construct
+//! `hadb_storage_s3::S3Storage` themselves and hand it to walrust as
+//! `Arc<dyn walrust::StorageBackend>`.
+pub use hadb_storage::StorageBackend;

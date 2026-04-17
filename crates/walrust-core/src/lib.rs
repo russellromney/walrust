@@ -18,11 +18,14 @@ pub mod snapshot_source;
 pub mod sync;
 pub mod wal;
 
-// Shared infrastructure from hadb-io (retry, S3, storage)
+// Storage trait (new substrate). Concrete impls (S3, Cinch, local, mem)
+// live in separate crates; consumers wire them in.
+pub use hadb_storage::StorageBackend;
+
+// Legacy shared infrastructure from hadb-io (retry, S3 helpers). Step i
+// of Phase Anvil moves the remaining helpers elsewhere and drops hadb-io.
 pub use hadb_io;
 pub use hadb_io::s3;
-pub use hadb_io::ObjectStore as StorageBackend;
-pub use hadb_io::S3Backend;
 pub use hadb_io::{RetryConfig, RetryPolicy};
 pub use hadb_io::{CircuitBreaker, CircuitState, ErrorKind, classify_error, is_retryable};
 

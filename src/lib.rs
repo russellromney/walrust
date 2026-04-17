@@ -17,8 +17,9 @@ pub mod uploader;
 pub mod wal;
 pub mod webhook;
 
-// Re-export storage types for convenience
-pub use storage::{S3Backend, StorageBackend};
+// Re-export the storage trait. Consumers pick a concrete impl
+// (hadb-storage-s3, hadb-storage-cinch, hadb-storage-mem, ...) themselves.
+pub use storage::StorageBackend;
 
 // Re-export retry types for DST
 pub use retry::{RetryConfig, RetryPolicy};

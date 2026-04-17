@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::ltx;
 use crate::wal;
-use hadb_io::ObjectStore as StorageBackend;
+use hadb_storage::StorageBackend;
 use hadb_io::RetryPolicy;
 
 // ============================================================================
@@ -183,9 +183,12 @@ pub async fn load_manifest(
     db_name: &str,
 ) -> Result<Manifest> {
     let manifest_key = format!("{}{}/manifest.json", prefix, db_name);
-    match storage.download_bytes(&manifest_key).await {
-        Ok(data) => Ok(serde_json::from_slice(&data)?),
-        Err(_) => Ok(Manifest {
+    match storage.get(&manifest_key).await {
+        Ok(Some(data)) => Ok(serde_json::from_slice(&data)?),
+        // Missing key or transient error: return an empty manifest, matching
+        // the previous `download_bytes`-returns-error fallback path. The
+        // caller treats an empty manifest as "fresh database".
+        Ok(None) | Err(_) => Ok(Manifest {
             name: db_name.to_string(),
             ..Default::default()
         }),
@@ -199,9 +202,8 @@ pub async fn save_manifest(
     manifest: &Manifest,
 ) -> Result<()> {
     let manifest_key = format!("{}{}/manifest.json", prefix, manifest.name);
-    storage
-        .upload_bytes(&manifest_key, serde_json::to_vec_pretty(manifest)?)
-        .await
+    let data = serde_json::to_vec_pretty(manifest)?;
+    storage.put(&manifest_key, &data).await
 }
 
 /// Save state.json for state persistence.
@@ -218,9 +220,8 @@ pub async fn save_state(
         "current_txid": state.current_txid,
         "last_snapshot": state.last_snapshot,
     });
-    storage
-        .upload_bytes(&state_key, serde_json::to_vec(&state_json)?)
-        .await
+    let data = serde_json::to_vec(&state_json)?;
+    storage.put(&state_key, &data).await
 }
 
 // ============================================================================
@@ -282,7 +283,7 @@ pub async fn sync_wal(
     let changeset_size = changeset_bytes.len() as u64;
     let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_LIVE, new_seq);
 
-    storage.upload_bytes(&changeset_key, changeset_bytes).await?;
+    storage.put(&changeset_key, &changeset_bytes).await?;
 
     tracing::info!(
         "{}: Synced {} WAL frames as HADBP changeset ({} bytes, seq {}) -> {}",
@@ -330,7 +331,7 @@ pub async fn take_snapshot(
     let changeset_size = changeset_bytes.len() as u64;
     let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_SNAPSHOT, new_seq);
 
-    storage.upload_bytes(&changeset_key, changeset_bytes).await?;
+    storage.put(&changeset_key, &changeset_bytes).await?;
 
     let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
 
@@ -381,7 +382,10 @@ pub async fn restore(
     );
 
     // Apply snapshot
-    let snapshot_data = storage.download_bytes(&snapshot.key).await?;
+    let snapshot_data = storage
+        .get(&snapshot.key)
+        .await?
+        .ok_or_else(|| anyhow!("snapshot key {} not found", snapshot.key))?;
     let decode_result = ltx::decode_to_db(&snapshot_data, output)?;
     tracing::info!(
         "Restored snapshot to {} (checksum: {:016x})",
@@ -395,7 +399,10 @@ pub async fn restore(
     // Apply incrementals in order. If a checksum chain doesn't match,
     // it's from a previous lineage (e.g., a prior leader). Stop applying.
     for inc in &incrementals {
-        let data = storage.download_bytes(&inc.key).await?;
+        let data = storage
+            .get(&inc.key)
+            .await?
+            .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
         match ltx::apply_changeset_to_db(&data, output, current_checksum) {
             Ok(result) => {
                 tracing::info!(
@@ -476,7 +483,10 @@ pub async fn restore_with_snapshot_source(
     // for the first incremental and let it establish the chain.
     let mut restored_seq = checkpoint_version;
     for inc in incrementals.iter() {
-        let data = storage.download_bytes(&inc.key).await?;
+        let data = storage
+            .get(&inc.key)
+            .await?
+            .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
         // For external snapshot sources, we can't verify the chain for the first
         // incremental since the snapshot wasn't encoded as HADBP. Decode without
         // chain verification and let subsequent incrementals verify against each other.
@@ -548,7 +558,7 @@ pub async fn take_snapshot_with_retry(
         .execute_with_context("upload snapshot", || {
             let data_arc = std::sync::Arc::clone(&upload_buffer);
             let key = upload_key.clone();
-            async move { storage.upload_bytes(&key, (*data_arc).clone()).await }
+            async move { storage.put(&key, &data_arc).await }
         })
         .await?;
 
@@ -621,7 +631,7 @@ pub async fn sync_wal_with_retry(
         .execute_with_context("upload WAL changes", || {
             let data_arc = std::sync::Arc::clone(&upload_buffer);
             let key = upload_key.clone();
-            async move { storage.upload_bytes(&key, (*data_arc).clone()).await }
+            async move { storage.put(&key, &data_arc).await }
         })
         .await?;
 
@@ -767,7 +777,11 @@ async fn download_one(
     key: &str,
     idx: usize,
 ) -> (usize, Result<Vec<u8>>) {
-    (idx, storage.download_bytes(key).await)
+    let fetched = storage
+        .get(key)
+        .await
+        .and_then(|opt| opt.ok_or_else(|| anyhow!("key {} not found", key)));
+    (idx, fetched)
 }
 
 /// Download multiple S3 objects concurrently, preserving order.
@@ -784,7 +798,12 @@ async fn download_parallel(
     }
 
     if files.len() == 1 {
-        return vec![storage.download_bytes(&files[0].key).await];
+        let key = &files[0].key;
+        let fetched = storage
+            .get(key)
+            .await
+            .and_then(|opt| opt.ok_or_else(|| anyhow!("key {} not found", key)));
+        return vec![fetched];
     }
 
     let mut pending = FuturesUnordered::new();
@@ -1021,58 +1040,27 @@ mod tests {
         }
     }
 
+    use hadb_storage::CasResult;
+
     #[async_trait]
     impl StorageBackend for TestStorage {
-        async fn upload_bytes(&self, _key: &str, _data: Vec<u8>) -> Result<()> {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.objects.get(key).cloned())
+        }
+        async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            // TestStorage is seeded via `put()` (inherent method) before each
+            // test; the trait-level `put` is unused in the sync tests.
             Ok(())
         }
-        async fn upload_bytes_with_checksum(
-            &self,
-            _key: &str,
-            _data: Vec<u8>,
-            _checksum: &str,
-        ) -> Result<()> {
+        async fn delete(&self, _key: &str) -> Result<()> {
             Ok(())
         }
-        async fn upload_file(&self, _key: &str, _path: &Path) -> Result<()> {
-            Ok(())
-        }
-        async fn upload_file_with_checksum(
-            &self,
-            _key: &str,
-            _path: &Path,
-            _checksum: &str,
-        ) -> Result<()> {
-            Ok(())
-        }
-        async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
-            self.objects
-                .get(key)
-                .cloned()
-                .ok_or_else(|| anyhow!("not found: {}", key))
-        }
-        async fn download_file(&self, _key: &str, _path: &Path) -> Result<()> {
-            Ok(())
-        }
-        async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
+        async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
             let mut keys: Vec<String> = self
                 .objects
                 .keys()
                 .filter(|k| k.starts_with(prefix))
-                .cloned()
-                .collect();
-            keys.sort();
-            Ok(keys)
-        }
-        async fn list_objects_after(
-            &self,
-            prefix: &str,
-            start_after: &str,
-        ) -> Result<Vec<String>> {
-            let mut keys: Vec<String> = self
-                .objects
-                .keys()
-                .filter(|k| k.starts_with(prefix) && k.as_str() > start_after)
+                .filter(|k| after.map(|a| k.as_str() > a).unwrap_or(true))
                 .cloned()
                 .collect();
             keys.sort();
@@ -1081,17 +1069,17 @@ mod tests {
         async fn exists(&self, key: &str) -> Result<bool> {
             Ok(self.objects.contains_key(key))
         }
-        async fn get_checksum(&self, _key: &str) -> Result<Option<String>> {
-            Ok(None)
+        async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<CasResult> {
+            // CAS is not exercised by the sync tests.
+            Ok(CasResult { success: true, etag: Some("test".into()) })
         }
-        async fn delete_object(&self, _key: &str) -> Result<()> {
-            Ok(())
-        }
-        async fn delete_objects(&self, _keys: &[String]) -> Result<usize> {
-            Ok(0)
-        }
-        fn bucket_name(&self) -> &str {
-            "test-bucket"
+        async fn put_if_match(
+            &self,
+            _key: &str,
+            _data: &[u8],
+            _etag: &str,
+        ) -> Result<CasResult> {
+            Ok(CasResult { success: true, etag: Some("test".into()) })
         }
     }
 
@@ -1103,57 +1091,29 @@ mod tests {
 
     #[async_trait]
     impl StorageBackend for FailOnKeyStorage {
-        async fn upload_bytes(&self, k: &str, d: Vec<u8>) -> Result<()> {
-            self.inner.upload_bytes(k, d).await
-        }
-        async fn upload_bytes_with_checksum(
-            &self,
-            k: &str,
-            d: Vec<u8>,
-            c: &str,
-        ) -> Result<()> {
-            self.inner.upload_bytes_with_checksum(k, d, c).await
-        }
-        async fn upload_file(&self, k: &str, p: &Path) -> Result<()> {
-            self.inner.upload_file(k, p).await
-        }
-        async fn upload_file_with_checksum(
-            &self,
-            k: &str,
-            p: &Path,
-            c: &str,
-        ) -> Result<()> {
-            self.inner.upload_file_with_checksum(k, p, c).await
-        }
-        async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
             if key == self.fail_key {
                 return Err(anyhow!("simulated download failure for {}", key));
             }
-            self.inner.download_bytes(key).await
+            self.inner.get(key).await
         }
-        async fn download_file(&self, k: &str, p: &Path) -> Result<()> {
-            self.inner.download_file(k, p).await
+        async fn put(&self, k: &str, d: &[u8]) -> Result<()> {
+            self.inner.put(k, d).await
         }
-        async fn list_objects(&self, p: &str) -> Result<Vec<String>> {
-            self.inner.list_objects(p).await
+        async fn delete(&self, k: &str) -> Result<()> {
+            self.inner.delete(k).await
         }
-        async fn list_objects_after(&self, p: &str, s: &str) -> Result<Vec<String>> {
-            self.inner.list_objects_after(p, s).await
+        async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+            self.inner.list(prefix, after).await
         }
         async fn exists(&self, k: &str) -> Result<bool> {
             self.inner.exists(k).await
         }
-        async fn get_checksum(&self, k: &str) -> Result<Option<String>> {
-            self.inner.get_checksum(k).await
+        async fn put_if_absent(&self, k: &str, d: &[u8]) -> Result<CasResult> {
+            self.inner.put_if_absent(k, d).await
         }
-        async fn delete_object(&self, k: &str) -> Result<()> {
-            self.inner.delete_object(k).await
-        }
-        async fn delete_objects(&self, k: &[String]) -> Result<usize> {
-            self.inner.delete_objects(k).await
-        }
-        fn bucket_name(&self) -> &str {
-            self.inner.bucket_name()
+        async fn put_if_match(&self, k: &str, d: &[u8], e: &str) -> Result<CasResult> {
+            self.inner.put_if_match(k, d, e).await
         }
     }
 
@@ -1165,58 +1125,30 @@ mod tests {
 
     #[async_trait]
     impl StorageBackend for OrderTrackingStorage {
-        async fn upload_bytes(&self, k: &str, d: Vec<u8>) -> Result<()> {
-            self.inner.upload_bytes(k, d).await
-        }
-        async fn upload_bytes_with_checksum(
-            &self,
-            k: &str,
-            d: Vec<u8>,
-            c: &str,
-        ) -> Result<()> {
-            self.inner.upload_bytes_with_checksum(k, d, c).await
-        }
-        async fn upload_file(&self, k: &str, p: &Path) -> Result<()> {
-            self.inner.upload_file(k, p).await
-        }
-        async fn upload_file_with_checksum(
-            &self,
-            k: &str,
-            p: &Path,
-            c: &str,
-        ) -> Result<()> {
-            self.inner.upload_file_with_checksum(k, p, c).await
-        }
-        async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
             self.download_order
                 .lock()
                 .unwrap()
                 .push(key.to_string());
-            self.inner.download_bytes(key).await
+            self.inner.get(key).await
         }
-        async fn download_file(&self, k: &str, p: &Path) -> Result<()> {
-            self.inner.download_file(k, p).await
+        async fn put(&self, k: &str, d: &[u8]) -> Result<()> {
+            self.inner.put(k, d).await
         }
-        async fn list_objects(&self, p: &str) -> Result<Vec<String>> {
-            self.inner.list_objects(p).await
+        async fn delete(&self, k: &str) -> Result<()> {
+            self.inner.delete(k).await
         }
-        async fn list_objects_after(&self, p: &str, s: &str) -> Result<Vec<String>> {
-            self.inner.list_objects_after(p, s).await
+        async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+            self.inner.list(prefix, after).await
         }
         async fn exists(&self, k: &str) -> Result<bool> {
             self.inner.exists(k).await
         }
-        async fn get_checksum(&self, k: &str) -> Result<Option<String>> {
-            self.inner.get_checksum(k).await
+        async fn put_if_absent(&self, k: &str, d: &[u8]) -> Result<CasResult> {
+            self.inner.put_if_absent(k, d).await
         }
-        async fn delete_object(&self, k: &str) -> Result<()> {
-            self.inner.delete_object(k).await
-        }
-        async fn delete_objects(&self, k: &[String]) -> Result<usize> {
-            self.inner.delete_objects(k).await
-        }
-        fn bucket_name(&self) -> &str {
-            self.inner.bucket_name()
+        async fn put_if_match(&self, k: &str, d: &[u8], e: &str) -> Result<CasResult> {
+            self.inner.put_if_match(k, d, e).await
         }
     }
 

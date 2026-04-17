@@ -1,14 +1,13 @@
 //! Tests for Replicator::flush() — on-demand WAL sync to S3.
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+use hadb_storage::{CasResult, StorageBackend};
 use walrust::ReplicationConfig;
 use walrust::Replicator;
-use hadb_io::ObjectStore as StorageBackend;
 
 // ============================================================================
 // In-memory storage backend for tests
@@ -36,53 +35,29 @@ impl MemStorage {
 
 #[async_trait]
 impl StorageBackend for MemStorage {
-    async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        self.objects.lock().unwrap().insert(key.to_string(), data);
-        Ok(())
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.objects.lock().unwrap().get(key).cloned())
     }
 
-    async fn upload_bytes_with_checksum(&self, key: &str, data: Vec<u8>, _checksum: &str) -> Result<()> {
-        self.objects.lock().unwrap().insert(key.to_string(), data);
-        Ok(())
-    }
-
-    async fn upload_file(&self, key: &str, path: &Path) -> Result<()> {
-        let data = tokio::fs::read(path).await?;
-        self.upload_bytes(key, data).await
-    }
-
-    async fn upload_file_with_checksum(&self, key: &str, path: &Path, checksum: &str) -> Result<()> {
-        let data = tokio::fs::read(path).await?;
-        self.upload_bytes_with_checksum(key, data, checksum).await
-    }
-
-    async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.objects
             .lock()
             .unwrap()
-            .get(key)
-            .cloned()
-            .ok_or_else(|| anyhow!("not found: {}", key))
-    }
-
-    async fn download_file(&self, key: &str, path: &Path) -> Result<()> {
-        let data = self.download_bytes(key).await?;
-        tokio::fs::write(path, data).await?;
+            .insert(key.to_string(), data.to_vec());
         Ok(())
     }
 
-    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
-        let map = self.objects.lock().unwrap();
-        let mut keys: Vec<String> = map.keys().filter(|k| k.starts_with(prefix)).cloned().collect();
-        keys.sort();
-        Ok(keys)
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
     }
 
-    async fn list_objects_after(&self, prefix: &str, start_after: &str) -> Result<Vec<String>> {
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
         let map = self.objects.lock().unwrap();
         let mut keys: Vec<String> = map
             .keys()
-            .filter(|k| k.starts_with(prefix) && k.as_str() > start_after)
+            .filter(|k| k.starts_with(prefix))
+            .filter(|k| after.map(|a| k.as_str() > a).unwrap_or(true))
             .cloned()
             .collect();
         keys.sort();
@@ -93,28 +68,22 @@ impl StorageBackend for MemStorage {
         Ok(self.objects.lock().unwrap().contains_key(key))
     }
 
-    async fn get_checksum(&self, _key: &str) -> Result<Option<String>> {
-        Ok(None)
-    }
-
-    async fn delete_object(&self, key: &str) -> Result<()> {
-        self.objects.lock().unwrap().remove(key);
-        Ok(())
-    }
-
-    async fn delete_objects(&self, keys: &[String]) -> Result<usize> {
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
         let mut map = self.objects.lock().unwrap();
-        let mut deleted = 0;
-        for k in keys {
-            if map.remove(k).is_some() {
-                deleted += 1;
-            }
+        if map.contains_key(key) {
+            return Ok(CasResult { success: false, etag: None });
         }
-        Ok(deleted)
+        map.insert(key.to_string(), data.to_vec());
+        Ok(CasResult { success: true, etag: Some("mem".into()) })
     }
 
-    fn bucket_name(&self) -> &str {
-        "test-bucket"
+    async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
+        let mut map = self.objects.lock().unwrap();
+        if !map.contains_key(key) {
+            return Ok(CasResult { success: false, etag: None });
+        }
+        map.insert(key.to_string(), data.to_vec());
+        Ok(CasResult { success: true, etag: Some("mem".into()) })
     }
 }
 

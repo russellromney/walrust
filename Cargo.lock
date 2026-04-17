@@ -1265,7 +1265,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "hadb-io",
+ "hadb-storage",
  "sha2",
  "thiserror 2.0.18",
  "tokio",
@@ -1289,6 +1289,29 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hadb-storage"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "serde",
+]
+
+[[package]]
+name = "hadb-storage-s3"
+version = "0.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "aws-config",
+ "aws-sdk-s3",
+ "aws-smithy-types",
+ "hadb-storage",
  "tokio",
  "tracing",
 ]
@@ -3296,6 +3319,7 @@ dependencies = [
  "futures",
  "hadb-changeset",
  "hadb-io",
+ "hadb-storage",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3319,6 +3343,8 @@ dependencies = [
  "futures",
  "glob",
  "hadb-io",
+ "hadb-storage",
+ "hadb-storage-s3",
  "hex",
  "hmac",
  "litepages",

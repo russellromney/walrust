@@ -99,7 +99,7 @@ impl UploadTaskContext {
         loop {
             attempts += 1;
 
-            match self.storage.upload_bytes(&key, data.clone()).await {
+            match self.storage.put(&key, &data).await {
                 Ok(_) => {
                     self.cache.mark_uploaded(txid)
                         .context("Failed to mark TXID as uploaded")?;
@@ -306,8 +306,8 @@ mod tests {
     use crate::storage::StorageBackend;
     use crate::webhook::WebhookSender;
     use async_trait::async_trait;
+    use hadb_storage::CasResult;
     use std::collections::HashMap;
-    use std::path::Path;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::TempDir;
@@ -366,7 +366,7 @@ mod tests {
 
     #[async_trait]
     impl StorageBackend for MockStorage {
-        async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()> {
+        async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
             // Track concurrency
             let active = self.active_uploads.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak_concurrent.fetch_max(active, Ordering::SeqCst);
@@ -380,9 +380,13 @@ mod tests {
                 let mut fail_count = self.fail_count.lock().unwrap();
                 if *fail_count < self.max_failures {
                     *fail_count += 1;
-                    Err(anyhow::anyhow!("Simulated S3 failure {}/{}", fail_count, self.max_failures))
+                    Err(anyhow::anyhow!(
+                        "Simulated S3 failure {}/{}",
+                        fail_count,
+                        self.max_failures
+                    ))
                 } else {
-                    self.objects.lock().unwrap().insert(key.to_string(), data);
+                    self.objects.lock().unwrap().insert(key.to_string(), data.to_vec());
                     Ok(())
                 }
             };
@@ -391,66 +395,47 @@ mod tests {
             result
         }
 
-        async fn upload_bytes_with_checksum(&self, key: &str, data: Vec<u8>, _checksum: &str) -> Result<()> {
-            self.upload_bytes(key, data).await
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.objects.lock().unwrap().get(key).cloned())
         }
 
-        async fn upload_file(&self, _key: &str, _path: &Path) -> Result<()> {
-            unimplemented!("upload_file not needed for tests")
-        }
-
-        async fn upload_file_with_checksum(&self, _key: &str, _path: &Path, _checksum: &str) -> Result<()> {
-            unimplemented!("upload_file_with_checksum not needed for tests")
-        }
-
-        async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
-            self.objects.lock().unwrap()
-                .get(key)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Object not found: {}", key))
-        }
-
-        async fn download_file(&self, _key: &str, _path: &Path) -> Result<()> {
-            unimplemented!("download_file not needed for tests")
-        }
-
-        async fn list_objects(&self, _prefix: &str) -> Result<Vec<String>> {
-            Ok(self.objects.lock().unwrap().keys().cloned().collect())
-        }
-
-        async fn list_objects_after(&self, prefix: &str, start_after: &str) -> Result<Vec<String>> {
-            Ok(self.objects.lock().unwrap().keys()
-                .filter(|k| k.starts_with(prefix) && k.as_str() > start_after)
-                .cloned()
-                .collect())
-        }
-
-        async fn exists(&self, key: &str) -> Result<bool> {
-            Ok(self.objects.lock().unwrap().contains_key(key))
-        }
-
-        async fn get_checksum(&self, _key: &str) -> Result<Option<String>> {
-            Ok(None)
-        }
-
-        async fn delete_object(&self, key: &str) -> Result<()> {
+        async fn delete(&self, key: &str) -> Result<()> {
             self.objects.lock().unwrap().remove(key);
             Ok(())
         }
 
-        async fn delete_objects(&self, keys: &[String]) -> Result<usize> {
-            let mut objects = self.objects.lock().unwrap();
-            let mut count = 0;
-            for key in keys {
-                if objects.remove(key).is_some() {
-                    count += 1;
-                }
-            }
-            Ok(count)
+        async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+            let objects = self.objects.lock().unwrap();
+            let mut keys: Vec<String> = objects
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .filter(|k| after.map(|a| k.as_str() > a).unwrap_or(true))
+                .cloned()
+                .collect();
+            keys.sort();
+            Ok(keys)
         }
 
-        fn bucket_name(&self) -> &str {
-            "mock-bucket"
+        async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+            let mut objects = self.objects.lock().unwrap();
+            if objects.contains_key(key) {
+                return Ok(CasResult { success: false, etag: None });
+            }
+            objects.insert(key.to_string(), data.to_vec());
+            Ok(CasResult { success: true, etag: Some("mock".into()) })
+        }
+
+        async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
+            let mut objects = self.objects.lock().unwrap();
+            if !objects.contains_key(key) {
+                return Ok(CasResult { success: false, etag: None });
+            }
+            objects.insert(key.to_string(), data.to_vec());
+            Ok(CasResult { success: true, etag: Some("mock".into()) })
+        }
+
+        fn backend_name(&self) -> &str {
+            "mock"
         }
     }
 

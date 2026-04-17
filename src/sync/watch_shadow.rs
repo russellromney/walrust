@@ -15,7 +15,8 @@ use crate::retention::RetentionPolicy;
 use crate::retry::{RetryConfig, RetryPolicy};
 use crate::s3::{self, create_client, parse_bucket};
 use crate::shadow::ShadowWal;
-use crate::storage::{S3Backend, StorageBackend};
+use crate::storage::StorageBackend;
+use hadb_storage_s3::S3Storage;
 use crate::uploader::{spawn_uploader, UploadMessage, Uploader};
 use crate::webhook::WebhookSender;
 
@@ -150,7 +151,7 @@ pub async fn watch_with_shadow(
         if cache_config.enabled {
             let cache = Arc::new(LocalCache::new(db_path)?);
             let storage: Arc<dyn StorageBackend> = Arc::new(
-                S3Backend::new((*client).clone(), bucket_name.clone())
+                S3Storage::new((*client).clone(), bucket_name.clone())
             );
             let s3_prefix = format!("{}{}", prefix, name);
             let uploader = Arc::new(Uploader::new(

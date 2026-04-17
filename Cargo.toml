@@ -64,7 +64,11 @@ hex = "0.4"
 # Core library (embeddable sync primitives)
 walrust-core = { version = "0.3.0", path = "crates/walrust-core", package = "walrust" }
 
-# Shared S3/retry/upload infrastructure
+# Storage substrate (trait + impls)
+hadb-storage = { path = "../hadb/hadb-storage" }
+hadb-storage-s3 = { path = "../hadb/hadb-storage-s3" }
+
+# Legacy config/webhook/retention/s3 helpers (step i removes this dep).
 hadb-io = { path = "../hadb/hadb-io" }
 
 # S3 client type (shared with hadb-io, needed for function signatures)
