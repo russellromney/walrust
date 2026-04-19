@@ -12,7 +12,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use walrust::StorageBackend;
+use hadb_storage::StorageBackend;
 
 /// Fault types that can be injected into storage operations
 #[derive(Debug, Clone)]

@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
+use hadb_storage::StorageBackend;
 use walrust::cache::{LocalCache, CacheStats};
 use walrust::retry::{RetryPolicy, RetryConfig};
-use walrust::storage::StorageBackend;
 use walrust::uploader::{Uploader, UploadMessage, spawn_uploader};
 use walrust::webhook::WebhookSender;
 

@@ -10,7 +10,6 @@ mod retention;
 mod retry;
 mod s3;
 mod shadow;
-mod storage;
 mod sync;
 mod uploader;
 mod wal;

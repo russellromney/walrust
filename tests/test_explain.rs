@@ -1,6 +1,11 @@
 // Comprehensive tests for `walrust explain` command
 //
 // Tests cover: positive cases, negative cases, edge cases, and integration tests
+//
+// Skipped without `--features s3`: the `walrust::sync` module under test is
+// itself S3-only.
+
+#![cfg(feature = "s3")]
 
 use anyhow::Result;
 use std::fs;

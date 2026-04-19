@@ -8,6 +8,13 @@ license = "Apache-2.0"
 repository = "https://github.com/russellromney/walrust"
 readme = "README.md"
 
+[features]
+default = []
+# Re-enables hadb-io's `s3` (AWS SDK + the `hadb_io::s3` helpers used by
+# legacy walrust-core consumers). The trait surface (StorageBackend) is
+# already AWS-free; this feature only governs the convenience re-exports.
+s3 = ["hadb-io/s3"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -19,7 +26,9 @@ async-trait = "0.1"
 hadb-storage = { path = "../../../hadb/hadb-storage", version = "0.4.0" }
 
 # Legacy retry/checksum helpers; replaced in step i.
-hadb-io = { path = "../../../hadb/hadb-io", version = "0.4.0" }
+# default-features off so consumers can build walrust-core with no AWS deps;
+# the outer walrust crate's `s3` feature re-enables hadb-io/s3.
+hadb-io = { path = "../../../hadb/hadb-io", version = "0.4.0", default-features = false }
 
 # HADBP changeset format
 hadb-changeset = { path = "../../../hadb/hadb-changeset", version = "0.4.0" }

@@ -12,7 +12,7 @@ use crate::retention::RetentionPolicy;
 use crate::retry::{RetryConfig, RetryPolicy};
 use crate::s3::{create_client, parse_bucket};
 use crate::shadow::ShadowWal;
-use crate::storage::StorageBackend;
+use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
 use crate::uploader::{spawn_uploader, UploadMessage, Uploader};
 use crate::webhook::WebhookSender;

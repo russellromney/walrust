@@ -9,15 +9,19 @@ walrust reads SQLite WAL frames, encodes them as LTX (Litestream Transaction) fi
 ## Usage
 
 ```rust
-use walrust::{S3Backend, StorageBackend, sync};
+use hadb_storage::StorageBackend;
+use hadb_storage_s3::S3Storage;
+use std::sync::Arc;
+use walrust::sync;
 
 // Continuous replication
-let storage = S3Backend::new(s3_client, "my-bucket", Some("prefix/"));
+let storage: Arc<dyn StorageBackend> =
+    Arc::new(S3Storage::from_env("my-bucket", None).await?);
 let config = sync::ReplicationConfig::default();
-sync::run_replication(&storage, "prefix/", &db_path, config, cancel_rx).await?;
+sync::run_replication(&*storage, "prefix/", &db_path, config, cancel_rx).await?;
 
 // Restore
-sync::restore(&storage, "prefix/", "my-db", &output_path, None).await?;
+sync::restore(&*storage, "prefix/", "my-db", &output_path, None).await?;
 ```
 
 ## Features

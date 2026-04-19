@@ -18,16 +18,19 @@ pub mod snapshot_source;
 pub mod sync;
 pub mod wal;
 
-// Storage trait (new substrate). Concrete impls (S3, Cinch, local, mem)
-// live in separate crates; consumers wire them in.
-pub use hadb_storage::StorageBackend;
+// `StorageBackend` lives in `hadb-storage`; consumers import it directly.
+// No re-export from here — one path per trait keeps the dep graph honest.
 
-// Legacy shared infrastructure from hadb-io (retry, S3 helpers). Step i
+// Legacy shared infrastructure from hadb-io (retry, circuit breaker). Step i
 // of Phase Anvil moves the remaining helpers elsewhere and drops hadb-io.
 pub use hadb_io;
-pub use hadb_io::s3;
 pub use hadb_io::{RetryConfig, RetryPolicy};
 pub use hadb_io::{CircuitBreaker, CircuitState, ErrorKind, classify_error, is_retryable};
+
+// Raw AWS SDK helpers — gated behind `s3` so AWS-free builds don't get a
+// dangling re-export.
+#[cfg(feature = "s3")]
+pub use hadb_io::s3;
 
 // Re-export walrust-specific types
 pub use sync::{LtxEntry, Manifest, ReplicationConfig, SyncState, restore_with_snapshot_source, run_wal_replication};

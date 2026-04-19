@@ -1,6 +1,11 @@
 // Comprehensive tests for webhook notifications
 //
 // Tests cover: circuit breaker notifications, corruption detection, integration tests
+//
+// Skipped without `--features s3`: the `walrust::webhook` module under test
+// is gated alongside the rest of the S3 path.
+
+#![cfg(feature = "s3")]
 
 use anyhow::Result;
 use std::sync::Arc;

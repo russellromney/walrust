@@ -82,18 +82,13 @@ fn test_reexport_s3_parse_bucket_simple() {
 }
 
 // ============================================================================
-// Re-export: StorageBackend alias works
+// StorageBackend lives in hadb-storage; consumers import it directly.
 // ============================================================================
 
-/// Compile-time check that walrust::StorageBackend is usable as a trait object.
+/// Compile-time check that the canonical S3 impl satisfies the trait
+/// the walrust pipeline accepts.
 #[allow(dead_code)]
-fn _assert_storage_backend_usable(_: &dyn walrust::StorageBackend) {}
-
-/// Compile-time check that the canonical S3 impl implements the trait
-/// walrust re-exports. Before Phase Anvil f walrust bundled its own
-/// `S3Backend`; now consumers wire in `hadb_storage_s3::S3Storage`.
-#[allow(dead_code)]
-fn _assert_s3_storage_usable<T: walrust::StorageBackend>() {}
+fn _assert_s3_storage_usable<T: hadb_storage::StorageBackend>() {}
 
 #[allow(dead_code)]
 fn _check_s3_storage_type() {

@@ -14,8 +14,9 @@ use async_trait::async_trait;
 use std::path::Path;
 use walrust::snapshot_source::SnapshotSource;
 use walrust::sync::restore_with_snapshot_source;
+use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
-use walrust::{StorageBackend, SyncState};
+use walrust::SyncState;
 
 fn test_bucket() -> String {
     std::env::var("WALRUST_S3_TEST_BUCKET")

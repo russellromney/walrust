@@ -27,8 +27,8 @@
 
 use crate::cache::LocalCache;
 use crate::retry::RetryPolicy;
-use crate::storage::StorageBackend;
 use crate::webhook::WebhookSender;
+use hadb_storage::StorageBackend;
 use anyhow::{Context, Result};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -303,8 +303,8 @@ mod tests {
     use super::*;
     use crate::cache::LocalCache;
     use crate::retry::RetryConfig;
-    use crate::storage::StorageBackend;
     use crate::webhook::WebhookSender;
+    use hadb_storage::StorageBackend;
     use async_trait::async_trait;
     use hadb_storage::CasResult;
     use std::collections::HashMap;
