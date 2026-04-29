@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use crate::ltx;
 use crate::wal;
-use hadb_storage::StorageBackend;
 use hadb_io::RetryPolicy;
+use hadb_storage::StorageBackend;
 
 // ============================================================================
 // Helpers
@@ -26,12 +26,17 @@ use hadb_io::RetryPolicy;
 ///
 /// Phase Somme: both walrust and turbolite use this counter as their version/txid.
 fn change_counter_from_pages(pages: &[(u32, Vec<u8>)]) -> Option<u64> {
-    pages.iter()
+    pages
+        .iter()
         .find(|(pn, _)| *pn == 1) // page_number 1 = DB page 0
         .and_then(|(_, data)| {
             if data.len() >= 28 {
                 let cc = u32::from_be_bytes([data[24], data[25], data[26], data[27]]) as u64;
-                if cc > 0 { Some(cc) } else { None }
+                if cc > 0 {
+                    Some(cc)
+                } else {
+                    None
+                }
             } else {
                 None
             }
@@ -150,12 +155,7 @@ const GENERATION_LIVE: u64 = cs_storage::GENERATION_INCREMENTAL;
 const GENERATION_SNAPSHOT: u64 = cs_storage::GENERATION_SNAPSHOT;
 
 /// Build S3 key for a changeset file.
-fn build_changeset_key(
-    prefix: &str,
-    db_name: &str,
-    generation: u64,
-    seq: u64,
-) -> String {
+fn build_changeset_key(prefix: &str, db_name: &str, generation: u64, seq: u64) -> String {
     cs_storage::format_key(prefix, db_name, generation, seq, ChangesetKind::Physical)
 }
 
@@ -366,15 +366,18 @@ pub async fn restore(
     _point_in_time: Option<&str>,
 ) -> Result<u64> {
     // Find latest snapshot
-    let snapshot = cs_storage::discover_latest_snapshot(
-        storage, prefix, db_name, ChangesetKind::Physical,
-    )
-    .await?
-    .ok_or_else(|| anyhow!("No snapshot found for database '{}'", db_name))?;
+    let snapshot =
+        cs_storage::discover_latest_snapshot(storage, prefix, db_name, ChangesetKind::Physical)
+            .await?
+            .ok_or_else(|| anyhow!("No snapshot found for database '{}'", db_name))?;
 
     // Find incrementals after the snapshot
     let incrementals = cs_storage::discover_after(
-        storage, prefix, db_name, snapshot.seq, ChangesetKind::Physical,
+        storage,
+        prefix,
+        db_name,
+        snapshot.seq,
+        ChangesetKind::Physical,
     )
     .await?;
 
@@ -709,7 +712,11 @@ pub async fn pull_incremental(
     current_seq: u64,
 ) -> Result<u64> {
     let new_files = cs_storage::discover_after(
-        storage, prefix, db_name, current_seq, ChangesetKind::Physical,
+        storage,
+        prefix,
+        db_name,
+        current_seq,
+        ChangesetKind::Physical,
     )
     .await?;
 
@@ -732,10 +739,7 @@ pub async fn pull_incremental(
         let changeset = match hadb_changeset::physical::decode(&data) {
             Ok(cs) => cs,
             Err(e) => {
-                tracing::error!(
-                    "Failed to decode changeset at {}: {}",
-                    file.key, e
-                );
+                tracing::error!("Failed to decode changeset at {}: {}", file.key, e);
                 return Err(anyhow!("Failed to decode changeset: {}", e));
             }
         };
@@ -852,6 +856,27 @@ pub struct ReplicationConfig {
     /// where snapshot creation must happen under a distributed lease
     /// to prevent checksum chain breaks. Default: true.
     pub autonomous_snapshots: bool,
+    /// Who owns the base state for this database.
+    ///
+    /// `Walrust` means walrust takes and restores HADBP snapshots itself.
+    /// `External` means some other layer owns the checkpointed base state
+    /// and walrust should only ship / replay WAL deltas after that point.
+    pub snapshot_ownership: SnapshotOwnership,
+}
+
+/// Ownership of the base database state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotOwnership {
+    /// walrust owns HADBP snapshots and WAL shipping.
+    Walrust,
+    /// An external layer owns checkpointed base state; walrust only ships WAL deltas.
+    External,
+}
+
+impl SnapshotOwnership {
+    pub fn is_external(self) -> bool {
+        matches!(self, Self::External)
+    }
 }
 
 impl Default for ReplicationConfig {
@@ -862,7 +887,20 @@ impl Default for ReplicationConfig {
             retry_policy: RetryPolicy::default_policy(),
             db_name: None,
             autonomous_snapshots: true,
+            snapshot_ownership: SnapshotOwnership::Walrust,
         }
+    }
+}
+
+impl ReplicationConfig {
+    /// Reject configuration combinations that violate walrust's replication invariants.
+    pub fn validate(&self) -> Result<()> {
+        if self.snapshot_ownership.is_external() && self.autonomous_snapshots {
+            anyhow::bail!(
+                "external snapshot ownership and autonomous snapshots are mutually exclusive"
+            );
+        }
+        Ok(())
     }
 }
 
@@ -882,6 +920,13 @@ pub async fn run_replication(
     config: ReplicationConfig,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    config.validate()?;
+    if config.snapshot_ownership.is_external() {
+        anyhow::bail!(
+            "run_replication() requires walrust-owned snapshots; use run_wal_replication() for external base state"
+        );
+    }
+
     let mut state = SyncState::new(db_path.to_path_buf())?;
     if let Some(ref name) = config.db_name {
         state.name = name.clone();
@@ -962,6 +1007,7 @@ pub async fn run_wal_replication(
     config: ReplicationConfig,
     mut cancel: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
+    config.validate()?;
     state.current_seq = initial_seq;
     state.current_txid = initial_seq; // Keep txid in sync for initial state
 
@@ -1076,15 +1122,16 @@ mod tests {
         }
         async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<CasResult> {
             // CAS is not exercised by the sync tests.
-            Ok(CasResult { success: true, etag: Some("test".into()) })
+            Ok(CasResult {
+                success: true,
+                etag: Some("test".into()),
+            })
         }
-        async fn put_if_match(
-            &self,
-            _key: &str,
-            _data: &[u8],
-            _etag: &str,
-        ) -> Result<CasResult> {
-            Ok(CasResult { success: true, etag: Some("test".into()) })
+        async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
+            Ok(CasResult {
+                success: true,
+                etag: Some("test".into()),
+            })
         }
     }
 
@@ -1131,10 +1178,7 @@ mod tests {
     #[async_trait]
     impl StorageBackend for OrderTrackingStorage {
         async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            self.download_order
-                .lock()
-                .unwrap()
-                .push(key.to_string());
+            self.download_order.lock().unwrap().push(key.to_string());
             self.inner.get(key).await
         }
         async fn put(&self, k: &str, d: &[u8]) -> Result<()> {
@@ -1332,8 +1376,7 @@ mod tests {
             if let Some(ref msg) = self.fail {
                 return Err(anyhow!("{}", msg));
             }
-            let conn =
-                rusqlite::Connection::open(output).map_err(|e| anyhow!("open: {}", e))?;
+            let conn = rusqlite::Connection::open(output).map_err(|e| anyhow!("open: {}", e))?;
             conn.execute_batch("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);")
                 .map_err(|e| anyhow!("create: {}", e))?;
             for i in 0..self.row_count {
@@ -1363,15 +1406,10 @@ mod tests {
             fail: None,
         };
 
-        let restored_seq = restore_with_snapshot_source(
-            &storage,
-            "test/",
-            "mydb",
-            &output,
-            &source,
-        )
-        .await
-        .unwrap();
+        let restored_seq =
+            restore_with_snapshot_source(&storage, "test/", "mydb", &output, &source)
+                .await
+                .unwrap();
 
         assert_eq!(restored_seq, 5);
 
@@ -1490,7 +1528,9 @@ mod tests {
             inner: TestStorage::new(),
             fail_key: "prefix/mydb/manifest.json".to_string(),
         };
-        let err = load_manifest(&storage, "prefix/", "mydb").await.unwrap_err();
+        let err = load_manifest(&storage, "prefix/", "mydb")
+            .await
+            .unwrap_err();
         // Previous behavior would have silently swallowed this and
         // returned a fresh-DB manifest; the fix propagates.
         let msg = err.to_string();
@@ -1505,7 +1545,9 @@ mod tests {
         let mut storage = TestStorage::new();
         let key = "prefix/mydb/manifest.json".to_string();
         storage.insert(&key, b"{ this is not valid json".to_vec());
-        let err = load_manifest(&storage, "prefix/", "mydb").await.unwrap_err();
+        let err = load_manifest(&storage, "prefix/", "mydb")
+            .await
+            .unwrap_err();
         assert!(
             err.to_string().contains("corrupt manifest"),
             "expected corrupt-manifest error, got: {err}"

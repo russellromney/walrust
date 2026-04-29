@@ -24,8 +24,8 @@ pub mod wal;
 // Legacy shared infrastructure from hadb-io (retry, circuit breaker). Step i
 // of Phase Anvil moves the remaining helpers elsewhere and drops hadb-io.
 pub use hadb_io;
+pub use hadb_io::{classify_error, is_retryable, CircuitBreaker, CircuitState, ErrorKind};
 pub use hadb_io::{RetryConfig, RetryPolicy};
-pub use hadb_io::{CircuitBreaker, CircuitState, ErrorKind, classify_error, is_retryable};
 
 // Raw AWS SDK helpers — gated behind `s3` so AWS-free builds don't get a
 // dangling re-export.
@@ -33,9 +33,12 @@ pub use hadb_io::{CircuitBreaker, CircuitState, ErrorKind, classify_error, is_re
 pub use hadb_io::s3;
 
 // Re-export walrust-specific types
-pub use sync::{LtxEntry, Manifest, ReplicationConfig, SyncState, restore_with_snapshot_source, run_wal_replication};
 pub use replicator::Replicator;
 pub use snapshot_source::SnapshotSource;
+pub use sync::{
+    restore_with_snapshot_source, run_wal_replication, LtxEntry, Manifest, ReplicationConfig,
+    SnapshotOwnership, SyncState,
+};
 
 // Re-export hadb-changeset for consumers
 pub use hadb_changeset;

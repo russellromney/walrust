@@ -23,8 +23,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
-use hadb_storage::StorageBackend;
 use crate::sync::{self, ReplicationConfig, SyncState};
+use hadb_storage::StorageBackend;
 
 /// Per-database replication state.
 struct DbState {
@@ -65,7 +65,22 @@ impl Replicator {
     ///
     /// `prefix` is the S3 key prefix for all databases (e.g., "wal/" or "ha-test/").
     /// Each database added via `add()` is stored under `{prefix}{db_name}/`.
-    pub fn new(storage: Arc<dyn StorageBackend>, prefix: &str, config: ReplicationConfig) -> Arc<Self> {
+    pub fn new(
+        storage: Arc<dyn StorageBackend>,
+        prefix: &str,
+        config: ReplicationConfig,
+    ) -> Arc<Self> {
+        Self::try_new(storage, prefix, config).expect("invalid walrust ReplicationConfig")
+    }
+
+    /// Fallible constructor for callers that want configuration errors instead of panic.
+    pub fn try_new(
+        storage: Arc<dyn StorageBackend>,
+        prefix: &str,
+        config: ReplicationConfig,
+    ) -> Result<Arc<Self>> {
+        config.validate()?;
+
         let replicator = Arc::new(Self {
             storage,
             config,
@@ -73,7 +88,8 @@ impl Replicator {
             databases: Arc::new(RwLock::new(HashMap::new())),
         });
 
-        tracing::info!("Replicator started (sync={}ms, snapshot={}s)",
+        tracing::info!(
+            "Replicator started (sync={}ms, snapshot={}s)",
             replicator.config.sync_interval.as_millis(),
             replicator.config.snapshot_interval.as_secs(),
         );
@@ -81,14 +97,20 @@ impl Replicator {
         let r = replicator.clone();
         tokio::spawn(async move { r.run_loop().await });
 
-        replicator
+        Ok(replicator)
     }
 
     /// Add a database to replication.
     ///
-    /// Takes an initial snapshot (blocks until uploaded). Returns error if the
-    /// snapshot fails after retries — the database is NOT added in that case.
+    /// In walrust-owned mode, takes an initial snapshot (blocks until uploaded).
+    /// In external-base-state mode, registers without uploading a snapshot.
+    ///
+    /// Returns error if initialization fails — the database is NOT added in that case.
     pub async fn add(&self, name: &str, db_path: &Path) -> Result<()> {
+        if self.config.snapshot_ownership.is_external() {
+            return self.add_without_snapshot(name, db_path).await;
+        }
+
         let prefix = self.prefix.clone();
 
         // Build state and take initial snapshot OUTSIDE the map lock
@@ -107,10 +129,7 @@ impl Replicator {
         )
         .await?;
 
-        let db_state = Arc::new(AsyncMutex::new(DbState {
-            state,
-            prefix,
-        }));
+        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix }));
 
         self.databases
             .write()
@@ -151,22 +170,26 @@ impl Replicator {
                 }
                 tracing::info!(
                     "Replicator: loaded state for '{}': seq={}, gen={}, txid={}",
-                    name, state.current_seq, state.wal_generation, state.current_txid,
+                    name,
+                    state.current_seq,
+                    state.wal_generation,
+                    state.current_txid,
                 );
             }
         }
 
-        let db_state = Arc::new(AsyncMutex::new(DbState {
-            state,
-            prefix,
-        }));
+        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix }));
 
         self.databases
             .write()
             .await
             .insert(name.to_string(), db_state);
 
-        tracing::info!("Replicator: added '{}' without snapshot ({})", name, db_path.display());
+        tracing::info!(
+            "Replicator: added '{}' without snapshot ({})",
+            name,
+            db_path.display()
+        );
         Ok(())
     }
 
@@ -180,13 +203,7 @@ impl Replicator {
         if let Some(db_state) = entry {
             let mut s = db_state.lock().await;
             let prefix = s.prefix.clone();
-            match sync::sync_wal(
-                self.storage.as_ref(),
-                &prefix,
-                &mut s.state,
-            )
-            .await
-            {
+            match sync::sync_wal(self.storage.as_ref(), &prefix, &mut s.state).await {
                 Ok(frames) if frames > 0 => {
                     tracing::info!(
                         "Replicator: final sync for '{}' captured {} frames",
@@ -214,7 +231,8 @@ impl Replicator {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let seq = match sync::restore(self.storage.as_ref(), &prefix, name, output_path, None).await {
+        let seq = match sync::restore(self.storage.as_ref(), &prefix, name, output_path, None).await
+        {
             Ok(seq) => seq,
             Err(e) if e.to_string().contains("No snapshot found") => return Ok(None),
             Err(e) => return Err(e),
@@ -246,12 +264,7 @@ impl Replicator {
 
         let mut state = db_state.lock().await;
         let prefix = state.prefix.clone();
-        let frame_count = sync::sync_wal(
-            self.storage.as_ref(),
-            &prefix,
-            &mut state.state,
-        )
-        .await?;
+        let frame_count = sync::sync_wal(self.storage.as_ref(), &prefix, &mut state.state).await?;
 
         Ok(frame_count)
     }
@@ -284,8 +297,9 @@ impl Replicator {
         let mut sync_timer = tokio::time::interval(self.config.sync_interval);
 
         if !self.config.autonomous_snapshots {
-            // Multiwriter mode: only sync WAL, never take autonomous snapshots.
-            // Snapshot creation is coordinated externally (under a lease).
+            // WAL-only mode: sync WAL, never take autonomous snapshots.
+            // Used both for lease-coordinated snapshot ownership and for
+            // external-base-state mode where another layer owns checkpoints.
             loop {
                 sync_timer.tick().await;
                 self.sync_all().await;
@@ -321,13 +335,7 @@ impl Replicator {
             set.spawn(async move {
                 let mut s = db_state.lock().await;
                 let prefix = s.prefix.clone();
-                match sync::sync_wal(
-                    storage.as_ref(),
-                    &prefix,
-                    &mut s.state,
-                )
-                .await
-                {
+                match sync::sync_wal(storage.as_ref(), &prefix, &mut s.state).await {
                     Ok(frames) if frames > 0 => {
                         tracing::debug!(
                             "Replicator: synced '{}' ({} frames, seq {})",

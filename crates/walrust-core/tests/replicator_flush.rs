@@ -7,8 +7,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use hadb_storage::{CasResult, StorageBackend};
-use walrust::ReplicationConfig;
 use walrust::Replicator;
+use walrust::{ReplicationConfig, SnapshotOwnership};
 
 // ============================================================================
 // In-memory storage backend for tests
@@ -72,19 +72,31 @@ impl StorageBackend for MemStorage {
     async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
         let mut map = self.objects.lock().unwrap();
         if map.contains_key(key) {
-            return Ok(CasResult { success: false, etag: None });
+            return Ok(CasResult {
+                success: false,
+                etag: None,
+            });
         }
         map.insert(key.to_string(), data.to_vec());
-        Ok(CasResult { success: true, etag: Some("mem".into()) })
+        Ok(CasResult {
+            success: true,
+            etag: Some("mem".into()),
+        })
     }
 
     async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
         let mut map = self.objects.lock().unwrap();
         if !map.contains_key(key) {
-            return Ok(CasResult { success: false, etag: None });
+            return Ok(CasResult {
+                success: false,
+                etag: None,
+            });
         }
         map.insert(key.to_string(), data.to_vec());
-        Ok(CasResult { success: true, etag: Some("mem".into()) })
+        Ok(CasResult {
+            success: true,
+            etag: Some("mem".into()),
+        })
     }
 }
 
@@ -127,6 +139,16 @@ fn make_config() -> ReplicationConfig {
         // Very long intervals so the background loop doesn't interfere with tests.
         sync_interval: std::time::Duration::from_secs(3600),
         snapshot_interval: std::time::Duration::from_secs(3600),
+        ..Default::default()
+    }
+}
+
+fn make_external_config() -> ReplicationConfig {
+    ReplicationConfig {
+        sync_interval: std::time::Duration::from_secs(3600),
+        snapshot_interval: std::time::Duration::from_secs(3600),
+        autonomous_snapshots: false,
+        snapshot_ownership: SnapshotOwnership::External,
         ..Default::default()
     }
 }
@@ -189,6 +211,67 @@ async fn test_flush_uploads_ltx() {
     drop(conn);
 }
 
+/// External-base-state mode must reject autonomous snapshots at construction time.
+#[test]
+fn test_try_new_rejects_external_mode_with_autonomous_snapshots() {
+    let storage = MemStorage::new();
+    let mut config = make_external_config();
+    config.autonomous_snapshots = true;
+
+    let err = match Replicator::try_new(storage, "wal/", config) {
+        Ok(_) => panic!("unsafe config should be rejected"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains(
+            "external snapshot ownership and autonomous snapshots are mutually exclusive"
+        ),
+        "unexpected error: {err}"
+    );
+}
+
+/// External-base-state mode should register the DB without uploading a snapshot.
+#[tokio::test]
+async fn test_add_external_mode_skips_snapshot_upload() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let storage = MemStorage::new();
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+
+    replicator.add("external", &db_path).await.unwrap();
+
+    let keys_after_add = storage.keys();
+    assert!(
+        keys_after_add.is_empty(),
+        "external mode should not upload a snapshot on add(), got keys: {:?}",
+        keys_after_add
+    );
+
+    write_rows(&conn, 100, 2);
+    let frames = replicator.flush("external").await.unwrap();
+    assert!(
+        frames > 0,
+        "flush should upload WAL frames in external mode"
+    );
+
+    let keys_after_flush = storage.keys();
+    let hadbp_keys: Vec<_> = keys_after_flush
+        .iter()
+        .filter(|k| k.starts_with("wal/external/") && k.ends_with(".hadbp"))
+        .collect();
+    assert!(
+        !hadbp_keys.is_empty(),
+        "flush should upload an incremental HADBP changeset, got keys: {:?}",
+        keys_after_flush
+    );
+
+    drop(conn);
+}
+
 /// flush() with no pending WAL frames should return 0.
 #[tokio::test]
 async fn test_flush_no_pending_frames_returns_zero() {
@@ -205,7 +288,11 @@ async fn test_flush_no_pending_frames_returns_zero() {
 
     // Second flush with no new writes should return 0
     let second = replicator.flush("test").await.unwrap();
-    assert_eq!(second, 0, "flush() with no new WAL data should return 0, got {}", second);
+    assert_eq!(
+        second, 0,
+        "flush() with no new WAL data should return 0, got {}",
+        second
+    );
 
     drop(conn);
 }
@@ -322,7 +409,9 @@ async fn test_flush_returns_frame_count() {
     let after = replicator.flush("count").await.unwrap();
     // Either flush caught them or the background loop did
     // At minimum, the data is in storage
-    let ltx_keys: Vec<_> = storage.keys().iter()
+    let ltx_keys: Vec<_> = storage
+        .keys()
+        .iter()
         .filter(|k| k.contains("0000/") && k.ends_with(".hadbp"))
         .cloned()
         .collect();
