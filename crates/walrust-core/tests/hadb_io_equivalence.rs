@@ -30,11 +30,17 @@ fn test_reexport_retry_policy() {
 #[test]
 fn test_reexport_classify_error() {
     assert_eq!(
-        format!("{:?}", walrust::classify_error(&anyhow!("500 Internal Server Error"))),
+        format!(
+            "{:?}",
+            walrust::classify_error(&anyhow!("500 Internal Server Error"))
+        ),
         "Transient"
     );
     assert_eq!(
-        format!("{:?}", walrust::classify_error(&anyhow!("401 Unauthorized"))),
+        format!(
+            "{:?}",
+            walrust::classify_error(&anyhow!("401 Unauthorized"))
+        ),
         "AuthError"
     );
     assert_eq!(

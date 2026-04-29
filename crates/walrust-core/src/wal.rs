@@ -177,7 +177,13 @@ pub async fn read_frames_as_page_map(
     path: &Path,
     page_size: u32,
     start_offset: u64,
-) -> Result<(std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32, u64)> {
+) -> Result<(
+    std::collections::HashMap<u32, Vec<u8>>,
+    usize,
+    u64,
+    u32,
+    u64,
+)> {
     let mut file = File::open(path).await?;
     let file_size = file.metadata().await?.len();
 
@@ -211,8 +217,10 @@ pub async fn read_frames_as_page_map(
         let mut header_buf = [0u8; 24];
         file.read_exact(&mut header_buf).await?;
 
-        let page_number = u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
-        let db_size = u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+        let page_number =
+            u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let db_size =
+            u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
 
         file.read_exact(&mut page_data).await?;
 
@@ -230,7 +238,13 @@ pub async fn read_frames_as_page_map(
 
     let new_offset = start_pos + full_frames * frame_size;
 
-    Ok((page_map, full_frames as usize, new_offset, max_db_size, commit_count))
+    Ok((
+        page_map,
+        full_frames as usize,
+        new_offset,
+        max_db_size,
+        commit_count,
+    ))
 }
 
 /// Count committed transactions in the entire WAL file.
@@ -261,7 +275,8 @@ pub async fn count_wal_commits(path: &Path, page_size: u32) -> Result<u64> {
     for _ in 0..full_frames {
         let mut header_buf = [0u8; 8];
         file.read_exact(&mut header_buf).await?;
-        let db_size = u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+        let db_size =
+            u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
         if db_size > 0 {
             commit_count += 1;
         }
@@ -294,7 +309,11 @@ pub async fn read_frames_as_pages(
         path, file_size, page_size, start_offset, start_pos, frame_size);
 
     if start_pos >= file_size {
-        tracing::debug!("read_frames_as_pages: start_pos ({}) >= file_size ({}), returning empty", start_pos, file_size);
+        tracing::debug!(
+            "read_frames_as_pages: start_pos ({}) >= file_size ({}), returning empty",
+            start_pos,
+            file_size
+        );
         return Ok((Vec::new(), start_pos, 0));
     }
 
@@ -303,7 +322,11 @@ pub async fn read_frames_as_pages(
     let available = file_size - start_pos;
     let full_frames = available / frame_size;
 
-    tracing::debug!("read_frames_as_pages: available={}, full_frames={}", available, full_frames);
+    tracing::debug!(
+        "read_frames_as_pages: available={}, full_frames={}",
+        available,
+        full_frames
+    );
 
     if full_frames == 0 {
         tracing::debug!("read_frames_as_pages: full_frames=0, returning empty");
@@ -318,8 +341,10 @@ pub async fn read_frames_as_pages(
         let mut header_buf = [0u8; 24];
         file.read_exact(&mut header_buf).await?;
 
-        let page_number = u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
-        let db_size = u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+        let page_number =
+            u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let db_size =
+            u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
 
         // Read page data
         let mut page_data = vec![0u8; page_size as usize];
@@ -545,7 +570,10 @@ mod tests {
 
         let result = read_header(&path).await;
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid WAL magic"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid WAL magic"));
 
         tokio::fs::remove_file(&path).await.ok();
     }
@@ -557,8 +585,8 @@ mod tests {
         // Create valid WAL header with magic 0x377F0682 (big-endian checksum)
         let mut header = [0u8; 32];
         header[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes()); // magic
-        header[4..8].copy_from_slice(&3007000u32.to_be_bytes());     // format version
-        header[8..12].copy_from_slice(&4096u32.to_be_bytes());       // page size
+        header[4..8].copy_from_slice(&3007000u32.to_be_bytes()); // format version
+        header[8..12].copy_from_slice(&4096u32.to_be_bytes()); // page size
 
         tokio::fs::write(&path, &header).await.unwrap();
 
@@ -577,8 +605,8 @@ mod tests {
         // Create valid WAL header with magic 0x377F0683 (little-endian checksum)
         let mut header = [0u8; 32];
         header[0..4].copy_from_slice(&0x377F0683u32.to_be_bytes()); // magic
-        header[4..8].copy_from_slice(&3007000u32.to_be_bytes());     // format version
-        header[8..12].copy_from_slice(&4096u32.to_be_bytes());       // page size
+        header[4..8].copy_from_slice(&3007000u32.to_be_bytes()); // format version
+        header[8..12].copy_from_slice(&4096u32.to_be_bytes()); // page size
 
         tokio::fs::write(&path, &header).await.unwrap();
 
@@ -655,7 +683,7 @@ mod tests {
         // Create WAL header + 2 frames
         let mut data = vec![0u8; 32 + frame_size * 2];
         data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes()); // magic
-        data[8..12].copy_from_slice(&page_size.to_be_bytes());    // page size
+        data[8..12].copy_from_slice(&page_size.to_be_bytes()); // page size
 
         // Fill frame data with recognizable pattern
         for i in 0..frame_size * 2 {
@@ -688,7 +716,9 @@ mod tests {
 
         // Read starting after first frame
         let start_offset = WAL_HEADER_SIZE + frame_size as u64;
-        let (frames, offset, count) = read_frames_from(&path, page_size, start_offset).await.unwrap();
+        let (frames, offset, count) = read_frames_from(&path, page_size, start_offset)
+            .await
+            .unwrap();
 
         assert_eq!(count, 2); // Should get remaining 2 frames
         assert_eq!(frames.len(), frame_size * 2);
@@ -769,7 +799,9 @@ mod tests {
     async fn test_read_frames_with_metadata_no_wal() {
         let path = PathBuf::from("/tmp/nonexistent-wal-for-metadata.db-wal");
 
-        let result = read_frames_with_metadata(&path, 4096, 0, None).await.unwrap();
+        let result = read_frames_with_metadata(&path, 4096, 0, None)
+            .await
+            .unwrap();
 
         assert!(result.frames.is_empty());
         assert_eq!(result.salt, (0, 0));
@@ -778,7 +810,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_frames_with_metadata_checkpoint_detection() {
-        let path = PathBuf::from(format!("/tmp/walrust-test-meta-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-meta-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
 
         // Create WAL header with specific salt
         let mut header = [0u8; 32];
@@ -791,7 +826,9 @@ mod tests {
 
         // Read with different expected salt - should detect checkpoint
         let old_salt = (0xAAAAAAAA, 0xBBBBBBBB);
-        let result = read_frames_with_metadata(&path, 4096, 0, Some(old_salt)).await.unwrap();
+        let result = read_frames_with_metadata(&path, 4096, 0, Some(old_salt))
+            .await
+            .unwrap();
 
         // Should return new salt and reset offset
         assert_eq!(result.salt, (0x11111111, 0x22222222));
@@ -802,7 +839,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_frames_with_metadata_same_salt() {
-        let path = PathBuf::from(format!("/tmp/walrust-test-meta-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-meta-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
 
         let page_size: u32 = 4096;
         let frame_size = FRAME_HEADER_SIZE as usize + page_size as usize;
@@ -822,7 +862,9 @@ mod tests {
 
         // Read with same salt - should proceed normally
         let same_salt = (0x11111111, 0x22222222);
-        let result = read_frames_with_metadata(&path, page_size, 0, Some(same_salt)).await.unwrap();
+        let result = read_frames_with_metadata(&path, page_size, 0, Some(same_salt))
+            .await
+            .unwrap();
 
         assert_eq!(result.frames.len(), 1);
         assert_eq!(result.salt, same_salt);
@@ -837,7 +879,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_frames_as_page_map_empty() {
-        let path = PathBuf::from(format!("/tmp/walrust-test-pagemap-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-pagemap-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
 
         // Create valid WAL header only (no frames)
         let mut header = [0u8; 32];
@@ -863,7 +908,10 @@ mod tests {
         // Regression test: read_frames_as_page_map must deduplicate during read.
         // If the same page appears multiple times, only the latest version should be in the map.
         // Peak memory = unique pages, NOT total frames.
-        let path = PathBuf::from(format!("/tmp/walrust-test-pagemap-dedup-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-pagemap-dedup-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
 
         let page_size: u32 = 4096;
         let frame_header_size = 24usize;
@@ -879,25 +927,33 @@ mod tests {
         let f0 = 32;
         data[f0..f0 + 4].copy_from_slice(&1u32.to_be_bytes()); // page_number=1
         data[f0 + 4..f0 + 8].copy_from_slice(&3u32.to_be_bytes()); // db_size=3
-        for b in &mut data[f0 + frame_header_size..f0 + frame_size] { *b = 0x11; } // v1 data
+        for b in &mut data[f0 + frame_header_size..f0 + frame_size] {
+            *b = 0x11;
+        } // v1 data
 
         // Frame 1: page 2
         let f1 = 32 + frame_size;
         data[f1..f1 + 4].copy_from_slice(&2u32.to_be_bytes()); // page_number=2
         data[f1 + 4..f1 + 8].copy_from_slice(&0u32.to_be_bytes()); // db_size=0
-        for b in &mut data[f1 + frame_header_size..f1 + frame_size] { *b = 0x22; }
+        for b in &mut data[f1 + frame_header_size..f1 + frame_size] {
+            *b = 0x22;
+        }
 
         // Frame 2: page 1, v2 (overwrites v1)
         let f2 = 32 + frame_size * 2;
         data[f2..f2 + 4].copy_from_slice(&1u32.to_be_bytes()); // page_number=1
         data[f2 + 4..f2 + 8].copy_from_slice(&0u32.to_be_bytes()); // db_size=0
-        for b in &mut data[f2 + frame_header_size..f2 + frame_size] { *b = 0xAA; } // v2 data
+        for b in &mut data[f2 + frame_header_size..f2 + frame_size] {
+            *b = 0xAA;
+        } // v2 data
 
         // Frame 3: page 3
         let f3 = 32 + frame_size * 3;
         data[f3..f3 + 4].copy_from_slice(&3u32.to_be_bytes()); // page_number=3
         data[f3 + 4..f3 + 8].copy_from_slice(&3u32.to_be_bytes()); // db_size=3 (commit)
-        for b in &mut data[f3 + frame_header_size..f3 + frame_size] { *b = 0x33; }
+        for b in &mut data[f3 + frame_header_size..f3 + frame_size] {
+            *b = 0x33;
+        }
 
         tokio::fs::write(&path, &data).await.unwrap();
 
@@ -909,7 +965,10 @@ mod tests {
         assert_eq!(page_map.len(), 3, "Should have 3 unique pages");
 
         // Page 1 should be v2 (0xAA), not v1 (0x11)
-        assert_eq!(page_map[&1][0], 0xAA, "Page 1 should be latest version (v2)");
+        assert_eq!(
+            page_map[&1][0], 0xAA,
+            "Page 1 should be latest version (v2)"
+        );
         assert_eq!(page_map[&2][0], 0x22, "Page 2 should be 0x22");
         assert_eq!(page_map[&3][0], 0x33, "Page 3 should be 0x33");
 
@@ -924,7 +983,10 @@ mod tests {
     async fn test_read_frames_as_page_map_matches_old_api() {
         // read_frames_as_page_map must produce the same result as
         // read_frames_as_pages + manual dedup. This is a regression guard.
-        let path = PathBuf::from(format!("/tmp/walrust-test-pagemap-compat-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-pagemap-compat-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
 
         let page_size: u32 = 4096;
         let frame_header_size = 24usize;
@@ -938,16 +1000,22 @@ mod tests {
         let f0 = 32;
         data[f0..f0 + 4].copy_from_slice(&5u32.to_be_bytes());
         data[f0 + 4..f0 + 8].copy_from_slice(&10u32.to_be_bytes());
-        for b in &mut data[f0 + frame_header_size..f0 + frame_size] { *b = 0x55; }
+        for b in &mut data[f0 + frame_header_size..f0 + frame_size] {
+            *b = 0x55;
+        }
 
         let f1 = 32 + frame_size;
         data[f1..f1 + 4].copy_from_slice(&5u32.to_be_bytes());
-        for b in &mut data[f1 + frame_header_size..f1 + frame_size] { *b = 0x66; } // overwrite
+        for b in &mut data[f1 + frame_header_size..f1 + frame_size] {
+            *b = 0x66;
+        } // overwrite
 
         let f2 = 32 + frame_size * 2;
         data[f2..f2 + 4].copy_from_slice(&10u32.to_be_bytes());
         data[f2 + 4..f2 + 8].copy_from_slice(&10u32.to_be_bytes());
-        for b in &mut data[f2 + frame_header_size..f2 + frame_size] { *b = 0xAA; }
+        for b in &mut data[f2 + frame_header_size..f2 + frame_size] {
+            *b = 0xAA;
+        }
 
         tokio::fs::write(&path, &data).await.unwrap();
 
@@ -987,7 +1055,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_count_wal_commits_empty_wal() {
-        let path = PathBuf::from(format!("/tmp/walrust-test-commits-empty-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-commits-empty-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
         let mut header = [0u8; 32];
         header[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
         header[8..12].copy_from_slice(&4096u32.to_be_bytes());
@@ -1000,7 +1071,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_count_wal_commits_counts_correctly() {
-        let path = PathBuf::from(format!("/tmp/walrust-test-commits-count-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-commits-count-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
 
         let page_size: u32 = 4096;
         let frame_header_size = 24usize;
@@ -1039,7 +1113,10 @@ mod tests {
     #[tokio::test]
     async fn test_commit_count_matches_page_map() {
         // count_wal_commits and read_frames_as_page_map must agree on commit count
-        let path = PathBuf::from(format!("/tmp/walrust-test-commits-agree-{}.db-wal", uuid::Uuid::new_v4()));
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-commits-agree-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
 
         let page_size: u32 = 4096;
         let frame_header_size = 24usize;

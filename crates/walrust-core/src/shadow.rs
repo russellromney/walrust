@@ -69,7 +69,9 @@ impl ShadowWal {
         };
 
         // Find highest existing generation
-        let generation = Self::find_latest_generation(&shadow_dir).await?.unwrap_or(0);
+        let generation = Self::find_latest_generation(&shadow_dir)
+            .await?
+            .unwrap_or(0);
 
         // Open read connection to prevent auto-checkpoint
         let checkpoint_blocker = Self::open_checkpoint_blocker(db_path)?;
@@ -108,16 +110,9 @@ impl ShadowWal {
         conn.execute_batch("BEGIN DEFERRED;")?;
 
         // Read from sqlite_master to establish the read transaction
-        let _: i64 = conn.query_row(
-            "SELECT COUNT(*) FROM sqlite_master",
-            [],
-            |row| row.get(0),
-        )?;
+        let _: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))?;
 
-        tracing::debug!(
-            "Opened checkpoint blocker for {}",
-            db_path.display()
-        );
+        tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
 
         Ok(conn)
     }
@@ -191,7 +186,8 @@ impl ShadowWal {
         }
 
         // Write frames to current shadow segment
-        self.write_frames_to_segment(&frames, header.page_size).await?;
+        self.write_frames_to_segment(&frames, header.page_size)
+            .await?;
 
         tracing::debug!(
             "Shadow WAL: copied {} frames to gen {} segment {} (offset {} -> {})",
@@ -206,7 +202,11 @@ impl ShadowWal {
     }
 
     /// Write frames to the current shadow segment file
-    async fn write_frames_to_segment(&mut self, frames: &[ParsedFrame], page_size: u32) -> Result<()> {
+    async fn write_frames_to_segment(
+        &mut self,
+        frames: &[ParsedFrame],
+        page_size: u32,
+    ) -> Result<()> {
         let segment_path = self.current_segment_path();
 
         // Open or create segment file

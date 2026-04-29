@@ -11,16 +11,15 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use hadb_storage::StorageBackend;
+use hadb_storage_s3::S3Storage;
 use std::path::Path;
 use walrust::snapshot_source::SnapshotSource;
 use walrust::sync::restore_with_snapshot_source;
-use hadb_storage::StorageBackend;
-use hadb_storage_s3::S3Storage;
 use walrust::SyncState;
 
 fn test_bucket() -> String {
-    std::env::var("WALRUST_S3_TEST_BUCKET")
-        .unwrap_or_else(|_| "sqlces-test".to_string())
+    std::env::var("WALRUST_S3_TEST_BUCKET").unwrap_or_else(|_| "sqlces-test".to_string())
 }
 
 fn test_endpoint() -> Option<String> {
@@ -53,14 +52,16 @@ struct TestSnapshotSource {
 #[async_trait]
 impl SnapshotSource for TestSnapshotSource {
     async fn materialize(&self, output: &Path) -> Result<u64> {
-        let conn = rusqlite::Connection::open(output)
-            .map_err(|e| anyhow::anyhow!("open: {}", e))?;
+        let conn =
+            rusqlite::Connection::open(output).map_err(|e| anyhow::anyhow!("open: {}", e))?;
         conn.execute_batch("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);")
             .map_err(|e| anyhow::anyhow!("create: {}", e))?;
         for i in 0..self.row_count {
-            conn.execute("INSERT INTO data VALUES (?1, ?2)",
-                rusqlite::params![i, format!("row_{}", i)])
-                .map_err(|e| anyhow::anyhow!("insert: {}", e))?;
+            conn.execute(
+                "INSERT INTO data VALUES (?1, ?2)",
+                rusqlite::params![i, format!("row_{}", i)],
+            )
+            .map_err(|e| anyhow::anyhow!("insert: {}", e))?;
         }
         Ok(self.version)
     }
@@ -102,16 +103,21 @@ async fn test_s3_restore_snapshot_source_no_incrementals() {
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("restored.db");
 
-    let source = TestSnapshotSource { row_count: 100, version: 5 };
+    let source = TestSnapshotSource {
+        row_count: 100,
+        version: 5,
+    };
 
-    let restored_txid = restore_with_snapshot_source(
-        &storage, &prefix, "testdb", &output, &source,
-    ).await.unwrap();
+    let restored_txid = restore_with_snapshot_source(&storage, &prefix, "testdb", &output, &source)
+        .await
+        .unwrap();
 
     assert_eq!(restored_txid, 5);
 
     let conn = rusqlite::Connection::open(&output).unwrap();
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0)).unwrap();
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0))
+        .unwrap();
     assert_eq!(count, 100);
 }
 
@@ -132,46 +138,67 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
     // Step 1: create base DB with 50 rows
     {
         let conn = rusqlite::Connection::open(&base_db).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
-        conn.execute_batch("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);").unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        conn.execute_batch("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
         for i in 0..50 {
-            conn.execute("INSERT INTO data VALUES (?1, ?2)",
-                rusqlite::params![i, format!("base_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO data VALUES (?1, ?2)",
+                rusqlite::params![i, format!("base_{}", i)],
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     // Step 2: take initial snapshot via walrust sync
     let mut state = SyncState::new(base_db.clone()).unwrap();
-    walrust::sync::take_snapshot(&storage, &prefix, &mut state).await.unwrap();
+    walrust::sync::take_snapshot(&storage, &prefix, &mut state)
+        .await
+        .unwrap();
     let snapshot_txid = state.current_txid;
 
     // Step 3: write more rows (WAL changes, no checkpoint)
     {
         let conn = rusqlite::Connection::open(&base_db).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;").unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
         for i in 50..100 {
-            conn.execute("INSERT INTO data VALUES (?1, ?2)",
-                rusqlite::params![i, format!("inc_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO data VALUES (?1, ?2)",
+                rusqlite::params![i, format!("inc_{}", i)],
+            )
+            .unwrap();
         }
     }
 
     // Step 4: sync WAL to S3 (creates incremental LTX)
-    let synced = walrust::sync::sync_wal(&storage, &prefix, &mut state).await.unwrap();
-    eprintln!("[test] synced {} WAL frames, snapshot_txid={}, current_txid={}",
-        synced, snapshot_txid, state.current_txid);
+    let synced = walrust::sync::sync_wal(&storage, &prefix, &mut state)
+        .await
+        .unwrap();
+    eprintln!(
+        "[test] synced {} WAL frames, snapshot_txid={}, current_txid={}",
+        synced, snapshot_txid, state.current_txid
+    );
 
     // Step 5: make a clean copy of the base DB (before WAL changes) for snapshot source
     let clean_base = dir.path().join("clean_base.db");
     {
         let conn = rusqlite::Connection::open(&clean_base).unwrap();
         conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        conn.execute_batch("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);").unwrap();
+        conn.execute_batch("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);")
+            .unwrap();
         for i in 0..50 {
-            conn.execute("INSERT INTO data VALUES (?1, ?2)",
-                rusqlite::params![i, format!("base_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO data VALUES (?1, ?2)",
+                rusqlite::params![i, format!("base_{}", i)],
+            )
+            .unwrap();
         }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
     }
 
     // Step 6: restore using snapshot source + S3 incrementals
@@ -181,16 +208,22 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
         version: snapshot_txid,
     };
 
-    let restored_txid = restore_with_snapshot_source(
-        &storage, &prefix, "base", &output, &source,
-    ).await.unwrap();
+    let restored_txid = restore_with_snapshot_source(&storage, &prefix, "base", &output, &source)
+        .await
+        .unwrap();
 
     eprintln!("[test] restored_txid={}", restored_txid);
 
     // Base data should be there at minimum
     let conn = rusqlite::Connection::open(&output).unwrap();
-    let count: i64 = conn.query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0)).unwrap();
-    assert!(count >= 50, "should have at least base 50 rows, got {}", count);
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0))
+        .unwrap();
+    assert!(
+        count >= 50,
+        "should have at least base 50 rows, got {}",
+        count
+    );
 
     // If incrementals applied successfully, we'd have 100 rows
     // (depends on checksum chain compatibility)
@@ -219,17 +252,20 @@ async fn test_s3_restore_snapshot_source_materialize_fails() {
     #[async_trait]
     impl SnapshotSource for FailingSource {
         async fn materialize(&self, _output: &Path) -> Result<u64> {
-            Err(anyhow::anyhow!("page group download failed: connection reset"))
+            Err(anyhow::anyhow!(
+                "page group download failed: connection reset"
+            ))
         }
-        async fn checkpoint_version(&self) -> Result<u64> { Ok(0) }
+        async fn checkpoint_version(&self) -> Result<u64> {
+            Ok(0)
+        }
     }
 
     let dir = tempfile::tempdir().unwrap();
     let output = dir.path().join("restored.db");
 
-    let result = restore_with_snapshot_source(
-        &storage, &prefix, "testdb", &output, &FailingSource,
-    ).await;
+    let result =
+        restore_with_snapshot_source(&storage, &prefix, "testdb", &output, &FailingSource).await;
 
     assert!(result.is_err());
     assert!(result.unwrap_err().to_string().contains("connection reset"));

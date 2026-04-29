@@ -20,9 +20,9 @@ pub const SQLITE_PAGE_ID_SIZE: PageIdSize = PageIdSize::U32;
 
 // Re-export hadb-changeset types used by sync.rs and consumers.
 pub use hadb_changeset::physical::{
-    compute_checksum, decode, encode, verify_chain,
-    PageEntry as HadbPageEntry, PageId as HadbPageId, PageIdSize as HadbPageIdSize,
-    PhysicalChangeset as HadbChangeset, PhysicalHeader as HadbHeader,
+    compute_checksum, decode, encode, verify_chain, PageEntry as HadbPageEntry,
+    PageId as HadbPageId, PageIdSize as HadbPageIdSize, PhysicalChangeset as HadbChangeset,
+    PhysicalHeader as HadbHeader,
 };
 
 /// Create an HADBP changeset from a SQLite database snapshot.
@@ -55,7 +55,8 @@ pub fn encode_snapshot(
         });
     }
 
-    let changeset = PhysicalChangeset::new(seq, prev_checksum, SQLITE_PAGE_ID_SIZE, page_size, pages);
+    let changeset =
+        PhysicalChangeset::new(seq, prev_checksum, SQLITE_PAGE_ID_SIZE, page_size, pages);
     Ok(physical::encode(&changeset))
 }
 
@@ -70,8 +71,8 @@ pub struct DecodeResult {
 ///
 /// Returns the header and checksum for chain tracking.
 pub fn decode_to_db(data: &[u8], output_path: &Path) -> Result<DecodeResult> {
-    let changeset = physical::decode(data)
-        .map_err(|e| anyhow!("Failed to decode HADBP changeset: {}", e))?;
+    let changeset =
+        physical::decode(data).map_err(|e| anyhow!("Failed to decode HADBP changeset: {}", e))?;
 
     let page_size = changeset.header.page_size as usize;
 
@@ -125,9 +126,13 @@ pub struct ApplyResult {
 /// Verifies the checksum chain before writing anything (fail-fast via hadb-changeset).
 ///
 /// Returns the header and checksum for chain tracking.
-pub fn apply_changeset_to_db(data: &[u8], db_path: &Path, expected_prev_checksum: u64) -> Result<ApplyResult> {
-    let changeset = physical::decode(data)
-        .map_err(|e| anyhow!("Failed to decode HADBP changeset: {}", e))?;
+pub fn apply_changeset_to_db(
+    data: &[u8],
+    db_path: &Path,
+    expected_prev_checksum: u64,
+) -> Result<ApplyResult> {
+    let changeset =
+        physical::decode(data).map_err(|e| anyhow!("Failed to decode HADBP changeset: {}", e))?;
 
     // Verify checksum chain before writing
     physical::verify_chain(expected_prev_checksum, &changeset)
@@ -186,7 +191,8 @@ pub fn encode_wal_changes(
         })
         .collect();
 
-    let changeset = PhysicalChangeset::new(seq, prev_checksum, SQLITE_PAGE_ID_SIZE, page_size, entries);
+    let changeset =
+        PhysicalChangeset::new(seq, prev_checksum, SQLITE_PAGE_ID_SIZE, page_size, entries);
     let checksum = changeset.checksum;
     let encoded = physical::encode(&changeset);
     Ok((encoded, checksum))
@@ -593,11 +599,8 @@ mod tests {
 
         // Snapshot (seq 1)
         let snap_encoded = encode_snapshot(&db_path, page_size, 1, 0).unwrap();
-        let snap_result = decode_to_db(
-            &snap_encoded,
-            &dir.path().join("snap_restored.db"),
-        )
-        .unwrap();
+        let snap_result =
+            decode_to_db(&snap_encoded, &dir.path().join("snap_restored.db")).unwrap();
 
         // First incremental: update page 1 (seq 2)
         let pre_checksum1 = compute_checksum_from_file(&db_path).unwrap();
@@ -615,8 +618,7 @@ mod tests {
         let pages2: Vec<(u32, Vec<u8>)> = vec![(2, vec![0xBB; page_size as usize])];
         let expected_post2 = chain_checksum(pre_checksum2, &pages2);
 
-        let (inc2_encoded, _) =
-            encode_wal_changes(&pages2, page_size, 3, pre_checksum2).unwrap();
+        let (inc2_encoded, _) = encode_wal_changes(&pages2, page_size, 3, pre_checksum2).unwrap();
 
         let result2 = apply_changeset_to_db(&inc2_encoded, &db_path, pre_checksum2).unwrap();
         assert_eq!(result2.checksum, expected_post2);
@@ -655,12 +657,12 @@ mod tests {
         let again = chain_checksum(pre, &[page1.clone(), page2.clone(), page3.clone()]);
         assert_eq!(forward, again);
 
-        let different_pre = chain_checksum(0xCAFEBABE, &[page1.clone(), page2.clone(), page3.clone()]);
+        let different_pre =
+            chain_checksum(0xCAFEBABE, &[page1.clone(), page2.clone(), page3.clone()]);
         assert_ne!(forward, different_pre);
 
         let page1_modified = (1u32, vec![0xFF; 4096]);
-        let different_data =
-            chain_checksum(pre, &[page1_modified, page2.clone(), page3.clone()]);
+        let different_data = chain_checksum(pre, &[page1_modified, page2.clone(), page3.clone()]);
         assert_ne!(forward, different_data);
 
         let page1_renumbered = (99u32, vec![0xAA; 4096]);
