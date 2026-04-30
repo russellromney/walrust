@@ -784,6 +784,121 @@ pub async fn pull_incremental(
     Ok(applied_seq)
 }
 
+/// Pull and apply new HADBP changesets from S3 through a `PageReplaySink`,
+/// without ever writing to a SQLite file.
+///
+/// Mirrors `pull_incremental` semantically — same discovery, same
+/// `current_seq` filtering, same `PULL_CONCURRENCY` for downloads, same
+/// `Ok(current_seq)` short-circuit when nothing is newer — but routes
+/// each decoded page through `sink.apply_page` instead of seeking into
+/// a `&Path`. Used by direct hybrid page replay (Phase
+/// `004-direct-hybrid-page-replay`) to compose Turbolite's checkpoint
+/// base with walrust's WAL deltas without staging through a temporary
+/// SQLite file.
+///
+/// Lifecycle: `sink.begin()` is called once at the start (even if no
+/// new changesets are discovered, so a zero-delta caller still observes
+/// a complete `begin → finalize` cycle). For each newly discovered
+/// changeset the function calls `sink.apply_page` per page in arrival
+/// order, then `sink.commit_changeset(seq)`. After all changesets
+/// succeed it calls `sink.finalize()`. On any error — download, decode,
+/// or sink — it calls `sink.abort()` and returns the error. Exactly one
+/// of `finalize` or `abort` is called per invocation.
+///
+/// Page id contract: pages flow as the SQLite-1-based `page_id`
+/// straight from the HADBP changeset (`hadb_changeset::physical::Page::page_id`).
+/// Sinks that need a 0-based index convert internally.
+pub async fn pull_incremental_into_sink(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    sink: &mut dyn crate::replay_sink::PageReplaySink,
+    current_seq: u64,
+) -> Result<u64> {
+    sink.begin()?;
+
+    let result =
+        pull_incremental_into_sink_inner(storage, prefix, db_name, sink, current_seq).await;
+
+    match result {
+        Ok(applied_seq) => {
+            sink.finalize()?;
+            Ok(applied_seq)
+        }
+        Err(e) => {
+            // Best-effort abort: if abort itself fails, surface the
+            // original error and log the abort failure. The original
+            // error is what the caller needs to act on.
+            if let Err(abort_err) = sink.abort() {
+                tracing::error!(
+                    "PageReplaySink::abort failed after primary error '{}': {}",
+                    e,
+                    abort_err
+                );
+            }
+            Err(e)
+        }
+    }
+}
+
+async fn pull_incremental_into_sink_inner(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    sink: &mut dyn crate::replay_sink::PageReplaySink,
+    current_seq: u64,
+) -> Result<u64> {
+    let new_files = cs_storage::discover_after(
+        storage,
+        prefix,
+        db_name,
+        current_seq,
+        ChangesetKind::Physical,
+    )
+    .await?;
+
+    if new_files.is_empty() {
+        return Ok(current_seq);
+    }
+
+    let downloaded = download_parallel(storage, &new_files, PULL_CONCURRENCY).await;
+
+    let mut applied_seq = current_seq;
+    let mut applied_count = 0u64;
+
+    for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
+        let data = data?;
+        let changeset = hadb_changeset::physical::decode(&data)
+            .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", file.key, e))?;
+
+        for page in &changeset.pages {
+            // SQLite 1-based page id straight from the HADBP changeset.
+            let sqlite_page_id: u32 = page
+                .page_id
+                .to_u64()
+                .try_into()
+                .map_err(|_| anyhow!("page_id {} exceeds u32", page.page_id.to_u64()))?;
+            sink.apply_page(sqlite_page_id, &page.data)?;
+        }
+
+        sink.commit_changeset(file.seq)?;
+
+        applied_seq = file.seq;
+        applied_count += 1;
+    }
+
+    if applied_count > 0 {
+        tracing::info!(
+            "pull_incremental_into_sink: applied {} HADBP changesets, seq {} -> {}",
+            applied_count,
+            current_seq,
+            applied_seq
+        );
+    }
+
+    Ok(applied_seq)
+}
+
 /// Download one S3 object, returning its index for ordered reassembly.
 async fn download_one(
     storage: &dyn StorageBackend,
@@ -1558,5 +1673,245 @@ mod tests {
             err.to_string().contains("corrupt manifest"),
             "expected corrupt-manifest error, got: {err}"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // pull_incremental_into_sink
+    //
+    // Phase 004 (direct hybrid page replay): the sink-based pull entry
+    // point. These tests pin the lifecycle (begin → apply_page* →
+    // commit_changeset → finalize/abort), the SQLite-1-based page id
+    // contract, abort-on-error semantics, and the no-new-changesets
+    // short-circuit.
+    // ------------------------------------------------------------------
+
+    use crate::ltx::encode_wal_changes;
+    use crate::replay_sink::test_support::RecordingSink;
+
+    fn seed_changeset(
+        storage: &mut TestStorage,
+        prefix: &str,
+        db_name: &str,
+        seq: u64,
+        page_size: u32,
+        pages: &[(u32, Vec<u8>)],
+    ) -> u64 {
+        let (bytes, post_checksum) =
+            encode_wal_changes(pages, page_size, seq, 0).expect("encode_wal_changes");
+        let key = build_changeset_key(prefix, db_name, GENERATION_LIVE, seq);
+        storage.insert(&key, bytes);
+        post_checksum
+    }
+
+    fn page_payload(page_size: usize, marker: u8) -> Vec<u8> {
+        vec![marker; page_size]
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_no_new_changesets_runs_begin_and_finalize() {
+        let storage = TestStorage::new();
+        let mut sink = RecordingSink::new();
+
+        let seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 5)
+            .await
+            .expect("pull");
+
+        assert_eq!(seq, 5, "no new changesets, returns current_seq");
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.begin_calls, 1, "begin must be called exactly once");
+        assert_eq!(ev.finalize_calls, 1, "finalize must run on success path");
+        assert_eq!(ev.abort_calls, 0, "abort must not run on success path");
+        assert!(ev.applied.is_empty());
+        assert!(ev.committed_seqs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_passes_sqlite_one_based_page_ids() {
+        let mut storage = TestStorage::new();
+        let page_size = 4096u32;
+        let p1 = page_payload(page_size as usize, 0xAA);
+        let p2 = page_payload(page_size as usize, 0xBB);
+        seed_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            1,
+            page_size,
+            &[(1, p1.clone()), (2, p2.clone())],
+        );
+
+        let mut sink = RecordingSink::new();
+        let seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0)
+            .await
+            .expect("pull");
+        assert_eq!(seq, 1);
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.begin_calls, 1);
+        assert_eq!(ev.finalize_calls, 1);
+        assert_eq!(ev.abort_calls, 0);
+        assert_eq!(ev.committed_seqs, vec![1]);
+        // Page ids round-trip as the SQLite 1-based ids carried in HADBP,
+        // not as a 0-based or otherwise normalized value. Sinks that
+        // need 0-based indexing convert internally.
+        let mut applied = ev.applied.clone();
+        applied.sort_by_key(|(id, _)| *id);
+        assert_eq!(applied[0].0, 1);
+        assert_eq!(applied[1].0, 2);
+        assert_eq!(applied[0].1, p1);
+        assert_eq!(applied[1].1, p2);
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_drives_lifecycle_across_multiple_changesets() {
+        let mut storage = TestStorage::new();
+        let page_size = 4096u32;
+        seed_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            1,
+            page_size,
+            &[(1, page_payload(page_size as usize, 0x11))],
+        );
+        seed_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            2,
+            page_size,
+            &[(2, page_payload(page_size as usize, 0x22))],
+        );
+        seed_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            3,
+            page_size,
+            &[(3, page_payload(page_size as usize, 0x33))],
+        );
+
+        let mut sink = RecordingSink::new();
+        let final_seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0)
+            .await
+            .expect("pull");
+        assert_eq!(final_seq, 3);
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.begin_calls, 1);
+        assert_eq!(ev.finalize_calls, 1);
+        assert_eq!(ev.abort_calls, 0);
+        // commit_changeset is called once per changeset, in order.
+        assert_eq!(ev.committed_seqs, vec![1, 2, 3]);
+        // Pages applied in the order they appear across changesets.
+        assert_eq!(ev.applied.len(), 3);
+        assert_eq!(ev.applied[0].0, 1);
+        assert_eq!(ev.applied[1].0, 2);
+        assert_eq!(ev.applied[2].0, 3);
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_skips_changesets_at_or_below_current_seq() {
+        let mut storage = TestStorage::new();
+        let page_size = 4096u32;
+        seed_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            1,
+            page_size,
+            &[(1, page_payload(page_size as usize, 0x11))],
+        );
+        seed_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            2,
+            page_size,
+            &[(2, page_payload(page_size as usize, 0x22))],
+        );
+
+        let mut sink = RecordingSink::new();
+        let seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 1)
+            .await
+            .expect("pull");
+        assert_eq!(seq, 2, "should advance past current_seq=1 to seq=2");
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.committed_seqs, vec![2], "only seq>1 applied");
+        assert_eq!(ev.applied.len(), 1);
+        assert_eq!(ev.applied[0].0, 2);
+        assert_eq!(ev.finalize_calls, 1);
+        assert_eq!(ev.abort_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_aborts_on_apply_page_error_no_finalize() {
+        let mut storage = TestStorage::new();
+        let page_size = 4096u32;
+        seed_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            1,
+            page_size,
+            &[
+                (1, page_payload(page_size as usize, 0x11)),
+                (2, page_payload(page_size as usize, 0x22)),
+                (3, page_payload(page_size as usize, 0x33)),
+            ],
+        );
+
+        // Inject a failure on the second apply_page call.
+        let mut sink = RecordingSink::new().fail_at(1);
+        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+
+        assert!(result.is_err(), "primary error must propagate");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("injected apply_page failure"),
+            "expected injected error, got: {err}"
+        );
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.begin_calls, 1, "begin must run before any apply");
+        assert_eq!(
+            ev.finalize_calls, 0,
+            "finalize must NOT run on the abort path"
+        );
+        assert_eq!(
+            ev.abort_calls, 1,
+            "abort must run exactly once when apply_page fails"
+        );
+        // First page was recorded before the injected failure on idx=1.
+        assert_eq!(ev.applied.len(), 1);
+        // commit_changeset must not run if any page in the changeset failed.
+        assert!(ev.committed_seqs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_aborts_on_decode_error_no_finalize() {
+        let mut storage = TestStorage::new();
+        // Seed a corrupt changeset blob at the expected key.
+        let key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 1);
+        storage.insert(&key, b"not a valid HADBP changeset".to_vec());
+
+        let mut sink = RecordingSink::new();
+        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+
+        assert!(result.is_err(), "decode failure must propagate");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("Failed to decode changeset"),
+            "expected decode failure, got: {err}"
+        );
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.begin_calls, 1);
+        assert_eq!(ev.finalize_calls, 0);
+        assert_eq!(ev.abort_calls, 1);
+        assert!(ev.applied.is_empty());
+        assert!(ev.committed_seqs.is_empty());
     }
 }

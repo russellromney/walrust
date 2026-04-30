@@ -12,6 +12,7 @@
 
 pub mod errors;
 pub mod ltx;
+pub mod replay_sink;
 pub mod replicator;
 pub mod shadow;
 pub mod snapshot_source;
@@ -33,11 +34,12 @@ pub use hadb_io::{RetryConfig, RetryPolicy};
 pub use hadb_io::s3;
 
 // Re-export walrust-specific types
+pub use replay_sink::PageReplaySink;
 pub use replicator::Replicator;
 pub use snapshot_source::SnapshotSource;
 pub use sync::{
-    restore_with_snapshot_source, run_wal_replication, LtxEntry, Manifest, ReplicationConfig,
-    SnapshotOwnership, SyncState,
+    pull_incremental_into_sink, restore_with_snapshot_source, run_wal_replication, LtxEntry,
+    Manifest, ReplicationConfig, SnapshotOwnership, SyncState,
 };
 
 // Re-export hadb-changeset for consumers
