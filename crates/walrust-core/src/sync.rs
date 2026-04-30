@@ -815,29 +815,47 @@ pub async fn pull_incremental_into_sink(
     sink: &mut dyn crate::replay_sink::PageReplaySink,
     current_seq: u64,
 ) -> Result<u64> {
-    sink.begin()?;
+    // begin() may fail; if it does, abort() is still called as a
+    // best-effort cleanup so the contract "exactly one of finalize or
+    // abort per invocation" holds even on early failure. Sinks must
+    // tolerate abort() being called when begin() itself errored.
+    if let Err(begin_err) = sink.begin() {
+        try_abort(sink, &begin_err);
+        return Err(begin_err);
+    }
 
     let result =
         pull_incremental_into_sink_inner(storage, prefix, db_name, sink, current_seq).await;
 
     match result {
         Ok(applied_seq) => {
-            sink.finalize()?;
+            // finalize() may fail mid-install (the Turbolite sink
+            // writes pages, marks bitmap, bumps generation, etc. — any
+            // step can fail). On failure we still need to give the
+            // sink a chance to clean up staged state.
+            if let Err(finalize_err) = sink.finalize() {
+                try_abort(sink, &finalize_err);
+                return Err(finalize_err);
+            }
             Ok(applied_seq)
         }
         Err(e) => {
-            // Best-effort abort: if abort itself fails, surface the
-            // original error and log the abort failure. The original
-            // error is what the caller needs to act on.
-            if let Err(abort_err) = sink.abort() {
-                tracing::error!(
-                    "PageReplaySink::abort failed after primary error '{}': {}",
-                    e,
-                    abort_err
-                );
-            }
+            try_abort(sink, &e);
             Err(e)
         }
+    }
+}
+
+/// Best-effort abort: if abort itself fails, log it but surface the
+/// primary error to the caller. The primary error is what the caller
+/// needs to act on; abort failure is secondary diagnostic info.
+fn try_abort(sink: &mut dyn crate::replay_sink::PageReplaySink, primary: &anyhow::Error) {
+    if let Err(abort_err) = sink.abort() {
+        tracing::error!(
+            "PageReplaySink::abort failed after primary error '{}': {}",
+            primary,
+            abort_err
+        );
     }
 }
 
@@ -1913,5 +1931,84 @@ mod tests {
         assert_eq!(ev.abort_calls, 1);
         assert!(ev.applied.is_empty());
         assert!(ev.committed_seqs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_aborts_when_begin_fails() {
+        // begin() failure must still trigger abort() so the contract
+        // "exactly one of finalize or abort per invocation" holds. Sinks
+        // that allocate state in begin (file handles, locks, etc.) need
+        // a single cleanup callback even on the earliest failure.
+        let storage = TestStorage::new();
+        let mut sink = RecordingSink::new().fail_begin();
+
+        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+
+        assert!(result.is_err(), "begin failure must propagate");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("injected begin failure"),
+            "expected begin failure error, got: {err}"
+        );
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.begin_calls, 1, "begin called once");
+        assert_eq!(
+            ev.finalize_calls, 0,
+            "finalize must not run after begin failure"
+        );
+        assert_eq!(
+            ev.abort_calls, 1,
+            "abort must be called exactly once even when begin failed"
+        );
+        assert!(ev.applied.is_empty());
+        assert!(ev.committed_seqs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_aborts_when_finalize_fails() {
+        // finalize() failure is the load-bearing case: the Turbolite
+        // sink does multi-step install work in finalize (page writes,
+        // bitmap, generation bump, bitmap persist). If any step fails
+        // mid-way, the sink needs an explicit cleanup call to drop
+        // partially installed state. Without this, a finalize crash
+        // leaks staged state with no way to recover.
+        let mut storage = TestStorage::new();
+        let page_size = 4096u32;
+        seed_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            1,
+            page_size,
+            &[(1, page_payload(page_size as usize, 0xAB))],
+        );
+
+        let mut sink = RecordingSink::new().fail_finalize();
+        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+
+        assert!(result.is_err(), "finalize failure must propagate");
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("injected finalize failure"),
+            "expected finalize failure error, got: {err}"
+        );
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.begin_calls, 1);
+        assert_eq!(
+            ev.applied.len(),
+            1,
+            "the page was applied successfully before finalize ran"
+        );
+        assert_eq!(ev.committed_seqs, vec![1]);
+        assert_eq!(
+            ev.finalize_calls, 1,
+            "finalize must have been attempted exactly once"
+        );
+        assert_eq!(
+            ev.abort_calls, 1,
+            "abort must run after a finalize failure to clean up"
+        );
     }
 }

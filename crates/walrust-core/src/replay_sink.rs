@@ -14,6 +14,14 @@
 //! a half-applied local state marked final. Sinks that stage to a side
 //! buffer until `finalize` (the recommended shape) drop the buffer in
 //! `abort` without touching the live readable state.
+//!
+//! The driver guarantees `abort` is called on **any** failure — including
+//! a failure inside `begin` itself or inside `finalize` — so sinks that
+//! allocate or arm state in `begin`, or that perform multi-step install
+//! work in `finalize`, are still given a single cleanup call. Sinks
+//! must therefore tolerate `abort` being called after a failed `begin`
+//! (no staged state to drop) and after a partially completed `finalize`
+//! (some install steps may have run).
 
 use anyhow::Result;
 
@@ -42,12 +50,16 @@ pub trait PageReplaySink: Send {
     fn commit_changeset(&mut self, seq: u64) -> Result<()>;
 
     /// Called once after the last successfully applied changeset.
-    /// Atomically installs the staged state.
+    /// Atomically installs the staged state. May fail mid-install;
+    /// the driver will call `abort` after a `finalize` failure.
     fn finalize(&mut self) -> Result<()>;
 
-    /// Called instead of `finalize` on any error. Drops staged state
-    /// without touching the live readable state. Must be safe to call
-    /// after `begin` even if no `apply_page` calls happened.
+    /// Called by the driver on any failure during the lifecycle —
+    /// including a failure inside `begin` itself or inside `finalize`.
+    /// Drops staged state without touching the live readable state.
+    /// Must be safe to call after a failed `begin` (no staged state
+    /// to drop) and after a partially completed `finalize` (some
+    /// install steps may have run).
     fn abort(&mut self) -> Result<()>;
 }
 
@@ -67,9 +79,13 @@ pub(crate) mod test_support {
 
     /// In-memory sink that records every call. Used by unit tests in
     /// `sync.rs` to assert the call shape `pull_incremental_into_sink`
-    /// drives.
+    /// drives. Failure injection is opt-in per lifecycle method so
+    /// tests can drive each error path independently.
     pub struct RecordingSink {
         pub events: Arc<Mutex<LifecycleEvents>>,
+        pub fail_begin: bool,
+        pub fail_finalize: bool,
+        pub fail_abort: bool,
         pub fail_at_apply_index: Option<usize>,
         next_apply_index: usize,
     }
@@ -78,6 +94,9 @@ pub(crate) mod test_support {
         pub fn new() -> Self {
             Self {
                 events: Arc::new(Mutex::new(LifecycleEvents::default())),
+                fail_begin: false,
+                fail_finalize: false,
+                fail_abort: false,
                 fail_at_apply_index: None,
                 next_apply_index: 0,
             }
@@ -85,6 +104,22 @@ pub(crate) mod test_support {
 
         pub fn fail_at(mut self, idx: usize) -> Self {
             self.fail_at_apply_index = Some(idx);
+            self
+        }
+
+        pub fn fail_begin(mut self) -> Self {
+            self.fail_begin = true;
+            self
+        }
+
+        pub fn fail_finalize(mut self) -> Self {
+            self.fail_finalize = true;
+            self
+        }
+
+        #[allow(dead_code)]
+        pub fn fail_abort(mut self) -> Self {
+            self.fail_abort = true;
             self
         }
 
@@ -96,6 +131,9 @@ pub(crate) mod test_support {
     impl PageReplaySink for RecordingSink {
         fn begin(&mut self) -> Result<()> {
             self.events.lock().unwrap().begin_calls += 1;
+            if self.fail_begin {
+                return Err(anyhow::anyhow!("injected begin failure"));
+            }
             Ok(())
         }
 
@@ -120,11 +158,17 @@ pub(crate) mod test_support {
 
         fn finalize(&mut self) -> Result<()> {
             self.events.lock().unwrap().finalize_calls += 1;
+            if self.fail_finalize {
+                return Err(anyhow::anyhow!("injected finalize failure"));
+            }
             Ok(())
         }
 
         fn abort(&mut self) -> Result<()> {
             self.events.lock().unwrap().abort_calls += 1;
+            if self.fail_abort {
+                return Err(anyhow::anyhow!("injected abort failure"));
+            }
             Ok(())
         }
     }
