@@ -107,14 +107,30 @@ impl Replicator {
     ///
     /// Returns error if initialization fails — the database is NOT added in that case.
     pub async fn add(&self, name: &str, db_path: &Path) -> Result<()> {
+        self.add_with_wal_path(name, db_path, &db_path.with_extension("db-wal"))
+            .await
+    }
+
+    /// Add a database to replication with an explicit WAL path.
+    ///
+    /// Use this when the checkpointed base file and live WAL file do not share
+    /// SQLite's normal `<db>.db` / `<db>.db-wal` layout.
+    pub async fn add_with_wal_path(
+        &self,
+        name: &str,
+        db_path: &Path,
+        wal_path: &Path,
+    ) -> Result<()> {
         if self.config.snapshot_ownership.is_external() {
-            return self.add_without_snapshot(name, db_path).await;
+            return self
+                .add_without_snapshot_with_wal_path(name, db_path, wal_path)
+                .await;
         }
 
         let prefix = self.prefix.clone();
 
         // Build state and take initial snapshot OUTSIDE the map lock
-        let mut state = SyncState::new(db_path.to_path_buf())?;
+        let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
 
         if db_path.exists() {
@@ -145,9 +161,20 @@ impl Replicator {
     /// from S3. Avoids uploading a redundant snapshot that could race with
     /// other nodes' changesets.
     pub async fn add_without_snapshot(&self, name: &str, db_path: &Path) -> Result<()> {
+        self.add_without_snapshot_with_wal_path(name, db_path, &db_path.with_extension("db-wal"))
+            .await
+    }
+
+    /// Register a database without taking a snapshot, with an explicit WAL path.
+    pub async fn add_without_snapshot_with_wal_path(
+        &self,
+        name: &str,
+        db_path: &Path,
+        wal_path: &Path,
+    ) -> Result<()> {
         let prefix = self.prefix.clone();
 
-        let mut state = SyncState::new(db_path.to_path_buf())?;
+        let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
 
         if db_path.exists() {

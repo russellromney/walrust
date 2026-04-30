@@ -113,12 +113,18 @@ pub struct SyncState {
 impl SyncState {
     /// Create new sync state for a database.
     pub fn new(db_path: PathBuf) -> Result<Self> {
+        let wal_path = db_path.with_extension("db-wal");
+        Self::new_with_paths(db_path, wal_path)
+    }
+
+    /// Create new sync state for a database whose base file and WAL file live
+    /// at different paths.
+    pub fn new_with_paths(db_path: PathBuf, wal_path: PathBuf) -> Result<Self> {
         let name = db_path
             .file_stem()
             .and_then(|s| s.to_str())
             .ok_or_else(|| anyhow!("Invalid database path"))?
             .to_string();
-        let wal_path = db_path.with_extension("db-wal");
         Ok(Self {
             name,
             db_path,
