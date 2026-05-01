@@ -1696,11 +1696,10 @@ mod tests {
     // ------------------------------------------------------------------
     // pull_incremental_into_sink
     //
-    // Phase 004 (direct hybrid page replay): the sink-based pull entry
-    // point. These tests pin the lifecycle (begin → apply_page* →
-    // commit_changeset → finalize/abort), the SQLite-1-based page id
-    // contract, abort-on-error semantics, and the no-new-changesets
-    // short-circuit.
+    // Sink-based pull entry point. These tests pin the lifecycle
+    // (begin → apply_page* → commit_changeset → finalize/abort),
+    // the SQLite-1-based page id contract, abort-on-error semantics,
+    // and the no-new-changesets short-circuit.
     // ------------------------------------------------------------------
 
     use crate::ltx::encode_wal_changes;
