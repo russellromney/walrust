@@ -72,13 +72,13 @@ hex = "0.4"
 walrust-core = { version = "0.3.0", path = "crates/walrust-core", package = "walrust" }
 
 # Storage substrate (trait is always available; concrete S3 impl is feature-gated).
-hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage" }
-hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", optional = true }
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", branch = "hoist-prereq-internal-lease-store" }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", branch = "hoist-prereq-internal-lease-store", optional = true }
 
 # Legacy config/webhook/retention/s3 helpers. Default-features = false so
 # `walrust --no-default-features` can build without aws-sdk; the `s3` feature
 # above re-enables hadb-io's `s3` (and pulls in aws-sdk-s3 transitively).
-hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", default-features = false }
+hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", branch = "hoist-prereq-internal-lease-store", default-features = false }
 
 # S3 client type (shared with hadb-io, needed for function signatures).
 aws-sdk-s3 = { version = "1", optional = true }

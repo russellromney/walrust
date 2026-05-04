@@ -1262,7 +1262,7 @@ dependencies = [
 [[package]]
 name = "hadb-changeset"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git#237fc5df304dac3b8b3e36fdcb20bdcc65e07330"
+source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1276,7 +1276,7 @@ dependencies = [
 [[package]]
 name = "hadb-io"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git#237fc5df304dac3b8b3e36fdcb20bdcc65e07330"
+source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1298,7 +1298,7 @@ dependencies = [
 [[package]]
 name = "hadb-storage"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git#237fc5df304dac3b8b3e36fdcb20bdcc65e07330"
+source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1308,7 +1308,7 @@ dependencies = [
 [[package]]
 name = "hadb-storage-s3"
 version = "0.4.0"
-source = "git+https://github.com/russellromney/hadb.git#237fc5df304dac3b8b3e36fdcb20bdcc65e07330"
+source = "git+https://github.com/russellromney/hadb.git?branch=hoist-prereq-internal-lease-store#6bf02111d555b2e495fd737c2074876424b2875d"
 dependencies = [
  "anyhow",
  "async-trait",
