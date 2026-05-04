@@ -23,15 +23,15 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # Storage substrate (trait)
-hadb-storage = { path = "../../../hadb/hadb-storage", version = "0.4.0" }
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage" }
 
 # Legacy retry/checksum helpers; replaced in step i.
 # default-features off so consumers can build walrust-core with no AWS deps;
 # the outer walrust crate's `s3` feature re-enables hadb-io/s3.
-hadb-io = { path = "../../../hadb/hadb-io", version = "0.4.0", default-features = false }
+hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", default-features = false }
 
 # HADBP changeset format
-hadb-changeset = { path = "../../../hadb/hadb-changeset", version = "0.4.0" }
+hadb-changeset = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-changeset" }
 
 # SQLite for checkpointing (shadow WAL)
 rusqlite = { version = "0.35", features = ["bundled"] }
@@ -54,4 +54,4 @@ walkdir = "2"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 # Integration tests use the S3 impl directly for compile-time usability checks.
-hadb-storage-s3 = { path = "../../../hadb/hadb-storage-s3" }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3" }
