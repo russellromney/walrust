@@ -151,9 +151,10 @@ pub struct WalReadResult {
     pub truncated_during_read: bool,
 }
 
-/// Read WAL frames, deduplicating into a page map during read.
-/// Peak memory = unique pages, not total frames.
-/// Returns (page_map, frame_count, new_offset, max_db_size)
+/// Read committed WAL frames, deduplicating into a page map during read.
+/// Trailing frames after the last commit frame are left unread by offset so a
+/// future sync can see them after SQLite appends their commit frame.
+/// Returns (page_map, committed_frame_count, new_offset, max_db_size, commit_count).
 pub async fn read_frames_as_page_map(
     path: &Path,
     page_size: u32,
@@ -183,35 +184,44 @@ pub async fn read_frames_as_page_map(
         return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
     }
 
-    let mut page_map = std::collections::HashMap::new();
-    let mut max_db_size: u32 = 0;
-    let mut commit_count: u64 = 0;
-    let mut page_data = vec![0u8; page_size as usize];
+    let mut frame_headers = Vec::with_capacity(full_frames as usize);
 
-    for _ in 0..full_frames {
+    for frame_index in 0..full_frames {
         let mut header_buf = [0u8; 24];
         file.read_exact(&mut header_buf).await?;
 
         let page_number = u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
         let db_size = u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
 
+        file.seek(SeekFrom::Current(page_size as i64)).await?;
+        frame_headers.push((frame_index + 1, page_number, db_size));
+    }
+
+    let Some((committed_frames, _, _)) = frame_headers.iter().rev().find(|(_, _, db_size)| *db_size > 0).copied() else {
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
+    };
+    let committed_frames = committed_frames as usize;
+    let max_db_size = frame_headers[..committed_frames].iter().map(|(_, _, db_size)| *db_size).max().unwrap_or(0);
+    let commit_count = frame_headers[..committed_frames].iter().filter(|(_, _, db_size)| *db_size > 0).count() as u64;
+
+    file.seek(SeekFrom::Start(start_pos)).await?;
+
+    let mut page_map = std::collections::HashMap::new();
+    let mut page_data = vec![0u8; page_size as usize];
+
+    for (_, page_number, _) in frame_headers.into_iter().take(committed_frames) {
+        let mut header_buf = [0u8; 24];
+        file.read_exact(&mut header_buf).await?;
         file.read_exact(&mut page_data).await?;
 
-        if db_size > 0 {
-            commit_count += 1;
-        }
-        if db_size > max_db_size {
-            max_db_size = db_size;
-        }
-
         // Dedup in-place: overwrite previous version of the same page.
-        // We reuse the buffer and clone only the final version into the map.
+        // We reuse the buffer and clone only the final committed version into the map.
         page_map.insert(page_number, page_data.clone());
     }
 
-    let new_offset = start_pos + full_frames * frame_size;
+    let new_offset = start_pos + committed_frames as u64 * frame_size;
 
-    Ok((page_map, full_frames as usize, new_offset, max_db_size, commit_count))
+    Ok((page_map, committed_frames, new_offset, max_db_size, commit_count))
 }
 
 /// Read and parse WAL frames into pages, returns (pages, new_offset, max_db_size)
@@ -277,7 +287,19 @@ pub async fn read_frames_as_pages(
         });
     }
 
-    let new_offset = start_pos + full_frames * frame_size;
+    let committed_frames = frames
+        .iter()
+        .rposition(|frame| frame.db_size > 0)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
+
+    if committed_frames == 0 {
+        return Ok((Vec::new(), start_pos, 0));
+    }
+
+    frames.truncate(committed_frames);
+    let max_db_size = frames.iter().map(|frame| frame.db_size).max().unwrap_or(0);
+    let new_offset = start_pos + committed_frames as u64 * frame_size;
 
     Ok((frames, new_offset, max_db_size))
 }
@@ -447,6 +469,22 @@ pub async fn read_frames_with_metadata(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    fn wal_header(page_size: u32) -> Vec<u8> {
+        let mut header = vec![0u8; WAL_HEADER_SIZE as usize];
+        header[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        header[4..8].copy_from_slice(&3007000u32.to_be_bytes());
+        header[8..12].copy_from_slice(&page_size.to_be_bytes());
+        header
+    }
+
+    fn append_frame(wal: &mut Vec<u8>, page_number: u32, db_size: u32, fill: u8, page_size: u32) {
+        let mut header = [0u8; 24];
+        header[0..4].copy_from_slice(&page_number.to_be_bytes());
+        header[4..8].copy_from_slice(&db_size.to_be_bytes());
+        wal.extend_from_slice(&header);
+        wal.extend(std::iter::repeat(fill).take(page_size as usize));
+    }
 
     #[tokio::test]
     async fn test_read_header_nonexistent_file() {
@@ -657,6 +695,75 @@ mod tests {
         // Should only return 1 complete frame, ignoring partial
         assert_eq!(count, 1);
         assert_eq!(frames.len(), frame_size);
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_as_page_map_waits_for_commit_frame() {
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let page_size = 1024u32;
+        let mut data = wal_header(page_size);
+        append_frame(&mut data, 1, 0, 0xAA, page_size);
+        append_frame(&mut data, 2, 0, 0xBB, page_size);
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        let (pages, frame_count, offset, max_db_size, commit_count) =
+            read_frames_as_page_map(&path, page_size, 0).await.unwrap();
+
+        assert!(pages.is_empty(), "uncommitted WAL frames must not publish pages");
+        assert_eq!(frame_count, 0);
+        assert_eq!(offset, WAL_HEADER_SIZE);
+        assert_eq!(max_db_size, 0);
+        assert_eq!(commit_count, 0);
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_as_page_map_stops_at_last_commit_frame() {
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let page_size = 1024u32;
+        let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+        let mut data = wal_header(page_size);
+        append_frame(&mut data, 1, 0, 0xAA, page_size);
+        append_frame(&mut data, 2, 2, 0xBB, page_size);
+        append_frame(&mut data, 3, 0, 0xCC, page_size);
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        let (pages, frame_count, offset, max_db_size, commit_count) =
+            read_frames_as_page_map(&path, page_size, 0).await.unwrap();
+
+        assert_eq!(frame_count, 2);
+        assert_eq!(offset, WAL_HEADER_SIZE + frame_size * 2);
+        assert_eq!(max_db_size, 2);
+        assert_eq!(commit_count, 1);
+        assert_eq!(pages.len(), 2);
+        assert_eq!(pages.get(&1).unwrap(), &vec![0xAA; page_size as usize]);
+        assert_eq!(pages.get(&2).unwrap(), &vec![0xBB; page_size as usize]);
+        assert!(!pages.contains_key(&3), "trailing uncommitted frames must be reread later");
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_as_pages_only_returns_committed_prefix() {
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let page_size = 1024u32;
+        let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+        let mut data = wal_header(page_size);
+        append_frame(&mut data, 1, 0, 0xAA, page_size);
+        append_frame(&mut data, 2, 2, 0xBB, page_size);
+        append_frame(&mut data, 3, 0, 0xCC, page_size);
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        let (frames, offset, max_db_size) = read_frames_as_pages(&path, page_size, 0).await.unwrap();
+
+        assert_eq!(frames.len(), 2);
+        assert_eq!(offset, WAL_HEADER_SIZE + frame_size * 2);
+        assert_eq!(max_db_size, 2);
+        assert_eq!(frames[0].page_number, 1);
+        assert_eq!(frames[1].page_number, 2);
 
         tokio::fs::remove_file(&path).await.ok();
     }

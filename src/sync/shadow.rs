@@ -30,8 +30,11 @@ fn encode_shadow_to_ltx(input: &ShadowSyncInput) -> Result<Option<(ShadowEncodeR
 
     let shadow_dir = &input.shadow_dir;
     let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
+    let mut pending_page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
     let mut max_db_size = 0u32;
     let mut frame_count = 0usize;
+    let mut pending_frame_count = 0usize;
+    let mut committed_frame_count = 0usize;
     let mut total_offset = 0u64;
     let frame_size = 24u64 + input.page_size as u64;
 
@@ -89,9 +92,16 @@ fn encode_shadow_to_ltx(input: &ShadowSyncInput) -> Result<Option<(ShadowEncodeR
 
             file.read_exact(&mut page_data)?;
 
-            max_db_size = max_db_size.max(db_size);
-            page_map.insert(page_number, page_data.clone());
-            frame_count += 1;
+            pending_page_map.insert(page_number, page_data.clone());
+            pending_frame_count += 1;
+
+            if db_size > 0 {
+                max_db_size = max_db_size.max(db_size);
+                page_map.extend(pending_page_map.drain());
+                frame_count += pending_frame_count;
+                committed_frame_count += pending_frame_count;
+                pending_frame_count = 0;
+            }
         }
 
         total_offset = segment_end;
@@ -130,7 +140,7 @@ fn encode_shadow_to_ltx(input: &ShadowSyncInput) -> Result<Option<(ShadowEncodeR
         expected_post,
     )?;
 
-    let new_offset = input.shadow_sync_offset + (frame_count as u64 * frame_size);
+    let new_offset = input.shadow_sync_offset + (committed_frame_count as u64 * frame_size);
 
     Ok(Some((
         ShadowEncodeResult {
@@ -578,6 +588,51 @@ mod tests {
         assert_eq!(encoded.unique_pages, 2);
         assert_eq!(encoded.min_txid, 11); // current_txid=10
         assert_eq!(encoded.max_txid, 12); // 2 unique pages
+    }
+
+    #[test]
+    fn test_encode_waits_for_commit_frame() {
+        let temp = TempDir::new().unwrap();
+        let shadow_dir = temp.path().join("shadow");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+        let db_path = temp.path().join("test.db");
+        std::fs::write(&db_path, &make_page(0x00)).unwrap();
+
+        let page1 = make_page(0xAA);
+        let page2 = make_page(0xBB);
+        write_shadow_segment(&shadow_dir, 1, 0, &[(1, 0, &page1), (2, 0, &page2)]);
+
+        let input = make_input(&db_path, &shadow_dir, 1, 0, 0);
+        let result = encode_shadow_to_ltx(&input).unwrap();
+
+        assert!(result.is_none(), "uncommitted shadow frames must not publish LTX");
+    }
+
+    #[test]
+    fn test_encode_ignores_trailing_uncommitted_frames() {
+        let temp = TempDir::new().unwrap();
+        let shadow_dir = temp.path().join("shadow");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+        let db_path = temp.path().join("test.db");
+        std::fs::write(&db_path, &make_page(0x00)).unwrap();
+
+        let page1 = make_page(0xAA);
+        let page2 = make_page(0xBB);
+        let page3 = make_page(0xCC);
+        write_shadow_segment(&shadow_dir, 1, 0, &[
+            (1, 0, &page1),
+            (2, 2, &page2),
+            (3, 0, &page3),
+        ]);
+
+        let frame_size = 24 + PAGE_SIZE as u64;
+        let input = make_input(&db_path, &shadow_dir, 1, 0, 0);
+        let result = encode_shadow_to_ltx(&input).unwrap().unwrap();
+
+        let (encoded, new_offset) = result;
+        assert_eq!(encoded.frame_count, 2);
+        assert_eq!(encoded.unique_pages, 2);
+        assert_eq!(new_offset, frame_size * 2);
     }
 
     #[test]
