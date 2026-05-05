@@ -44,12 +44,22 @@ fn change_counter_from_pages(pages: &[(u32, Vec<u8>)]) -> Option<u64> {
 }
 
 /// Read the file change counter directly from a SQLite database file.
-fn change_counter_from_file(path: &Path) -> Result<u64> {
+pub fn change_counter_from_file(path: &Path) -> Result<u64> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut header = [0u8; 28];
     f.read_exact(&mut header)?;
     Ok(u32::from_be_bytes([header[24], header[25], header[26], header[27]]) as u64)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeltaSequence {
+    /// Plain walrust-owned mode: snapshots and incrementals share a
+    /// monotonically incremented HADBP sequence.
+    WalrustOwned,
+    /// External-base-state mode: Turbolite's base manifest carries SQLite's
+    /// file change counter, so delta object seqs must live in that same domain.
+    ExternalChangeCounter,
 }
 
 // ============================================================================
@@ -248,6 +258,29 @@ pub async fn sync_wal(
     prefix: &str,
     state: &mut SyncState,
 ) -> Result<u64> {
+    sync_wal_with_sequence(storage, prefix, state, DeltaSequence::WalrustOwned).await
+}
+
+/// Sync WAL changes to storage as incremental HADBP changesets whose object
+/// sequence is SQLite's change-counter domain.
+///
+/// This is for external-base-state integrations such as Turbolite: the base
+/// manifest's `change_counter` is the replay floor, and followers list/apply
+/// physical delta objects with seq greater than that floor.
+pub async fn sync_wal_after_external_base(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+) -> Result<u64> {
+    sync_wal_with_sequence(storage, prefix, state, DeltaSequence::ExternalChangeCounter).await
+}
+
+async fn sync_wal_with_sequence(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+    sequence: DeltaSequence,
+) -> Result<u64> {
     let header = match wal::read_header(&state.wal_path).await? {
         Some(h) => h,
         None => return Ok(0),
@@ -283,8 +316,10 @@ pub async fn sync_wal(
         .filter(|&cc| cc > state.current_txid)
         .unwrap_or(state.current_txid + commit_count.max(1));
 
-    // Seq increments by 1 per sync
-    let new_seq = state.current_seq + 1;
+    let new_seq = match sequence {
+        DeltaSequence::WalrustOwned => state.current_seq + 1,
+        DeltaSequence::ExternalChangeCounter => max_txid.max(state.current_seq + 1),
+    };
 
     let (changeset_bytes, post_checksum) =
         ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;

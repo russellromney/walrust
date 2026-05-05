@@ -135,6 +135,9 @@ impl Replicator {
 
         if db_path.exists() {
             state.init_checksum()?;
+            let base_change_counter = sync::change_counter_from_file(db_path).unwrap_or(0);
+            state.current_seq = base_change_counter;
+            state.current_txid = base_change_counter;
         }
 
         sync::take_snapshot_with_retry(
@@ -179,6 +182,9 @@ impl Replicator {
 
         if db_path.exists() {
             state.init_checksum()?;
+            let base_change_counter = sync::change_counter_from_file(db_path).unwrap_or(0);
+            state.current_seq = base_change_counter;
+            state.current_txid = base_change_counter;
         }
 
         // Load existing state from storage to get the correct current_seq.
@@ -230,7 +236,13 @@ impl Replicator {
         if let Some(db_state) = entry {
             let mut s = db_state.lock().await;
             let prefix = s.prefix.clone();
-            match sync::sync_wal(self.storage.as_ref(), &prefix, &mut s.state).await {
+            let sync_result = if self.config.snapshot_ownership.is_external() {
+                sync::sync_wal_after_external_base(self.storage.as_ref(), &prefix, &mut s.state)
+                    .await
+            } else {
+                sync::sync_wal(self.storage.as_ref(), &prefix, &mut s.state).await
+            };
+            match sync_result {
                 Ok(frames) if frames > 0 => {
                     tracing::info!(
                         "Replicator: final sync for '{}' captured {} frames",
@@ -291,7 +303,12 @@ impl Replicator {
 
         let mut state = db_state.lock().await;
         let prefix = state.prefix.clone();
-        let frame_count = sync::sync_wal(self.storage.as_ref(), &prefix, &mut state.state).await?;
+        let frame_count = if self.config.snapshot_ownership.is_external() {
+            sync::sync_wal_after_external_base(self.storage.as_ref(), &prefix, &mut state.state)
+                .await?
+        } else {
+            sync::sync_wal(self.storage.as_ref(), &prefix, &mut state.state).await?
+        };
 
         Ok(frame_count)
     }
@@ -357,12 +374,19 @@ impl Replicator {
         };
 
         let mut set = JoinSet::new();
+        let external_base_state = self.config.snapshot_ownership.is_external();
         for (name, db_state) in entries {
             let storage = self.storage.clone();
             set.spawn(async move {
                 let mut s = db_state.lock().await;
                 let prefix = s.prefix.clone();
-                match sync::sync_wal(storage.as_ref(), &prefix, &mut s.state).await {
+                let sync_result = if external_base_state {
+                    sync::sync_wal_after_external_base(storage.as_ref(), &prefix, &mut s.state)
+                        .await
+                } else {
+                    sync::sync_wal(storage.as_ref(), &prefix, &mut s.state).await
+                };
+                match sync_result {
                     Ok(frames) if frames > 0 => {
                         tracing::debug!(
                             "Replicator: synced '{}' ({} frames, seq {})",

@@ -242,7 +242,14 @@ async fn test_add_external_mode_skips_snapshot_upload() {
     let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
         .expect("external config should be valid");
 
+    let base_counter =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
     replicator.add("external", &db_path).await.unwrap();
+    assert_eq!(
+        replicator.current_seq("external").await,
+        Some(base_counter),
+        "external mode should start delta seq at the checkpoint/base change counter"
+    );
 
     let keys_after_add = storage.keys();
     assert!(
@@ -267,6 +274,19 @@ async fn test_add_external_mode_skips_snapshot_upload() {
         !hadbp_keys.is_empty(),
         "flush should upload an incremental HADBP changeset, got keys: {:?}",
         keys_after_flush
+    );
+    let uploaded_seq = hadbp_keys
+        .iter()
+        .filter_map(|key| {
+            key.strip_suffix(".hadbp")
+                .and_then(|s| s.rsplit('/').next())
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+        })
+        .max()
+        .expect("uploaded changeset seq");
+    assert!(
+        uploaded_seq > base_counter,
+        "external delta seq must be greater than base change counter; base={base_counter}, keys={hadbp_keys:?}"
     );
 
     drop(conn);
