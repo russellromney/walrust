@@ -4,7 +4,11 @@
 
 # walrust
 
-> **Experimental.** walrust is under active development and not yet stable. APIs will change without notice.
+> **Experimental / active development.** walrust is useful for exploration and
+> internal integration work, but it is not yet a stable public replication
+> substrate. APIs, WAL/change-set formats, restore semantics, and retention
+> behavior may change without notice. Treat the README as a current working
+> model, not a compatibility promise.
 
 **Lightweight SQLite replication to S3 in Rust.**
 
