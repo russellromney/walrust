@@ -24,7 +24,9 @@ use hadb_storage::StorageBackend;
 /// WAL uses 1-based page numbers. Page 0 of the database = page_number 1 in WAL.
 /// The change counter is at offset 24 (4 bytes BE) in the database header (page 0).
 ///
-/// Phase Somme: both walrust and turbolite use this counter as their version/txid.
+/// This counter is one source of external-base replay sequence. In WAL mode it
+/// may not advance for every transaction, so walrust also falls back to commit
+/// counts while keeping object sequences monotonic.
 fn change_counter_from_pages(pages: &[(u32, Vec<u8>)]) -> Option<u64> {
     pages
         .iter()
@@ -57,8 +59,8 @@ enum DeltaSequence {
     /// Plain walrust-owned mode: snapshots and incrementals share a
     /// monotonically incremented HADBP sequence.
     WalrustOwned,
-    /// External-base-state mode: Turbolite's base manifest carries SQLite's
-    /// file change counter, so delta object seqs must live in that same domain.
+    /// External-base-state mode: the base manifest carries the replay cursor, so
+    /// delta object seqs must stay ahead of that floor.
     ExternalChangeCounter,
 }
 
@@ -357,7 +359,7 @@ pub async fn take_snapshot(
     let timestamp = Utc::now();
     let page_size = get_page_size(&state.db_path).await?;
 
-    // Phase Somme: use file change counter as txid when available.
+    // Use the file change counter as a txid source when available.
     let cc = change_counter_from_file(&state.db_path).unwrap_or(0);
     let wal_commits = wal::count_wal_commits(&state.wal_path, page_size).await?;
     let new_txid = if cc + wal_commits > state.current_txid {

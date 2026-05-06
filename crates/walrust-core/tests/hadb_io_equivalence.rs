@@ -73,6 +73,7 @@ fn test_reexport_circuit_breaker() {
 // Re-export: S3 module accessible via walrust::s3::
 // ============================================================================
 
+#[cfg(feature = "s3")]
 #[test]
 fn test_reexport_s3_parse_bucket() {
     let (bucket, prefix) = walrust::s3::parse_bucket("s3://my-bucket/backups");
@@ -80,6 +81,7 @@ fn test_reexport_s3_parse_bucket() {
     assert_eq!(prefix, "backups/");
 }
 
+#[cfg(feature = "s3")]
 #[test]
 fn test_reexport_s3_parse_bucket_simple() {
     let (bucket, prefix) = walrust::s3::parse_bucket("my-bucket");
@@ -93,9 +95,11 @@ fn test_reexport_s3_parse_bucket_simple() {
 
 /// Compile-time check that the canonical S3 impl satisfies the trait
 /// the walrust pipeline accepts.
+#[cfg(feature = "s3")]
 #[allow(dead_code)]
 fn _assert_s3_storage_usable<T: hadb_storage::StorageBackend>() {}
 
+#[cfg(feature = "s3")]
 #[allow(dead_code)]
 fn _check_s3_storage_type() {
     _assert_s3_storage_usable::<hadb_storage_s3::S3Storage>();
