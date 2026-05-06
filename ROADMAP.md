@@ -81,36 +81,22 @@ S3 page groups as the snapshot.
 
 ---
 
-## Phase Somme: Unified Version Counter (file change counter)
+## Phase Somme: Replay Cursor Alignment
 
 > After: SnapshotSource · Before: Rename
 
-Both walrust and turbolite use SQLite's file change counter (page 0, offset 24, 4 bytes BE) as their version/txid. This counter increments on every transaction commit. Using it as the shared version eliminates any coordination protocol between the two systems.
+Historical note: the first design tried to make `manifest.version`, SQLite's file
+change counter, and walrust txid all be the same number. Sashimono split those
+concepts:
 
-**Why:** turbolite's manifest.version and walrust's current_txid must agree so that recovery works: "materialize page groups at version N, apply WAL with txid > N." If both derive from the same source (SQLite's change counter), they're synchronized automatically.
+- Turbolite `manifest.version` is a monotonic object-key/publication version.
+- Turbolite `manifest.change_counter` is the durable replay cursor/floor.
+- walrust/HADBP delta sequences must be greater than the replay cursor.
+- SQLite's file change counter is one useful input, but WAL mode and direct page
+  replay mean it is not the whole contract.
 
-**Current state:** walrust derives txid from `state.current_txid + page_count` (an internal counter). turbolite increments `manifest.version` by 1 each checkpoint. Neither uses the change counter.
-
-### Somme-a: walrust txid from file change counter
-- [ ] In `sync_wal()`: extract file change counter from page 0 WAL frames
-  - WAL frames with page_number=1 (1-based in WAL) contain page 0 data
-  - Read bytes 24..28 (BE u32) from the frame's page data
-  - Use as `max_txid` instead of `state.current_txid + pages.len()`
-  - `min_txid` = previous `current_txid + 1` (or change counter from previous sync)
-- [ ] In `take_snapshot()`: read change counter from DB file page 0, use as txid
-- [ ] `SyncState.current_txid` tracks the latest change counter value
-- [ ] LTX filename format unchanged (hex txid), just the number source changes
-- [ ] Backward compat: old LTX files with old-style txids still discoverable
-- [ ] Tests: txid matches file change counter after sync, txid advances with commits, txid stable when no commits
-
-### Somme-b: turbolite version from file change counter
-(Tracked in turbolite ROADMAP, Phase Somme-b)
-
-### Somme-c: End-to-end test
-- [ ] turbolite imports DB, checkpoints (manifest.version = change counter)
-- [ ] walrust ships WAL (txid = change counter from commit frames)
-- [ ] Recovery: materialize + apply WAL, verify all data present
-- [ ] Version numbers match between manifest.version and walrust txid at checkpoint boundaries
+Current work should preserve that split and test recovery as "materialize base
+at replay cursor N, apply delta objects with seq > N."
 
 ## Rename to walsync (future)
 

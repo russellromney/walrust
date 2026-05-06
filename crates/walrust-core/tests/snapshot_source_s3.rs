@@ -6,7 +6,7 @@
 //!
 //! ```bash
 //! set -a && source ../../.env && set +a
-//! WALRUST_S3_TEST_BUCKET=sqlces-test cargo test --test snapshot_source_s3
+//! WALRUST_S3_TEST_BUCKET=sqlces-test cargo test --test snapshot_source_s3 -- --ignored
 //! ```
 
 use anyhow::Result;
@@ -91,6 +91,7 @@ impl SnapshotSource for FileSnapshotSource {
 /// Happy path: materialize via snapshot source, no incrementals in S3.
 /// All S3 operations hit real Tigris.
 #[tokio::test]
+#[ignore = "real S3 proof; run with soup credentials and --ignored"]
 async fn test_s3_restore_snapshot_source_no_incrementals() {
     let bucket = test_bucket();
     let endpoint = test_endpoint();
@@ -123,6 +124,7 @@ async fn test_s3_restore_snapshot_source_no_incrementals() {
 
 /// E2E: create base DB, sync WAL to real Tigris, then restore via snapshot source.
 #[tokio::test]
+#[ignore = "real S3 proof; run with soup credentials and --ignored"]
 async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
     let bucket = test_bucket();
     let endpoint = test_endpoint();
@@ -160,28 +162,30 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
         .unwrap();
     let snapshot_txid = state.current_txid;
 
-    // Step 3: write more rows (WAL changes, no checkpoint)
-    {
-        let conn = rusqlite::Connection::open(&base_db).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
-            .unwrap();
-        for i in 50..100 {
-            conn.execute(
-                "INSERT INTO data VALUES (?1, ?2)",
-                rusqlite::params![i, format!("inc_{}", i)],
-            )
-            .unwrap();
-        }
+    // Step 3: write more rows and keep the writer connection open while
+    // walrust reads the live WAL. If the last SQLite connection closes first,
+    // SQLite can checkpoint/delete the WAL and this stops proving incrementals.
+    let conn = rusqlite::Connection::open(&base_db).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    for i in 50..100 {
+        conn.execute(
+            "INSERT INTO data VALUES (?1, ?2)",
+            rusqlite::params![i, format!("inc_{}", i)],
+        )
+        .unwrap();
     }
 
-    // Step 4: sync WAL to S3 (creates incremental LTX)
-    let synced = walrust::sync::sync_wal(&storage, &prefix, &mut state)
+    // Step 4: sync WAL to S3 (creates incremental HADBP)
+    let synced = walrust::sync::sync_wal_after_external_base(&storage, &prefix, &mut state)
         .await
         .unwrap();
+    assert!(synced > 0, "real WAL sync proof must capture frames");
     eprintln!(
         "[test] synced {} WAL frames, snapshot_txid={}, current_txid={}",
         synced, snapshot_txid, state.current_txid
     );
+    drop(conn);
 
     // Step 5: make a clean copy of the base DB (before WAL changes) for snapshot source
     let clean_base = dir.path().join("clean_base.db");
@@ -214,19 +218,14 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
 
     eprintln!("[test] restored_txid={}", restored_txid);
 
-    // Base data should be there at minimum
     let conn = rusqlite::Connection::open(&output).unwrap();
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM data", [], |r| r.get(0))
         .unwrap();
-    assert!(
-        count >= 50,
-        "should have at least base 50 rows, got {}",
-        count
+    assert_eq!(
+        count, 100,
+        "restore should include base plus WAL incrementals"
     );
-
-    // If incrementals applied successfully, we'd have 100 rows
-    // (depends on checksum chain compatibility)
     eprintln!("[test] final row count: {}", count);
 
     // Clean up S3 objects
@@ -238,6 +237,7 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
 
 /// Negative: snapshot source fails, error propagates through real S3 path.
 #[tokio::test]
+#[ignore = "real S3 proof; run with soup credentials and --ignored"]
 async fn test_s3_restore_snapshot_source_materialize_fails() {
     let bucket = test_bucket();
     let endpoint = test_endpoint();

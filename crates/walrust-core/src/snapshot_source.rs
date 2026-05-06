@@ -31,14 +31,15 @@ use std::path::Path;
 pub trait SnapshotSource: Send + Sync {
     /// Materialize the database at the latest checkpoint to a local file.
     ///
-    /// Writes a complete SQLite database to `output`. Returns the checkpoint
-    /// version (e.g., manifest version) so walrust knows which WAL increments
-    /// are newer and need to be applied.
+    /// Writes a complete SQLite database to `output`. Returns the durable replay
+    /// cursor for that checkpoint/base state so walrust knows which WAL
+    /// increments are newer and need to be applied. For external base-state
+    /// integrations this is not necessarily the provider's manifest version.
     ///
     /// This replaces the LTX snapshot download step in `restore()`.
     async fn materialize(&self, output: &Path) -> Result<u64>;
 
-    /// Return the current checkpoint version without materializing.
+    /// Return the current checkpoint/base replay cursor without materializing.
     ///
     /// Used to check if WAL increments exist before doing a full materialization.
     async fn checkpoint_version(&self) -> Result<u64>;

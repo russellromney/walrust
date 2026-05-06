@@ -169,7 +169,7 @@ pub struct WalReadResult {
 /// Peak memory = unique pages, not total frames. For a WAL with 1000 frames touching
 /// 50 unique pages, this uses 50 * page_size instead of 1000 * page_size.
 ///
-/// Returns (page_map, frame_count, new_offset, max_db_size, commit_count).
+/// Returns (page_map, committed_frame_count, new_offset, final_db_size, commit_count).
 /// `commit_count` is the number of committed transactions in the batch (frames with
 /// non-zero db_size_after_commit). Used for deterministic TXID derivation in WAL mode
 /// where the file change counter is not incremented per-transaction.
@@ -208,12 +208,9 @@ pub async fn read_frames_as_page_map(
         return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
     }
 
-    let mut page_map = std::collections::HashMap::new();
-    let mut max_db_size: u32 = 0;
-    let mut commit_count: u64 = 0;
-    let mut page_data = vec![0u8; page_size as usize];
+    let mut frame_headers = Vec::with_capacity(full_frames as usize);
 
-    for _ in 0..full_frames {
+    for frame_index in 0..full_frames {
         let mut header_buf = [0u8; 24];
         file.read_exact(&mut header_buf).await?;
 
@@ -222,27 +219,46 @@ pub async fn read_frames_as_page_map(
         let db_size =
             u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
 
+        file.seek(SeekFrom::Current(page_size as i64)).await?;
+        frame_headers.push((frame_index + 1, page_number, db_size));
+    }
+
+    let Some((committed_frames, _, final_db_size)) = frame_headers
+        .iter()
+        .rev()
+        .find(|(_, _, db_size)| *db_size > 0)
+        .copied()
+    else {
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
+    };
+    let committed_frames = committed_frames as usize;
+    let commit_count = frame_headers[..committed_frames]
+        .iter()
+        .filter(|(_, _, db_size)| *db_size > 0)
+        .count() as u64;
+
+    file.seek(SeekFrom::Start(start_pos)).await?;
+
+    let mut page_map = std::collections::HashMap::new();
+    let mut page_data = vec![0u8; page_size as usize];
+
+    for (_, page_number, _) in frame_headers.into_iter().take(committed_frames) {
+        let mut header_buf = [0u8; 24];
+        file.read_exact(&mut header_buf).await?;
         file.read_exact(&mut page_data).await?;
 
-        if db_size > 0 {
-            commit_count += 1;
-        }
-        if db_size > max_db_size {
-            max_db_size = db_size;
-        }
-
         // Dedup in-place: overwrite previous version of the same page.
-        // We reuse the buffer and clone only the final version into the map.
+        // We reuse the buffer and clone only the final committed version into the map.
         page_map.insert(page_number, page_data.clone());
     }
 
-    let new_offset = start_pos + full_frames * frame_size;
+    let new_offset = start_pos + committed_frames as u64 * frame_size;
 
     Ok((
         page_map,
-        full_frames as usize,
+        committed_frames,
         new_offset,
-        max_db_size,
+        final_db_size,
         commit_count,
     ))
 }
@@ -334,7 +350,6 @@ pub async fn read_frames_as_pages(
     }
 
     let mut frames = Vec::with_capacity(full_frames as usize);
-    let mut max_db_size: u32 = 0;
 
     for _ in 0..full_frames {
         // Read frame header (24 bytes)
@@ -350,10 +365,6 @@ pub async fn read_frames_as_pages(
         let mut page_data = vec![0u8; page_size as usize];
         file.read_exact(&mut page_data).await?;
 
-        if db_size > max_db_size {
-            max_db_size = db_size;
-        }
-
         frames.push(ParsedFrame {
             page_number,
             db_size,
@@ -361,9 +372,26 @@ pub async fn read_frames_as_pages(
         });
     }
 
-    let new_offset = start_pos + full_frames * frame_size;
+    let committed_frames = frames
+        .iter()
+        .rposition(|frame| frame.db_size > 0)
+        .map(|idx| idx + 1)
+        .unwrap_or(0);
 
-    Ok((frames, new_offset, max_db_size))
+    if committed_frames == 0 {
+        return Ok((Vec::new(), start_pos, 0));
+    }
+
+    frames.truncate(committed_frames);
+    let final_db_size = frames
+        .iter()
+        .rev()
+        .find(|frame| frame.db_size > 0)
+        .map(|frame| frame.db_size)
+        .unwrap_or(0);
+    let new_offset = start_pos + committed_frames as u64 * frame_size;
+
+    Ok((frames, new_offset, final_db_size))
 }
 
 /// Read WAL frames with full metadata for robust checkpoint detection
@@ -972,7 +1000,10 @@ mod tests {
         assert_eq!(page_map[&2][0], 0x22, "Page 2 should be 0x22");
         assert_eq!(page_map[&3][0], 0x33, "Page 3 should be 0x33");
 
-        assert_eq!(max_db_size, 3, "max_db_size should be 3 from commit frames");
+        assert_eq!(
+            max_db_size, 3,
+            "final db size should come from the last commit frame"
+        );
         // Frames 0 and 3 have db_size > 0 (commit frames)
         assert_eq!(commit_count, 2, "Should count 2 committed transactions");
 
@@ -1039,6 +1070,46 @@ mod tests {
             let new_data = new_map.get(page_num).expect("Page must exist in new map");
             assert_eq!(old_data, new_data, "Page {} data must match", page_num);
         }
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_reports_last_commit_db_size_not_max() {
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-pagemap-shrink-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let page_size: u32 = 4096;
+        let frame_header_size = 24usize;
+        let frame_size = frame_header_size + page_size as usize;
+        let mut data = vec![0u8; 32 + frame_size * 2];
+        data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
+        data[8..12].copy_from_slice(&page_size.to_be_bytes());
+
+        let f0 = 32;
+        data[f0..f0 + 4].copy_from_slice(&5u32.to_be_bytes());
+        data[f0 + 4..f0 + 8].copy_from_slice(&5u32.to_be_bytes());
+        for b in &mut data[f0 + frame_header_size..f0 + frame_size] {
+            *b = 0x55;
+        }
+
+        let f1 = 32 + frame_size;
+        data[f1..f1 + 4].copy_from_slice(&3u32.to_be_bytes());
+        data[f1 + 4..f1 + 8].copy_from_slice(&3u32.to_be_bytes());
+        for b in &mut data[f1 + frame_header_size..f1 + frame_size] {
+            *b = 0x33;
+        }
+
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        let (_, _, _, final_db_size, commit_count) =
+            read_frames_as_page_map(&path, page_size, 0).await.unwrap();
+        assert_eq!(final_db_size, 3);
+        assert_eq!(commit_count, 2);
+
+        let (_, _, final_db_size_pages) = read_frames_as_pages(&path, page_size, 0).await.unwrap();
+        assert_eq!(final_db_size_pages, 3);
 
         tokio::fs::remove_file(&path).await.ok();
     }

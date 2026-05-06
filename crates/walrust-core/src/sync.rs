@@ -24,7 +24,9 @@ use hadb_storage::StorageBackend;
 /// WAL uses 1-based page numbers. Page 0 of the database = page_number 1 in WAL.
 /// The change counter is at offset 24 (4 bytes BE) in the database header (page 0).
 ///
-/// Phase Somme: both walrust and turbolite use this counter as their version/txid.
+/// This counter is one source of external-base replay sequence. In WAL mode it
+/// may not advance for every transaction, so walrust also falls back to commit
+/// counts while keeping object sequences monotonic.
 fn change_counter_from_pages(pages: &[(u32, Vec<u8>)]) -> Option<u64> {
     pages
         .iter()
@@ -44,12 +46,22 @@ fn change_counter_from_pages(pages: &[(u32, Vec<u8>)]) -> Option<u64> {
 }
 
 /// Read the file change counter directly from a SQLite database file.
-fn change_counter_from_file(path: &Path) -> Result<u64> {
+pub fn change_counter_from_file(path: &Path) -> Result<u64> {
     use std::io::Read;
     let mut f = std::fs::File::open(path)?;
     let mut header = [0u8; 28];
     f.read_exact(&mut header)?;
     Ok(u32::from_be_bytes([header[24], header[25], header[26], header[27]]) as u64)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DeltaSequence {
+    /// Plain walrust-owned mode: snapshots and incrementals share a
+    /// monotonically incremented HADBP sequence.
+    WalrustOwned,
+    /// External-base-state mode: the base manifest carries the replay cursor, so
+    /// delta object seqs must stay ahead of that floor.
+    ExternalChangeCounter,
 }
 
 // ============================================================================
@@ -227,6 +239,7 @@ pub async fn save_state(
         "wal_generation": state.wal_generation,
         "current_seq": state.current_seq,
         "current_txid": state.current_txid,
+        "db_checksum": state.db_checksum,
         "last_snapshot": state.last_snapshot,
     });
     let data = serde_json::to_vec(&state_json)?;
@@ -247,6 +260,29 @@ pub async fn sync_wal(
     storage: &dyn StorageBackend,
     prefix: &str,
     state: &mut SyncState,
+) -> Result<u64> {
+    sync_wal_with_sequence(storage, prefix, state, DeltaSequence::WalrustOwned).await
+}
+
+/// Sync WAL changes to storage as incremental HADBP changesets whose object
+/// sequence is SQLite's change-counter domain.
+///
+/// This is for external-base-state integrations such as Turbolite: the base
+/// manifest's `change_counter` is the replay floor, and followers list/apply
+/// physical delta objects with seq greater than that floor.
+pub async fn sync_wal_after_external_base(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+) -> Result<u64> {
+    sync_wal_with_sequence(storage, prefix, state, DeltaSequence::ExternalChangeCounter).await
+}
+
+async fn sync_wal_with_sequence(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+    sequence: DeltaSequence,
 ) -> Result<u64> {
     let header = match wal::read_header(&state.wal_path).await? {
         Some(h) => h,
@@ -283,8 +319,10 @@ pub async fn sync_wal(
         .filter(|&cc| cc > state.current_txid)
         .unwrap_or(state.current_txid + commit_count.max(1));
 
-    // Seq increments by 1 per sync
-    let new_seq = state.current_seq + 1;
+    let new_seq = match sequence {
+        DeltaSequence::WalrustOwned => state.current_seq + 1,
+        DeltaSequence::ExternalChangeCounter => max_txid.max(state.current_seq + 1),
+    };
 
     let (changeset_bytes, post_checksum) =
         ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;
@@ -322,7 +360,7 @@ pub async fn take_snapshot(
     let timestamp = Utc::now();
     let page_size = get_page_size(&state.db_path).await?;
 
-    // Phase Somme: use file change counter as txid when available.
+    // Use the file change counter as a txid source when available.
     let cc = change_counter_from_file(&state.db_path).unwrap_or(0);
     let wal_commits = wal::count_wal_commits(&state.wal_path, page_size).await?;
     let new_txid = if cc + wal_commits > state.current_txid {
