@@ -30,8 +30,9 @@ fn encode_shadow_to_ltx(input: &ShadowSyncInput) -> Result<Option<(ShadowEncodeR
 
     let shadow_dir = &input.shadow_dir;
     let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
-    let mut pending_page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
-    let mut max_db_size = 0u32;
+    let mut pending_page_map: std::collections::HashMap<u32, Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut final_db_size = 0u32;
     let mut frame_count = 0usize;
     let mut pending_frame_count = 0usize;
     let mut committed_frame_count = 0usize;
@@ -96,7 +97,7 @@ fn encode_shadow_to_ltx(input: &ShadowSyncInput) -> Result<Option<(ShadowEncodeR
             pending_frame_count += 1;
 
             if db_size > 0 {
-                max_db_size = max_db_size.max(db_size);
+                final_db_size = db_size;
                 page_map.extend(pending_page_map.drain());
                 frame_count += pending_frame_count;
                 committed_frame_count += pending_frame_count;
@@ -116,10 +117,12 @@ fn encode_shadow_to_ltx(input: &ShadowSyncInput) -> Result<Option<(ShadowEncodeR
 
     let min_txid = input.current_txid + 1;
     let max_txid = min_txid + pages.len() as u64 - 1;
-    let commit_page = if max_db_size > 0 { max_db_size } else { 1 };
+    let commit_page = if final_db_size > 0 { final_db_size } else { 1 };
 
     let unique_pages = pages.len();
-    let estimated_size = unique_pages.saturating_mul(input.page_size as usize).saturating_mul(2);
+    let estimated_size = unique_pages
+        .saturating_mul(input.page_size as usize)
+        .saturating_mul(2);
     let page_size = input.page_size;
 
     let expected_post = if let Some(pre) = pre_checksum {
@@ -190,16 +193,20 @@ pub(crate) async fn sync_shadow_concurrent(
 ) -> Result<ShadowSyncOutput> {
     // Encoding is CPU-bound, run in blocking thread pool
     let input_clone = input.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        encode_shadow_to_ltx(&input_clone)
-    }).await??;
+    let result = tokio::task::spawn_blocking(move || encode_shadow_to_ltx(&input_clone)).await??;
 
     let (encoded, new_offset) = match result {
         Some(r) => r,
         None => return Ok(build_empty_output(&input)),
     };
 
-    let ltx_key = build_ltx_key(prefix, &input.name, GENERATION_LIVE, encoded.min_txid, encoded.max_txid);
+    let ltx_key = build_ltx_key(
+        prefix,
+        &input.name,
+        GENERATION_LIVE,
+        encoded.min_txid,
+        encoded.max_txid,
+    );
     let ltx_size = encoded.ltx_buffer.len() as u64;
     let output = build_output(&input, &encoded, new_offset);
 
@@ -229,9 +236,7 @@ pub(crate) async fn sync_shadow_to_cache(
     input: ShadowSyncInput,
 ) -> Result<ShadowSyncOutput> {
     let input_clone = input.clone();
-    let result = tokio::task::spawn_blocking(move || {
-        encode_shadow_to_ltx(&input_clone)
-    }).await??;
+    let result = tokio::task::spawn_blocking(move || encode_shadow_to_ltx(&input_clone)).await??;
 
     let (encoded, new_offset) = match result {
         Some(r) => r,
@@ -573,11 +578,16 @@ mod tests {
         let page2 = make_page(0xCC);
 
         // page 1 written twice — only last write should be in output
-        write_shadow_segment(&shadow_dir, 1, 0, &[
-            (1, 2, &page1_v1),
-            (2, 2, &page2),
-            (1, 2, &page1_v2), // overwrites page 1
-        ]);
+        write_shadow_segment(
+            &shadow_dir,
+            1,
+            0,
+            &[
+                (1, 2, &page1_v1),
+                (2, 2, &page2),
+                (1, 2, &page1_v2), // overwrites page 1
+            ],
+        );
 
         let input = make_input(&db_path, &shadow_dir, 1, 0, 0);
         let result = encode_shadow_to_ltx(&input).unwrap().unwrap();
@@ -588,6 +598,25 @@ mod tests {
         assert_eq!(encoded.unique_pages, 2);
         assert_eq!(encoded.min_txid, 11); // current_txid=10
         assert_eq!(encoded.max_txid, 12); // 2 unique pages
+    }
+
+    #[test]
+    fn test_encode_uses_last_commit_db_size_not_max() {
+        let temp = TempDir::new().unwrap();
+        let shadow_dir = temp.path().join("shadow");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+        let db_path = temp.path().join("test.db");
+        std::fs::write(&db_path, &make_page(0x00)).unwrap();
+
+        let page1 = make_page(0xAA);
+        let page2 = make_page(0xBB);
+        write_shadow_segment(&shadow_dir, 1, 0, &[(1, 5, &page1), (2, 3, &page2)]);
+
+        let input = make_input(&db_path, &shadow_dir, 1, 0, 0);
+        let (encoded, _) = encode_shadow_to_ltx(&input).unwrap().unwrap();
+        let header = ltx::verify_ltx(std::io::Cursor::new(&encoded.ltx_buffer)).unwrap();
+
+        assert_eq!(header.commit.into_inner(), 3);
     }
 
     #[test]
@@ -605,7 +634,10 @@ mod tests {
         let input = make_input(&db_path, &shadow_dir, 1, 0, 0);
         let result = encode_shadow_to_ltx(&input).unwrap();
 
-        assert!(result.is_none(), "uncommitted shadow frames must not publish LTX");
+        assert!(
+            result.is_none(),
+            "uncommitted shadow frames must not publish LTX"
+        );
     }
 
     #[test]
@@ -619,11 +651,12 @@ mod tests {
         let page1 = make_page(0xAA);
         let page2 = make_page(0xBB);
         let page3 = make_page(0xCC);
-        write_shadow_segment(&shadow_dir, 1, 0, &[
-            (1, 0, &page1),
-            (2, 2, &page2),
-            (3, 0, &page3),
-        ]);
+        write_shadow_segment(
+            &shadow_dir,
+            1,
+            0,
+            &[(1, 0, &page1), (2, 2, &page2), (3, 0, &page3)],
+        );
 
         let frame_size = 24 + PAGE_SIZE as u64;
         let input = make_input(&db_path, &shadow_dir, 1, 0, 0);
@@ -662,10 +695,7 @@ mod tests {
 
         let page1 = make_page(0xAA);
         let page2 = make_page(0xBB);
-        write_shadow_segment(&shadow_dir, 1, 0, &[
-            (1, 2, &page1),
-            (2, 2, &page2),
-        ]);
+        write_shadow_segment(&shadow_dir, 1, 0, &[(1, 2, &page1), (2, 2, &page2)]);
 
         let frame_size = 24 + PAGE_SIZE as u64;
 
@@ -786,7 +816,10 @@ mod tests {
         assert_eq!(output.frame_count, 0);
         assert_eq!(output.new_current_txid, 10); // preserved from input (make_input remaps 0→10)
         assert!(cache.pending_uploads().is_empty());
-        assert!(rx.try_recv().is_err(), "No upload notification for empty sync");
+        assert!(
+            rx.try_recv().is_err(),
+            "No upload notification for empty sync"
+        );
     }
 
     #[tokio::test]
@@ -805,11 +838,12 @@ mod tests {
         let page1 = make_page(0xAA);
         let page2 = make_page(0xBB);
         let page3 = make_page(0xCC);
-        write_shadow_segment(&shadow_dir, 1, 0, &[
-            (1, 3, &page1),
-            (2, 3, &page2),
-            (3, 3, &page3),
-        ]);
+        write_shadow_segment(
+            &shadow_dir,
+            1,
+            0,
+            &[(1, 3, &page1), (2, 3, &page2), (3, 3, &page3)],
+        );
 
         let input = make_input(&db_path, &shadow_dir, 1, 0, 0);
         let output = sync_shadow_to_cache(&cache, &tx, input).await.unwrap();
@@ -842,10 +876,7 @@ mod tests {
 
         let page1 = make_page(0xAA);
         let page2 = make_page(0xBB);
-        write_shadow_segment(&shadow_dir, 1, 0, &[
-            (1, 2, &page1),
-            (2, 2, &page2),
-        ]);
+        write_shadow_segment(&shadow_dir, 1, 0, &[(1, 2, &page1), (2, 2, &page2)]);
 
         // First sync
         let input = make_input(&db_path, &shadow_dir, 1, 0, 0);
@@ -899,7 +930,10 @@ mod tests {
         let input = make_input(&db_path, &shadow_dir, 1, 0, 0);
         let result = sync_shadow_to_cache(&cache, &tx, input).await;
 
-        assert!(result.is_err(), "Should fail when uploader channel is closed");
+        assert!(
+            result.is_err(),
+            "Should fail when uploader channel is closed"
+        );
         let err = result.unwrap_err().to_string();
         assert!(err.contains("Failed to notify uploader"), "Error: {}", err);
     }

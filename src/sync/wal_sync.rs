@@ -34,7 +34,10 @@ pub(crate) async fn sync_wal_concurrent(
     // Special case: Initial sync (current_txid == 0) should ALWAYS create a snapshot from DB file
     // This handles the case where WAL file exists but is empty (0 bytes)
     if input.current_txid == 0 {
-        tracing::debug!("{}: Initial sync - creating snapshot from database file", input.name);
+        tracing::debug!(
+            "{}: Initial sync - creating snapshot from database file",
+            input.name
+        );
 
         // Get page size from WAL header if available, otherwise use default
         let page_size = match wal::read_header(&input.wal_path).await? {
@@ -51,10 +54,17 @@ pub(crate) async fn sync_wal_concurrent(
         let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
             let mut ltx_buffer = Vec::with_capacity(estimated_size);
             ltx::encode_snapshot(&mut ltx_buffer, &db_path_for_encode, page_size, new_txid)
-                .map_err(|e| anyhow::anyhow!("{}: Initial snapshot encode failed: {}", db_name_for_error, e))?;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}: Initial snapshot encode failed: {}",
+                        db_name_for_error,
+                        e
+                    )
+                })?;
             let db_checksum = ltx::compute_checksum_from_file(&db_path_for_encode)?;
             Ok::<_, anyhow::Error>((ltx_buffer, db_checksum))
-        }).await??;
+        })
+        .await??;
 
         let ltx_size = ltx_buffer.len() as u64;
         // Snapshots go to generation 1+ (litestream format)
@@ -116,8 +126,13 @@ pub(crate) async fn sync_wal_concurrent(
     }
 
     // Read WAL frames with streaming dedup (peak memory = unique pages, not total frames)
-    let (page_map, frame_count, new_offset, max_db_size, _commit_count): (std::collections::HashMap<u32, Vec<u8>>, usize, u64, u32, u64) =
-        wal::read_frames_as_page_map(&input.wal_path, header.page_size, wal_offset).await?;
+    let (page_map, frame_count, new_offset, final_db_size, _commit_count): (
+        std::collections::HashMap<u32, Vec<u8>>,
+        usize,
+        u64,
+        u32,
+        u64,
+    ) = wal::read_frames_as_page_map(&input.wal_path, header.page_size, wal_offset).await?;
 
     if page_map.is_empty() {
         return Ok(SyncOutput {
@@ -138,7 +153,10 @@ pub(crate) async fn sync_wal_concurrent(
     let pre_checksum = match db_checksum {
         Some(cs) => Checksum::new(cs),
         None => {
-            tracing::debug!("{}: Computing checksum from database (no cached value)", input.name);
+            tracing::debug!(
+                "{}: Computing checksum from database (no cached value)",
+                input.name
+            );
             ltx::compute_checksum_from_file(&input.db_path)?
         }
     };
@@ -146,7 +164,9 @@ pub(crate) async fn sync_wal_concurrent(
     // Increment TXID for this incremental
     let min_txid = input.current_txid + 1;
     let max_txid = min_txid + pages.len() as u64 - 1;
-    let commit_page = if max_db_size > 0 { max_db_size } else {
+    let commit_page = if final_db_size > 0 {
+        final_db_size
+    } else {
         let db_size = std::fs::metadata(&input.db_path)?.len();
         (db_size / page_size as u64) as u32
     };
@@ -156,7 +176,9 @@ pub(crate) async fn sync_wal_concurrent(
 
     // Encode as incremental LTX (CPU-bound, run in blocking thread pool)
     let unique_pages = pages.len();
-    let estimated_size = unique_pages.saturating_mul(page_size as usize).saturating_mul(2);
+    let estimated_size = unique_pages
+        .saturating_mul(page_size as usize)
+        .saturating_mul(2);
     let db_name_for_error = input.name.clone();
     let page_nums: Vec<u32> = pages.iter().map(|(n, _)| *n).collect();
     let (ltx_buffer, post_checksum) = tokio::task::spawn_blocking(move || {
@@ -170,10 +192,22 @@ pub(crate) async fn sync_wal_concurrent(
             commit_page,
             Some(pre_checksum),
             expected_post,
-        ).map_err(|e| anyhow::anyhow!("{}: LTX encode failed (pages={:?}, page_size={}, txid={}-{}, commit={}): {}",
-            db_name_for_error, page_nums, page_size, min_txid, max_txid, commit_page, e))?;
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{}: LTX encode failed (pages={:?}, page_size={}, txid={}-{}, commit={}): {}",
+                db_name_for_error,
+                page_nums,
+                page_size,
+                min_txid,
+                max_txid,
+                commit_page,
+                e
+            )
+        })?;
         Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
-    }).await??;
+    })
+    .await??;
 
     let ltx_size = ltx_buffer.len() as u64;
 
@@ -227,7 +261,9 @@ pub(crate) async fn sync_wal_concurrent_with_retry(
 
                 if error_kind == ErrorKind::AuthError {
                     tracing::error!("{}: Authentication error during WAL sync: {}", db_name, e);
-                    webhook_sender.notify_auth_failure(&db_name, &e.to_string()).await;
+                    webhook_sender
+                        .notify_auth_failure(&db_name, &e.to_string())
+                        .await;
                     return Err(e);
                 }
 
@@ -281,12 +317,7 @@ pub(crate) async fn do_sync(
 
     let result = if let Some(cache) = cache_state {
         // Cache-enabled path: shadow WAL → encode → cache → notify uploader
-        sync_wal_to_cache(
-            &input,
-            &cache.cache,
-            &cache.shadow,
-            &cache.upload_tx,
-        ).await?
+        sync_wal_to_cache(&input, &cache.cache, &cache.shadow, &cache.upload_tx).await?
     } else {
         // Direct S3 upload path (current behavior)
         sync_wal_concurrent_with_retry(
@@ -296,7 +327,8 @@ pub(crate) async fn do_sync(
             input,
             retry_policy.clone(),
             Arc::clone(webhook_sender),
-        ).await?
+        )
+        .await?
     };
 
     if result.frame_count > 0 {
@@ -316,18 +348,20 @@ pub(crate) async fn do_sync(
         let wal_size = std::fs::metadata(&state.db_state.wal_path)
             .map(|m| m.len())
             .unwrap_or(0);
-        metrics_state.update_db(DbStatus {
-            name: state.db_state.name.clone(),
-            path: state.db_state.db_path.display().to_string(),
-            last_sync_timestamp: chrono::Utc::now().timestamp(),
-            wal_size_bytes: wal_size,
-            next_snapshot_timestamp: 0, // TODO
-            error_count: 0,
-            snapshot_count: 0,
-            current_txid: state.db_state.current_txid,
-            last_error: None,
-            errors_last_hour: None,
-        }).await;
+        metrics_state
+            .update_db(DbStatus {
+                name: state.db_state.name.clone(),
+                path: state.db_state.db_path.display().to_string(),
+                last_sync_timestamp: chrono::Utc::now().timestamp(),
+                wal_size_bytes: wal_size,
+                next_snapshot_timestamp: 0, // TODO
+                error_count: 0,
+                snapshot_count: 0,
+                current_txid: state.db_state.current_txid,
+                last_error: None,
+                errors_last_hour: None,
+            })
+            .await;
     }
 
     Ok(result.frame_count)
@@ -355,7 +389,10 @@ pub(crate) async fn sync_wal_to_cache(
 
     // Special case: Initial sync (current_txid == 0) should create a snapshot
     if input.current_txid == 0 {
-        tracing::debug!("{}: Initial sync - creating snapshot from database file", input.name);
+        tracing::debug!(
+            "{}: Initial sync - creating snapshot from database file",
+            input.name
+        );
 
         let page_size = {
             let shadow_guard = shadow.lock().await;
@@ -371,10 +408,17 @@ pub(crate) async fn sync_wal_to_cache(
         let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
             let mut ltx_buffer = Vec::with_capacity(estimated_size);
             ltx::encode_snapshot(&mut ltx_buffer, &db_path_for_encode, page_size, new_txid)
-                .map_err(|e| anyhow::anyhow!("{}: Initial snapshot encode failed: {}", db_name_for_error, e))?;
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}: Initial snapshot encode failed: {}",
+                        db_name_for_error,
+                        e
+                    )
+                })?;
             let db_checksum = ltx::compute_checksum_from_file(&db_path_for_encode)?;
             Ok::<_, anyhow::Error>((ltx_buffer, db_checksum))
-        }).await??;
+        })
+        .await??;
 
         let ltx_size = ltx_buffer.len();
 
@@ -383,7 +427,12 @@ pub(crate) async fn sync_wal_to_cache(
 
         // Notify uploader
         if let Err(e) = upload_tx.send(UploadMessage::Upload(new_txid)).await {
-            tracing::warn!("{}: Failed to notify uploader for TXID {}: {}", input.name, new_txid, e);
+            tracing::warn!(
+                "{}: Failed to notify uploader for TXID {}: {}",
+                input.name,
+                new_txid,
+                e
+            );
         }
 
         tracing::info!(
@@ -437,13 +486,13 @@ pub(crate) async fn sync_wal_to_cache(
         });
     }
 
-    // Deduplicate pages and extract max_db_size in one pass (move, not clone)
+    // Deduplicate pages and extract final committed db size in one pass (move, not clone)
     let frame_count = frames.len();
-    let mut max_db_size = 0u32;
+    let mut final_db_size = 0u32;
     let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
     for frame in frames {
-        if frame.db_size > max_db_size {
-            max_db_size = frame.db_size;
+        if frame.db_size > 0 {
+            final_db_size = frame.db_size;
         }
         page_map.insert(frame.page_number, frame.data);
     }
@@ -454,7 +503,10 @@ pub(crate) async fn sync_wal_to_cache(
     let pre_checksum = match db_checksum {
         Some(cs) => Checksum::new(cs),
         None => {
-            tracing::debug!("{}: Computing checksum from database (no cached value)", input.name);
+            tracing::debug!(
+                "{}: Computing checksum from database (no cached value)",
+                input.name
+            );
             ltx::compute_checksum_from_file(&input.db_path)?
         }
     };
@@ -462,7 +514,9 @@ pub(crate) async fn sync_wal_to_cache(
     // Increment TXID for this incremental
     let min_txid = input.current_txid + 1;
     let max_txid = min_txid + pages.len() as u64 - 1;
-    let commit_page = if max_db_size > 0 { max_db_size } else {
+    let commit_page = if final_db_size > 0 {
+        final_db_size
+    } else {
         let db_size = std::fs::metadata(&input.db_path)?.len();
         (db_size / page_size as u64) as u32
     };
@@ -472,7 +526,9 @@ pub(crate) async fn sync_wal_to_cache(
 
     // Encode as incremental LTX
     let unique_pages = pages.len();
-    let estimated_size = unique_pages.saturating_mul(page_size as usize).saturating_mul(2);
+    let estimated_size = unique_pages
+        .saturating_mul(page_size as usize)
+        .saturating_mul(2);
     let db_name_for_error = input.name.clone();
     let page_nums: Vec<u32> = pages.iter().map(|(n, _)| *n).collect();
 
@@ -487,10 +543,22 @@ pub(crate) async fn sync_wal_to_cache(
             commit_page,
             Some(pre_checksum),
             expected_post,
-        ).map_err(|e| anyhow::anyhow!("{}: LTX encode failed (pages={:?}, page_size={}, txid={}-{}, commit={}): {}",
-            db_name_for_error, page_nums, page_size, min_txid, max_txid, commit_page, e))?;
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "{}: LTX encode failed (pages={:?}, page_size={}, txid={}-{}, commit={}): {}",
+                db_name_for_error,
+                page_nums,
+                page_size,
+                min_txid,
+                max_txid,
+                commit_page,
+                e
+            )
+        })?;
         Ok::<_, anyhow::Error>((ltx_buffer, post_checksum))
-    }).await??;
+    })
+    .await??;
 
     let ltx_size = ltx_buffer.len();
 
@@ -499,7 +567,12 @@ pub(crate) async fn sync_wal_to_cache(
 
     // Notify uploader
     if let Err(e) = upload_tx.send(UploadMessage::Upload(max_txid)).await {
-        tracing::warn!("{}: Failed to notify uploader for TXID {}: {}", input.name, max_txid, e);
+        tracing::warn!(
+            "{}: Failed to notify uploader for TXID {}: {}",
+            input.name,
+            max_txid,
+            e
+        );
     }
 
     tracing::info!(
@@ -551,7 +624,9 @@ pub(crate) async fn take_snapshot_with_retry(
                 // Handle auth errors immediately
                 if error_kind == ErrorKind::AuthError {
                     tracing::error!("{}: Authentication error during snapshot: {}", db_name, e);
-                    webhook_sender.notify_auth_failure(&db_name, &e.to_string()).await;
+                    webhook_sender
+                        .notify_auth_failure(&db_name, &e.to_string())
+                        .await;
                     return Err(e);
                 }
 
