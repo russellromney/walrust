@@ -289,6 +289,33 @@ async fn test_add_external_mode_skips_snapshot_upload() {
         "external delta seq must be greater than base change counter; base={base_counter}, keys={hadbp_keys:?}"
     );
 
+    let uploaded_key = hadbp_keys
+        .into_iter()
+        .find(|key| {
+            key.strip_suffix(".hadbp")
+                .and_then(|s| s.rsplit('/').next())
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+                == Some(uploaded_seq)
+        })
+        .expect("uploaded key for max seq");
+    let changeset_bytes = storage
+        .get(uploaded_key)
+        .await
+        .unwrap()
+        .expect("uploaded changeset bytes");
+    let changeset = hadb_changeset::physical::decode(&changeset_bytes).unwrap();
+    let state_json = storage
+        .get("wal/external/state.json")
+        .await
+        .unwrap()
+        .expect("state json");
+    let state: serde_json::Value = serde_json::from_slice(&state_json).unwrap();
+    assert_eq!(
+        state.get("db_checksum").and_then(|value| value.as_u64()),
+        Some(changeset.checksum),
+        "state.json must persist the chain checksum for promoted writers"
+    );
+
     drop(conn);
 }
 

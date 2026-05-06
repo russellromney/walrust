@@ -239,6 +239,7 @@ pub async fn save_state(
         "wal_generation": state.wal_generation,
         "current_seq": state.current_seq,
         "current_txid": state.current_txid,
+        "db_checksum": state.db_checksum,
         "last_snapshot": state.last_snapshot,
     });
     let data = serde_json::to_vec(&state_json)?;

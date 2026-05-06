@@ -201,12 +201,16 @@ impl Replicator {
                 if let Some(txid) = saved.get("current_txid").and_then(|v| v.as_u64()) {
                     state.current_txid = txid;
                 }
+                if let Some(checksum) = saved.get("db_checksum").and_then(|v| v.as_u64()) {
+                    state.db_checksum = Some(checksum);
+                }
                 tracing::info!(
-                    "Replicator: loaded state for '{}': seq={}, gen={}, txid={}",
+                    "Replicator: loaded state for '{}': seq={}, gen={}, txid={}, checksum={:?}",
                     name,
                     state.current_seq,
                     state.wal_generation,
                     state.current_txid,
+                    state.db_checksum,
                 );
             }
         }
