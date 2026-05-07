@@ -16,12 +16,12 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::Result;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 
 use crate::sync::{self, ReplicationConfig, SyncState};
 use hadb_storage::StorageBackend;
@@ -48,6 +48,30 @@ pub struct Replicator {
     /// Each database is stored under `{prefix}{db_name}/`.
     prefix: String,
     databases: Arc<RwLock<HashMap<String, Arc<AsyncMutex<DbState>>>>>,
+    /// Background sync/snapshot task. Held so `Drop` can abort it — without
+    /// this, a Replicator that is built and immediately discarded (e.g. an
+    /// init retry that fails after `try_new` succeeds) leaves the task
+    /// running forever, holding the `Arc<dyn StorageBackend>` and its
+    /// connection pool. Wrapped in `Mutex<Option<…>>` so the field is
+    /// initialised after the spawn (the task itself needs the `Weak<Self>`
+    /// handle, which can only be derived after the Arc exists) and so
+    /// `Drop` can sync-take the handle without bringing in a runtime.
+    background: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl Drop for Replicator {
+    fn drop(&mut self) {
+        // Abort the spawned loop so the storage backend / connection pool
+        // it holds is released immediately. The loop also exits naturally
+        // on the next iteration (its `Weak<Self>::upgrade()` will return
+        // `None`), but that introduces a tick of delay; aborting closes
+        // the gap and makes drop-in-flight test assertions deterministic.
+        if let Ok(mut guard) = self.background.lock() {
+            if let Some(h) = guard.take() {
+                h.abort();
+            }
+        }
+    }
 }
 
 impl Replicator {
@@ -86,6 +110,7 @@ impl Replicator {
             config,
             prefix: prefix.to_string(),
             databases: Arc::new(RwLock::new(HashMap::new())),
+            background: Mutex::new(None),
         });
 
         tracing::info!(
@@ -94,8 +119,19 @@ impl Replicator {
             replicator.config.snapshot_interval.as_secs(),
         );
 
-        let r = replicator.clone();
-        tokio::spawn(async move { r.run_loop().await });
+        // The background task must NOT pin the Replicator alive: if it held
+        // a strong `Arc<Self>`, the strong refcount would never drop to zero
+        // when the caller's last clone is released, `Drop` would never run,
+        // and the task (plus its `Arc<dyn StorageBackend>` connection pool)
+        // would leak. Hand the task a `Weak<Self>` and re-upgrade per tick.
+        let weak = Arc::downgrade(&replicator);
+        let handle = tokio::spawn(async move { Self::run_loop_weak(weak).await });
+        // Stash the handle so `Drop` can abort the task synchronously.
+        // `expect` is safe — no other code holds this lock yet.
+        *replicator
+            .background
+            .lock()
+            .expect("background mutex poisoned at init") = Some(handle);
 
         Ok(replicator)
     }
@@ -341,27 +377,56 @@ impl Replicator {
     // Background loop
     // ========================================================================
 
-    async fn run_loop(&self) {
-        let mut sync_timer = tokio::time::interval(self.config.sync_interval);
+    /// Background loop body. Runs with a `Weak<Self>` so the task does
+    /// not keep the Replicator alive: when the last public `Arc<Self>` is
+    /// dropped, the next `upgrade()` returns `None` and the loop returns.
+    /// `Drop` also aborts this task explicitly for prompt cleanup.
+    async fn run_loop_weak(weak: Weak<Self>) {
+        // Read the configuration once up front; if the Replicator has
+        // already been dropped before we even start ticking, return now
+        // and never construct a timer.
+        let (sync_interval, autonomous, snapshot_interval) = match weak.upgrade() {
+            Some(this) => (
+                this.config.sync_interval,
+                this.config.autonomous_snapshots,
+                this.config.snapshot_interval,
+            ),
+            None => return,
+        };
 
-        if !self.config.autonomous_snapshots {
+        let mut sync_timer = tokio::time::interval(sync_interval);
+
+        if !autonomous {
             // WAL-only mode: sync WAL, never take autonomous snapshots.
             // Used both for lease-coordinated snapshot ownership and for
             // external-base-state mode where another layer owns checkpoints.
             loop {
                 sync_timer.tick().await;
-                self.sync_all().await;
+                let Some(this) = weak.upgrade() else { return };
+                this.sync_all().await;
+                // Drop the strong ref before sleeping/awaiting the next
+                // tick so we don't keep the Replicator alive across the
+                // idle window between syncs.
+                drop(this);
             }
         } else {
             // Standalone mode: sync WAL + periodic snapshots.
-            let mut snapshot_timer = tokio::time::interval(self.config.snapshot_interval);
+            let mut snapshot_timer = tokio::time::interval(snapshot_interval);
             // Skip first snapshot tick -- databases take snapshots on add()
             snapshot_timer.tick().await;
 
             loop {
                 tokio::select! {
-                    _ = sync_timer.tick() => self.sync_all().await,
-                    _ = snapshot_timer.tick() => self.snapshot_all().await,
+                    _ = sync_timer.tick() => {
+                        let Some(this) = weak.upgrade() else { return };
+                        this.sync_all().await;
+                        drop(this);
+                    }
+                    _ = snapshot_timer.tick() => {
+                        let Some(this) = weak.upgrade() else { return };
+                        this.snapshot_all().await;
+                        drop(this);
+                    }
                 }
             }
         }
