@@ -123,6 +123,16 @@ pub struct SyncState {
     pub db_checksum: Option<u64>,
 }
 
+/// Explicit base cursor for callers whose checkpoint/base state is owned by
+/// another layer, such as Turbolite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalBaseCursor {
+    /// The durable base replay sequence. Delta objects must start at `seq + 1`.
+    pub seq: u64,
+    /// Checksum of the materialized base. The first delta must chain from this.
+    pub checksum: u64,
+}
+
 impl SyncState {
     /// Create new sync state for a database.
     pub fn new(db_path: PathBuf) -> Result<Self> {
@@ -330,7 +340,24 @@ async fn sync_wal_with_sequence(
     let changeset_size = changeset_bytes.len() as u64;
     let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_LIVE, new_seq);
 
-    storage.put(&changeset_key, &changeset_bytes).await?;
+    match sequence {
+        DeltaSequence::ExternalChangeCounter => {
+            let cas = storage
+                .put_if_absent(&changeset_key, &changeset_bytes)
+                .await?;
+            if !cas.success {
+                anyhow::bail!(
+                    "{}: external-base duplicate changeset seq {}; refusing overwrite at {}",
+                    state.name,
+                    new_seq,
+                    changeset_key
+                );
+            }
+        }
+        DeltaSequence::WalrustOwned => {
+            storage.put(&changeset_key, &changeset_bytes).await?;
+        }
+    }
 
     tracing::info!(
         "{}: Synced {} WAL frames as HADBP changeset ({} bytes, seq {}) -> {}",
@@ -346,9 +373,49 @@ async fn sync_wal_with_sequence(
     state.current_txid = max_txid;
     state.db_checksum = Some(post_checksum);
 
-    save_state(storage, prefix, state).await?;
+    if matches!(sequence, DeltaSequence::WalrustOwned) {
+        save_state(storage, prefix, state).await?;
+    }
 
     Ok(frame_count as u64)
+}
+
+/// Initialize external-base state from an explicit base cursor and the
+/// already-published physical delta object chain. Remote `state.json` is not
+/// consulted here; the base plus `.hadbp` chain is the protocol truth.
+pub async fn initialize_external_base_state(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+    base: ExternalBaseCursor,
+) -> Result<()> {
+    state.current_seq = base.seq;
+    state.current_txid = base.seq;
+    state.db_checksum = Some(base.checksum);
+    state.wal_offset = 0;
+    state.wal_generation = 0;
+
+    let head = cs_storage::discover_strict_physical_chain(
+        storage,
+        prefix,
+        &state.name,
+        cs_storage::StrictChainBase {
+            seq: base.seq,
+            checksum: base.checksum,
+        },
+    )
+    .await?;
+    state.current_seq = head.seq;
+    state.current_txid = head.seq;
+    state.db_checksum = Some(head.checksum);
+
+    // The object chain is authoritative for seq/checksum. WAL offset is only
+    // a local process cursor. On restart after already-published deltas, skip
+    // the bytes currently present; new writes will extend the WAL beyond this
+    // point and be captured normally.
+    state.wal_offset = crate::wal::get_wal_size(&state.wal_path).await.unwrap_or(0);
+
+    Ok(())
 }
 
 /// Take a full database snapshot as HADBP changeset.

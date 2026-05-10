@@ -32,6 +32,27 @@ impl MemStorage {
         keys.sort();
         keys
     }
+
+    async fn value(&self, key: &str) -> serde_json::Value {
+        let bytes = self
+            .get(key)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("missing storage key {key}"));
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn max_hadbp_seq(&self, prefix: &str) -> Option<u64> {
+        self.keys()
+            .into_iter()
+            .filter(|key| key.starts_with(prefix) && key.ends_with(".hadbp"))
+            .filter_map(|key| {
+                key.strip_suffix(".hadbp")
+                    .and_then(|s| s.rsplit('/').next())
+                    .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            })
+            .max()
+    }
 }
 
 #[async_trait]
@@ -97,6 +118,60 @@ impl StorageBackend for MemStorage {
             success: true,
             etag: Some("mem".into()),
         })
+    }
+}
+
+struct StateJsonForbiddenStorage {
+    inner: Arc<MemStorage>,
+}
+
+impl StateJsonForbiddenStorage {
+    fn new(inner: Arc<MemStorage>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+
+    fn reject_state_key(key: &str) -> Result<()> {
+        if key.ends_with("/state.json") {
+            anyhow::bail!("state.json access is forbidden in external-base mode: {key}");
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl StorageBackend for StateJsonForbiddenStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Self::reject_state_key(key)?;
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        Self::reject_state_key(key)?;
+        self.inner.put(key, data).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        Self::reject_state_key(key)?;
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        Self::reject_state_key(key)?;
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        Self::reject_state_key(key)?;
+        self.inner.put_if_absent(key, data).await
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        Self::reject_state_key(key)?;
+        self.inner.put_if_match(key, data, etag).await
     }
 }
 
@@ -305,16 +380,226 @@ async fn test_add_external_mode_skips_snapshot_upload() {
         .unwrap()
         .expect("uploaded changeset bytes");
     let changeset = hadb_changeset::physical::decode(&changeset_bytes).unwrap();
-    let state_json = storage
-        .get("wal/external/state.json")
+    assert_eq!(
+        changeset.header.prev_checksum,
+        walrust::ltx::compute_checksum_from_file(&db_path).unwrap(),
+        "external-base delta must chain from the base checksum"
+    );
+    assert!(
+        !keys_after_flush
+            .iter()
+            .any(|key| key.ends_with("state.json")),
+        "external-base mode must not write remote state.json; keys={keys_after_flush:?}"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_external_mode_reopen_derives_head_without_remote_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-reopen.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let storage = MemStorage::new();
+    let first = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    first.add("external", &db_path).await.unwrap();
+
+    write_rows(&conn, 100, 2);
+    let first_frames = first.flush("external").await.unwrap();
+    assert!(first_frames > 0, "first flush should upload WAL frames");
+
+    let saved_seq = storage
+        .max_hadbp_seq("wal/external/")
+        .expect("first flush should publish a HADBP delta");
+    assert!(
+        storage
+            .get("wal/external/state.json")
+            .await
+            .unwrap()
+            .is_none(),
+        "external-base mode should not write remote state.json"
+    );
+
+    drop(first);
+
+    let second = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    second.add("external", &db_path).await.unwrap();
+
+    let duplicate_frames = second.flush("external").await.unwrap();
+    assert_eq!(
+        duplicate_frames, 0,
+        "reopened external-base replicator must derive the object-chain head and not re-encode already-published WAL frames"
+    );
+    assert_eq!(
+        second.current_seq("external").await,
+        Some(saved_seq),
+        "reopened external-base replicator must preserve saved sequence when no new WAL frames exist"
+    );
+
+    write_rows(&conn, 200, 1);
+    let new_frames = second.flush("external").await.unwrap();
+    assert!(new_frames > 0, "new rows after reopen should still flush");
+
+    assert_eq!(
+        storage.max_hadbp_seq("wal/external/"),
+        Some(saved_seq + 1),
+        "new frames after reopen should produce exactly one new contiguous changeset"
+    );
+    assert!(
+        storage
+            .get("wal/external/state.json")
+            .await
+            .unwrap()
+            .is_none(),
+        "external-base mode should still not write remote state.json after reopen"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_external_mode_ignores_stale_state_after_wal_reset() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-reset.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_counter =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+    let base_checksum = walrust::ltx::compute_checksum_from_file(&db_path).unwrap();
+
+    let storage = MemStorage::new();
+    storage
+        .put(
+            "wal/external/state.json",
+            serde_json::json!({
+                "wal_offset": 999_999_u64,
+                "wal_generation": 4_u64,
+                "current_seq": base_counter + 97,
+                "current_txid": base_counter + 97,
+                "db_checksum": 0xfeed_face_dead_beefu64,
+                "last_snapshot": null,
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator.add("external", &db_path).await.unwrap();
+    assert_eq!(
+        replicator.current_seq("external").await,
+        Some(base_counter),
+        "stale external state from an older WAL incarnation must not override the current base cursor"
+    );
+
+    write_rows(&conn, 100, 1);
+    let frames = replicator.flush("external").await.unwrap();
+    assert!(frames > 0, "fresh post-reset rows should flush");
+
+    let hadbp_key = storage
+        .keys()
+        .into_iter()
+        .find(|key| key.ends_with(".hadbp"))
+        .expect("uploaded changeset");
+    let changeset_bytes = storage
+        .get(&hadbp_key)
         .await
         .unwrap()
-        .expect("state json");
-    let state: serde_json::Value = serde_json::from_slice(&state_json).unwrap();
+        .expect("uploaded changeset bytes");
+    let changeset = hadb_changeset::physical::decode(&changeset_bytes).unwrap();
     assert_eq!(
-        state.get("db_checksum").and_then(|value| value.as_u64()),
-        Some(changeset.checksum),
-        "state.json must persist the chain checksum for promoted writers"
+        changeset.header.seq,
+        base_counter + 1,
+        "post-reset external delta must continue directly after the current base cursor"
+    );
+    assert_eq!(
+        changeset.header.prev_checksum, base_checksum,
+        "post-reset external delta must chain from the current base checksum, not stale state.json"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_external_mode_does_not_read_or_write_remote_state_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-no-state-access.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let raw_storage = MemStorage::new();
+    let guarded_storage = StateJsonForbiddenStorage::new(raw_storage.clone());
+    let replicator = Replicator::try_new(guarded_storage, "wal/", make_external_config())
+        .expect("external config should be valid");
+
+    replicator.add("external", &db_path).await.unwrap();
+    write_rows(&conn, 100, 1);
+    let frames = replicator.flush("external").await.unwrap();
+    assert!(
+        frames > 0,
+        "external-base flush should still publish frames"
+    );
+    assert!(
+        raw_storage
+            .get("wal/external/state.json")
+            .await
+            .unwrap()
+            .is_none(),
+        "external-base mode must not write state.json"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_walrust_owned_reopen_uses_legacy_state_json() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("walrust-owned-reopen.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let storage = MemStorage::new();
+    let first = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    first.add("owned", &db_path).await.unwrap();
+    write_rows(&conn, 100, 2);
+    let frames = first.flush("owned").await.unwrap();
+    assert!(
+        frames > 0,
+        "first walrust-owned flush should publish frames"
+    );
+
+    let saved_state = storage.value("wal/owned/state.json").await;
+    let saved_seq = saved_state
+        .get("current_seq")
+        .and_then(|value| value.as_u64())
+        .expect("walrust-owned mode persists current_seq");
+    assert!(
+        saved_state
+            .get("wal_offset")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(0)
+            > 0,
+        "walrust-owned mode persists wal_offset"
+    );
+
+    drop(first);
+
+    let second = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    second
+        .add_without_snapshot("owned", &db_path)
+        .await
+        .expect("walrust-owned reopen from state");
+    assert_eq!(
+        second.current_seq("owned").await,
+        Some(saved_seq),
+        "walrust-owned add_without_snapshot should still use legacy state.json"
+    );
+    let duplicate = second.flush("owned").await.unwrap();
+    assert_eq!(
+        duplicate, 0,
+        "walrust-owned reopen should not re-encode old WAL frames"
     );
 
     drop(conn);

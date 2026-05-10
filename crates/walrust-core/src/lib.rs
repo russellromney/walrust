@@ -38,8 +38,8 @@ pub use replay_sink::PageReplaySink;
 pub use replicator::Replicator;
 pub use snapshot_source::SnapshotSource;
 pub use sync::{
-    pull_incremental_into_sink, restore_with_snapshot_source, run_wal_replication, LtxEntry,
-    Manifest, ReplicationConfig, SnapshotOwnership, SyncState,
+    pull_incremental_into_sink, restore_with_snapshot_source, run_wal_replication,
+    ExternalBaseCursor, LtxEntry, Manifest, ReplicationConfig, SnapshotOwnership, SyncState,
 };
 
 // Re-export hadb-changeset for consumers

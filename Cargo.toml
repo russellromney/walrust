@@ -107,6 +107,12 @@ uuid = { version = "1", features = ["v4"] }
 brunch = "0.5"
 tower = "0.5"
 
+[patch."https://github.com/russellromney/hadb.git"]
+hadb-changeset = { path = "../hadb/hadb-changeset" }
+hadb-io = { path = "../hadb/hadb-io" }
+hadb-storage = { path = "../hadb/hadb-storage" }
+hadb-storage-s3 = { path = "../hadb/hadb-storage-s3" }
+
 [[example]]
 name = "profile_rss"
 path = "bench/profile_rss.rs"

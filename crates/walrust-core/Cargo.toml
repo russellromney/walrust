@@ -55,3 +55,9 @@ uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 # Integration tests use the S3 impl directly for compile-time usability checks.
 hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", branch = "hoist-prereq-internal-lease-store" }
+
+[patch."https://github.com/russellromney/hadb.git"]
+hadb-changeset = { path = "../../../hadb/hadb-changeset" }
+hadb-io = { path = "../../../hadb/hadb-io" }
+hadb-storage = { path = "../../../hadb/hadb-storage" }
+hadb-storage-s3 = { path = "../../../hadb/hadb-storage-s3" }

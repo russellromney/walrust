@@ -23,7 +23,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::sync::{self, ReplicationConfig, SyncState};
+use crate::sync::{self, ExternalBaseCursor, ReplicationConfig, SyncState};
 use hadb_storage::StorageBackend;
 
 /// Per-database replication state.
@@ -211,6 +211,22 @@ impl Replicator {
         db_path: &Path,
         wal_path: &Path,
     ) -> Result<()> {
+        if self.config.snapshot_ownership.is_external() {
+            let base_seq = sync::change_counter_from_file(db_path).unwrap_or(0);
+            let base_checksum = crate::ltx::compute_checksum_from_file(db_path)?;
+            return self
+                .add_external_base_with_wal_path(
+                    name,
+                    db_path,
+                    wal_path,
+                    ExternalBaseCursor {
+                        seq: base_seq,
+                        checksum: base_checksum,
+                    },
+                )
+                .await;
+        }
+
         let prefix = self.prefix.clone();
 
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
@@ -223,31 +239,52 @@ impl Replicator {
             state.current_txid = base_change_counter;
         }
 
-        // Load existing state from storage to get the correct current_seq.
-        // This ensures flush() starts at the right seq (after any existing changesets).
+        // Load existing state from storage to get the correct current_seq and
+        // WAL offset. This ensures flush() starts after already-published
+        // changesets. In external-base mode, a truncated/reset WAL means the
+        // saved state belongs to an older local incarnation; keep the freshly
+        // computed base checksum/sequence instead of chaining from stale state.
         let state_key = format!("{}{}/state.json", prefix, name);
         if let Ok(Some(data)) = self.storage.get(&state_key).await {
             if let Ok(saved) = serde_json::from_slice::<serde_json::Value>(&data) {
-                if let Some(seq) = saved.get("current_seq").and_then(|v| v.as_u64()) {
-                    state.current_seq = seq;
+                let saved_offset = saved.get("wal_offset").and_then(|v| v.as_u64());
+                let wal_size = crate::wal::get_wal_size(wal_path).await.unwrap_or(0);
+                let stale_external_state = self.config.snapshot_ownership.is_external()
+                    && saved_offset.map(|offset| offset > wal_size).unwrap_or(true);
+
+                if stale_external_state {
+                    tracing::warn!(
+                        "Replicator: ignoring stale external state for '{}': saved_wal_offset={:?}, current_wal_size={}",
+                        name,
+                        saved_offset,
+                        wal_size,
+                    );
+                } else {
+                    if let Some(seq) = saved.get("current_seq").and_then(|v| v.as_u64()) {
+                        state.current_seq = seq;
+                    }
+                    if let Some(offset) = saved_offset {
+                        state.wal_offset = offset;
+                    }
+                    if let Some(gen) = saved.get("wal_generation").and_then(|v| v.as_u64()) {
+                        state.wal_generation = gen;
+                    }
+                    if let Some(txid) = saved.get("current_txid").and_then(|v| v.as_u64()) {
+                        state.current_txid = txid;
+                    }
+                    if let Some(checksum) = saved.get("db_checksum").and_then(|v| v.as_u64()) {
+                        state.db_checksum = Some(checksum);
+                    }
+                    tracing::info!(
+                        "Replicator: loaded state for '{}': seq={}, gen={}, txid={}, offset={}, checksum={:?}",
+                        name,
+                        state.current_seq,
+                        state.wal_generation,
+                        state.current_txid,
+                        state.wal_offset,
+                        state.db_checksum,
+                    );
                 }
-                if let Some(gen) = saved.get("wal_generation").and_then(|v| v.as_u64()) {
-                    state.wal_generation = gen;
-                }
-                if let Some(txid) = saved.get("current_txid").and_then(|v| v.as_u64()) {
-                    state.current_txid = txid;
-                }
-                if let Some(checksum) = saved.get("db_checksum").and_then(|v| v.as_u64()) {
-                    state.db_checksum = Some(checksum);
-                }
-                tracing::info!(
-                    "Replicator: loaded state for '{}': seq={}, gen={}, txid={}, checksum={:?}",
-                    name,
-                    state.current_seq,
-                    state.wal_generation,
-                    state.current_txid,
-                    state.db_checksum,
-                );
             }
         }
 
@@ -261,6 +298,42 @@ impl Replicator {
         tracing::info!(
             "Replicator: added '{}' without snapshot ({})",
             name,
+            db_path.display()
+        );
+        Ok(())
+    }
+
+    /// Register an externally checkpointed database with an explicit base
+    /// cursor. External-base mode does not read remote `state.json`; the base
+    /// cursor plus the `.hadbp` object chain are the source of truth.
+    pub async fn add_external_base_with_wal_path(
+        &self,
+        name: &str,
+        db_path: &Path,
+        wal_path: &Path,
+        base: ExternalBaseCursor,
+    ) -> Result<()> {
+        if !self.config.snapshot_ownership.is_external() {
+            anyhow::bail!("add_external_base_with_wal_path requires external snapshot ownership");
+        }
+
+        let prefix = self.prefix.clone();
+        let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
+        state.name = name.to_string();
+        sync::initialize_external_base_state(self.storage.as_ref(), &prefix, &mut state, base)
+            .await?;
+
+        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix }));
+
+        self.databases
+            .write()
+            .await
+            .insert(name.to_string(), db_state);
+
+        tracing::info!(
+            "Replicator: added '{}' with external base seq {} ({})",
+            name,
+            base.seq,
             db_path.display()
         );
         Ok(())
