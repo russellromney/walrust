@@ -59,8 +59,9 @@ enum DeltaSequence {
     /// Plain walrust-owned mode: snapshots and incrementals share a
     /// monotonically incremented HADBP sequence.
     WalrustOwned,
-    /// External-base-state mode: the base manifest carries the replay cursor, so
-    /// delta object seqs must stay ahead of that floor.
+    /// External-base-state mode: the base manifest carries the replay cursor.
+    /// Delta object seqs continue contiguously from that floor; the SQLite
+    /// change counter is tracked separately as `current_txid`.
     ExternalChangeCounter,
 }
 
@@ -320,8 +321,7 @@ async fn sync_wal_with_sequence(
         .unwrap_or(state.current_txid + commit_count.max(1));
 
     let new_seq = match sequence {
-        DeltaSequence::WalrustOwned => state.current_seq + 1,
-        DeltaSequence::ExternalChangeCounter => max_txid.max(state.current_seq + 1),
+        DeltaSequence::WalrustOwned | DeltaSequence::ExternalChangeCounter => state.current_seq + 1,
     };
 
     let (changeset_bytes, post_checksum) =

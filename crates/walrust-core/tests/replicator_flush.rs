@@ -284,9 +284,10 @@ async fn test_add_external_mode_skips_snapshot_upload() {
         })
         .max()
         .expect("uploaded changeset seq");
-    assert!(
-        uploaded_seq > base_counter,
-        "external delta seq must be greater than base change counter; base={base_counter}, keys={hadbp_keys:?}"
+    assert_eq!(
+        uploaded_seq,
+        base_counter + 1,
+        "external delta seq must be contiguous after the base cursor; base={base_counter}, keys={hadbp_keys:?}"
     );
 
     let uploaded_key = hadbp_keys
