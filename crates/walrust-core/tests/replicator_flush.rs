@@ -2,6 +2,8 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use hadb_changeset::physical::{self, PageEntry, PageId, PageIdSize, PhysicalChangeset};
+use hadb_changeset::storage::{self as cs_storage, ChangesetKind, GENERATION_INCREMENTAL};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -226,6 +228,34 @@ fn make_external_config() -> ReplicationConfig {
         snapshot_ownership: SnapshotOwnership::External,
         ..Default::default()
     }
+}
+
+async fn seed_physical_delta(
+    storage: &MemStorage,
+    prefix: &str,
+    db_name: &str,
+    seq: u64,
+    prev_checksum: u64,
+) -> PhysicalChangeset {
+    let changeset = PhysicalChangeset::new(
+        seq,
+        prev_checksum,
+        PageIdSize::U32,
+        4096,
+        vec![PageEntry {
+            page_id: PageId::U32(1),
+            data: vec![seq as u8; 4096],
+        }],
+    );
+    let key = cs_storage::format_key(
+        prefix,
+        db_name,
+        GENERATION_INCREMENTAL,
+        seq,
+        ChangesetKind::Physical,
+    );
+    storage.put(&key, &physical::encode(&changeset)).await.unwrap();
+    changeset
 }
 
 // ============================================================================
@@ -549,6 +579,81 @@ async fn test_external_mode_does_not_read_or_write_remote_state_json() {
             .unwrap()
             .is_none(),
         "external-base mode must not write state.json"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_external_mode_rejects_wrong_chain_existing_delta_after_base() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-wrong-chain.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+
+    let storage = MemStorage::new();
+    seed_physical_delta(
+        &storage,
+        "wal/",
+        "external",
+        base_seq + 1,
+        0xfeed_face_dead_beefu64,
+    )
+    .await;
+
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    let err = replicator
+        .add("external", &db_path)
+        .await
+        .expect_err("wrong-chain existing delta must fail external-base registration")
+        .to_string();
+    assert!(
+        err.contains("checksum chain break"),
+        "expected checksum-chain failure, got {err}"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_external_mode_duplicate_next_seq_publish_fails_closed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-duplicate-publish.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+    let base_checksum = walrust::ltx::compute_checksum_from_file(&db_path).unwrap();
+
+    let storage = MemStorage::new();
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator.add("external", &db_path).await.unwrap();
+
+    seed_physical_delta(
+        &storage,
+        "wal/",
+        "external",
+        base_seq + 1,
+        base_checksum,
+    )
+    .await;
+    write_rows(&conn, 100, 1);
+
+    let err = replicator
+        .flush("external")
+        .await
+        .expect_err("duplicate next seq must not overwrite an existing object")
+        .to_string();
+    assert!(
+        err.contains("duplicate changeset seq"),
+        "expected duplicate-seq failure, got {err}"
+    );
+    assert_eq!(
+        storage.max_hadbp_seq("wal/external/"),
+        Some(base_seq + 1),
+        "duplicate failure should leave the existing object in place"
     );
 
     drop(conn);
