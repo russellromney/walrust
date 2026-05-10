@@ -99,7 +99,6 @@ yarn-debug.log*
 yarn-error.log*
 
 # Development/Build artifacts
-benches/
 .astro/
 
 
