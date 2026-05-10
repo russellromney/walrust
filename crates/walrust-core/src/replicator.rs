@@ -239,52 +239,37 @@ impl Replicator {
             state.current_txid = base_change_counter;
         }
 
-        // Load existing state from storage to get the correct current_seq and
-        // WAL offset. This ensures flush() starts after already-published
-        // changesets. In external-base mode, a truncated/reset WAL means the
-        // saved state belongs to an older local incarnation; keep the freshly
-        // computed base checksum/sequence instead of chaining from stale state.
+        // Walrust-owned mode still uses remote state.json as its reopen cursor.
+        // External-base mode returned above and derives its cursor from the
+        // caller's base plus the physical changeset chain.
         let state_key = format!("{}{}/state.json", prefix, name);
         if let Ok(Some(data)) = self.storage.get(&state_key).await {
             if let Ok(saved) = serde_json::from_slice::<serde_json::Value>(&data) {
                 let saved_offset = saved.get("wal_offset").and_then(|v| v.as_u64());
-                let wal_size = crate::wal::get_wal_size(wal_path).await.unwrap_or(0);
-                let stale_external_state = self.config.snapshot_ownership.is_external()
-                    && saved_offset.map(|offset| offset > wal_size).unwrap_or(true);
-
-                if stale_external_state {
-                    tracing::warn!(
-                        "Replicator: ignoring stale external state for '{}': saved_wal_offset={:?}, current_wal_size={}",
-                        name,
-                        saved_offset,
-                        wal_size,
-                    );
-                } else {
-                    if let Some(seq) = saved.get("current_seq").and_then(|v| v.as_u64()) {
-                        state.current_seq = seq;
-                    }
-                    if let Some(offset) = saved_offset {
-                        state.wal_offset = offset;
-                    }
-                    if let Some(gen) = saved.get("wal_generation").and_then(|v| v.as_u64()) {
-                        state.wal_generation = gen;
-                    }
-                    if let Some(txid) = saved.get("current_txid").and_then(|v| v.as_u64()) {
-                        state.current_txid = txid;
-                    }
-                    if let Some(checksum) = saved.get("db_checksum").and_then(|v| v.as_u64()) {
-                        state.db_checksum = Some(checksum);
-                    }
-                    tracing::info!(
-                        "Replicator: loaded state for '{}': seq={}, gen={}, txid={}, offset={}, checksum={:?}",
-                        name,
-                        state.current_seq,
-                        state.wal_generation,
-                        state.current_txid,
-                        state.wal_offset,
-                        state.db_checksum,
-                    );
+                if let Some(seq) = saved.get("current_seq").and_then(|v| v.as_u64()) {
+                    state.current_seq = seq;
                 }
+                if let Some(offset) = saved_offset {
+                    state.wal_offset = offset;
+                }
+                if let Some(gen) = saved.get("wal_generation").and_then(|v| v.as_u64()) {
+                    state.wal_generation = gen;
+                }
+                if let Some(txid) = saved.get("current_txid").and_then(|v| v.as_u64()) {
+                    state.current_txid = txid;
+                }
+                if let Some(checksum) = saved.get("db_checksum").and_then(|v| v.as_u64()) {
+                    state.db_checksum = Some(checksum);
+                }
+                tracing::info!(
+                    "Replicator: loaded state for '{}': seq={}, gen={}, txid={}, offset={}, checksum={:?}",
+                    name,
+                    state.current_seq,
+                    state.wal_generation,
+                    state.current_txid,
+                    state.wal_offset,
+                    state.db_checksum,
+                );
             }
         }
 
