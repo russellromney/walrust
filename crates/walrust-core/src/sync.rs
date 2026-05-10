@@ -391,7 +391,34 @@ pub async fn initialize_external_base_state(
 ) -> Result<()> {
     state.current_seq = base.seq;
     state.current_txid = base.seq;
-    state.db_checksum = Some(base.checksum);
+    let base_chain_checksum = if base.seq > 0 {
+        let base_key = build_changeset_key(
+            prefix,
+            &state.name,
+            GENERATION_LIVE,
+            base.seq,
+        );
+        match storage.get(&base_key).await? {
+            Some(data) => {
+                let changeset = hadb_changeset::physical::decode(&data).map_err(|e| {
+                    anyhow!("failed to decode external base changeset at {}: {}", base_key, e)
+                })?;
+                if changeset.header.seq != base.seq {
+                    anyhow::bail!(
+                        "external base changeset seq mismatch at {}: expected {}, found {}",
+                        base_key,
+                        base.seq,
+                        changeset.header.seq
+                    );
+                }
+                changeset.checksum
+            }
+            None => base.checksum,
+        }
+    } else {
+        base.checksum
+    };
+    state.db_checksum = Some(base_chain_checksum);
     state.wal_offset = 0;
     state.wal_generation = 0;
 
@@ -401,7 +428,7 @@ pub async fn initialize_external_base_state(
         &state.name,
         cs_storage::StrictChainBase {
             seq: base.seq,
-            checksum: base.checksum,
+            checksum: base_chain_checksum,
         },
     )
     .await?;
@@ -1825,8 +1852,98 @@ mod tests {
         post_checksum
     }
 
+    fn seed_chained_changeset(
+        storage: &mut TestStorage,
+        prefix: &str,
+        db_name: &str,
+        seq: u64,
+        prev_checksum: u64,
+        page_size: u32,
+        pages: &[(u32, Vec<u8>)],
+    ) -> u64 {
+        let (bytes, post_checksum) =
+            encode_wal_changes(pages, page_size, seq, prev_checksum).expect("encode_wal_changes");
+        let key = build_changeset_key(prefix, db_name, GENERATION_LIVE, seq);
+        storage.insert(&key, bytes);
+        post_checksum
+    }
+
     fn page_payload(page_size: usize, marker: u8) -> Vec<u8> {
         vec![marker; page_size]
+    }
+
+    #[tokio::test]
+    async fn external_base_state_continues_from_existing_base_changeset_checksum() {
+        let mut storage = TestStorage::new();
+        let page_size = 4096u32;
+        let checksum3 = seed_chained_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            3,
+            0x1111,
+            page_size,
+            &[(1, page_payload(page_size as usize, 0x33))],
+        );
+        let checksum4 = seed_chained_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            4,
+            checksum3,
+            page_size,
+            &[(2, page_payload(page_size as usize, 0x44))],
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut state =
+            SyncState::new_with_paths(dir.path().join("mydb.db"), dir.path().join("mydb.db-wal"))
+                .expect("sync state");
+        state.name = "mydb".to_string();
+
+        initialize_external_base_state(
+            &storage,
+            "test/",
+            &mut state,
+            ExternalBaseCursor {
+                seq: 3,
+                checksum: 0x2222,
+            },
+        )
+        .await
+        .expect("external base init should chain from seq 3 object checksum");
+
+        assert_eq!(state.current_seq, 4);
+        assert_eq!(
+            state.db_checksum,
+            Some(checksum4),
+            "writer state must continue the object chain, not the materialized base-file hash"
+        );
+    }
+
+    #[tokio::test]
+    async fn external_base_state_uses_file_checksum_when_base_changeset_is_absent() {
+        let storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let mut state =
+            SyncState::new_with_paths(dir.path().join("mydb.db"), dir.path().join("mydb.db-wal"))
+                .expect("sync state");
+        state.name = "mydb".to_string();
+
+        initialize_external_base_state(
+            &storage,
+            "test/",
+            &mut state,
+            ExternalBaseCursor {
+                seq: 3,
+                checksum: 0x2222,
+            },
+        )
+        .await
+        .expect("missing same-seq object falls back to materialized base checksum");
+
+        assert_eq!(state.current_seq, 3);
+        assert_eq!(state.db_checksum, Some(0x2222));
     }
 
     #[tokio::test]
