@@ -254,7 +254,10 @@ async fn seed_physical_delta(
         seq,
         ChangesetKind::Physical,
     );
-    storage.put(&key, &physical::encode(&changeset)).await.unwrap();
+    storage
+        .put(&key, &physical::encode(&changeset))
+        .await
+        .unwrap();
     changeset
 }
 
@@ -631,14 +634,7 @@ async fn test_external_mode_duplicate_next_seq_publish_fails_closed() {
         .expect("external config should be valid");
     replicator.add("external", &db_path).await.unwrap();
 
-    seed_physical_delta(
-        &storage,
-        "wal/",
-        "external",
-        base_seq + 1,
-        base_checksum,
-    )
-    .await;
+    seed_physical_delta(&storage, "wal/", "external", base_seq + 1, base_checksum).await;
     write_rows(&conn, 100, 1);
 
     let err = replicator
