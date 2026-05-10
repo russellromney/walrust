@@ -57,6 +57,55 @@ impl MemStorage {
     }
 }
 
+struct ConcurrentIdenticalPutStore {
+    inner: Arc<MemStorage>,
+}
+
+impl ConcurrentIdenticalPutStore {
+    fn new(inner: Arc<MemStorage>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+}
+
+#[async_trait]
+impl StorageBackend for ConcurrentIdenticalPutStore {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.inner.put(key, data).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.inner.put_if_absent(key, data).await?;
+        Ok(CasResult {
+            success: false,
+            etag: None,
+        })
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.inner.put_if_match(key, data, etag).await
+    }
+
+    async fn range_get(&self, key: &str, start: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        self.inner.range_get(key, start, len).await
+    }
+}
+
 #[async_trait]
 impl StorageBackend for MemStorage {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
@@ -650,6 +699,38 @@ async fn test_external_mode_duplicate_next_seq_publish_fails_closed() {
         storage.max_hadbp_seq("wal/external/"),
         Some(base_seq + 1),
         "duplicate failure should leave the existing object in place"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_external_mode_identical_duplicate_next_seq_publish_is_idempotent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-idempotent-duplicate-publish.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+
+    let raw_storage = MemStorage::new();
+    let storage = ConcurrentIdenticalPutStore::new(raw_storage.clone());
+    let replicator = Replicator::try_new(storage, "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator.add("external", &db_path).await.unwrap();
+    write_rows(&conn, 100, 1);
+
+    let frames = replicator
+        .flush("external")
+        .await
+        .expect("identical duplicate publish should be idempotent");
+    assert!(
+        frames > 0,
+        "idempotent duplicate publish should still advance local sync state"
+    );
+    assert_eq!(
+        raw_storage.max_hadbp_seq("wal/external/"),
+        Some(base_seq + 1),
+        "idempotent duplicate publish leaves one changeset object in place"
     );
 
     drop(conn);

@@ -346,11 +346,29 @@ async fn sync_wal_with_sequence(
                 .put_if_absent(&changeset_key, &changeset_bytes)
                 .await?;
             if !cas.success {
-                anyhow::bail!(
-                    "{}: external-base duplicate changeset seq {}; refusing overwrite at {}",
+                let existing = storage
+                    .get(&changeset_key)
+                    .await?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "{}: external-base duplicate changeset seq {} vanished after CAS failure at {}",
+                            state.name,
+                            new_seq,
+                            changeset_key
+                        )
+                    })?;
+                if existing != changeset_bytes {
+                    anyhow::bail!(
+                        "{}: external-base duplicate changeset seq {}; refusing overwrite at {}",
+                        state.name,
+                        new_seq,
+                        changeset_key
+                    );
+                }
+                tracing::info!(
+                    "{}: external-base changeset seq {} already exists with identical bytes; treating publish as idempotent",
                     state.name,
-                    new_seq,
-                    changeset_key
+                    new_seq
                 );
             }
         }
@@ -392,16 +410,15 @@ pub async fn initialize_external_base_state(
     state.current_seq = base.seq;
     state.current_txid = base.seq;
     let base_chain_checksum = if base.seq > 0 {
-        let base_key = build_changeset_key(
-            prefix,
-            &state.name,
-            GENERATION_LIVE,
-            base.seq,
-        );
+        let base_key = build_changeset_key(prefix, &state.name, GENERATION_LIVE, base.seq);
         match storage.get(&base_key).await? {
             Some(data) => {
                 let changeset = hadb_changeset::physical::decode(&data).map_err(|e| {
-                    anyhow!("failed to decode external base changeset at {}: {}", base_key, e)
+                    anyhow!(
+                        "failed to decode external base changeset at {}: {}",
+                        base_key,
+                        e
+                    )
                 })?;
                 if changeset.header.seq != base.seq {
                     anyhow::bail!(
