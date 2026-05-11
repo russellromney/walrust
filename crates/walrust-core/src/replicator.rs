@@ -431,6 +431,50 @@ impl Replicator {
         Some(state.state.current_seq)
     }
 
+    /// Adopt a newly published external page/base cursor as the chain root for
+    /// future WAL deltas.
+    ///
+    /// This is intentionally only for external-base integrations. The caller
+    /// must publish a durable page/base manifest first; walrust then continues
+    /// from that manifest checksum while preserving the current WAL offset so
+    /// concurrent frames beyond the already-flushed range are not skipped.
+    pub async fn adopt_external_base_cursor(
+        &self,
+        name: &str,
+        base: ExternalBaseCursor,
+    ) -> Result<bool> {
+        if !self.config.snapshot_ownership.is_external() {
+            anyhow::bail!("adopt_external_base_cursor requires external snapshot ownership");
+        }
+
+        let databases = self.databases.read().await;
+        let Some(db_state) = databases.get(name).cloned() else {
+            return Ok(false);
+        };
+        drop(databases);
+
+        let mut state = db_state.lock().await;
+        if base.seq < state.state.current_seq {
+            anyhow::bail!(
+                "{}: refused to adopt stale external base seq {} behind current seq {}",
+                name,
+                base.seq,
+                state.state.current_seq
+            );
+        }
+
+        state.state.current_seq = base.seq;
+        state.state.current_txid = base.seq;
+        state.state.db_checksum = Some(base.checksum);
+        tracing::info!(
+            "{}: adopted external base cursor seq {} checksum {:016x}",
+            name,
+            base.seq,
+            base.checksum,
+        );
+        Ok(true)
+    }
+
     // ========================================================================
     // Background loop
     // ========================================================================
