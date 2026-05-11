@@ -607,6 +607,56 @@ async fn test_external_mode_ignores_stale_state_after_wal_reset() {
 }
 
 #[tokio::test]
+async fn test_external_mode_ignores_stale_same_seq_delta() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-stale-same-seq.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_counter =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+    let base_checksum = walrust::ltx::compute_checksum_from_file(&db_path).unwrap();
+
+    let storage = MemStorage::new();
+    seed_physical_delta(
+        &storage,
+        "wal/",
+        "external",
+        base_counter,
+        0xfeed_face_dead_beefu64,
+    )
+    .await;
+
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator.add("external", &db_path).await.unwrap();
+
+    write_rows(&conn, 100, 1);
+    let frames = replicator.flush("external").await.unwrap();
+    assert!(
+        frames > 0,
+        "fresh post-base rows should flush even when a stale same-seq object exists"
+    );
+
+    let changeset_bytes = storage
+        .get(&cs_storage::format_key(
+            "wal/",
+            "external",
+            GENERATION_INCREMENTAL,
+            base_counter + 1,
+            ChangesetKind::Physical,
+        ))
+        .await
+        .unwrap()
+        .expect("uploaded post-base changeset bytes");
+    let changeset = hadb_changeset::physical::decode(&changeset_bytes).unwrap();
+    assert_eq!(
+        changeset.header.prev_checksum, base_checksum,
+        "post-base delta must chain from the current external page-base checksum, not a stale same-seq object"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
 async fn test_external_mode_does_not_read_or_write_remote_state_json() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("external-no-state-access.db");
