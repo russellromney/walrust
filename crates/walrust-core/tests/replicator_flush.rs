@@ -6,6 +6,7 @@ use hadb_changeset::physical::{self, PageEntry, PageId, PageIdSize, PhysicalChan
 use hadb_changeset::storage::{self as cs_storage, ChangesetKind, GENERATION_INCREMENTAL};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use hadb_storage::{CasResult, StorageBackend};
@@ -70,6 +71,70 @@ impl ConcurrentIdenticalPutStore {
 #[async_trait]
 impl StorageBackend for ConcurrentIdenticalPutStore {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.inner.put(key, data).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.inner.put_if_absent(key, data).await?;
+        Ok(CasResult {
+            success: false,
+            etag: None,
+        })
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.inner.put_if_match(key, data, etag).await
+    }
+
+    async fn range_get(&self, key: &str, start: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        self.inner.range_get(key, start, len).await
+    }
+}
+
+struct DelayedDuplicateVisibleStore {
+    inner: Arc<MemStorage>,
+    hidden_hadbp_gets: AtomicUsize,
+}
+
+impl DelayedDuplicateVisibleStore {
+    fn new(inner: Arc<MemStorage>, hidden_hadbp_gets: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            hidden_hadbp_gets: AtomicUsize::new(hidden_hadbp_gets),
+        })
+    }
+}
+
+#[async_trait]
+impl StorageBackend for DelayedDuplicateVisibleStore {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if key.ends_with(".hadbp")
+            && self.inner.exists(key).await?
+            && self
+                .hidden_hadbp_gets
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            return Ok(None);
+        }
         self.inner.get(key).await
     }
 
@@ -781,6 +846,38 @@ async fn test_external_mode_identical_duplicate_next_seq_publish_is_idempotent()
         raw_storage.max_hadbp_seq("wal/external/"),
         Some(base_seq + 1),
         "idempotent duplicate publish leaves one changeset object in place"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_external_mode_duplicate_publish_waits_for_visible_existing_object() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-delayed-duplicate-visible.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+
+    let raw_storage = MemStorage::new();
+    let storage = DelayedDuplicateVisibleStore::new(raw_storage.clone(), 2);
+    let replicator = Replicator::try_new(storage, "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator.add("external", &db_path).await.unwrap();
+    write_rows(&conn, 100, 1);
+
+    let frames = replicator
+        .flush("external")
+        .await
+        .expect("CAS loser should retry until the identical object is visible");
+    assert!(
+        frames > 0,
+        "delayed duplicate visibility should still advance local sync state"
+    );
+    assert_eq!(
+        raw_storage.max_hadbp_seq("wal/external/"),
+        Some(base_seq + 1),
+        "delayed duplicate publish leaves one changeset object in place"
     );
 
     drop(conn);

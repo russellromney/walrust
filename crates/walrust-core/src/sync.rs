@@ -289,6 +289,24 @@ pub async fn sync_wal_after_external_base(
     sync_wal_with_sequence(storage, prefix, state, DeltaSequence::ExternalChangeCounter).await
 }
 
+async fn get_existing_after_failed_cas(
+    storage: &dyn StorageBackend,
+    key: &str,
+) -> Result<Option<Vec<u8>>> {
+    const RETRY_DELAYS_MS: [u64; 4] = [10, 25, 50, 100];
+
+    for delay_ms in [0].into_iter().chain(RETRY_DELAYS_MS) {
+        if delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+        }
+        if let Some(existing) = storage.get(key).await? {
+            return Ok(Some(existing));
+        }
+    }
+
+    Ok(None)
+}
+
 async fn sync_wal_with_sequence(
     storage: &dyn StorageBackend,
     prefix: &str,
@@ -346,8 +364,7 @@ async fn sync_wal_with_sequence(
                 .put_if_absent(&changeset_key, &changeset_bytes)
                 .await?;
             if !cas.success {
-                let existing = storage
-                    .get(&changeset_key)
+                let existing = get_existing_after_failed_cas(storage, &changeset_key)
                     .await?
                     .ok_or_else(|| {
                         anyhow::anyhow!(
