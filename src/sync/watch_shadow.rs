@@ -15,12 +15,14 @@ use crate::retention::RetentionPolicy;
 use crate::retry::{RetryConfig, RetryPolicy};
 use crate::s3::{self, create_client, parse_bucket};
 use crate::shadow::ShadowWal;
-use hadb_storage::StorageBackend;
-use hadb_storage_s3::S3Storage;
 use crate::uploader::{spawn_uploader, UploadMessage, Uploader};
 use crate::webhook::WebhookSender;
+use hadb_storage::StorageBackend;
+use hadb_storage_s3::S3Storage;
 
-use super::shadow::{run_compaction, sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry};
+use super::shadow::{
+    run_compaction, sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry,
+};
 use super::types::{DbState, Manifest, ShadowDbState, ShadowSyncInput, TriggerState};
 use super::verify::validate_backup_integrity;
 use super::wal_sync::take_snapshot_with_retry;
@@ -71,7 +73,8 @@ pub async fn watch_with_shadow(
     }
 
     // Initialize cache + uploader per database (if cache enabled)
-    let mut cache_states: HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)> = HashMap::new();
+    let mut cache_states: HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)> =
+        HashMap::new();
     let mut uploader_handles: Vec<(PathBuf, tokio::task::JoinHandle<()>)> = Vec::new();
     if cache_config.enabled {
         tracing::info!(
@@ -150,9 +153,8 @@ pub async fn watch_with_shadow(
         // Initialize cache + uploader for this database (if cache enabled)
         if cache_config.enabled {
             let cache = Arc::new(LocalCache::new(db_path)?);
-            let storage: Arc<dyn StorageBackend> = Arc::new(
-                S3Storage::new((*client).clone(), bucket_name.clone())
-            );
+            let storage: Arc<dyn StorageBackend> =
+                Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
             let s3_prefix = format!("{}{}", prefix, name);
             let uploader = Arc::new(Uploader::new(
                 name.clone(),
@@ -760,7 +762,10 @@ pub async fn watch_with_shadow(
 
     // Shutdown uploaders (drain in-flight uploads)
     for (db_path, (_, upload_tx)) in cache_states.iter() {
-        let name = db_states.get(db_path).map(|s| s.name.as_str()).unwrap_or("unknown");
+        let name = db_states
+            .get(db_path)
+            .map(|s| s.name.as_str())
+            .unwrap_or("unknown");
         tracing::debug!("{}: Sending shutdown to uploader", name);
         if let Err(e) = upload_tx.send(UploadMessage::Shutdown).await {
             tracing::error!("{}: Failed to send shutdown to uploader: {}", name, e);
@@ -770,11 +775,18 @@ pub async fn watch_with_shadow(
     // Wait for uploaders to finish draining (with timeout)
     let drain_timeout = Duration::from_secs(10);
     for (db_path, handle) in uploader_handles {
-        let name = db_states.get(&db_path).map(|s| s.name.as_str()).unwrap_or("unknown");
+        let name = db_states
+            .get(&db_path)
+            .map(|s| s.name.as_str())
+            .unwrap_or("unknown");
         match tokio::time::timeout(drain_timeout, handle).await {
             Ok(Ok(())) => tracing::debug!("{}: Uploader drained successfully", name),
             Ok(Err(e)) => tracing::error!("{}: Uploader task panicked: {}", name, e),
-            Err(_) => tracing::warn!("{}: Uploader drain timed out after {:?}", name, drain_timeout),
+            Err(_) => tracing::warn!(
+                "{}: Uploader drain timed out after {:?}",
+                name,
+                drain_timeout
+            ),
         }
     }
 

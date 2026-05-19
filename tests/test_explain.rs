@@ -9,7 +9,9 @@
 
 use anyhow::Result;
 use std::fs;
-use walrust::config::{Config, DatabaseConfig, RetentionConfig, S3Config, SyncConfig, WebhookConfig};
+use walrust::config::{
+    Config, DatabaseConfig, RetentionConfig, S3Config, SyncConfig, WebhookConfig,
+};
 use walrust::sync;
 
 /// Helper to create a test database file
@@ -89,7 +91,10 @@ fn test_explain_with_valid_config() -> Result<()> {
             monthly: 12,
         },
         databases: vec![
-            db_config(db1_path.to_str().unwrap().to_string(), Some("app".to_string())),
+            db_config(
+                db1_path.to_str().unwrap().to_string(),
+                Some("app".to_string()),
+            ),
             DatabaseConfig {
                 path: db2_path.to_str().unwrap().to_string(),
                 prefix: Some("users".to_string()),
@@ -130,7 +135,10 @@ fn test_explain_with_validation_enabled() -> Result<()> {
     config.sync.validation_interval = 3600; // Hourly validation
 
     let result = sync::explain(&Some(config));
-    assert!(result.is_ok(), "explain() should succeed with validation enabled");
+    assert!(
+        result.is_ok(),
+        "explain() should succeed with validation enabled"
+    );
 
     Ok(())
 }
@@ -146,13 +154,19 @@ fn test_explain_with_webhooks_configured() -> Result<()> {
         },
         WebhookConfig {
             url: "https://webhook2.com".to_string(),
-            events: vec!["auth_failure".to_string(), "corruption_detected".to_string()],
+            events: vec![
+                "auth_failure".to_string(),
+                "corruption_detected".to_string(),
+            ],
             secret: None, // No HMAC
         },
     ];
 
     let result = sync::explain(&Some(config));
-    assert!(result.is_ok(), "explain() should succeed with multiple webhooks");
+    assert!(
+        result.is_ok(),
+        "explain() should succeed with multiple webhooks"
+    );
 
     Ok(())
 }
@@ -164,7 +178,10 @@ fn test_explain_with_compaction_enabled() -> Result<()> {
     config.sync.compact_interval = 7200;
 
     let result = sync::explain(&Some(config));
-    assert!(result.is_ok(), "explain() should succeed with compaction enabled");
+    assert!(
+        result.is_ok(),
+        "explain() should succeed with compaction enabled"
+    );
 
     Ok(())
 }
@@ -188,7 +205,7 @@ fn test_explain_with_per_database_overrides() -> Result<()> {
         path: db_path.to_str().unwrap().to_string(),
         prefix: Some("override-test".to_string()),
         snapshot_interval: Some(900), // Override: 15 minutes
-        max_changes: Some(50),         // Override
+        max_changes: Some(50),        // Override
         retention: Some(RetentionConfig {
             hourly: 48, // Override
             daily: 14,  // Override
@@ -205,7 +222,10 @@ fn test_explain_with_per_database_overrides() -> Result<()> {
     }];
 
     let result = sync::explain(&Some(config));
-    assert!(result.is_ok(), "explain() should succeed with per-database overrides");
+    assert!(
+        result.is_ok(),
+        "explain() should succeed with per-database overrides"
+    );
 
     Ok(())
 }
@@ -218,7 +238,10 @@ fn test_explain_with_per_database_overrides() -> Result<()> {
 fn test_explain_with_no_config() -> Result<()> {
     // Should handle None gracefully
     let result = sync::explain(&None);
-    assert!(result.is_ok(), "explain() should handle no config gracefully");
+    assert!(
+        result.is_ok(),
+        "explain() should handle no config gracefully"
+    );
 
     Ok(())
 }
@@ -229,7 +252,10 @@ fn test_explain_with_empty_databases() -> Result<()> {
     // databases vec is empty
 
     let result = sync::explain(&Some(config));
-    assert!(result.is_ok(), "explain() should handle empty databases list");
+    assert!(
+        result.is_ok(),
+        "explain() should handle empty databases list"
+    );
 
     Ok(())
 }
@@ -254,12 +280,15 @@ fn test_explain_with_nonexistent_databases() -> Result<()> {
     let mut config = minimal_config();
     config.databases = vec![db_config(
         "/nonexistent/path/to/database.db".to_string(),
-        Some("ghost".to_string())
+        Some("ghost".to_string()),
     )];
 
     // Should handle error gracefully (print error message, not panic)
     let result = sync::explain(&Some(config));
-    assert!(result.is_ok(), "explain() should handle nonexistent databases gracefully");
+    assert!(
+        result.is_ok(),
+        "explain() should handle nonexistent databases gracefully"
+    );
 
     Ok(())
 }
@@ -271,12 +300,15 @@ fn test_explain_with_wildcard_no_matches() -> Result<()> {
     let mut config = minimal_config();
     config.databases = vec![db_config(
         format!("{}/*.db", tempdir.path().display()),
-        Some("wildcard".to_string())
+        Some("wildcard".to_string()),
     )];
 
     // Should handle no matches gracefully
     let result = sync::explain(&Some(config));
-    assert!(result.is_ok(), "explain() should handle wildcard with no matches");
+    assert!(
+        result.is_ok(),
+        "explain() should handle wildcard with no matches"
+    );
 
     Ok(())
 }
@@ -302,7 +334,7 @@ fn test_explain_cost_estimation_with_multiple_databases() -> Result<()> {
         create_test_db(db_path.to_str().unwrap())?;
         databases.push(db_config(
             db_path.to_str().unwrap().to_string(),
-            Some(format!("db{}", i))
+            Some(format!("db{}", i)),
         ));
     }
 
@@ -317,7 +349,10 @@ fn test_explain_cost_estimation_with_multiple_databases() -> Result<()> {
 
     // Should calculate costs for 5 databases × 55 snapshots = 275 snapshots
     let result = sync::explain(&Some(config));
-    assert!(result.is_ok(), "explain() should calculate costs for multiple databases");
+    assert!(
+        result.is_ok(),
+        "explain() should calculate costs for multiple databases"
+    );
 
     Ok(())
 }
@@ -328,7 +363,10 @@ fn test_explain_with_validation_disabled() -> Result<()> {
     config.sync.validation_interval = 0; // Disabled
 
     let result = sync::explain(&Some(config));
-    assert!(result.is_ok(), "explain() should handle disabled validation");
+    assert!(
+        result.is_ok(),
+        "explain() should handle disabled validation"
+    );
 
     Ok(())
 }
@@ -397,19 +435,46 @@ secret = "test-secret"
         .arg(config_path.to_str().unwrap())
         .output()?;
 
-    assert!(output.status.success(), "walrust explain should exit successfully");
+    assert!(
+        output.status.success(),
+        "walrust explain should exit successfully"
+    );
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Verify output contains expected sections
-    assert!(stdout.contains("Configuration Summary"), "Output should contain summary header");
-    assert!(stdout.contains("S3 Storage:"), "Output should contain S3 section");
-    assert!(stdout.contains("Validation:"), "Output should contain Validation section");
-    assert!(stdout.contains("Webhook Notifications:"), "Output should contain Webhooks section");
-    assert!(stdout.contains("Estimated Storage Costs:"), "Output should contain cost estimation");
-    assert!(stdout.contains("integration-test-bucket"), "Output should show bucket name");
-    assert!(stdout.contains("86400 seconds (24 hours)"), "Output should show validation interval");
-    assert!(stdout.contains("hooks.example.com"), "Output should show webhook URL");
+    assert!(
+        stdout.contains("Configuration Summary"),
+        "Output should contain summary header"
+    );
+    assert!(
+        stdout.contains("S3 Storage:"),
+        "Output should contain S3 section"
+    );
+    assert!(
+        stdout.contains("Validation:"),
+        "Output should contain Validation section"
+    );
+    assert!(
+        stdout.contains("Webhook Notifications:"),
+        "Output should contain Webhooks section"
+    );
+    assert!(
+        stdout.contains("Estimated Storage Costs:"),
+        "Output should contain cost estimation"
+    );
+    assert!(
+        stdout.contains("integration-test-bucket"),
+        "Output should show bucket name"
+    );
+    assert!(
+        stdout.contains("86400 seconds (24 hours)"),
+        "Output should show validation interval"
+    );
+    assert!(
+        stdout.contains("hooks.example.com"),
+        "Output should show webhook URL"
+    );
 
     Ok(())
 }

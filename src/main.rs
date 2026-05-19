@@ -16,11 +16,11 @@ mod wal;
 mod webhook;
 
 use anyhow::{anyhow, Result};
-use errors::{classify_error, ExitStatus};
-use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 use config::{Config, ResolvedDbConfig, RetentionConfig, SyncConfig};
+use errors::{classify_error, ExitStatus};
 use std::path::PathBuf;
+use std::process::ExitCode;
 use std::time::Duration;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -28,9 +28,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(name = "walrust")]
 #[command(version)]
 #[command(about = "Lightweight SQLite WAL sync to S3/Tigris with data integrity verification")]
-#[command(long_about = "Walrust provides production-grade SQLite database backup and replication \
+#[command(
+    long_about = "Walrust provides production-grade SQLite database backup and replication \
 to S3-compatible storage. Features include point-in-time recovery, GFS retention policies, \
-Litestream-compatible LTX format, and multi-database support in a single process.")]
+Litestream-compatible LTX format, and multi-database support in a single process."
+)]
 struct Cli {
     /// Config file path (checks ./walrust.toml if not specified)
     #[arg(long, global = true)]
@@ -385,7 +387,15 @@ struct WatchArgs {
 fn resolve_watch_config(
     config: &Option<Config>,
     cli: &WatchArgs,
-) -> Result<(Vec<ResolvedDbConfig>, String, Option<String>, SyncConfig, RetentionConfig, retry::RetryConfig, Vec<config::WebhookConfig>)> {
+) -> Result<(
+    Vec<ResolvedDbConfig>,
+    String,
+    Option<String>,
+    SyncConfig,
+    RetentionConfig,
+    retry::RetryConfig,
+    Vec<config::WebhookConfig>,
+)> {
     match config {
         Some(cfg) => {
             // Start with config file values, CLI overrides
@@ -439,7 +449,15 @@ fn resolve_watch_config(
             let retry_config = merge_cli_retry_overrides(&cfg.retry, cli);
             let webhooks = cfg.webhooks.clone();
 
-            Ok((resolved_dbs, bucket, endpoint, sync, retention, retry_config, webhooks))
+            Ok((
+                resolved_dbs,
+                bucket,
+                endpoint,
+                sync,
+                retention,
+                retry_config,
+                webhooks,
+            ))
         }
         None => {
             // No config file - require CLI args
@@ -519,8 +537,12 @@ fn merge_cli_sync_overrides(base: &SyncConfig, cli: &WatchArgs) -> SyncConfig {
         compact_after_snapshot: cli.compact_after_snapshot || base.compact_after_snapshot,
         compact_interval: cli.compact_interval.unwrap_or(base.compact_interval),
         checkpoint_interval: cli.checkpoint_interval.unwrap_or(base.checkpoint_interval),
-        min_checkpoint_page_count: cli.min_checkpoint_pages.unwrap_or(base.min_checkpoint_page_count),
-        wal_truncate_threshold_pages: cli.wal_truncate_threshold.unwrap_or(base.wal_truncate_threshold_pages),
+        min_checkpoint_page_count: cli
+            .min_checkpoint_pages
+            .unwrap_or(base.min_checkpoint_page_count),
+        wal_truncate_threshold_pages: cli
+            .wal_truncate_threshold
+            .unwrap_or(base.wal_truncate_threshold_pages),
         validation_interval: cli.validation_interval.unwrap_or(base.validation_interval),
     }
 }
@@ -542,17 +564,16 @@ fn merge_cli_retry_overrides(base: &retry::RetryConfig, cli: &WatchArgs) -> retr
         base_delay_ms: cli.base_delay_ms.unwrap_or(base.base_delay_ms),
         max_delay_ms: cli.max_delay_ms.unwrap_or(base.max_delay_ms),
         circuit_breaker_enabled: !cli.no_circuit_breaker && base.circuit_breaker_enabled,
-        circuit_breaker_threshold: cli.circuit_breaker_threshold.unwrap_or(base.circuit_breaker_threshold),
+        circuit_breaker_threshold: cli
+            .circuit_breaker_threshold
+            .unwrap_or(base.circuit_breaker_threshold),
         circuit_breaker_cooldown_ms: base.circuit_breaker_cooldown_ms,
     }
 }
 
 /// Resolve cache configuration from config file and CLI args
 fn resolve_cache_config(config: &Option<Config>, cli: &WatchArgs) -> config::CacheConfig {
-    let base = config
-        .as_ref()
-        .map(|c| c.cache.clone())
-        .unwrap_or_default();
+    let base = config.as_ref().map(|c| c.cache.clone()).unwrap_or_default();
 
     // CLI --enable-cache overrides config, --no-cache forces disable
     let enabled = if cli.no_cache {
@@ -565,7 +586,11 @@ fn resolve_cache_config(config: &Option<Config>, cli: &WatchArgs) -> config::Cac
         enabled,
         retention: cli.cache_retention.clone(),
         max_size: cli.cache_max_size.unwrap_or(base.max_size),
-        path: cli.cache_dir.as_ref().map(|p| p.display().to_string()).or(base.path),
+        path: cli
+            .cache_dir
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .or(base.path),
         uploader_concurrency: cli.uploader_concurrency,
     }
 }
@@ -712,8 +737,15 @@ async fn run() -> Result<()> {
                 no_cache,
             };
 
-            let (resolved_dbs, bucket, endpoint, sync_config, retention_config, retry_config, webhooks) =
-                resolve_watch_config(&config, &watch_args)?;
+            let (
+                resolved_dbs,
+                bucket,
+                endpoint,
+                sync_config,
+                retention_config,
+                retry_config,
+                webhooks,
+            ) = resolve_watch_config(&config, &watch_args)?;
 
             // Resolve cache configuration
             let cache_config = resolve_cache_config(&config, &watch_args);
@@ -778,7 +810,16 @@ async fn run() -> Result<()> {
             point_in_time,
             cache_dir,
         } => {
-            sync::restore(&name, &output, &bucket, endpoint.as_deref(), point_in_time.as_deref(), cache_dir.as_deref(), None).await?;
+            sync::restore(
+                &name,
+                &output,
+                &bucket,
+                endpoint.as_deref(),
+                point_in_time.as_deref(),
+                cache_dir.as_deref(),
+                None,
+            )
+            .await?;
         }
         Commands::List { bucket, endpoint } => {
             sync::list(&bucket, endpoint.as_deref()).await?;
@@ -855,7 +896,9 @@ fn generate_pragma_sql(with_comments: bool) -> String {
 
     if with_comments {
         sql.push_str("\n-- Disable auto-checkpointing (walrust manages checkpoints)\n");
-        sql.push_str("-- This prevents checkpoint contention and ensures walrust captures all WAL frames\n");
+        sql.push_str(
+            "-- This prevents checkpoint contention and ensures walrust captures all WAL frames\n",
+        );
     }
     sql.push_str("PRAGMA wal_autocheckpoint=0;\n");
 
@@ -867,7 +910,9 @@ fn generate_pragma_sql(with_comments: bool) -> String {
 
     if with_comments {
         sql.push_str("\n-- Optional: Set page size (must be done before any tables are created)\n");
-        sql.push_str("-- 4096 is a good default, 8192 or 16384 can improve large row performance\n");
+        sql.push_str(
+            "-- 4096 is a good default, 8192 or 16384 can improve large row performance\n",
+        );
     }
     sql.push_str("PRAGMA page_size=4096;\n");
 

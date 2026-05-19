@@ -43,7 +43,8 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
 
             // Snapshot Triggers
             println!("Snapshot Triggers (global defaults):");
-            println!("  Interval:    {} seconds ({} minutes)",
+            println!(
+                "  Interval:    {} seconds ({} minutes)",
                 cfg.sync.snapshot_interval,
                 cfg.sync.snapshot_interval / 60
             );
@@ -60,7 +61,10 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
             } else {
                 println!("  On idle:     disabled");
             }
-            println!("  On startup:  {}", if cfg.sync.on_startup { "yes" } else { "no" });
+            println!(
+                "  On startup:  {}",
+                if cfg.sync.on_startup { "yes" } else { "no" }
+            );
             println!();
 
             // Compaction Settings
@@ -71,7 +75,8 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
                 println!("  After snapshot: disabled");
             }
             if cfg.sync.compact_interval > 0 {
-                println!("  Interval:       {} seconds ({} minutes)",
+                println!(
+                    "  Interval:       {} seconds ({} minutes)",
                     cfg.sync.compact_interval,
                     cfg.sync.compact_interval / 60
                 );
@@ -82,10 +87,22 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
 
             // Retention Policy
             println!("Retention Policy (GFS rotation):");
-            println!("  Hourly:  {} snapshots (last {} hours)", cfg.retention.hourly, cfg.retention.hourly);
-            println!("  Daily:   {} snapshots (last {} days)", cfg.retention.daily, cfg.retention.daily);
-            println!("  Weekly:  {} snapshots (last {} weeks)", cfg.retention.weekly, cfg.retention.weekly);
-            println!("  Monthly: {} snapshots (last {} months)", cfg.retention.monthly, cfg.retention.monthly);
+            println!(
+                "  Hourly:  {} snapshots (last {} hours)",
+                cfg.retention.hourly, cfg.retention.hourly
+            );
+            println!(
+                "  Daily:   {} snapshots (last {} days)",
+                cfg.retention.daily, cfg.retention.daily
+            );
+            println!(
+                "  Weekly:  {} snapshots (last {} weeks)",
+                cfg.retention.weekly, cfg.retention.weekly
+            );
+            println!(
+                "  Monthly: {} snapshots (last {} months)",
+                cfg.retention.monthly, cfg.retention.monthly
+            );
             println!();
 
             // Databases
@@ -105,7 +122,8 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
                                 // Show per-database overrides if different from global
                                 let mut overrides = Vec::new();
                                 if db.sync.snapshot_interval != cfg.sync.snapshot_interval {
-                                    overrides.push(format!("interval={}s", db.sync.snapshot_interval));
+                                    overrides
+                                        .push(format!("interval={}s", db.sync.snapshot_interval));
                                 }
                                 if db.sync.max_changes != cfg.sync.max_changes {
                                     overrides.push(format!("max_changes={}", db.sync.max_changes));
@@ -117,8 +135,10 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
                                 {
                                     overrides.push(format!(
                                         "retention={}/{}/{}/{}",
-                                        db.retention.hourly, db.retention.daily,
-                                        db.retention.weekly, db.retention.monthly
+                                        db.retention.hourly,
+                                        db.retention.daily,
+                                        db.retention.weekly,
+                                        db.retention.monthly
                                     ));
                                 }
                                 if !overrides.is_empty() {
@@ -140,7 +160,8 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
             // Validation
             println!("Validation:");
             if cfg.sync.validation_interval > 0 {
-                println!("  Interval: {} seconds ({} hours)",
+                println!(
+                    "  Interval: {} seconds ({} hours)",
                     cfg.sync.validation_interval,
                     cfg.sync.validation_interval / 3600
                 );
@@ -166,10 +187,15 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
             println!();
 
             // Summary with cost estimation
-            let total_snapshots = cfg.retention.hourly + cfg.retention.daily
-                + cfg.retention.weekly + cfg.retention.monthly;
+            let total_snapshots = cfg.retention.hourly
+                + cfg.retention.daily
+                + cfg.retention.weekly
+                + cfg.retention.monthly;
             println!("Summary:");
-            println!("  Max snapshots retained per database: ~{}", total_snapshots);
+            println!(
+                "  Max snapshots retained per database: ~{}",
+                total_snapshots
+            );
             if cfg.sync.compact_after_snapshot || cfg.sync.compact_interval > 0 {
                 println!("  Automatic compaction: enabled");
             } else {
@@ -193,14 +219,21 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
                     let cost_tigris = storage_gb * 0.02;
                     let cost_s3 = storage_gb * 0.023; // S3 Standard pricing
 
-                    println!("  Total snapshots: {} databases x {} snapshots = {} snapshots",
-                        db_count, snapshots_per_db, db_count as f64 * snapshots_per_db);
+                    println!(
+                        "  Total snapshots: {} databases x {} snapshots = {} snapshots",
+                        db_count,
+                        snapshots_per_db,
+                        db_count as f64 * snapshots_per_db
+                    );
                     println!("  Estimated storage: {:.1} GB", storage_gb);
                     println!("  Monthly cost (Tigris): ~${:.2}", cost_tigris);
                     println!("  Monthly cost (S3 Standard): ~${:.2}", cost_s3);
                     println!();
                     println!("  Actual costs depend on:");
-                    println!("  - Real database sizes (current estimate: {}GB per DB)", avg_db_size_gb);
+                    println!(
+                        "  - Real database sizes (current estimate: {}GB per DB)",
+                        avg_db_size_gb
+                    );
                     println!("  - Compression ratio (LTX typically compresses well)");
                     println!("  - Incremental file sizes between snapshots");
                 }

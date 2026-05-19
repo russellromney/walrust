@@ -97,11 +97,7 @@ pub async fn replicate(
             }
             Err(e) => {
                 tracing::error!("Replication error: {}", e);
-                eprintln!(
-                    "[{}] Error: {}",
-                    chrono::Local::now().format("%H:%M:%S"),
-                    e
-                );
+                eprintln!("[{}] Error: {}", chrono::Local::now().format("%H:%M:%S"), e);
             }
         }
 

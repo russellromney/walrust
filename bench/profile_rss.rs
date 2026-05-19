@@ -1,8 +1,8 @@
 //! RSS profiling: realistic sync simulation + allocator behavior test.
 //! Run: cargo run --example profile_rss --release
 
-use std::process;
 use std::collections::HashMap;
+use std::process;
 
 fn rss_mb() -> f64 {
     let pid = process::id();
@@ -41,16 +41,22 @@ async fn main() {
     db.execute_batch(
         "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
          CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v BLOB);",
-    ).unwrap();
+    )
+    .unwrap();
 
     let blocker = rusqlite::Connection::open(&tmp).unwrap();
-    blocker.execute_batch(
-        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
+    blocker
+        .execute_batch(
+            "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;
          BEGIN DEFERRED; SELECT COUNT(*) FROM sqlite_master;",
-    ).unwrap();
+        )
+        .unwrap();
     stage("SQLite DB + checkpoint blocker", base);
 
-    let _pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+    let _pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(4)
+        .build()
+        .unwrap();
     let _reg = prometheus::Registry::new();
     let _req = reqwest::Client::new();
     stage("rayon + prometheus + reqwest", base);
@@ -63,20 +69,34 @@ async fn main() {
 
     // Pre-populate DB with 10K rows (simulating a real database)
     for i in 0..10_000 {
-        db.execute("INSERT INTO t VALUES (?1, randomblob(1024))", [i as i64]).unwrap();
+        db.execute("INSERT INTO t VALUES (?1, randomblob(1024))", [i as i64])
+            .unwrap();
     }
 
     // Checkpoint to flush WAL into DB (simulating existing DB before walrust starts)
     blocker.execute_batch("ROLLBACK;").unwrap();
-    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
-    blocker.execute_batch("BEGIN DEFERRED; SELECT COUNT(*) FROM sqlite_master;").unwrap();
+    db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    blocker
+        .execute_batch("BEGIN DEFERRED; SELECT COUNT(*) FROM sqlite_master;")
+        .unwrap();
 
     let db_size = std::fs::metadata(&tmp).unwrap().len();
-    println!("{:>55}: {:.1} MB", "DB file size", db_size as f64 / 1024.0 / 1024.0);
+    println!(
+        "{:>55}: {:.1} MB",
+        "DB file size",
+        db_size as f64 / 1024.0 / 1024.0
+    );
 
     // Simulate initial snapshot: read entire DB + encode
     let db_data = std::fs::read(&tmp).unwrap();
-    stage(&format!("Read entire DB ({:.1} MB)", db_data.len() as f64 / 1024.0 / 1024.0), base);
+    stage(
+        &format!(
+            "Read entire DB ({:.1} MB)",
+            db_data.len() as f64 / 1024.0 / 1024.0
+        ),
+        base,
+    );
 
     // Simulate LTX encoding buffer (roughly same size as DB)
     let ltx_buf: Vec<u8> = vec![0u8; db_data.len()];
@@ -84,7 +104,10 @@ async fn main() {
 
     // Both held simultaneously during encode (this is the peak!)
     let peak_snapshot = rss_mb();
-    println!("\n{:>55}: {:6.1} MB  ← THIS IS THE PEAK", "Peak during snapshot", peak_snapshot);
+    println!(
+        "\n{:>55}: {:6.1} MB  ← THIS IS THE PEAK",
+        "Peak during snapshot", peak_snapshot
+    );
 
     // Drop both
     drop(ltx_buf);
@@ -103,7 +126,11 @@ async fn main() {
     for cycle in 1..=20 {
         // 400 writes
         for i in 0..400 {
-            db.execute("INSERT OR REPLACE INTO t VALUES (?1, randomblob(1024))", [i as i64]).unwrap();
+            db.execute(
+                "INSERT OR REPLACE INTO t VALUES (?1, randomblob(1024))",
+                [i as i64],
+            )
+            .unwrap();
         }
 
         // Read only NEW frames from WAL (using offset, like real walrust)
@@ -124,9 +151,11 @@ async fn main() {
             let num_frames = bytes_to_read / frame_size;
             for i in 0..num_frames {
                 let off = i * frame_size;
-                if off + frame_size > buf.len() { break; }
-                let pn = u32::from_be_bytes(buf[off..off+4].try_into().unwrap());
-                page_map.insert(pn, buf[off+24..off+24+page_size].to_vec());
+                if off + frame_size > buf.len() {
+                    break;
+                }
+                let pn = u32::from_be_bytes(buf[off..off + 4].try_into().unwrap());
+                page_map.insert(pn, buf[off + 24..off + 24 + page_size].to_vec());
             }
             let unique = page_map.len();
 
@@ -144,9 +173,11 @@ async fn main() {
                 let now = rss_mb();
                 println!(
                     "  cycle {:>2}: {:5.1} MB  (read {:.1} MB new, {} frames → {} unique)",
-                    cycle, now,
+                    cycle,
+                    now,
                     bytes_to_read as f64 / 1024.0 / 1024.0,
-                    num_frames, unique
+                    num_frames,
+                    unique
                 );
             }
         }
@@ -155,13 +186,17 @@ async fn main() {
         if cycle % 5 == 0 {
             blocker.execute_batch("ROLLBACK;").unwrap();
             db.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").unwrap();
-            blocker.execute_batch("BEGIN DEFERRED; SELECT COUNT(*) FROM sqlite_master;").unwrap();
+            blocker
+                .execute_batch("BEGIN DEFERRED; SELECT COUNT(*) FROM sqlite_master;")
+                .unwrap();
             wal_offset = 0; // reset after checkpoint
             if cycle % 5 == 0 {
                 let wal_after = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-                println!("  checkpoint: WAL {:.1} MB → {:.1} MB",
+                println!(
+                    "  checkpoint: WAL {:.1} MB → {:.1} MB",
                     wal_size as f64 / 1024.0 / 1024.0,
-                    wal_after as f64 / 1024.0 / 1024.0);
+                    wal_after as f64 / 1024.0 / 1024.0
+                );
             }
         }
     }
@@ -169,13 +204,27 @@ async fn main() {
     // ================================================================
     println!("\n=== Summary ===\n");
     println!("{:>55}: {:6.1} MB", "Init RSS", init);
-    println!("{:>55}: {:6.1} MB", "Peak (during initial snapshot)", peak_snapshot);
-    println!("{:>55}: {:6.1} MB", "Final RSS after 20 sync cycles", rss_mb());
-    println!("{:>55}: {:6.1} MB", "Allocator retained (final - init)", rss_mb() - init);
+    println!(
+        "{:>55}: {:6.1} MB",
+        "Peak (during initial snapshot)", peak_snapshot
+    );
+    println!(
+        "{:>55}: {:6.1} MB",
+        "Final RSS after 20 sync cycles",
+        rss_mb()
+    );
+    println!(
+        "{:>55}: {:6.1} MB",
+        "Allocator retained (final - init)",
+        rss_mb() - init
+    );
     println!();
     println!("  Conclusion: RSS ≈ init + peak_alloc because macOS allocator");
     println!("  never returns freed memory. The peak is set by the initial");
-    println!("  snapshot which reads the entire DB ({:.1} MB) + encodes it.", db_size as f64 / 1024.0 / 1024.0);
+    println!(
+        "  snapshot which reads the entire DB ({:.1} MB) + encodes it.",
+        db_size as f64 / 1024.0 / 1024.0
+    );
 
     // Cleanup
     drop(blocker);

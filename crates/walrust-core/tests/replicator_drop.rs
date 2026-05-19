@@ -133,8 +133,8 @@ async fn drop_releases_storage_backend() {
     let storage = MemStorage::new();
     let storage_dyn: Arc<dyn StorageBackend> = storage.clone();
 
-    let replicator = Replicator::try_new(storage_dyn, "test/", config_for_test())
-        .expect("construct replicator");
+    let replicator =
+        Replicator::try_new(storage_dyn, "test/", config_for_test()).expect("construct replicator");
     // Sanity: the replicator owns one strong ref to storage on top of ours.
     assert_eq!(
         Arc::strong_count(&storage),
@@ -198,8 +198,8 @@ async fn create_drop_cycles_do_not_accumulate_storage_refs() {
 async fn drop_during_active_sync_loop_is_clean() {
     let storage = MemStorage::new();
     let storage_dyn: Arc<dyn StorageBackend> = storage.clone();
-    let replicator = Replicator::try_new(storage_dyn, "test/", config_for_test())
-        .expect("construct replicator");
+    let replicator =
+        Replicator::try_new(storage_dyn, "test/", config_for_test()).expect("construct replicator");
 
     // Let the loop tick a few times so we're past first-iteration
     // initialisation.

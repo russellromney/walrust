@@ -55,10 +55,13 @@ fn test_walrust_snapshot_round_trip() {
     // Decode back to a new database
     let restored_db = dir.path().join("restored.db");
     let cursor = std::io::Cursor::new(&ltx_data);
-    let result = walrust::ltx::decode_to_db(cursor, &restored_db)
-        .expect("decode_to_db should succeed");
+    let result =
+        walrust::ltx::decode_to_db(cursor, &restored_db).expect("decode_to_db should succeed");
 
-    assert!(result.header.max_txid.into_inner() >= 1, "Should have valid TXID");
+    assert!(
+        result.header.max_txid.into_inner() >= 1,
+        "Should have valid TXID"
+    );
 
     // Verify the restored database has the same data
     let restored_count_output = Command::new("sqlite3")
@@ -72,7 +75,10 @@ fn test_walrust_snapshot_round_trip() {
         .parse()
         .unwrap();
 
-    assert_eq!(original_count, restored_count, "Data count should match after round-trip");
+    assert_eq!(
+        original_count, restored_count,
+        "Data count should match after round-trip"
+    );
 
     // Verify actual data content
     let data_output = Command::new("sqlite3")

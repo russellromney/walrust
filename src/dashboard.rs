@@ -146,18 +146,28 @@ impl MetricsState {
             .unwrap();
 
         let validation_success = IntCounterVec::new(
-            Opts::new("walrust_validation_success_total", "Successful backup validations"),
+            Opts::new(
+                "walrust_validation_success_total",
+                "Successful backup validations",
+            ),
             &["database"],
         )
         .unwrap();
-        registry.register(Box::new(validation_success.clone())).unwrap();
+        registry
+            .register(Box::new(validation_success.clone()))
+            .unwrap();
 
         let validation_failure = IntCounterVec::new(
-            Opts::new("walrust_validation_failure_total", "Failed backup validations"),
+            Opts::new(
+                "walrust_validation_failure_total",
+                "Failed backup validations",
+            ),
             &["database"],
         )
         .unwrap();
-        registry.register(Box::new(validation_failure.clone())).unwrap();
+        registry
+            .register(Box::new(validation_failure.clone()))
+            .unwrap();
 
         let last_validation_timestamp = GaugeVec::new(
             Opts::new(
@@ -167,36 +177,50 @@ impl MetricsState {
             &["database"],
         )
         .unwrap();
-        registry.register(Box::new(last_validation_timestamp.clone())).unwrap();
+        registry
+            .register(Box::new(last_validation_timestamp.clone()))
+            .unwrap();
 
         // Production hardening metrics (v0.2.0)
         let checkpoint_total = IntCounterVec::new(
             Opts::new("walrust_checkpoint_total", "Total checkpoints triggered"),
-            &["database", "type"],  // type: "passive" or "truncate"
+            &["database", "type"], // type: "passive" or "truncate"
         )
         .unwrap();
-        registry.register(Box::new(checkpoint_total.clone())).unwrap();
+        registry
+            .register(Box::new(checkpoint_total.clone()))
+            .unwrap();
 
         let checkpoint_duration = GaugeVec::new(
-            Opts::new("walrust_checkpoint_duration_seconds", "Last checkpoint duration in seconds"),
+            Opts::new(
+                "walrust_checkpoint_duration_seconds",
+                "Last checkpoint duration in seconds",
+            ),
             &["database"],
         )
         .unwrap();
-        registry.register(Box::new(checkpoint_duration.clone())).unwrap();
+        registry
+            .register(Box::new(checkpoint_duration.clone()))
+            .unwrap();
 
         let retry_total = IntCounterVec::new(
             Opts::new("walrust_retry_total", "Total S3 operation retries"),
-            &["database", "operation"],  // operation: "upload", "download", "list"
+            &["database", "operation"], // operation: "upload", "download", "list"
         )
         .unwrap();
         registry.register(Box::new(retry_total.clone())).unwrap();
 
         let sync_latency_seconds = GaugeVec::new(
-            Opts::new("walrust_sync_latency_seconds", "Time from WAL change to S3 upload complete"),
+            Opts::new(
+                "walrust_sync_latency_seconds",
+                "Time from WAL change to S3 upload complete",
+            ),
             &["database"],
         )
         .unwrap();
-        registry.register(Box::new(sync_latency_seconds.clone())).unwrap();
+        registry
+            .register(Box::new(sync_latency_seconds.clone()))
+            .unwrap();
 
         Self {
             start_time: Instant::now(),
@@ -454,7 +478,8 @@ async fn health(State(state): State<Arc<MetricsState>>) -> impl IntoResponse {
     (
         status_code,
         [("content-type", "application/json")],
-        serde_json::to_string_pretty(&health).unwrap_or_else(|_| r#"{"status":"unhealthy"}"#.to_string()),
+        serde_json::to_string_pretty(&health)
+            .unwrap_or_else(|_| r#"{"status":"unhealthy"}"#.to_string()),
     )
         .into_response()
 }
@@ -519,7 +544,12 @@ mod tests {
             .with_state(state);
 
         let response = app
-            .oneshot(Request::builder().uri("/metrics").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 

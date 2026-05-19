@@ -28,8 +28,8 @@
 use crate::cache::LocalCache;
 use crate::retry::RetryPolicy;
 use crate::webhook::WebhookSender;
-use hadb_storage::StorageBackend;
 use anyhow::{Context, Result};
+use hadb_storage::StorageBackend;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -86,7 +86,9 @@ impl UploadTaskContext {
         }
 
         // Read LTX from cache
-        let data = self.cache.read_ltx(txid)
+        let data = self
+            .cache
+            .read_ltx(txid)
             .with_context(|| format!("Failed to read TXID {} from cache", txid))?;
 
         let data_len = data.len() as u64;
@@ -101,7 +103,8 @@ impl UploadTaskContext {
 
             match self.storage.put(&key, &data).await {
                 Ok(_) => {
-                    self.cache.mark_uploaded(txid)
+                    self.cache
+                        .mark_uploaded(txid)
                         .context("Failed to mark TXID as uploaded")?;
 
                     let mut stats = self.stats.lock().await;
@@ -111,7 +114,10 @@ impl UploadTaskContext {
                         stats.last_uploaded_txid = txid;
                     }
 
-                    info!("[{}] Uploaded TXID {} ({} bytes)", self.db_name, txid, data_len);
+                    info!(
+                        "[{}] Uploaded TXID {} ({} bytes)",
+                        self.db_name, txid, data_len
+                    );
 
                     return Ok(UploadResult { _txid: txid });
                 }
@@ -123,8 +129,13 @@ impl UploadTaskContext {
                     );
 
                     if error_kind == crate::retry::ErrorKind::AuthError {
-                        error!("[{}] Auth error uploading TXID {}: {}", self.db_name, txid, e);
-                        self.webhook_sender.notify_auth_failure(&self.db_name, &e.to_string()).await;
+                        error!(
+                            "[{}] Auth error uploading TXID {}: {}",
+                            self.db_name, txid, e
+                        );
+                        self.webhook_sender
+                            .notify_auth_failure(&self.db_name, &e.to_string())
+                            .await;
 
                         let mut stats = self.stats.lock().await;
                         stats.uploads_failed += 1;
@@ -144,13 +155,19 @@ impl UploadTaskContext {
                         let mut stats = self.stats.lock().await;
                         stats.uploads_failed += 1;
 
-                        return Err(e).context(format!("Failed to upload TXID {} after retries", txid));
+                        return Err(e)
+                            .context(format!("Failed to upload TXID {} after retries", txid));
                     }
 
                     let delay = self.retry_policy.calculate_delay(attempts - 1);
                     warn!(
                         "[{}] Upload failed for TXID {}, attempt {}/{}, retrying in {:?}: {}",
-                        self.db_name, txid, attempts, max_retries + 1, delay, e
+                        self.db_name,
+                        txid,
+                        attempts,
+                        max_retries + 1,
+                        delay,
+                        e
                     );
                     tokio::time::sleep(delay).await;
                 }
@@ -195,18 +212,22 @@ impl Uploader {
     ///
     /// Processes upload messages from channel with up to max_concurrent
     /// uploads in flight simultaneously via JoinSet.
-    pub async fn run(
-        &self,
-        mut rx: mpsc::Receiver<UploadMessage>,
-    ) -> Result<UploaderStats> {
-        info!("[{}] Uploader task started (max_concurrent={})", self.ctx.db_name, self.max_concurrent);
+    pub async fn run(&self, mut rx: mpsc::Receiver<UploadMessage>) -> Result<UploaderStats> {
+        info!(
+            "[{}] Uploader task started (max_concurrent={})",
+            self.ctx.db_name, self.max_concurrent
+        );
 
         let mut in_flight: JoinSet<Result<UploadResult>> = JoinSet::new();
 
         // Resume pending uploads on startup
         let pending = self.ctx.cache.pending_uploads();
         if !pending.is_empty() {
-            info!("[{}] Resuming {} pending uploads", self.ctx.db_name, pending.len());
+            info!(
+                "[{}] Resuming {} pending uploads",
+                self.ctx.db_name,
+                pending.len()
+            );
             for txid in pending {
                 // Wait for a slot if at capacity
                 while in_flight.len() >= self.max_concurrent {
@@ -255,13 +276,19 @@ impl Uploader {
         }
 
         let stats = self.ctx.stats.lock().await.clone();
-        info!("[{}] Uploader task stopped. Stats: {:?}", self.ctx.db_name, stats);
+        info!(
+            "[{}] Uploader task stopped. Stats: {:?}",
+            self.ctx.db_name, stats
+        );
 
         Ok(stats)
     }
 
     /// Handle a JoinSet result
-    fn handle_join_result(db_name: &str, result: Result<Result<UploadResult>, tokio::task::JoinError>) {
+    fn handle_join_result(
+        db_name: &str,
+        result: Result<Result<UploadResult>, tokio::task::JoinError>,
+    ) {
         match result {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => {
@@ -304,9 +331,9 @@ mod tests {
     use crate::cache::LocalCache;
     use crate::retry::RetryConfig;
     use crate::webhook::WebhookSender;
-    use hadb_storage::StorageBackend;
     use async_trait::async_trait;
     use hadb_storage::CasResult;
+    use hadb_storage::StorageBackend;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -386,7 +413,10 @@ mod tests {
                         self.max_failures
                     ))
                 } else {
-                    self.objects.lock().unwrap().insert(key.to_string(), data.to_vec());
+                    self.objects
+                        .lock()
+                        .unwrap()
+                        .insert(key.to_string(), data.to_vec());
                     Ok(())
                 }
             };
@@ -419,19 +449,31 @@ mod tests {
         async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
             let mut objects = self.objects.lock().unwrap();
             if objects.contains_key(key) {
-                return Ok(CasResult { success: false, etag: None });
+                return Ok(CasResult {
+                    success: false,
+                    etag: None,
+                });
             }
             objects.insert(key.to_string(), data.to_vec());
-            Ok(CasResult { success: true, etag: Some("mock".into()) })
+            Ok(CasResult {
+                success: true,
+                etag: Some("mock".into()),
+            })
         }
 
         async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
             let mut objects = self.objects.lock().unwrap();
             if !objects.contains_key(key) {
-                return Ok(CasResult { success: false, etag: None });
+                return Ok(CasResult {
+                    success: false,
+                    etag: None,
+                });
             }
             objects.insert(key.to_string(), data.to_vec());
-            Ok(CasResult { success: true, etag: Some("mock".into()) })
+            Ok(CasResult {
+                success: true,
+                etag: Some("mock".into()),
+            })
         }
 
         fn backend_name(&self) -> &str {
@@ -452,7 +494,9 @@ mod tests {
         setup_uploader_with_concurrency(4)
     }
 
-    fn setup_uploader_with_concurrency(max_concurrent: usize) -> (Arc<Uploader>, Arc<LocalCache>, Arc<MockStorage>, TempDir) {
+    fn setup_uploader_with_concurrency(
+        max_concurrent: usize,
+    ) -> (Arc<Uploader>, Arc<LocalCache>, Arc<MockStorage>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
 
@@ -472,7 +516,10 @@ mod tests {
         (uploader, cache, storage, temp_dir)
     }
 
-    fn setup_uploader_with_storage(storage: Arc<MockStorage>, max_concurrent: usize) -> (Arc<Uploader>, Arc<LocalCache>, TempDir) {
+    fn setup_uploader_with_storage(
+        storage: Arc<MockStorage>,
+        max_concurrent: usize,
+    ) -> (Arc<Uploader>, Arc<LocalCache>, TempDir) {
         let temp_dir = TempDir::new().unwrap();
         let db_path = temp_dir.path().join("test.db");
         let cache = Arc::new(LocalCache::new(&db_path).unwrap());
@@ -726,7 +773,8 @@ mod tests {
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
-        let stats = timeout(Duration::from_secs(5), task).await
+        let stats = timeout(Duration::from_secs(5), task)
+            .await
             .expect("should not timeout")
             .unwrap()
             .unwrap();
@@ -756,14 +804,18 @@ mod tests {
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
-        let stats = timeout(Duration::from_secs(5), task).await
+        let stats = timeout(Duration::from_secs(5), task)
+            .await
             .expect("should not timeout")
             .unwrap()
             .unwrap();
 
         assert_eq!(stats.uploads_succeeded, 6);
-        assert!(storage.peak_concurrent() <= 2,
-            "peak concurrent {} should not exceed max_concurrent 2", storage.peak_concurrent());
+        assert!(
+            storage.peak_concurrent() <= 2,
+            "peak concurrent {} should not exceed max_concurrent 2",
+            storage.peak_concurrent()
+        );
     }
 
     #[tokio::test]
@@ -800,10 +852,16 @@ mod tests {
         assert_eq!(stats.uploads_succeeded, 5);
         assert_eq!(cache.pending_uploads().len(), 0);
         // Should have used concurrency (peak > 1)
-        assert!(storage.peak_concurrent() > 1,
-            "resume should use concurrency, got peak {}", storage.peak_concurrent());
-        assert!(storage.peak_concurrent() <= 3,
-            "resume should respect limit, got peak {}", storage.peak_concurrent());
+        assert!(
+            storage.peak_concurrent() > 1,
+            "resume should use concurrency, got peak {}",
+            storage.peak_concurrent()
+        );
+        assert!(
+            storage.peak_concurrent() <= 3,
+            "resume should respect limit, got peak {}",
+            storage.peak_concurrent()
+        );
     }
 
     #[tokio::test]
@@ -827,7 +885,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
-        let stats = timeout(Duration::from_secs(5), task).await
+        let stats = timeout(Duration::from_secs(5), task)
+            .await
             .expect("shutdown should drain in-flight")
             .unwrap()
             .unwrap();
@@ -857,7 +916,8 @@ mod tests {
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
-        let stats = timeout(Duration::from_secs(5), task).await
+        let stats = timeout(Duration::from_secs(5), task)
+            .await
             .expect("should not timeout")
             .unwrap()
             .unwrap();
@@ -895,8 +955,11 @@ mod tests {
         // Sequential: 8 * 100ms = 800ms minimum
         // Concurrent(4): 2 batches * 100ms = ~200ms
         // Be generous: just check it's faster than sequential
-        assert!(elapsed < Duration::from_millis(600),
-            "concurrent should be faster than sequential, took {:?}", elapsed);
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "concurrent should be faster than sequential, took {:?}",
+            elapsed
+        );
     }
 
     // ============================================
@@ -944,7 +1007,8 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(20)).await;
         drop(tx);
 
-        let stats = timeout(Duration::from_secs(5), task).await
+        let stats = timeout(Duration::from_secs(5), task)
+            .await
             .expect("should drain on channel close")
             .unwrap()
             .unwrap();
@@ -987,7 +1051,8 @@ mod tests {
 
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
-        let stats = timeout(Duration::from_secs(2), task).await
+        let stats = timeout(Duration::from_secs(2), task)
+            .await
             .expect("should shutdown immediately")
             .unwrap()
             .unwrap();

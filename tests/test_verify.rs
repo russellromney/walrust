@@ -62,13 +62,29 @@ fn test_verify_valid_backup() -> Result<()> {
     let stdout = String::from_utf8_lossy(&verify_output.stdout);
 
     // Should succeed with exit code 0
-    assert!(verify_output.status.success(), "Verify should succeed: {}", stdout);
+    assert!(
+        verify_output.status.success(),
+        "Verify should succeed: {}",
+        stdout
+    );
 
     // Check output format
-    assert!(stdout.contains("Verifying backup:"), "Output should have header");
-    assert!(stdout.contains("Snapshot: Found generation"), "Output should confirm snapshot exists");
-    assert!(stdout.contains("All checks passed"), "Output should show success");
-    assert!(stdout.contains("Exit code: 0"), "Output should show exit code 0");
+    assert!(
+        stdout.contains("Verifying backup:"),
+        "Output should have header"
+    );
+    assert!(
+        stdout.contains("Snapshot: Found generation"),
+        "Output should confirm snapshot exists"
+    );
+    assert!(
+        stdout.contains("All checks passed"),
+        "Output should show success"
+    );
+    assert!(
+        stdout.contains("Exit code: 0"),
+        "Output should show exit code 0"
+    );
 
     Ok(())
 }
@@ -95,7 +111,10 @@ fn test_verify_with_incrementals() -> Result<()> {
     // Add more data to create incrementals
     let conn = rusqlite::Connection::open(&db_path)?;
     for i in 3..10 {
-        conn.execute("INSERT INTO test VALUES (?, ?)", rusqlite::params![i, format!("data{}", i)])?;
+        conn.execute(
+            "INSERT INTO test VALUES (?, ?)",
+            rusqlite::params![i, format!("data{}", i)],
+        )?;
     }
     drop(conn);
 
@@ -128,7 +147,11 @@ fn test_verify_with_incrementals() -> Result<()> {
 
     let stdout = String::from_utf8_lossy(&verify_output.stdout);
 
-    assert!(verify_output.status.success(), "Verify with incrementals should succeed: {}", stdout);
+    assert!(
+        verify_output.status.success(),
+        "Verify with incrementals should succeed: {}",
+        stdout
+    );
     assert!(stdout.contains("OK"), "Should have OK for verified files");
     assert!(stdout.contains("files"), "Should show file count");
 
@@ -152,7 +175,10 @@ fn test_verify_no_backup_found() -> Result<()> {
     let stdout = String::from_utf8_lossy(&verify_output.stdout);
 
     // Should gracefully handle missing backup
-    assert!(stdout.contains("No LTX files found"), "Should report no files found");
+    assert!(
+        stdout.contains("No LTX files found"),
+        "Should report no files found"
+    );
 
     Ok(())
 }
@@ -186,8 +212,15 @@ fn test_verify_exit_codes() -> Result<()> {
         .output()?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(output.status.success(), "Exit code should be 0 for valid backup: {}", stdout);
-    assert!(stdout.contains("Exit code: 0"), "Output should explicitly state exit code 0");
+    assert!(
+        output.status.success(),
+        "Exit code should be 0 for valid backup: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Exit code: 0"),
+        "Output should explicitly state exit code 0"
+    );
 
     Ok(())
 }
@@ -223,9 +256,14 @@ fn test_verify_continuity_check() -> Result<()> {
     let stdout = String::from_utf8_lossy(&output.stdout);
 
     // Should report on continuity
-    assert!(stdout.contains("Continuity:"), "Should check TXID continuity");
     assert!(
-        stdout.contains("No gaps detected") || stdout.contains("Gaps detected") || stdout.contains("Snapshot only"),
+        stdout.contains("Continuity:"),
+        "Should check TXID continuity"
+    );
+    assert!(
+        stdout.contains("No gaps detected")
+            || stdout.contains("Gaps detected")
+            || stdout.contains("Snapshot only"),
         "Should report continuity status"
     );
 
@@ -247,7 +285,10 @@ fn test_verify_requires_database_name() {
         .expect("Failed to execute command");
 
     // Should fail without database name
-    assert!(!output.status.success(), "Should fail without database name");
+    assert!(
+        !output.status.success(),
+        "Should fail without database name"
+    );
 }
 
 #[test]
@@ -275,8 +316,14 @@ fn test_verify_help_output() {
 
     assert!(output.status.success(), "Help should succeed");
     assert!(stdout.contains("Verify"), "Help should mention verify");
-    assert!(stdout.contains("integrity"), "Help should mention integrity");
-    assert!(stdout.contains("--bucket"), "Help should show --bucket flag");
+    assert!(
+        stdout.contains("integrity"),
+        "Help should mention integrity"
+    );
+    assert!(
+        stdout.contains("--bucket"),
+        "Help should show --bucket flag"
+    );
 }
 
 // ============================================================================
@@ -321,7 +368,10 @@ fn test_verify_doesnt_double_count_file_sizes() -> Result<()> {
         .output()?;
 
     // Should succeed and not panic with overflow
-    assert!(output.status.success(), "Should handle large files without overflow");
+    assert!(
+        output.status.success(),
+        "Should handle large files without overflow"
+    );
 
     Ok(())
 }

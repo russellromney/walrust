@@ -87,8 +87,7 @@ impl LocalCache {
         let manifest_path = cache_dir.join("manifest.json");
 
         // Create cache directory structure
-        fs::create_dir_all(cache_dir.join("ltx"))
-            .context("Failed to create cache directory")?;
+        fs::create_dir_all(cache_dir.join("ltx")).context("Failed to create cache directory")?;
 
         // Load or create manifest
         let manifest = if manifest_path.exists() {
@@ -98,8 +97,7 @@ impl LocalCache {
             // Save default manifest to disk
             let json = serde_json::to_string_pretty(&default_manifest)
                 .context("Failed to serialize default manifest")?;
-            fs::write(&manifest_path, json)
-                .context("Failed to write default manifest")?;
+            fs::write(&manifest_path, json).context("Failed to write default manifest")?;
             default_manifest
         };
 
@@ -182,10 +180,9 @@ impl LocalCache {
 
     /// Load manifest from disk
     fn load_manifest(path: &Path) -> Result<CacheManifest> {
-        let contents = fs::read_to_string(path)
-            .context("Failed to read manifest")?;
-        let manifest: CacheManifest = serde_json::from_str(&contents)
-            .context("Failed to parse manifest JSON")?;
+        let contents = fs::read_to_string(path).context("Failed to read manifest")?;
+        let manifest: CacheManifest =
+            serde_json::from_str(&contents).context("Failed to parse manifest JSON")?;
         Ok(manifest)
     }
 
@@ -194,14 +191,12 @@ impl LocalCache {
         let tmp_path = self.manifest_path.with_extension("tmp");
 
         // Write to temp file
-        let json = serde_json::to_string_pretty(manifest)
-            .context("Failed to serialize manifest")?;
-        fs::write(&tmp_path, json)
-            .context("Failed to write temporary manifest")?;
+        let json =
+            serde_json::to_string_pretty(manifest).context("Failed to serialize manifest")?;
+        fs::write(&tmp_path, json).context("Failed to write temporary manifest")?;
 
         // Atomic rename
-        fs::rename(&tmp_path, &self.manifest_path)
-            .context("Failed to rename manifest")?;
+        fs::rename(&tmp_path, &self.manifest_path).context("Failed to rename manifest")?;
 
         Ok(())
     }
@@ -225,13 +220,16 @@ impl LocalCache {
         let mut manifest = self.manifest.lock().unwrap();
         manifest.pending_txids.insert(txid);
         manifest.cache_size_bytes += data.len() as u64;
-        manifest.entries.insert(txid, CacheEntry {
+        manifest.entries.insert(
             txid,
-            size: data.len() as u64,
-            created_at: Utc::now(),
-            uploaded: false,
-            uploaded_at: None,
-        });
+            CacheEntry {
+                txid,
+                size: data.len() as u64,
+                created_at: Utc::now(),
+                uploaded: false,
+                uploaded_at: None,
+            },
+        );
 
         self.save_manifest(&manifest)?;
 
@@ -241,8 +239,7 @@ impl LocalCache {
     /// Read LTX from cache
     pub fn read_ltx(&self, txid: u64) -> Result<Vec<u8>> {
         let ltx_path = self.ltx_path(txid);
-        fs::read(&ltx_path)
-            .with_context(|| format!("Failed to read LTX file for TXID {}", txid))
+        fs::read(&ltx_path).with_context(|| format!("Failed to read LTX file for TXID {}", txid))
     }
 
     /// Mark TXID as uploaded
@@ -284,7 +281,11 @@ impl LocalCache {
     ///
     /// - Keeps files uploaded within `retention_duration`
     /// - Enforces `max_cache_size` by deleting oldest uploaded files first
-    pub fn cleanup(&self, retention_duration: chrono::Duration, max_cache_size: u64) -> Result<CleanupStats> {
+    pub fn cleanup(
+        &self,
+        retention_duration: chrono::Duration,
+        max_cache_size: u64,
+    ) -> Result<CleanupStats> {
         let mut manifest = self.manifest.lock().unwrap();
         let now = Utc::now();
 
@@ -310,7 +311,9 @@ impl LocalCache {
 
         // Sort both lists by age (oldest first)
         let sort_by_age = |txid: &u64| {
-            manifest.entries.get(txid)
+            manifest
+                .entries
+                .get(txid)
                 .and_then(|e| e.uploaded_at)
                 .unwrap_or_else(|| Utc::now())
         };
@@ -429,10 +432,16 @@ impl LocalCache {
         for txid in &manifest.pending_txids {
             if let Some(entry) = manifest.entries.get(txid) {
                 if entry.uploaded {
-                    issues.push(format!("TXID {} marked pending but entry shows uploaded", txid));
+                    issues.push(format!(
+                        "TXID {} marked pending but entry shows uploaded",
+                        txid
+                    ));
                 }
             } else {
-                issues.push(format!("TXID {} in pending set but no manifest entry", txid));
+                issues.push(format!(
+                    "TXID {} in pending set but no manifest entry",
+                    txid
+                ));
             }
         }
 

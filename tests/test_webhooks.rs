@@ -11,16 +11,10 @@ use anyhow::Result;
 use std::sync::Arc;
 use walrust::config::WebhookConfig;
 use walrust::retry::{RetryConfig, RetryPolicy};
-use walrust::webhook::{WebhookSender, WebhookPayload};
+use walrust::webhook::{WebhookPayload, WebhookSender};
 
 // Test webhook server infrastructure
-use axum::{
-    Router,
-    extract::State,
-    response::IntoResponse,
-    http::StatusCode,
-    routing::post,
-};
+use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Router};
 use std::sync::Mutex;
 use tokio::net::TcpListener;
 
@@ -57,10 +51,11 @@ async fn webhook_handler(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
-    server.received.lock().unwrap().push(ReceivedWebhook {
-        body,
-        signature,
-    });
+    server
+        .received
+        .lock()
+        .unwrap()
+        .push(ReceivedWebhook { body, signature });
 
     (StatusCode::OK, "webhook received")
 }
@@ -113,7 +108,10 @@ fn test_webhook_sender_creation() {
 
     // Empty webhooks
     let sender = WebhookSender::new(vec![]);
-    assert!(sender.is_empty(), "Empty webhook sender should report isEmpty");
+    assert!(
+        sender.is_empty(),
+        "Empty webhook sender should report isEmpty"
+    );
 
     // Single webhook
     let configs = vec![WebhookConfig {
@@ -122,7 +120,10 @@ fn test_webhook_sender_creation() {
         secret: Some("secret123".to_string()),
     }];
     let sender = WebhookSender::new(configs);
-    assert!(!sender.is_empty(), "Non-empty webhook sender should not be isEmpty");
+    assert!(
+        !sender.is_empty(),
+        "Non-empty webhook sender should not be isEmpty"
+    );
 
     // Multiple webhooks
     let configs = vec![
@@ -138,7 +139,10 @@ fn test_webhook_sender_creation() {
         },
     ];
     let sender = WebhookSender::new(configs);
-    assert!(!sender.is_empty(), "Multiple webhooks should not be isEmpty");
+    assert!(
+        !sender.is_empty(),
+        "Multiple webhooks should not be isEmpty"
+    );
 }
 
 #[test]
@@ -157,7 +161,10 @@ fn test_webhook_payload_creation() {
     assert_eq!(payload.database, "test-db");
     assert_eq!(payload.error, "Checksum mismatch");
     assert_eq!(payload.attempts, 0);
-    assert!(payload.timestamp.contains("T"), "Timestamp should be ISO 8601");
+    assert!(
+        payload.timestamp.contains("T"),
+        "Timestamp should be ISO 8601"
+    );
 
     // Test circuit_breaker_open payload
     let payload = WebhookPayload::new(
@@ -177,8 +184,14 @@ fn test_webhook_event_conversion() {
     use walrust::webhook::WebhookEvent;
 
     // Test as_str()
-    assert_eq!(WebhookEvent::CorruptionDetected.as_str(), "corruption_detected");
-    assert_eq!(WebhookEvent::CircuitBreakerOpen.as_str(), "circuit_breaker_open");
+    assert_eq!(
+        WebhookEvent::CorruptionDetected.as_str(),
+        "corruption_detected"
+    );
+    assert_eq!(
+        WebhookEvent::CircuitBreakerOpen.as_str(),
+        "circuit_breaker_open"
+    );
     assert_eq!(WebhookEvent::UploadFailed.as_str(), "upload_failed");
     assert_eq!(WebhookEvent::AuthFailure.as_str(), "auth_failure");
 }
@@ -202,7 +215,9 @@ async fn test_webhook_notify_corruption() -> Result<()> {
     let sender = WebhookSender::new(configs);
 
     // Send notification
-    sender.notify_corruption("test-database", "Checksum mismatch in file xyz.ltx").await;
+    sender
+        .notify_corruption("test-database", "Checksum mismatch in file xyz.ltx")
+        .await;
 
     // Give webhook time to be received
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -212,11 +227,26 @@ async fn test_webhook_notify_corruption() -> Result<()> {
     assert_eq!(received.len(), 1, "Should receive exactly one webhook");
 
     let webhook = &received[0];
-    assert!(webhook.body.contains("corruption_detected"), "Body should contain event type");
-    assert!(webhook.body.contains("test-database"), "Body should contain database name");
-    assert!(webhook.body.contains("Checksum mismatch"), "Body should contain error message");
-    assert!(webhook.signature.is_some(), "Should have HMAC signature with secret configured");
-    assert!(webhook.signature.as_ref().unwrap().starts_with("sha256="), "Signature should be sha256 format");
+    assert!(
+        webhook.body.contains("corruption_detected"),
+        "Body should contain event type"
+    );
+    assert!(
+        webhook.body.contains("test-database"),
+        "Body should contain database name"
+    );
+    assert!(
+        webhook.body.contains("Checksum mismatch"),
+        "Body should contain error message"
+    );
+    assert!(
+        webhook.signature.is_some(),
+        "Should have HMAC signature with secret configured"
+    );
+    assert!(
+        webhook.signature.as_ref().unwrap().starts_with("sha256="),
+        "Signature should be sha256 format"
+    );
 
     Ok(())
 }
@@ -236,7 +266,9 @@ async fn test_webhook_notify_circuit_breaker() -> Result<()> {
     let sender = WebhookSender::new(configs);
 
     // Send notification
-    sender.notify_circuit_breaker_open("production-db", 10).await;
+    sender
+        .notify_circuit_breaker_open("production-db", 10)
+        .await;
 
     // Give webhook time to be received
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -246,9 +278,18 @@ async fn test_webhook_notify_circuit_breaker() -> Result<()> {
     assert_eq!(received.len(), 1, "Should receive exactly one webhook");
 
     let webhook = &received[0];
-    assert!(webhook.body.contains("circuit_breaker_open"), "Body should contain event type");
-    assert!(webhook.body.contains("production-db"), "Body should contain database name");
-    assert!(webhook.body.contains("10"), "Body should contain failure count");
+    assert!(
+        webhook.body.contains("circuit_breaker_open"),
+        "Body should contain event type"
+    );
+    assert!(
+        webhook.body.contains("production-db"),
+        "Body should contain database name"
+    );
+    assert!(
+        webhook.body.contains("10"),
+        "Body should contain failure count"
+    );
     assert!(webhook.signature.is_some(), "Should have HMAC signature");
 
     Ok(())
@@ -278,7 +319,9 @@ async fn test_webhook_with_multiple_endpoints() -> Result<()> {
     let sender = WebhookSender::new(configs);
 
     // Send notification - should go to both endpoints
-    sender.notify_corruption("multi-test-db", "Test corruption error").await;
+    sender
+        .notify_corruption("multi-test-db", "Test corruption error")
+        .await;
 
     // Give webhooks time to be received
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -291,12 +334,24 @@ async fn test_webhook_with_multiple_endpoints() -> Result<()> {
     assert_eq!(received2.len(), 1, "Server 2 should receive one webhook");
 
     // Both should have the same payload content
-    assert!(received1[0].body.contains("multi-test-db"), "Server 1 should receive correct payload");
-    assert!(received2[0].body.contains("multi-test-db"), "Server 2 should receive correct payload");
+    assert!(
+        received1[0].body.contains("multi-test-db"),
+        "Server 1 should receive correct payload"
+    );
+    assert!(
+        received2[0].body.contains("multi-test-db"),
+        "Server 2 should receive correct payload"
+    );
 
     // Both should have signatures (but different due to different secrets)
-    assert!(received1[0].signature.is_some(), "Server 1 should have signature");
-    assert!(received2[0].signature.is_some(), "Server 2 should have signature");
+    assert!(
+        received1[0].signature.is_some(),
+        "Server 1 should have signature"
+    );
+    assert!(
+        received2[0].signature.is_some(),
+        "Server 2 should have signature"
+    );
 
     Ok(())
 }
@@ -316,7 +371,9 @@ async fn test_webhook_hmac_signature() -> Result<()> {
     let sender = WebhookSender::new(configs);
 
     // Send notification
-    sender.notify_corruption("hmac-test-db", "Test HMAC signature").await;
+    sender
+        .notify_corruption("hmac-test-db", "Test HMAC signature")
+        .await;
 
     // Give webhook time to be received
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -326,15 +383,28 @@ async fn test_webhook_hmac_signature() -> Result<()> {
     assert_eq!(received.len(), 1, "Should receive exactly one webhook");
 
     let webhook = &received[0];
-    assert!(webhook.signature.is_some(), "Should have HMAC signature header");
+    assert!(
+        webhook.signature.is_some(),
+        "Should have HMAC signature header"
+    );
 
     let signature = webhook.signature.as_ref().unwrap();
-    assert!(signature.starts_with("sha256="), "Signature should be sha256 format");
+    assert!(
+        signature.starts_with("sha256="),
+        "Signature should be sha256 format"
+    );
 
     // Verify signature format (sha256= followed by hex characters)
     let hex_part = signature.strip_prefix("sha256=").unwrap();
-    assert_eq!(hex_part.len(), 64, "HMAC-SHA256 signature should be 64 hex characters");
-    assert!(hex_part.chars().all(|c| c.is_ascii_hexdigit()), "Signature should be hex encoded");
+    assert_eq!(
+        hex_part.len(),
+        64,
+        "HMAC-SHA256 signature should be 64 hex characters"
+    );
+    assert!(
+        hex_part.chars().all(|c| c.is_ascii_hexdigit()),
+        "Signature should be hex encoded"
+    );
 
     // Verify the signature is actually valid by computing it ourselves
     use hmac::{Hmac, Mac};
@@ -345,7 +415,10 @@ async fn test_webhook_hmac_signature() -> Result<()> {
     mac.update(webhook.body.as_bytes());
     let expected_signature = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
 
-    assert_eq!(*signature, expected_signature, "HMAC signature should match computed signature");
+    assert_eq!(
+        *signature, expected_signature,
+        "HMAC signature should match computed signature"
+    );
 
     Ok(())
 }
@@ -387,13 +460,18 @@ async fn test_webhook_with_no_secret() {
     }];
 
     let sender = WebhookSender::new(configs);
-    sender.notify_corruption("no-secret-db", "No HMAC test").await;
+    sender
+        .notify_corruption("no-secret-db", "No HMAC test")
+        .await;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     let received = server.get_received();
     assert_eq!(received.len(), 1, "Should receive exactly one webhook");
-    assert!(received[0].signature.is_none(), "Should NOT have signature header when no secret configured");
+    assert!(
+        received[0].signature.is_none(),
+        "Should NOT have signature header when no secret configured"
+    );
     assert!(received[0].body.contains("no-secret-db"));
 }
 
@@ -434,7 +512,9 @@ async fn test_webhook_spawn_does_not_block() {
     let start = Instant::now();
     let webhook_clone = Arc::clone(&webhook);
     tokio::spawn(async move {
-        webhook_clone.notify_corruption("test-db", "Test error").await;
+        webhook_clone
+            .notify_corruption("test-db", "Test error")
+            .await;
     });
     let elapsed = start.elapsed();
 
@@ -451,8 +531,8 @@ async fn test_webhook_spawn_does_not_block() {
 async fn test_circuit_breaker_webhook_does_not_block() {
     // Regression test: circuit breaker webhook should not block record_failure()
 
-    use walrust::retry::{RetryConfig, RetryPolicy};
     use std::time::Instant;
+    use walrust::retry::{RetryConfig, RetryPolicy};
 
     // This test verifies that CircuitBreaker.record_failure() spawns webhook task
     // and doesn't block on webhook delivery
@@ -503,17 +583,25 @@ async fn test_webhook_with_special_characters() {
     }];
 
     let sender = WebhookSender::new(configs);
-    sender.notify_corruption(
-        "test-db-with-unicode-\u{6D4B}\u{8BD5}",
-        "Error with special chars: <>&\"' and emoji",
-    ).await;
+    sender
+        .notify_corruption(
+            "test-db-with-unicode-\u{6D4B}\u{8BD5}",
+            "Error with special chars: <>&\"' and emoji",
+        )
+        .await;
 
     tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
 
     let received = server.get_received();
     assert_eq!(received.len(), 1, "Should receive exactly one webhook");
-    assert!(received[0].body.contains("test-db-with-unicode"), "Body should contain unicode database name");
-    assert!(received[0].signature.is_some(), "Should have HMAC signature");
+    assert!(
+        received[0].body.contains("test-db-with-unicode"),
+        "Body should contain unicode database name"
+    );
+    assert!(
+        received[0].signature.is_some(),
+        "Should have HMAC signature"
+    );
 }
 
 #[test]
@@ -523,7 +611,10 @@ fn test_webhook_config_validation() {
     // Valid config
     let config = WebhookConfig {
         url: "https://hooks.example.com/walrust".to_string(),
-        events: vec!["upload_failed".to_string(), "corruption_detected".to_string()],
+        events: vec![
+            "upload_failed".to_string(),
+            "corruption_detected".to_string(),
+        ],
         secret: Some("my-secret".to_string()),
     };
     assert!(!config.url.is_empty());

@@ -200,12 +200,27 @@ mod tests {
 
     #[test]
     fn test_walrust_error_exit_status() {
-        assert_eq!(WalrustError::config("test").exit_status(), ExitStatus::Config);
-        assert_eq!(WalrustError::database("test").exit_status(), ExitStatus::Database);
+        assert_eq!(
+            WalrustError::config("test").exit_status(),
+            ExitStatus::Config
+        );
+        assert_eq!(
+            WalrustError::database("test").exit_status(),
+            ExitStatus::Database
+        );
         assert_eq!(WalrustError::s3("test").exit_status(), ExitStatus::S3);
-        assert_eq!(WalrustError::integrity("test").exit_status(), ExitStatus::Integrity);
-        assert_eq!(WalrustError::restore("test").exit_status(), ExitStatus::Restore);
-        assert_eq!(WalrustError::general("test").exit_status(), ExitStatus::General);
+        assert_eq!(
+            WalrustError::integrity("test").exit_status(),
+            ExitStatus::Integrity
+        );
+        assert_eq!(
+            WalrustError::restore("test").exit_status(),
+            ExitStatus::Restore
+        );
+        assert_eq!(
+            WalrustError::general("test").exit_status(),
+            ExitStatus::General
+        );
     }
 
     #[test]
@@ -278,9 +293,6 @@ mod tests {
             WalrustError::s3("connection failed").to_string(),
             "S3 error: connection failed"
         );
-        assert_eq!(
-            WalrustError::general("oops").to_string(),
-            "oops"
-        );
+        assert_eq!(WalrustError::general("oops").to_string(), "oops");
     }
 }

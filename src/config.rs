@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 // Re-export shared config types from hadb-io
-pub use hadb_io::config::{CacheConfig, S3Config, WebhookConfig, parse_duration_string};
+pub use hadb_io::config::{parse_duration_string, CacheConfig, S3Config, WebhookConfig};
 
 /// Root configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -272,9 +272,7 @@ impl Config {
             && self.retention.weekly == 0
             && self.retention.monthly == 0
         {
-            return Err(anyhow!(
-                "[retention]: at least one tier must be > 0"
-            ));
+            return Err(anyhow!("[retention]: at least one tier must be > 0"));
         }
 
         // Validate S3 bucket format if specified
@@ -284,10 +282,7 @@ impl Config {
             }
             // Bucket should not contain spaces or invalid characters
             if bucket.contains(' ') {
-                return Err(anyhow!(
-                    "[s3].bucket cannot contain spaces: '{}'",
-                    bucket
-                ));
+                return Err(anyhow!("[s3].bucket cannot contain spaces: '{}'", bucket));
             }
         }
 

@@ -6,11 +6,7 @@ use tempfile::tempdir;
 #[test]
 fn test_decode_litestream_ltx() {
     // Check if litestream is available
-    if Command::new("litestream")
-        .arg("version")
-        .output()
-        .is_err()
-    {
+    if Command::new("litestream").arg("version").output().is_err() {
         eprintln!("Skipping test: litestream not installed");
         eprintln!("Install with: brew install litestream");
         return;
@@ -114,14 +110,30 @@ fn test_decode_litestream_ltx() {
         match litepages::Decoder::new(cursor) {
             Ok((decoder, header)) => {
                 println!("  Header decoded successfully:");
-                println!("    TXID: {}-{}", header.min_txid.into_inner(), header.max_txid.into_inner());
+                println!(
+                    "    TXID: {}-{}",
+                    header.min_txid.into_inner(),
+                    header.max_txid.into_inner()
+                );
                 println!("    Page size: {}", header.page_size.into_inner());
                 println!("    Commit: {}", header.commit.into_inner());
                 println!("    Flags: {:?}", header.flags);
-                println!("    Pre-apply checksum: {:?}", header.pre_apply_checksum.map(|c| format!("{:016x}", c.into_inner())));
+                println!(
+                    "    Pre-apply checksum: {:?}",
+                    header
+                        .pre_apply_checksum
+                        .map(|c| format!("{:016x}", c.into_inner()))
+                );
 
                 let is_snapshot = header.min_txid.into_inner() == 1;
-                println!("    Type: {}", if is_snapshot { "SNAPSHOT" } else { "INCREMENTAL" });
+                println!(
+                    "    Type: {}",
+                    if is_snapshot {
+                        "SNAPSHOT"
+                    } else {
+                        "INCREMENTAL"
+                    }
+                );
 
                 // For snapshots, try to decode to a new database
                 if is_snapshot {
@@ -131,12 +143,18 @@ fn test_decode_litestream_ltx() {
                     match walrust::ltx::decode_to_db(cursor, &test_output) {
                         Ok(result) => {
                             println!("  ✓ Successfully decoded snapshot!");
-                            println!("    Post-apply checksum: {:016x}", result.post_apply_checksum.into_inner());
+                            println!(
+                                "    Post-apply checksum: {:016x}",
+                                result.post_apply_checksum.into_inner()
+                            );
 
                             // Verify the decoded file exists and has content
                             let decoded_data = std::fs::read(&test_output).unwrap();
                             println!("    Decoded DB size: {} bytes", decoded_data.len());
-                            assert!(!decoded_data.is_empty(), "Decoded database should not be empty");
+                            assert!(
+                                !decoded_data.is_empty(),
+                                "Decoded database should not be empty"
+                            );
 
                             decoded_count += 1;
                         }
@@ -160,6 +178,9 @@ fn test_decode_litestream_ltx() {
         decoded_count > 0,
         "Should successfully read at least one litestream LTX file"
     );
-    println!("\n✓ Successfully read {} litestream LTX files with NO_CHECKSUM flag", decoded_count);
+    println!(
+        "\n✓ Successfully read {} litestream LTX files with NO_CHECKSUM flag",
+        decoded_count
+    );
     println!("This confirms walrust can handle litestream format!");
 }

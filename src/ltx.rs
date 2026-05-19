@@ -25,7 +25,8 @@ pub fn encode_snapshot<W: Write>(
     let file = std::fs::File::open(db_path)
         .map_err(|e| anyhow!("Failed to open database for snapshot: {}", e))?;
     let file_size = file.metadata()?.len() as usize;
-    let page_size_val = PageSize::new(page_size).map_err(|e| anyhow!("Invalid page size: {}", e))?;
+    let page_size_val =
+        PageSize::new(page_size).map_err(|e| anyhow!("Invalid page size: {}", e))?;
     let num_pages = file_size / page_size as usize;
 
     let header = Header {
@@ -47,7 +48,8 @@ pub fn encode_snapshot<W: Write>(
     // Stream page-by-page: encode + hash incrementally
     for i in 0..num_pages {
         reader.read_exact(&mut page_buf)?;
-        let page_num = PageNum::new((i + 1) as u32).map_err(|e| anyhow!("Invalid page num: {}", e))?;
+        let page_num =
+            PageNum::new((i + 1) as u32).map_err(|e| anyhow!("Invalid page num: {}", e))?;
         encoder.encode_page(page_num, &page_buf)?;
         hasher.update(&page_buf);
     }
@@ -201,10 +203,7 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
     // Verify checksums using chained page hash (skip if NO_CHECKSUM)
     let post_checksum = if !skip_checksums {
         if let Some(expected_pre) = header.pre_apply_checksum {
-            tracing::debug!(
-                "Pre-apply checksum: {:016x}",
-                expected_pre.into_inner()
-            );
+            tracing::debug!("Pre-apply checksum: {:016x}", expected_pre.into_inner());
         }
 
         if let Some(hasher) = chain_hasher {
@@ -259,12 +258,16 @@ pub fn compute_checksum_from_file(db_path: &Path) -> Result<Checksum> {
 
     loop {
         let n = reader.read(&mut buf)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buf[..n]);
     }
 
     let result = hasher.finalize();
-    Ok(Checksum::new(u64::from_be_bytes(result[0..8].try_into().unwrap())))
+    Ok(Checksum::new(u64::from_be_bytes(
+        result[0..8].try_into().unwrap(),
+    )))
 }
 
 /// Encode WAL changes as an LTX file (incremental, not snapshot)
@@ -283,7 +286,8 @@ pub fn encode_wal_changes<W: Write>(
     pre_checksum: Option<Checksum>,
     post_checksum: Checksum,
 ) -> Result<Checksum> {
-    let page_size_val = PageSize::new(page_size).map_err(|e| anyhow!("Invalid page size: {}", e))?;
+    let page_size_val =
+        PageSize::new(page_size).map_err(|e| anyhow!("Invalid page size: {}", e))?;
 
     let header = Header {
         flags: HeaderFlags::COMPRESS_LZ4,
@@ -348,7 +352,10 @@ impl ChainHasher {
         use sha2::Digest;
         let mut hasher = sha2::Sha256::new();
         hasher.update(pre.into_inner().to_be_bytes());
-        Self { hasher, page_count: 0 }
+        Self {
+            hasher,
+            page_count: 0,
+        }
     }
 
     /// Feed a page into the hash. Pages must arrive in sorted order.
@@ -401,7 +408,6 @@ pub fn compute_db_checksum(data: &[u8]) -> Checksum {
     let hash = u64::from_be_bytes(result[0..8].try_into().unwrap());
     Checksum::new(hash)
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -560,9 +566,9 @@ mod tests {
             &mut ltx_buffer,
             &pages,
             page_size,
-            10,  // min_txid
-            12,  // max_txid
-            3,   // commit_page (db size in pages)
+            10, // min_txid
+            12, // max_txid
+            3,  // commit_page (db size in pages)
             Some(pre_checksum),
             expected_post,
         )
@@ -682,7 +688,6 @@ mod tests {
         assert_ne!(cs1.into_inner(), cs3.into_inner());
     }
 
-
     #[test]
     fn test_large_database() {
         let dir = tempdir().unwrap();
@@ -772,8 +777,8 @@ mod tests {
             &mut ltx_buffer,
             &pages,
             page_size,
-            2,  // min_txid
-            3,  // max_txid
+            2, // min_txid
+            3, // max_txid
             num_pages as u32,
             Some(pre_checksum),
             expected_post,
@@ -788,19 +793,34 @@ mod tests {
         let result_data = std::fs::read(&db_path).unwrap();
 
         // Page 1 (index 0): unchanged
-        assert_eq!(&result_data[0..page_size as usize], &vec![0x00u8; page_size as usize][..]);
+        assert_eq!(
+            &result_data[0..page_size as usize],
+            &vec![0x00u8; page_size as usize][..]
+        );
         // Page 2 (index 1): updated to 0xAA
         let page2_start = page_size as usize;
-        assert_eq!(&result_data[page2_start..page2_start + page_size as usize], &vec![0xAAu8; page_size as usize][..]);
+        assert_eq!(
+            &result_data[page2_start..page2_start + page_size as usize],
+            &vec![0xAAu8; page_size as usize][..]
+        );
         // Page 3 (index 2): unchanged
         let page3_start = 2 * page_size as usize;
-        assert_eq!(&result_data[page3_start..page3_start + page_size as usize], &vec![0x00u8; page_size as usize][..]);
+        assert_eq!(
+            &result_data[page3_start..page3_start + page_size as usize],
+            &vec![0x00u8; page_size as usize][..]
+        );
         // Page 4 (index 3): updated to 0xBB
         let page4_start = 3 * page_size as usize;
-        assert_eq!(&result_data[page4_start..page4_start + page_size as usize], &vec![0xBBu8; page_size as usize][..]);
+        assert_eq!(
+            &result_data[page4_start..page4_start + page_size as usize],
+            &vec![0xBBu8; page_size as usize][..]
+        );
         // Page 5 (index 4): unchanged
         let page5_start = 4 * page_size as usize;
-        assert_eq!(&result_data[page5_start..page5_start + page_size as usize], &vec![0x00u8; page_size as usize][..]);
+        assert_eq!(
+            &result_data[page5_start..page5_start + page_size as usize],
+            &vec![0x00u8; page_size as usize][..]
+        );
 
         assert_eq!(result.header.min_txid.into_inner(), 2);
         assert_eq!(result.header.max_txid.into_inner(), 3);
@@ -821,9 +841,7 @@ mod tests {
         std::fs::write(&db_path, &db_data).unwrap();
 
         // Update only page 3
-        let pages: Vec<(u32, Vec<u8>)> = vec![
-            (3, vec![0xFF; page_size as usize]),
-        ];
+        let pages: Vec<(u32, Vec<u8>)> = vec![(3, vec![0xFF; page_size as usize])];
 
         let pre_checksum = compute_checksum_from_file(&db_path).unwrap();
 
@@ -831,7 +849,17 @@ mod tests {
         let expected_post = chain_checksum(pre_checksum, &pages);
 
         let mut ltx_buffer = Vec::new();
-        encode_wal_changes(&mut ltx_buffer, &pages, page_size, 10, 11, 4, Some(pre_checksum), expected_post).unwrap();
+        encode_wal_changes(
+            &mut ltx_buffer,
+            &pages,
+            page_size,
+            10,
+            11,
+            4,
+            Some(pre_checksum),
+            expected_post,
+        )
+        .unwrap();
 
         let cursor = std::io::Cursor::new(ltx_buffer);
         apply_ltx_to_db(cursor, &db_path).unwrap();
@@ -839,12 +867,24 @@ mod tests {
         let result_data = std::fs::read(&db_path).unwrap();
 
         // Verify pages 1, 2, 4 unchanged
-        assert_eq!(&result_data[0..page_size as usize], &vec![0u8; page_size as usize][..]);
-        assert_eq!(&result_data[page_size as usize..2 * page_size as usize], &vec![10u8; page_size as usize][..]);
+        assert_eq!(
+            &result_data[0..page_size as usize],
+            &vec![0u8; page_size as usize][..]
+        );
+        assert_eq!(
+            &result_data[page_size as usize..2 * page_size as usize],
+            &vec![10u8; page_size as usize][..]
+        );
         // Page 3 updated
-        assert_eq!(&result_data[2 * page_size as usize..3 * page_size as usize], &vec![0xFFu8; page_size as usize][..]);
+        assert_eq!(
+            &result_data[2 * page_size as usize..3 * page_size as usize],
+            &vec![0xFFu8; page_size as usize][..]
+        );
         // Page 4 unchanged
-        assert_eq!(&result_data[3 * page_size as usize..4 * page_size as usize], &vec![30u8; page_size as usize][..]);
+        assert_eq!(
+            &result_data[3 * page_size as usize..4 * page_size as usize],
+            &vec![30u8; page_size as usize][..]
+        );
     }
 
     #[test]
@@ -896,11 +936,13 @@ mod tests {
             &mut inc1_buffer,
             &pages1,
             page_size,
-            2, 2,
+            2,
+            2,
             num_pages as u32,
             Some(pre_checksum1),
             expected_post1,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Apply first incremental
         let cursor1 = std::io::Cursor::new(inc1_buffer);
@@ -918,11 +960,13 @@ mod tests {
             &mut inc2_buffer,
             &pages2,
             page_size,
-            3, 3,
+            3,
+            3,
             num_pages as u32,
             Some(pre_checksum2),
             expected_post2,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Apply second incremental
         let cursor2 = std::io::Cursor::new(inc2_buffer);
@@ -930,9 +974,18 @@ mod tests {
 
         // Final verification
         let final_data = std::fs::read(&db_path).unwrap();
-        assert_eq!(&final_data[0..page_size as usize], &vec![0xAAu8; page_size as usize][..]); // Page 1 updated
-        assert_eq!(&final_data[page_size as usize..2 * page_size as usize], &vec![0xBBu8; page_size as usize][..]); // Page 2 updated
-        assert_eq!(&final_data[2 * page_size as usize..3 * page_size as usize], &vec![20u8; page_size as usize][..]); // Page 3 unchanged
+        assert_eq!(
+            &final_data[0..page_size as usize],
+            &vec![0xAAu8; page_size as usize][..]
+        ); // Page 1 updated
+        assert_eq!(
+            &final_data[page_size as usize..2 * page_size as usize],
+            &vec![0xBBu8; page_size as usize][..]
+        ); // Page 2 updated
+        assert_eq!(
+            &final_data[2 * page_size as usize..3 * page_size as usize],
+            &vec![20u8; page_size as usize][..]
+        ); // Page 3 unchanged
     }
 
     // ============================================
@@ -960,16 +1013,21 @@ mod tests {
             &mut ltx_buffer,
             &pages,
             page_size,
-            2, 2,
+            2,
+            2,
             3,
             Some(wrong_pre_checksum),
             wrong_post,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Self-consistent LTX applies successfully
         let cursor = std::io::Cursor::new(ltx_buffer);
         let result = apply_ltx_to_db(cursor, &db_path);
-        assert!(result.is_ok(), "Self-consistent LTX should apply successfully");
+        assert!(
+            result.is_ok(),
+            "Self-consistent LTX should apply successfully"
+        );
     }
 
     #[test]
@@ -996,20 +1054,32 @@ mod tests {
             &mut ltx_buffer,
             &pages,
             page_size,
-            2, 2,
+            2,
+            2,
             3,
             Some(pre_checksum),
             wrong_post_checksum, // This is wrong!
-        ).unwrap();
+        )
+        .unwrap();
 
         // Applying should FAIL with post-apply checksum mismatch
         let cursor = std::io::Cursor::new(ltx_buffer);
         let result = apply_ltx_to_db(cursor, &db_path);
 
-        assert!(result.is_err(), "Should detect post-apply checksum mismatch");
+        assert!(
+            result.is_err(),
+            "Should detect post-apply checksum mismatch"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("Post-apply checksum mismatch"), "Error should mention post-apply mismatch: {}", err_msg);
-        assert!(err_msg.contains(&format!("{:016x}", wrong_post_checksum.into_inner())), "Error should show expected checksum");
+        assert!(
+            err_msg.contains("Post-apply checksum mismatch"),
+            "Error should mention post-apply mismatch: {}",
+            err_msg
+        );
+        assert!(
+            err_msg.contains(&format!("{:016x}", wrong_post_checksum.into_inner())),
+            "Error should show expected checksum"
+        );
     }
 
     #[test]
@@ -1031,7 +1101,17 @@ mod tests {
         let pages1: Vec<(u32, Vec<u8>)> = vec![(1, vec![0xAA; page_size as usize])];
         let post1 = chain_checksum(checksum0, &pages1);
         let mut buf1 = Vec::new();
-        encode_wal_changes(&mut buf1, &pages1, page_size, 2, 2, 3, Some(checksum0), post1).unwrap();
+        encode_wal_changes(
+            &mut buf1,
+            &pages1,
+            page_size,
+            2,
+            2,
+            3,
+            Some(checksum0),
+            post1,
+        )
+        .unwrap();
 
         let pages2: Vec<(u32, Vec<u8>)> = vec![(2, vec![0xBB; page_size as usize])];
         let post2 = chain_checksum(post1, &pages2);
@@ -1064,8 +1144,14 @@ mod tests {
         let r3 = apply_ltx_to_db(std::io::Cursor::new(&buf3), &db_path).unwrap();
 
         // Chain links match
-        assert_eq!(r1.post_apply_checksum.into_inner(), r2.header.pre_apply_checksum.unwrap().into_inner());
-        assert_eq!(r2.post_apply_checksum.into_inner(), r3.header.pre_apply_checksum.unwrap().into_inner());
+        assert_eq!(
+            r1.post_apply_checksum.into_inner(),
+            r2.header.pre_apply_checksum.unwrap().into_inner()
+        );
+        assert_eq!(
+            r2.post_apply_checksum.into_inner(),
+            r3.header.pre_apply_checksum.unwrap().into_inner()
+        );
     }
 
     #[test]
@@ -1112,7 +1198,10 @@ mod tests {
 
         // Verify restored content byte-for-byte
         let restored_data = std::fs::read(&restored_path).unwrap();
-        assert_eq!(restored_data, db_data, "Restored data should match original exactly");
+        assert_eq!(
+            restored_data, db_data,
+            "Restored data should match original exactly"
+        );
     }
 
     // ============================================
@@ -1149,7 +1238,13 @@ mod tests {
 
         // Encode all 3 pages
         for i in 0..3u32 {
-            encoder.encode_page(PageNum::new(i + 1).unwrap(), &db_data[(i as usize * page_size as usize)..(i as usize + 1) * page_size as usize]).unwrap();
+            encoder
+                .encode_page(
+                    PageNum::new(i + 1).unwrap(),
+                    &db_data
+                        [(i as usize * page_size as usize)..(i as usize + 1) * page_size as usize],
+                )
+                .unwrap();
         }
 
         // Use zero checksum (litestream doesn't track checksums)
@@ -1159,20 +1254,32 @@ mod tests {
         let cursor = std::io::Cursor::new(&ltx_buffer);
         let result = decode_to_db(cursor, &restored_path);
 
-        assert!(result.is_ok(), "Should decode successfully with NO_CHECKSUM flag");
+        assert!(
+            result.is_ok(),
+            "Should decode successfully with NO_CHECKSUM flag"
+        );
         let decode_result = result.unwrap();
 
         // Walrust computes checksums internally even when NO_CHECKSUM is set (for tracking)
         // But it doesn't verify them against the LTX file's checksums
-        assert!(decode_result.post_apply_checksum.into_inner() != 0, "Should compute actual checksum even with NO_CHECKSUM");
+        assert!(
+            decode_result.post_apply_checksum.into_inner() != 0,
+            "Should compute actual checksum even with NO_CHECKSUM"
+        );
 
         // Verify data was restored correctly
         let restored_data = std::fs::read(&restored_path).unwrap();
-        assert_eq!(restored_data, db_data, "Data should be restored correctly even with NO_CHECKSUM");
+        assert_eq!(
+            restored_data, db_data,
+            "Data should be restored correctly even with NO_CHECKSUM"
+        );
 
         // Verify the checksum matches the actual data
         let expected_checksum = compute_db_checksum(&db_data);
-        assert_eq!(decode_result.post_apply_checksum.into_inner(), expected_checksum.into_inner());
+        assert_eq!(
+            decode_result.post_apply_checksum.into_inner(),
+            expected_checksum.into_inner()
+        );
     }
 
     #[test]
@@ -1205,7 +1312,9 @@ mod tests {
 
         // Modify page 2
         let modified_page = vec![0xAAu8; page_size as usize];
-        encoder.encode_page(PageNum::new(2).unwrap(), &modified_page).unwrap();
+        encoder
+            .encode_page(PageNum::new(2).unwrap(), &modified_page)
+            .unwrap();
 
         // Use zero checksum
         encoder.finish(Checksum::new(0)).unwrap();
@@ -1214,22 +1323,40 @@ mod tests {
         let cursor = std::io::Cursor::new(&ltx_buffer);
         let result = apply_ltx_to_db(cursor, &db_path);
 
-        assert!(result.is_ok(), "Should apply successfully with NO_CHECKSUM flag");
+        assert!(
+            result.is_ok(),
+            "Should apply successfully with NO_CHECKSUM flag"
+        );
         let apply_result = result.unwrap();
 
         // Walrust computes checksums internally even when NO_CHECKSUM is set (for tracking)
         // But it doesn't verify them against the LTX file's checksums
-        assert!(apply_result.post_apply_checksum.into_inner() != 0, "Should compute actual checksum even with NO_CHECKSUM");
+        assert!(
+            apply_result.post_apply_checksum.into_inner() != 0,
+            "Should compute actual checksum even with NO_CHECKSUM"
+        );
 
         // Verify page 2 was modified
         let result_data = std::fs::read(&db_path).unwrap();
-        assert_eq!(&result_data[page_size as usize..2 * page_size as usize], &modified_page[..]);
+        assert_eq!(
+            &result_data[page_size as usize..2 * page_size as usize],
+            &modified_page[..]
+        );
         // Verify other pages unchanged
-        assert_eq!(&result_data[0..page_size as usize], &vec![0x00u8; page_size as usize][..]);
-        assert_eq!(&result_data[2 * page_size as usize..3 * page_size as usize], &vec![0x00u8; page_size as usize][..]);
+        assert_eq!(
+            &result_data[0..page_size as usize],
+            &vec![0x00u8; page_size as usize][..]
+        );
+        assert_eq!(
+            &result_data[2 * page_size as usize..3 * page_size as usize],
+            &vec![0x00u8; page_size as usize][..]
+        );
 
         // With NO_CHECKSUM and a zero pre_checksum, the chain checksum is computed
-        assert!(apply_result.post_apply_checksum.into_inner() != 0, "Should compute a chain checksum");
+        assert!(
+            apply_result.post_apply_checksum.into_inner() != 0,
+            "Should compute a chain checksum"
+        );
     }
 
     #[test]
@@ -1250,7 +1377,11 @@ mod tests {
         let actual_checksum = compute_checksum_from_file(&db_path).unwrap();
         let wrong_checksum = Checksum::new(0xDEADBEEF); // Intentionally wrong
 
-        assert_ne!(wrong_checksum.into_inner(), actual_checksum.into_inner(), "Checksums should be different");
+        assert_ne!(
+            wrong_checksum.into_inner(),
+            actual_checksum.into_inner(),
+            "Checksums should be different"
+        );
 
         let header = Header {
             flags: HeaderFlags::NO_CHECKSUM | HeaderFlags::COMPRESS_LZ4,
@@ -1264,14 +1395,18 @@ mod tests {
 
         let mut ltx_buffer = Vec::new();
         let mut encoder = Encoder::new(&mut ltx_buffer, &header).unwrap();
-        encoder.encode_page(PageNum::new(1).unwrap(), &vec![0x99u8; page_size as usize]).unwrap();
+        encoder
+            .encode_page(PageNum::new(1).unwrap(), &vec![0x99u8; page_size as usize])
+            .unwrap();
         encoder.finish(Checksum::new(0xBADC0FFEE)).unwrap(); // Also wrong!
 
         // Should succeed because NO_CHECKSUM skips all verification
         let cursor = std::io::Cursor::new(&ltx_buffer);
         let result = apply_ltx_to_db(cursor, &db_path);
 
-        assert!(result.is_ok(), "Should succeed with wrong checksums when NO_CHECKSUM is set");
+        assert!(
+            result.is_ok(),
+            "Should succeed with wrong checksums when NO_CHECKSUM is set"
+        );
     }
 }
-

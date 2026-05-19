@@ -1,10 +1,12 @@
-use anyhow::{anyhow, Result};
-use std::path::Path;
 use crate::cache::LocalCache;
 use crate::ltx;
 use crate::s3::{self, create_client, parse_bucket};
+use anyhow::{anyhow, Result};
+use std::path::Path;
 
-use super::manifest::{discover_state_from_s3, find_latest_snapshot, list_generation_files, GENERATION_LIVE};
+use super::manifest::{
+    discover_state_from_s3, find_latest_snapshot, list_generation_files, GENERATION_LIVE,
+};
 
 pub async fn restore(
     name: &str,
@@ -26,7 +28,10 @@ pub async fn restore(
                 Some(c)
             }
             None => {
-                tracing::warn!("Cache directory {} has no manifest, falling back to S3", dir.display());
+                tracing::warn!(
+                    "Cache directory {} has no manifest, falling back to S3",
+                    dir.display()
+                );
                 None
             }
         }
@@ -51,9 +56,8 @@ pub async fn restore(
 
     // Parse point in time if provided (TXID only for litestream format)
     let target_txid = if let Some(pit) = point_in_time {
-        pit.parse::<u64>().map_err(|_| {
-            anyhow!("Invalid point_in_time format. Use TXID (number)")
-        })?
+        pit.parse::<u64>()
+            .map_err(|_| anyhow!("Invalid point_in_time format. Use TXID (number)"))?
     } else {
         current_txid
     };
@@ -73,7 +77,10 @@ pub async fn restore(
             tracing::info!("Reading snapshot TXID {} from cache", snapshot_max_txid);
             cache.read_ltx(snapshot_max_txid)?
         } else {
-            tracing::debug!("Snapshot TXID {} not in cache, fetching from S3", snapshot_max_txid);
+            tracing::debug!(
+                "Snapshot TXID {} not in cache, fetching from S3",
+                snapshot_max_txid
+            );
             s3::download_bytes(&client, &bucket_name, &snapshot_key).await?
         }
     } else {
@@ -106,7 +113,8 @@ pub async fn restore(
     let mut final_txid = snapshot_max_txid;
 
     // Get incrementals from generation 0 (live folder)
-    let incrementals = list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE).await?;
+    let incrementals =
+        list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE).await?;
 
     // Filter to files we need: min_txid > snapshot_max_txid and max_txid <= target_txid
     let applicable: Vec<_> = incrementals
@@ -209,7 +217,8 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
                 discover_state_from_s3(&client, &bucket_name, &prefix, db).await?;
 
             // Count files in generation 0 (live incrementals)
-            let live_files = list_generation_files(&client, &bucket_name, &prefix, db, GENERATION_LIVE).await?;
+            let live_files =
+                list_generation_files(&client, &bucket_name, &prefix, db, GENERATION_LIVE).await?;
 
             // Find snapshots (generation 1+)
             let snapshot = find_latest_snapshot(&client, &bucket_name, &prefix, db).await?;

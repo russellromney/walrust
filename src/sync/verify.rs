@@ -4,7 +4,9 @@ use std::sync::Arc;
 use crate::ltx;
 use crate::s3::{self, create_client, parse_bucket};
 
-use super::manifest::{discover_state_from_s3, list_generation_files, load_manifest, GENERATION_LIVE};
+use super::manifest::{
+    discover_state_from_s3, list_generation_files, load_manifest, GENERATION_LIVE,
+};
 
 /// Verification issue found during verify
 #[derive(Debug, Clone)]
@@ -68,8 +70,7 @@ pub(crate) async fn validate_backup_integrity(
                                         filename: entry.filename.clone(),
                                         issue: format!(
                                             "TXID mismatch: manifest {}-{}, header {}-{}",
-                                            entry.min_txid, entry.max_txid,
-                                            header_min, header_max
+                                            entry.min_txid, entry.max_txid, header_min, header_max
                                         ),
                                         is_orphan: false,
                                     });
@@ -126,8 +127,10 @@ pub(crate) async fn validate_backup_integrity(
                     filename: entry.filename.clone(),
                     issue: format!(
                         "TXID gap: expected {}, got {} (missing {}-{})",
-                        expected, entry.min_txid,
-                        expected, entry.min_txid - 1
+                        expected,
+                        entry.min_txid,
+                        expected,
+                        entry.min_txid - 1
                     ),
                     is_orphan: false,
                 });
@@ -161,8 +164,10 @@ pub async fn verify(
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint).await?;
 
-    println!("Verifying integrity of '{}' in s3://{}/{}{}...",
-        name, bucket_name, prefix, name);
+    println!(
+        "Verifying integrity of '{}' in s3://{}/{}{}...",
+        name, bucket_name, prefix, name
+    );
     println!();
 
     // Discover state from S3 (litestream format - no manifest)
@@ -178,7 +183,8 @@ pub async fn verify(
     let mut all_files: Vec<(String, u64, u64, u64)> = Vec::new(); // (key, gen, min, max)
 
     // Get files from generation 0 (live incrementals)
-    let live_files = list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE).await?;
+    let live_files =
+        list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE).await?;
     for (key, min, max) in live_files {
         all_files.push((key, GENERATION_LIVE, min, max));
     }
@@ -191,12 +197,17 @@ pub async fn verify(
         }
     }
 
-    println!("Verifying backup: {} in s3://{}/{}{}", name, bucket_name, prefix, name);
+    println!(
+        "Verifying backup: {} in s3://{}/{}{}",
+        name, bucket_name, prefix, name
+    );
     println!("================================================");
     println!();
 
     // Check for snapshot existence (critical requirement)
-    let has_snapshot = all_files.iter().any(|(_, gen, min, max)| *gen > 0 || (*min == 1 && *max == 1));
+    let has_snapshot = all_files
+        .iter()
+        .any(|(_, gen, min, max)| *gen > 0 || (*min == 1 && *max == 1));
 
     if !has_snapshot {
         println!("CRITICAL: No snapshot found (generation file)");
@@ -206,7 +217,10 @@ pub async fn verify(
         anyhow::bail!("No snapshot found - backup is incomplete");
     }
 
-    println!("Snapshot: Found generation {} (TXID range covered)", max_gen);
+    println!(
+        "Snapshot: Found generation {} (TXID range covered)",
+        max_gen
+    );
     println!();
 
     let mut issues: Vec<VerifyIssue> = Vec::new();
@@ -230,21 +244,21 @@ pub async fn verify(
                         // Verify header matches filename
                         if header_min != *expected_min || header_max != *expected_max {
                             let txid_count = expected_max - expected_min + 1;
-                            println!("  WARNING {} ({} TXIDs, {}KB) - TXID mismatch!",
-                                filename, txid_count, size_kb);
+                            println!(
+                                "  WARNING {} ({} TXIDs, {}KB) - TXID mismatch!",
+                                filename, txid_count, size_kb
+                            );
                             issues.push(VerifyIssue {
                                 filename: key.clone(),
                                 issue: format!(
                                     "TXID mismatch: filename says {}-{}, header says {}-{}",
-                                    expected_min, expected_max,
-                                    header_min, header_max
+                                    expected_min, expected_max, header_min, header_max
                                 ),
                                 is_orphan: false,
                             });
                         } else {
                             let txid_count = expected_max - expected_min + 1;
-                            println!("  OK {} ({} TXIDs, {}KB)",
-                                filename, txid_count, size_kb);
+                            println!("  OK {} ({} TXIDs, {}KB)", filename, txid_count, size_kb);
                             verified_count += 1;
                             total_size += data.len() as u64;
                         }
@@ -295,8 +309,10 @@ pub async fn verify(
                     filename: key.clone(),
                     issue: format!(
                         "TXID gap: expected min_txid={}, got {} (missing TXIDs {}-{})",
-                        expected, min_txid,
-                        expected, min_txid - 1
+                        expected,
+                        min_txid,
+                        expected,
+                        min_txid - 1
                     ),
                     is_orphan: false,
                 });
@@ -313,7 +329,8 @@ pub async fn verify(
         let last_txid = live_files.last().map(|(_, _, _, max)| *max).unwrap_or(0);
 
         // Check for gaps in continuity
-        let gap_issues: Vec<_> = issues.iter()
+        let gap_issues: Vec<_> = issues
+            .iter()
             .filter(|i| i.issue.contains("TXID gap"))
             .collect();
 
@@ -343,7 +360,12 @@ pub async fn verify(
         println!();
     }
 
-    println!("Verified: {}/{} files ({:.1} KB total)", verified_count, all_files.len(), total_size as f64 / 1024.0);
+    println!(
+        "Verified: {}/{} files ({:.1} KB total)",
+        verified_count,
+        all_files.len(),
+        total_size as f64 / 1024.0
+    );
     println!();
 
     // Exit with appropriate code

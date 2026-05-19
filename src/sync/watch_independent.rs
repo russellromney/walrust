@@ -5,17 +5,19 @@ use std::time::Duration;
 use tokio::signal;
 
 use crate::cache::LocalCache;
-use crate::config::{parse_duration_string, CacheConfig, ResolvedDbConfig, SyncConfig, WebhookConfig};
+use crate::config::{
+    parse_duration_string, CacheConfig, ResolvedDbConfig, SyncConfig, WebhookConfig,
+};
 use crate::dashboard::{self, MetricsState};
 use crate::ltx;
 use crate::retention::RetentionPolicy;
 use crate::retry::{RetryConfig, RetryPolicy};
 use crate::s3::{create_client, parse_bucket};
 use crate::shadow::ShadowWal;
-use hadb_storage::StorageBackend;
-use hadb_storage_s3::S3Storage;
 use crate::uploader::{spawn_uploader, UploadMessage, Uploader};
 use crate::webhook::WebhookSender;
+use hadb_storage::StorageBackend;
+use hadb_storage_s3::S3Storage;
 
 use super::manifest::discover_state_from_s3;
 use super::types::{CacheState, DbState, DbTaskState, SyncInput, TriggerState};
@@ -58,7 +60,11 @@ pub async fn watch_with_independent_tasks(
                 Some(d)
             }
             Err(e) => {
-                return Err(anyhow!("Invalid cache retention '{}': {}", cache_config.retention, e));
+                return Err(anyhow!(
+                    "Invalid cache retention '{}': {}",
+                    cache_config.retention,
+                    e
+                ));
             }
         }
     } else {
@@ -114,7 +120,9 @@ pub async fn watch_with_independent_tasks(
             "Spawning independent task for {} (TXID: {}, checksum: {})",
             name,
             current_txid,
-            db_checksum.map(|c| format!("{:#x}", c)).unwrap_or_else(|| "none".to_string())
+            db_checksum
+                .map(|c| format!("{:#x}", c))
+                .unwrap_or_else(|| "none".to_string())
         );
 
         // Initial sync of any existing WAL data (before starting event loop)
@@ -124,7 +132,13 @@ pub async fn watch_with_independent_tasks(
         tracing::debug!("{}: WAL exists = {}", name, wal_exists);
 
         let (wal_offset, wal_generation, current_txid, db_checksum) = if wal_exists {
-            tracing::debug!("{}: Starting initial sync (offset={}, gen={}, txid={})", name, wal_offset, wal_generation, current_txid);
+            tracing::debug!(
+                "{}: Starting initial sync (offset={}, gen={}, txid={})",
+                name,
+                wal_offset,
+                wal_generation,
+                current_txid
+            );
             let input = SyncInput {
                 db_path: db_path.clone(),
                 name: name.clone(),
@@ -141,12 +155,23 @@ pub async fn watch_with_independent_tasks(
                 input,
                 retry_policy.clone(),
                 Arc::clone(&webhook_sender),
-            ).await {
+            )
+            .await
+            {
                 Ok(result) => {
-                    tracing::debug!("{}: Initial sync returned: frame_count={}, new_offset={}, new_txid={}",
-                        name, result.frame_count, result.new_wal_offset, result.new_current_txid);
+                    tracing::debug!(
+                        "{}: Initial sync returned: frame_count={}, new_offset={}, new_txid={}",
+                        name,
+                        result.frame_count,
+                        result.new_wal_offset,
+                        result.new_current_txid
+                    );
                     if result.frame_count > 0 {
-                        tracing::info!("{}: Initial sync captured {} frames", name, result.frame_count);
+                        tracing::info!(
+                            "{}: Initial sync captured {} frames",
+                            name,
+                            result.frame_count
+                        );
                     } else {
                         tracing::debug!("{}: Initial sync returned 0 frames", name);
                     }
@@ -158,7 +183,11 @@ pub async fn watch_with_independent_tasks(
                     )
                 }
                 Err(e) => {
-                    tracing::warn!("{}: Initial sync failed (will retry on changes): {}", name, e);
+                    tracing::warn!(
+                        "{}: Initial sync failed (will retry on changes): {}",
+                        name,
+                        e
+                    );
                     (wal_offset, wal_generation, current_txid, db_checksum)
                 }
             }
@@ -196,31 +225,47 @@ pub async fn watch_with_independent_tasks(
 
             // Create cache directory if it doesn't exist
             if !cache_dir.exists() {
-                std::fs::create_dir_all(&cache_dir)
-                    .map_err(|e| anyhow!("Failed to create cache directory {}: {}", cache_dir.display(), e))?;
+                std::fs::create_dir_all(&cache_dir).map_err(|e| {
+                    anyhow!(
+                        "Failed to create cache directory {}: {}",
+                        cache_dir.display(),
+                        e
+                    )
+                })?;
             }
 
             // Create LocalCache
             let cache = Arc::new(LocalCache::new(&cache_dir)?);
-            tracing::debug!("{}: LocalCache initialized at {}", name, cache_dir.display());
+            tracing::debug!(
+                "{}: LocalCache initialized at {}",
+                name,
+                cache_dir.display()
+            );
 
             // Create ShadowWal for checkpoint-safe frame copying
-            let shadow = ShadowWal::new(db_path).await
+            let shadow = ShadowWal::new(db_path)
+                .await
                 .map_err(|e| anyhow!("{}: Failed to create shadow WAL: {}", name, e))?;
             let shadow = Arc::new(tokio::sync::Mutex::new(shadow));
-            tracing::debug!("{}: ShadowWal initialized (checkpoint blocker active)", name);
+            tracing::debug!(
+                "{}: ShadowWal initialized (checkpoint blocker active)",
+                name
+            );
 
             // Resume pending uploads count
             let pending_count = cache.pending_uploads().len();
             if pending_count > 0 {
-                tracing::info!("{}: Found {} pending uploads to resume", name, pending_count);
+                tracing::info!(
+                    "{}: Found {} pending uploads to resume",
+                    name,
+                    pending_count
+                );
             }
 
             // Create storage backend for the uploader.
             // AWS SDK Client is Clone (cheap Arc internally).
-            let storage: Arc<dyn StorageBackend> = Arc::new(
-                S3Storage::new((*client).clone(), bucket_name.clone())
-            );
+            let storage: Arc<dyn StorageBackend> =
+                Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
 
             // Create Uploader
             let s3_prefix = format!("{}/{}", prefix, name);
@@ -271,7 +316,9 @@ pub async fn watch_with_independent_tasks(
                 metrics,
                 shutdown_rx,
                 cache_state,
-            ).await {
+            )
+            .await
+            {
                 tracing::error!("{}: Task failed: {}", name, e);
             }
         });
@@ -290,8 +337,10 @@ pub async fn watch_with_independent_tasks(
         #[cfg(unix)]
         {
             use signal::unix::{signal, SignalKind};
-            let mut sigterm = signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
-            let mut sigint = signal(SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
+            let mut sigterm =
+                signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
+            let mut sigint =
+                signal(SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
             tokio::select! {
                 _ = sigterm.recv() => "SIGTERM",
                 _ = sigint.recv() => "SIGINT",
@@ -299,7 +348,9 @@ pub async fn watch_with_independent_tasks(
         }
         #[cfg(not(unix))]
         {
-            signal::ctrl_c().await.expect("Failed to set up Ctrl+C handler");
+            signal::ctrl_c()
+                .await
+                .expect("Failed to set up Ctrl+C handler");
             "Ctrl+C"
         }
     };
@@ -316,7 +367,9 @@ pub async fn watch_with_independent_tasks(
         for handle in task_handles {
             let _ = handle.await;
         }
-    }).await {
+    })
+    .await
+    {
         Ok(_) => tracing::info!("All tasks shut down gracefully"),
         Err(_) => tracing::warn!("Shutdown timeout - some tasks may not have completed"),
     }
@@ -360,9 +413,7 @@ async fn run_db_task(
     cleanup_timer.tick().await; // Skip first immediate tick
 
     // Track last synced WAL size to detect changes
-    let mut last_synced_wal_size: u64 = std::fs::metadata(&wal_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let mut last_synced_wal_size: u64 = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
 
     tracing::debug!(
         "{}: Task started, polling every {}s (WAL: {})",

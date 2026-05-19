@@ -1,7 +1,7 @@
 use anyhow::Result;
 
-use crate::s3;
 use super::types::Manifest;
+use crate::s3;
 
 // ============================================
 // Litestream-compatible format helpers
@@ -24,7 +24,11 @@ pub(crate) fn parse_txid_hex(s: &str) -> Option<u64> {
 
 /// Format an LTX filename in litestream format
 pub(crate) fn format_ltx_filename(min_txid: u64, max_txid: u64) -> String {
-    format!("{}-{}.ltx", format_txid_hex(min_txid), format_txid_hex(max_txid))
+    format!(
+        "{}-{}.ltx",
+        format_txid_hex(min_txid),
+        format_txid_hex(max_txid)
+    )
 }
 
 /// Parse min/max TXID from litestream-format filename
@@ -53,7 +57,13 @@ pub(crate) fn parse_generation(s: &str) -> Option<u64> {
 /// Build S3 key for an LTX file in litestream format
 /// - generation 0 = live incrementals (0000/)
 /// - generation 1+ = snapshots and compacted files
-pub(crate) fn build_ltx_key(prefix: &str, db_name: &str, generation: u64, min_txid: u64, max_txid: u64) -> String {
+pub(crate) fn build_ltx_key(
+    prefix: &str,
+    db_name: &str,
+    generation: u64,
+    min_txid: u64,
+    max_txid: u64,
+) -> String {
     format!(
         "{}{}/{}/{}",
         prefix,

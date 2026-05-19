@@ -148,7 +148,6 @@ fn format_age(now: chrono::DateTime<Utc>, created_at: chrono::DateTime<Utc>) -> 
     }
 }
 
-
 /// Take immediate snapshot as LTX file
 pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
@@ -167,7 +166,8 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
     let page_size = get_page_size(database).await?;
 
     // Discover current state from S3 to get current TXID and generation
-    let (current_txid, current_gen, _) = discover_state_from_s3(&client, &bucket_name, &prefix, name).await?;
+    let (current_txid, current_gen, _) =
+        discover_state_from_s3(&client, &bucket_name, &prefix, name).await?;
     let new_txid = current_txid + 1;
     let snapshot_gen = current_gen + 1;
 
