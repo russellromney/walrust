@@ -1079,21 +1079,36 @@ pub async fn restore_with_snapshot_source(
         checkpoint_version,
     );
 
-    // Step 3: apply incrementals in order
-    // Note: when restoring with an external snapshot source, we don't have
-    // the HADBP checksum chain from the snapshot. We skip chain verification
-    // for the first incremental and let it establish the chain.
+    // Step 3: apply incrementals in order, verifying the HADBP checksum chain.
+    //
+    // When restoring from an external snapshot source we do not have the HADBP
+    // checksum of the materialized base, so the *first* incremental cannot be
+    // chain-verified against the snapshot — it establishes the chain. Every
+    // subsequent incremental must chain from the prior one; a break means the
+    // object belongs to a different lineage (e.g. a stale delta from a prior
+    // leader sitting at an in-range seq) and must NOT be applied wholesale.
     let mut restored_seq = checkpoint_version;
+    let mut current_checksum: Option<u64> = None;
     for inc in incrementals.iter() {
         let data = storage
             .get(&inc.key)
             .await?
             .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
-        // For external snapshot sources, we can't verify the chain for the first
-        // incremental since the snapshot wasn't encoded as HADBP. Decode without
-        // chain verification and let subsequent incrementals verify against each other.
         let changeset = hadb_changeset::physical::decode(&data)
             .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", inc.key, e))?;
+
+        // Verify the chain for every incremental after the first one.
+        if let Some(prev) = current_checksum {
+            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
+                tracing::warn!(
+                    "Stopping restore at seq {}: checksum chain broken ({}); \
+                     remaining incrementals are from a different lineage",
+                    inc.seq,
+                    e
+                );
+                break;
+            }
+        }
 
         // Apply pages directly (SQLite 1-based page offsets)
         use std::fs::OpenOptions;
@@ -1119,6 +1134,7 @@ pub async fn restore_with_snapshot_source(
             changeset.checksum
         );
         restored_seq = inc.seq;
+        current_checksum = Some(changeset.checksum);
     }
 
     Ok(restored_seq)
@@ -1323,11 +1339,14 @@ pub async fn pull_incremental(
 
     let mut applied_seq = current_seq;
     let mut applied_count = 0u64;
-    let stale_count = 0u64;
+    let mut stale_count = 0u64;
 
-    // For followers pulling incrementals, we don't have a prev_checksum from the
-    // last applied changeset. We decode and apply directly, relying on the
-    // changeset's internal integrity (decode verifies checksum).
+    // For followers pulling incrementals we don't have the prev_checksum of the
+    // base, so the first changeset establishes the chain. Every changeset after
+    // it must chain from the prior one; a break means a stale object from a
+    // different lineage is sitting at an in-range seq and must NOT be applied —
+    // we stop rather than corrupting the follower's database.
+    let mut current_checksum: Option<u64> = None;
     for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
         let data = data?;
         let changeset = match hadb_changeset::physical::decode(&data) {
@@ -1337,6 +1356,19 @@ pub async fn pull_incremental(
                 return Err(anyhow!("Failed to decode changeset: {}", e));
             }
         };
+
+        if let Some(prev) = current_checksum {
+            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
+                tracing::warn!(
+                    "Stopping pull at seq {}: checksum chain broken ({}); \
+                     remaining changesets are from a different lineage",
+                    file.seq,
+                    e
+                );
+                stale_count = new_files.len() as u64 - applied_count;
+                break;
+            }
+        }
 
         // Apply pages (SQLite 1-based page offsets)
         use std::fs::OpenOptions;
@@ -1357,6 +1389,7 @@ pub async fn pull_incremental(
 
         applied_seq = file.seq;
         applied_count += 1;
+        current_checksum = Some(changeset.checksum);
     }
 
     if applied_count > 0 {
@@ -1472,10 +1505,28 @@ async fn pull_incremental_into_sink_inner(
     let mut applied_seq = current_seq;
     let mut applied_count = 0u64;
 
+    // The first changeset establishes the chain; each subsequent one must chain
+    // from the prior. A break means a stale object from a different lineage at
+    // an in-range seq — stop before routing its pages into the sink (the sink
+    // commits per changeset, so a mis-chained changeset must be rejected whole,
+    // not partially applied).
+    let mut current_checksum: Option<u64> = None;
     for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
         let data = data?;
         let changeset = hadb_changeset::physical::decode(&data)
             .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", file.key, e))?;
+
+        if let Some(prev) = current_checksum {
+            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
+                tracing::warn!(
+                    "pull_incremental_into_sink: stopping at seq {}: checksum chain broken \
+                     ({}); remaining changesets are from a different lineage",
+                    file.seq,
+                    e
+                );
+                break;
+            }
+        }
 
         for page in &changeset.pages {
             // SQLite 1-based page id straight from the HADBP changeset.
@@ -1491,6 +1542,7 @@ async fn pull_incremental_into_sink_inner(
 
         applied_seq = file.seq;
         applied_count += 1;
+        current_checksum = Some(changeset.checksum);
     }
 
     if applied_count > 0 {
@@ -2508,27 +2560,31 @@ mod tests {
     async fn pull_into_sink_drives_lifecycle_across_multiple_changesets() {
         let mut storage = TestStorage::new();
         let page_size = 4096u32;
-        seed_changeset(
+        // Properly chained changesets: each prev_checksum is the prior post.
+        let ck1 = seed_chained_changeset(
             &mut storage,
             "test/",
             "mydb",
             1,
+            0,
             page_size,
             &[(1, page_payload(page_size as usize, 0x11))],
         );
-        seed_changeset(
+        let ck2 = seed_chained_changeset(
             &mut storage,
             "test/",
             "mydb",
             2,
+            ck1,
             page_size,
             &[(2, page_payload(page_size as usize, 0x22))],
         );
-        seed_changeset(
+        seed_chained_changeset(
             &mut storage,
             "test/",
             "mydb",
             3,
+            ck2,
             page_size,
             &[(3, page_payload(page_size as usize, 0x33))],
         );
@@ -2550,6 +2606,57 @@ mod tests {
         assert_eq!(ev.applied[0].0, 1);
         assert_eq!(ev.applied[1].0, 2);
         assert_eq!(ev.applied[2].0, 3);
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_stops_on_broken_chain() {
+        // F13: a stale changeset from a different lineage sitting at an in-range
+        // seq must NOT be applied. Seq 1 and 2 chain; seq 3 carries a bogus
+        // prev_checksum (a prior leader's lineage). Pull must apply 1 and 2,
+        // then stop at 3.
+        let mut storage = TestStorage::new();
+        let page_size = 4096u32;
+        let ck1 = seed_chained_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            1,
+            0,
+            page_size,
+            &[(1, page_payload(page_size as usize, 0x11))],
+        );
+        let _ck2 = seed_chained_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            2,
+            ck1,
+            page_size,
+            &[(2, page_payload(page_size as usize, 0x22))],
+        );
+        // Seq 3 chains from a wrong prev (different lineage).
+        seed_chained_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            3,
+            0xDEAD_BEEF_DEAD_BEEF,
+            page_size,
+            &[(3, page_payload(page_size as usize, 0x33))],
+        );
+
+        let mut sink = RecordingSink::new();
+        let final_seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0)
+            .await
+            .expect("pull");
+        assert_eq!(final_seq, 2, "must stop before the mis-chained seq 3");
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.committed_seqs, vec![1, 2], "seq 3 rejected");
+        assert_eq!(ev.applied.len(), 2);
+        // The valid prefix still finalizes cleanly (no abort).
+        assert_eq!(ev.finalize_calls, 1);
+        assert_eq!(ev.abort_calls, 0);
     }
 
     #[tokio::test]

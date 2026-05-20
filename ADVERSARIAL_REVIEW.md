@@ -84,12 +84,19 @@ in unverified.
   the same two-pronged check inline. Salt is persisted in `state.json` and
   tracked even on no-op syncs.
 
-### F13 — [High] `restore_with_snapshot_source` / `pull_incremental` apply with no chain verification — **Documented**
-- `crates/walrust-core/src/sync.rs:966-1047`, `1225-1297`
-- Both loops apply changesets in seq order with no `verify_chain`, so a stale
-  object from a prior lineage at an in-range seq is applied wholesale.
-- **Fix:** thread `current_checksum` through both loops and call the same
-  `verify_chain(prev, &changeset)` `restore()` uses, breaking on mismatch.
+### F13 — [High] `restore_with_snapshot_source` / `pull_incremental` apply with no chain verification — **Fixed**
+- `crates/walrust-core/src/sync.rs` — `restore_with_snapshot_source`,
+  `pull_incremental`, `pull_incremental_into_sink_inner`
+- All three loops applied changesets in seq order with no `verify_chain`, so a
+  stale object from a prior lineage at an in-range seq was applied wholesale.
+- **Fix:** thread `current_checksum: Option<u64>` through each loop. The first
+  changeset establishes the chain (the base isn't HADBP-encoded, so its prior
+  checksum is unknown); every subsequent changeset is checked with
+  `hadb_changeset::physical::verify_chain(prev, &changeset)` and the loop breaks
+  on a chain break rather than applying. The sink path verifies *before*
+  routing any pages so a mis-chained changeset is rejected whole.
+  `pull_into_sink_stops_on_broken_chain` covers it; the multi-changeset
+  lifecycle test was updated to seed properly chained fixtures.
 
 ### F10 — [Med] Durable cursor advances before the S3 PUT is durable — **Documented**
 - `src/sync/wal_sync.rs:336-338,566-569` vs `src/uploader.rs:101-122`
