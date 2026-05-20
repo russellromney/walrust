@@ -23,13 +23,63 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::sync::{self, ExternalBaseCursor, ReplicationConfig, SyncState};
+use crate::sync::{self, ExternalBaseCursor, Phase4SyncParams, ReplicationConfig, SyncState};
 use hadb_storage::StorageBackend;
+
+/// Phase 004 delta-shipping state for a database.
+///
+/// When present on a [`DbState`], the replicator ships TLM_DELTA
+/// envelopes via [`sync::sync_wal_phase4`] instead of phase-3 `.hadbp`
+/// changesets. `epoch` + `writer_id` are constant for a leadership term
+/// (set by the integration layer at base publish); `prev_checksum`
+/// advances after each delta to the published envelope's BLAKE3.
+#[derive(Debug, Clone)]
+struct Phase4DeltaState {
+    epoch: u64,
+    writer_id: String,
+    /// BLAKE3 of the prior object's envelope — the base anchor for the
+    /// first delta after a base, then each prior delta's checksum.
+    prev_checksum: [u8; 32],
+}
 
 /// Per-database replication state.
 struct DbState {
     state: SyncState,
     prefix: String,
+    /// `Some` when this database ships phase-004 TLM_DELTA envelopes.
+    /// `None` = phase-3 behavior (walrust-owned or external `.hadbp`).
+    phase4: Option<Phase4DeltaState>,
+}
+
+/// Dispatch one sync for a database: phase-4 TLM_DELTA when configured,
+/// else phase-3 (external `.hadbp` or walrust-owned). Centralises the
+/// three call sites (background loop, flush, remove) so the phase-4
+/// branch lives in one place. Returns the frame count.
+async fn sync_one_db(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db: &mut DbState,
+    external_base_state: bool,
+) -> Result<u64> {
+    if let Some(p4) = db.phase4.as_mut() {
+        let params = Phase4SyncParams {
+            epoch: p4.epoch,
+            writer_id: p4.writer_id.clone(),
+            prev_envelope_checksum: p4.prev_checksum,
+        };
+        match sync::sync_wal_phase4(storage, prefix, &mut db.state, &params).await? {
+            Some(result) => {
+                // Advance the chain anchor to the just-published envelope.
+                p4.prev_checksum = result.envelope_checksum;
+                Ok(result.frame_count)
+            }
+            None => Ok(0),
+        }
+    } else if external_base_state {
+        sync::sync_wal_after_external_base(storage, prefix, &mut db.state).await
+    } else {
+        sync::sync_wal(storage, prefix, &mut db.state).await
+    }
 }
 
 /// Multi-database WAL replicator.
@@ -184,7 +234,7 @@ impl Replicator {
         )
         .await?;
 
-        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix }));
+        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix, phase4: None }));
 
         self.databases
             .write()
@@ -273,7 +323,7 @@ impl Replicator {
             }
         }
 
-        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix }));
+        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix, phase4: None }));
 
         self.databases
             .write()
@@ -308,7 +358,7 @@ impl Replicator {
         sync::initialize_external_base_state(self.storage.as_ref(), &prefix, &mut state, base)
             .await?;
 
-        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix }));
+        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix, phase4: None }));
 
         self.databases
             .write()
@@ -334,12 +384,8 @@ impl Replicator {
         if let Some(db_state) = entry {
             let mut s = db_state.lock().await;
             let prefix = s.prefix.clone();
-            let sync_result = if self.config.snapshot_ownership.is_external() {
-                sync::sync_wal_after_external_base(self.storage.as_ref(), &prefix, &mut s.state)
-                    .await
-            } else {
-                sync::sync_wal(self.storage.as_ref(), &prefix, &mut s.state).await
-            };
+            let external = self.config.snapshot_ownership.is_external();
+            let sync_result = sync_one_db(self.storage.as_ref(), &prefix, &mut s, external).await;
             match sync_result {
                 Ok(frames) if frames > 0 => {
                     tracing::info!(
@@ -401,12 +447,8 @@ impl Replicator {
 
         let mut state = db_state.lock().await;
         let prefix = state.prefix.clone();
-        let frame_count = if self.config.snapshot_ownership.is_external() {
-            sync::sync_wal_after_external_base(self.storage.as_ref(), &prefix, &mut state.state)
-                .await?
-        } else {
-            sync::sync_wal(self.storage.as_ref(), &prefix, &mut state.state).await?
-        };
+        let external = self.config.snapshot_ownership.is_external();
+        let frame_count = sync_one_db(self.storage.as_ref(), &prefix, &mut state, external).await?;
 
         Ok(frame_count)
     }
@@ -471,6 +513,64 @@ impl Replicator {
             name,
             base.seq,
             base.checksum,
+        );
+        Ok(true)
+    }
+
+    /// Phase 004: enable (or re-anchor) TLM_DELTA delta shipping for a
+    /// database after publishing a base.
+    ///
+    /// `epoch` + `writer_id` are the leadership term's fencing identity;
+    /// `base_anchor` is the BLAKE3 of the just-published base manifest
+    /// (turbolite's `base_anchor_checksum`) — the first delta after this
+    /// base carries it as `prev_checksum`. Subsequent deltas chain from
+    /// each prior envelope automatically. Also aligns the SyncState seq
+    /// to `base_seq` so the first delta is `base_seq + 1`.
+    ///
+    /// Calling this is what flips a database from the phase-3 `.hadbp`
+    /// path to the phase-4 `.tlmd` path. Until it is called, the
+    /// database stays on phase-3 (the shipped failover behavior).
+    ///
+    /// Returns `false` if the database is not registered.
+    pub async fn set_phase4_base(
+        &self,
+        name: &str,
+        epoch: u64,
+        writer_id: &str,
+        base_seq: u64,
+        base_anchor: [u8; 32],
+    ) -> Result<bool> {
+        if !self.config.snapshot_ownership.is_external() {
+            anyhow::bail!("set_phase4_base requires external snapshot ownership");
+        }
+        let databases = self.databases.read().await;
+        let Some(db_state) = databases.get(name).cloned() else {
+            return Ok(false);
+        };
+        drop(databases);
+
+        let mut state = db_state.lock().await;
+        if base_seq < state.state.current_seq {
+            anyhow::bail!(
+                "{}: refused to set phase4 base seq {} behind current seq {}",
+                name,
+                base_seq,
+                state.state.current_seq
+            );
+        }
+        state.state.current_seq = base_seq;
+        state.state.current_txid = base_seq;
+        state.phase4 = Some(Phase4DeltaState {
+            epoch,
+            writer_id: writer_id.to_string(),
+            prev_checksum: base_anchor,
+        });
+        tracing::info!(
+            "{}: phase4 delta shipping enabled (epoch {}, writer {}, base_seq {})",
+            name,
+            epoch,
+            writer_id,
+            base_seq,
         );
         Ok(true)
     }
@@ -551,12 +651,8 @@ impl Replicator {
             set.spawn(async move {
                 let mut s = db_state.lock().await;
                 let prefix = s.prefix.clone();
-                let sync_result = if external_base_state {
-                    sync::sync_wal_after_external_base(storage.as_ref(), &prefix, &mut s.state)
-                        .await
-                } else {
-                    sync::sync_wal(storage.as_ref(), &prefix, &mut s.state).await
-                };
+                let sync_result =
+                    sync_one_db(storage.as_ref(), &prefix, &mut s, external_base_state).await;
                 match sync_result {
                     Ok(frames) if frames > 0 => {
                         tracing::debug!(
