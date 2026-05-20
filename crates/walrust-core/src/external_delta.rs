@@ -32,16 +32,21 @@
 //! disambiguates the two payload types if they ever land in the same
 //! storage prefix.
 //!
-//! ### Canonical encoding stability
+//! ### Encoding stability (deterministic, not RFC-8949 canonical)
 //!
-//! Same approach as `turbolite::tiered::wire`: ciborium serializes
-//! the serde-derived `DeltaPayloadV1` deterministically because the
-//! struct has fixed-order fields, no maps with non-deterministic
-//! iteration, and integer encoding is smallest-length. The golden
-//! BLAKE3 hash in [`tests::canonical_delta_v1_blake3_golden_hash`]
-//! is the trip-wire — fires loud on any encoding drift across
-//! ciborium / serde_bytes / blake3 upgrades. Re-pin only after
-//! root-causing the drift and bumping [`VERSION_V1`].
+//! Same approach as `turbolite::tiered::wire`: ciborium serializes the
+//! serde-derived `DeltaPayloadV1` *deterministically for this fixed struct
+//! definition* — fields emit in declaration order, integers use
+//! smallest-length form, and there are no maps or floats (whose ordering /
+//! representation ciborium does not canonicalize per RFC 8949). This is
+//! sufficient ONLY because every verifier hashes the *stored bytes*, never
+//! a re-encoding. Do not add `f64` or map-typed fields, and do not hash a
+//! re-encoded payload — either would let two nodes derive different
+//! checksums for the same logical delta and break chain verification
+//! permanently. The golden BLAKE3 hash in
+//! [`tests::canonical_delta_v1_blake3_golden_hash`] is the trip-wire: it
+//! fires on any drift across ciborium / serde_bytes / blake3 upgrades.
+//! Re-pin only after root-causing the drift and bumping [`VERSION_V1`].
 
 use serde::{Deserialize, Serialize};
 

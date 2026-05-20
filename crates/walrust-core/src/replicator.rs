@@ -531,7 +531,12 @@ impl Replicator {
     /// path to the phase-4 `.tlmd` path. Until it is called, the
     /// database stays on phase-3 (the shipped failover behavior).
     ///
-    /// Returns `false` if the database is not registered.
+    /// Returns `Ok(false)` if the database is not registered yet. Callers
+    /// MUST treat `false` as a hard failure: ignoring it silently leaves
+    /// the database on the phase-3 `.hadbp` path forever (the cutover
+    /// no-op bug). Re-call after the db is registered.
+    #[must_use = "set_phase4_base returns false when the db is not registered; \
+                  ignoring it leaves the database on the phase-3 path"]
     pub async fn set_phase4_base(
         &self,
         name: &str,
@@ -542,6 +547,11 @@ impl Replicator {
     ) -> Result<bool> {
         if !self.config.snapshot_ownership.is_external() {
             anyhow::bail!("set_phase4_base requires external snapshot ownership");
+        }
+        if writer_id.is_empty() {
+            anyhow::bail!(
+                "set_phase4_base requires a non-empty writer_id (it fences the delta chain)"
+            );
         }
         let databases = self.databases.read().await;
         let Some(db_state) = databases.get(name).cloned() else {
