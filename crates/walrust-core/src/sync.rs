@@ -535,9 +535,17 @@ fn delta_envelope_key(prefix: &str, db_name: &str, seq: u64) -> String {
 
 /// Parse the seq out of a `.tlmd` envelope key. `None` for keys that
 /// aren't delta envelopes (wrong extension, malformed hex).
+///
+/// Requires the exact 16-char zero-padded width `delta_envelope_key`
+/// emits: lexical object-store list order only equals numeric seq order at
+/// a fixed width, so a foreign/short `.tlmd` key must be rejected rather
+/// than parsed and mis-ordered.
 fn parse_delta_envelope_seq(key: &str) -> Option<u64> {
     let file = key.rsplit('/').next()?;
     let hex = file.strip_suffix(&format!(".{DELTA_ENVELOPE_EXT}"))?;
+    if hex.len() != 16 {
+        return None;
+    }
     u64::from_str_radix(hex, 16).ok()
 }
 
