@@ -27,10 +27,24 @@ use std::sync::{Arc, Mutex};
 /// Manifest tracking upload state and cache metadata
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheManifest {
-    /// Last successfully uploaded TXID
+    /// Highest TXID for which a PUT has been confirmed durable. May be ahead of
+    /// `last_contiguous_uploaded_txid` when uploads complete out of order, so it
+    /// is NOT a safe restore cursor on its own (a lower TXID may still be
+    /// missing). Kept for stats / observability.
     pub last_uploaded_txid: u64,
+    /// Highest TXID `T` such that EVERY TXID in `1..=T` has a confirmed durable
+    /// PUT. This is the durable restore cursor: a node reseeding from remote
+    /// state can replay up to here with no gap. Advances only after confirmed
+    /// uploads, never on a mere cache write (F10).
+    #[serde(default)]
+    pub last_contiguous_uploaded_txid: u64,
     /// Set of pending TXIDs (written to cache but not uploaded)
     pub pending_txids: HashSet<u64>,
+    /// TXIDs whose upload exhausted retries and failed. A non-empty set is a
+    /// permanent gap that must be surfaced, not silently hidden by advancing a
+    /// max-based cursor past it (F9).
+    #[serde(default)]
+    pub failed_txids: HashSet<u64>,
     /// Total cache size in bytes
     pub cache_size_bytes: u64,
     /// Last cleanup timestamp
@@ -58,7 +72,9 @@ impl Default for CacheManifest {
     fn default() -> Self {
         Self {
             last_uploaded_txid: 0,
+            last_contiguous_uploaded_txid: 0,
             pending_txids: HashSet::new(),
+            failed_txids: HashSet::new(),
             cache_size_bytes: 0,
             last_cleanup: Utc::now(),
             entries: HashMap::new(),
@@ -242,13 +258,18 @@ impl LocalCache {
         fs::read(&ltx_path).with_context(|| format!("Failed to read LTX file for TXID {}", txid))
     }
 
-    /// Mark TXID as uploaded
+    /// Mark TXID as uploaded (PUT confirmed durable).
     ///
-    /// Removes from pending set, updates upload timestamp
+    /// Removes from pending/failed sets, records the timestamp, and advances
+    /// both cursors: `last_uploaded_txid` to the max seen, and
+    /// `last_contiguous_uploaded_txid` forward across the now-complete
+    /// gap-free prefix. The contiguous cursor is the only safe restore point
+    /// because uploads can complete out of order (F9/F10).
     pub fn mark_uploaded(&self, txid: u64) -> Result<()> {
         let mut manifest = self.manifest.lock().unwrap();
 
         manifest.pending_txids.remove(&txid);
+        manifest.failed_txids.remove(&txid);
         manifest.last_uploaded_txid = manifest.last_uploaded_txid.max(txid);
 
         if let Some(entry) = manifest.entries.get_mut(&txid) {
@@ -256,9 +277,45 @@ impl LocalCache {
             entry.uploaded_at = Some(Utc::now());
         }
 
+        Self::recompute_contiguous(&mut manifest);
+
         self.save_manifest(&manifest)?;
 
         Ok(())
+    }
+
+    /// Mark a TXID as permanently failed (uploader exhausted retries).
+    ///
+    /// Records the gap so it cannot be silently swallowed by a max-based
+    /// cursor. The contiguous cursor never advances past a failed TXID.
+    pub fn mark_failed(&self, txid: u64) -> Result<()> {
+        let mut manifest = self.manifest.lock().unwrap();
+        manifest.pending_txids.remove(&txid);
+        manifest.failed_txids.insert(txid);
+        // A failure at or below the current contiguous cursor would mean the
+        // cursor was advanced incorrectly; recompute to be safe.
+        Self::recompute_contiguous(&mut manifest);
+        self.save_manifest(&manifest)?;
+        Ok(())
+    }
+
+    /// Advance `last_contiguous_uploaded_txid` across the longest gap-free run
+    /// of confirmed-uploaded TXIDs starting just after the current cursor.
+    /// Stops at the first TXID that is missing, still pending, or failed.
+    fn recompute_contiguous(manifest: &mut CacheManifest) {
+        let mut next = manifest.last_contiguous_uploaded_txid + 1;
+        loop {
+            if manifest.failed_txids.contains(&next) {
+                break;
+            }
+            match manifest.entries.get(&next) {
+                Some(entry) if entry.uploaded => {
+                    manifest.last_contiguous_uploaded_txid = next;
+                    next += 1;
+                }
+                _ => break,
+            }
+        }
     }
 
     /// Get list of pending uploads
@@ -271,10 +328,26 @@ impl LocalCache {
         pending
     }
 
-    /// Get last uploaded TXID
+    /// Get last uploaded TXID (max-based; may sit above a gap, NOT a safe
+    /// restore cursor — use `last_contiguous_uploaded_txid` for that).
     pub fn last_uploaded_txid(&self) -> u64 {
         let manifest = self.manifest.lock().unwrap();
         manifest.last_uploaded_txid
+    }
+
+    /// Get the durable restore cursor: the highest TXID with no gap below it.
+    pub fn last_contiguous_uploaded_txid(&self) -> u64 {
+        let manifest = self.manifest.lock().unwrap();
+        manifest.last_contiguous_uploaded_txid
+    }
+
+    /// Get the set of TXIDs whose upload permanently failed, sorted ascending.
+    /// A non-empty result is a durable gap that callers must surface/alarm.
+    pub fn failed_uploads(&self) -> Vec<u64> {
+        let manifest = self.manifest.lock().unwrap();
+        let mut failed: Vec<u64> = manifest.failed_txids.iter().copied().collect();
+        failed.sort();
+        failed
     }
 
     /// Cleanup old uploaded files based on retention policy
@@ -371,8 +444,10 @@ impl LocalCache {
             total_entries: manifest.entries.len(),
             pending_count: manifest.pending_txids.len(),
             uploaded_count: manifest.entries.values().filter(|e| e.uploaded).count(),
+            failed_count: manifest.failed_txids.len(),
             total_bytes: manifest.cache_size_bytes,
             last_uploaded_txid: manifest.last_uploaded_txid,
+            last_contiguous_uploaded_txid: manifest.last_contiguous_uploaded_txid,
         }
     }
 
@@ -463,8 +538,12 @@ pub struct CacheStats {
     pub total_entries: usize,
     pub pending_count: usize,
     pub uploaded_count: usize,
+    /// Count of TXIDs whose upload permanently failed (a durable gap).
+    pub failed_count: usize,
     pub total_bytes: u64,
     pub last_uploaded_txid: u64,
+    /// Durable restore cursor (gap-free prefix).
+    pub last_contiguous_uploaded_txid: u64,
 }
 
 #[cfg(test)]
@@ -593,6 +672,78 @@ mod tests {
         cache.mark_uploaded(5).unwrap();
         assert_eq!(cache.last_uploaded_txid(), 5); // Max TXID
         assert_eq!(cache.pending_uploads(), vec![3, 4]);
+    }
+
+    #[test]
+    fn test_contiguous_cursor_advances_only_over_gap_free_prefix() {
+        // F10: out-of-order uploads must not advance the durable cursor past a
+        // hole. Upload 1, 3, 4 (2 missing). last_uploaded_txid jumps to 4 but
+        // the contiguous cursor stays at 1 until 2 lands.
+        let (cache, _temp) = setup_cache();
+        for txid in 1..=4 {
+            cache.write_ltx(txid, b"data").unwrap();
+        }
+
+        cache.mark_uploaded(1).unwrap();
+        assert_eq!(cache.last_contiguous_uploaded_txid(), 1);
+
+        cache.mark_uploaded(3).unwrap();
+        cache.mark_uploaded(4).unwrap();
+        assert_eq!(cache.last_uploaded_txid(), 4, "max-based cursor jumps");
+        assert_eq!(
+            cache.last_contiguous_uploaded_txid(),
+            1,
+            "durable cursor must not pass the missing TXID 2"
+        );
+
+        // Filling the hole advances the contiguous cursor across 2,3,4 at once.
+        cache.mark_uploaded(2).unwrap();
+        assert_eq!(cache.last_contiguous_uploaded_txid(), 4);
+    }
+
+    #[test]
+    fn test_failed_upload_surfaces_gap_and_blocks_cursor() {
+        // F9: a permanently failed upload is a durable gap. The contiguous
+        // cursor must not advance past it even if later TXIDs upload fine.
+        let (cache, _temp) = setup_cache();
+        for txid in 1..=4 {
+            cache.write_ltx(txid, b"data").unwrap();
+        }
+
+        cache.mark_uploaded(1).unwrap();
+        cache.mark_failed(2).unwrap();
+        cache.mark_uploaded(3).unwrap();
+        cache.mark_uploaded(4).unwrap();
+
+        assert_eq!(cache.failed_uploads(), vec![2], "gap is surfaced");
+        assert_eq!(cache.stats().failed_count, 1);
+        assert_eq!(
+            cache.last_contiguous_uploaded_txid(),
+            1,
+            "durable cursor blocked behind the failed TXID 2"
+        );
+        // A later retry that succeeds clears the gap and advances the cursor.
+        cache.mark_uploaded(2).unwrap();
+        assert_eq!(cache.failed_uploads(), Vec::<u64>::new());
+        assert_eq!(cache.last_contiguous_uploaded_txid(), 4);
+    }
+
+    #[test]
+    fn test_contiguous_cursor_survives_restart() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        {
+            let cache = LocalCache::new(&db_path).unwrap();
+            for txid in 1..=3 {
+                cache.write_ltx(txid, b"data").unwrap();
+            }
+            cache.mark_uploaded(1).unwrap();
+            cache.mark_uploaded(2).unwrap();
+        }
+        {
+            let cache = LocalCache::new(&db_path).unwrap();
+            assert_eq!(cache.last_contiguous_uploaded_txid(), 2);
+        }
     }
 
     #[test]

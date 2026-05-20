@@ -55,8 +55,11 @@ pub struct UploaderStats {
     pub uploads_failed: u64,
     /// Total bytes uploaded
     pub bytes_uploaded: u64,
-    /// Last uploaded TXID
+    /// Highest uploaded TXID (max-based; may sit above a gap).
     pub last_uploaded_txid: u64,
+    /// Durable restore cursor: highest TXID with no gap below it. This is the
+    /// value safe to expose to a node reseeding from remote state (F10).
+    pub last_contiguous_uploaded_txid: u64,
 }
 
 /// Shared context for upload tasks spawned into JoinSet.
@@ -106,6 +109,10 @@ impl UploadTaskContext {
                     self.cache
                         .mark_uploaded(txid)
                         .context("Failed to mark TXID as uploaded")?;
+                    // The durable cursor is whatever the cache computed after
+                    // recording this confirmed PUT — it only advances across a
+                    // gap-free prefix (F10).
+                    let durable = self.cache.last_contiguous_uploaded_txid();
 
                     let mut stats = self.stats.lock().await;
                     stats.uploads_succeeded += 1;
@@ -113,10 +120,11 @@ impl UploadTaskContext {
                     if txid > stats.last_uploaded_txid {
                         stats.last_uploaded_txid = txid;
                     }
+                    stats.last_contiguous_uploaded_txid = durable;
 
                     info!(
-                        "[{}] Uploaded TXID {} ({} bytes)",
-                        self.db_name, txid, data_len
+                        "[{}] Uploaded TXID {} ({} bytes, durable cursor {})",
+                        self.db_name, txid, data_len, durable
                     );
 
                     return Ok(UploadResult { _txid: txid });
@@ -137,6 +145,16 @@ impl UploadTaskContext {
                             .notify_auth_failure(&self.db_name, &e.to_string())
                             .await;
 
+                        // Surface the permanent gap: this TXID's PUT did not
+                        // become durable, so the contiguous restore cursor must
+                        // not advance past it (F9).
+                        if let Err(mark_err) = self.cache.mark_failed(txid) {
+                            error!(
+                                "[{}] Failed to record upload failure for TXID {}: {}",
+                                self.db_name, txid, mark_err
+                            );
+                        }
+
                         let mut stats = self.stats.lock().await;
                         stats.uploads_failed += 1;
 
@@ -151,6 +169,13 @@ impl UploadTaskContext {
                         self.webhook_sender
                             .notify_upload_failed(&self.db_name, &e.to_string(), attempts)
                             .await;
+
+                        if let Err(mark_err) = self.cache.mark_failed(txid) {
+                            error!(
+                                "[{}] Failed to record upload failure for TXID {}: {}",
+                                self.db_name, txid, mark_err
+                            );
+                        }
 
                         let mut stats = self.stats.lock().await;
                         stats.uploads_failed += 1;

@@ -98,19 +98,27 @@ in unverified.
   `pull_into_sink_stops_on_broken_chain` covers it; the multi-changeset
   lifecycle test was updated to seed properly chained fixtures.
 
-### F10 — [Med] Durable cursor advances before the S3 PUT is durable — **Documented**
-- `src/sync/wal_sync.rs:336-338,566-569` vs `src/uploader.rs:101-122`
-- `current_txid` advances on cache-write before the uploader confirms the PUT;
-  a node reseeded from remote `state.json` believes un-uploaded TXIDs are
-  restorable.
-- **Fix:** advance the exposed/persisted durable cursor only after
-  `mark_uploaded` confirms the PUT (or persist a separate `durable_txid`).
-  Coordinate with F9.
+### F10 — [Med] Durable cursor advances before the S3 PUT is durable — **Fixed**
+- `src/cache.rs`, `src/uploader.rs`
+- The exposed cursor advanced on cache-write / max(txid) before the uploader
+  confirmed the PUT; a node reseeded from remote state believed un-uploaded
+  TXIDs were restorable.
+- **Fix:** added `last_contiguous_uploaded_txid` to the cache manifest — the
+  highest TXID with a confirmed durable PUT *and* no gap below it. It advances
+  only inside `mark_uploaded` (after a confirmed PUT) across the gap-free
+  prefix, never on a mere cache write. The uploader exposes it in
+  `UploaderStats.last_contiguous_uploaded_txid`. This is the safe restore
+  cursor; `last_uploaded_txid` (max-based) is kept only for observability.
 
-### F9 — [Med] `last_uploaded_txid = max(txid)` hides a permanent gap; uploader returns Ok on failed PUTs — **Documented**
-- `src/cache.rs:252`, `src/uploader.rs:113-115,155-159,294-297`
-- **Fix:** track `last_contiguous_uploaded_txid` (advance only when
-  `txid == last+1`); surface a non-zero failed count as an error/alarm.
+### F9 — [Med] `last_uploaded_txid = max(txid)` hides a permanent gap; uploader returns Ok on failed PUTs — **Fixed**
+- `src/cache.rs`, `src/uploader.rs`
+- **Fix:** `mark_uploaded` advances the contiguous cursor only across an
+  unbroken `1..=T` run. Added `mark_failed` + a `failed_txids` set in the
+  manifest; the uploader records every permanently-failed PUT (auth error or
+  retries exhausted) so the gap is durable and surfaced via `failed_uploads()`
+  / `CacheStats.failed_count` (the upload-failed webhook still fires). The
+  contiguous cursor never advances past a failed or missing TXID. Tests cover
+  out-of-order uploads, a failed-then-retried gap, and restart persistence.
 
 ### F8 — [Med] Cache cleanup can evict the only restorable copy — **Documented**
 - `src/cache.rs:296-355`
