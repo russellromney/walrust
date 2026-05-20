@@ -84,9 +84,9 @@ pub fn decode_to_db(data: &[u8], output_path: &Path) -> Result<DecodeResult> {
         .max()
         .unwrap_or(0);
     // Bound the allocation against an untrusted/corrupt max page id.
-    let db_size = (max_page as usize)
-        .checked_mul(page_size)
-        .ok_or_else(|| anyhow!("changeset max_page * page_size overflows usize (corrupt changeset)"))?;
+    let db_size = (max_page as usize).checked_mul(page_size).ok_or_else(|| {
+        anyhow!("changeset max_page * page_size overflows usize (corrupt changeset)")
+    })?;
 
     let mut db_data = vec![0u8; db_size];
 

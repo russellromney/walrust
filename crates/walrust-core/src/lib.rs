@@ -39,14 +39,14 @@ pub use replay_sink::PageReplaySink;
 pub use replicator::Replicator;
 pub use snapshot_source::SnapshotSource;
 pub use sync::{
-    fetch_delta_envelope, list_delta_envelopes_after, publish_delta_envelope, pull_incremental_into_sink,
-    restore_with_snapshot_source, run_wal_replication, sync_wal_phase4, DeltaPublishResult,
-    DiscoveredDelta, ExternalBaseCursor, LtxEntry, Manifest, Phase4SyncParams, ReplicationConfig,
-    SnapshotOwnership, SyncState,
+    fetch_delta_envelope, list_delta_envelopes_after, publish_delta_envelope,
+    pull_incremental_into_sink, restore_with_snapshot_source, run_wal_replication, sync_wal_phase4,
+    DeltaPublishResult, DiscoveredDelta, ExternalBaseCursor, LtxEntry, Manifest, Phase4SyncParams,
+    ReplicationConfig, SnapshotOwnership, SyncState,
 };
 
 // Phase 004 delta envelope codec.
-pub use external_delta::{DeltaPayloadV1, DeltaPayloadError};
+pub use external_delta::{DeltaPayloadError, DeltaPayloadV1};
 
 // Re-export hadb-changeset for consumers
 pub use hadb_changeset;

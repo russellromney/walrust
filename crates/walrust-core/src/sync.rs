@@ -339,10 +339,7 @@ struct WalBatch {
 ///
 /// The running checksum chain (`state.wal_checksum_chain`) seeds per-frame
 /// validation; a torn tail frame is rejected (see [`wal::read_frames_as_page_map_checked`]).
-async fn read_next_wal_batch(
-    state: &mut SyncState,
-    header: &wal::WalHeader,
-) -> Result<WalBatch> {
+async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> Result<WalBatch> {
     let current_salt = header.salt();
 
     // Two-pronged rollover detection: size shrink OR salt change.
@@ -743,8 +740,8 @@ pub async fn list_delta_envelopes_after(
     // from the beginning). The `seq <= after_seq` filter below is kept
     // as a correctness backstop in case a backend's `after` is
     // inclusive or ignores the marker.
-    let after_marker = (after_seq > 0)
-        .then(|| format!("{}{:016x}.{}", dir_prefix, after_seq, DELTA_ENVELOPE_EXT));
+    let after_marker =
+        (after_seq > 0).then(|| format!("{}{:016x}.{}", dir_prefix, after_seq, DELTA_ENVELOPE_EXT));
     let keys = storage.list(&dir_prefix, after_marker.as_deref()).await?;
 
     let mut out = Vec::new();
@@ -2985,7 +2982,10 @@ mod tests {
         assert_eq!(found[0].payload.writer_id, "w");
         // envelope_checksum matches a fresh hash of the re-encoded payload.
         let reencoded = external_delta::encode(&found[0].payload).unwrap();
-        assert_eq!(found[0].envelope_checksum, external_delta::checksum(&reencoded));
+        assert_eq!(
+            found[0].envelope_checksum,
+            external_delta::checksum(&reencoded)
+        );
     }
 
     #[tokio::test]
@@ -3053,6 +3053,9 @@ mod tests {
             .expect("list");
         assert_eq!(found.len(), 2);
         // second.prev_checksum == BLAKE3(first envelope) == first.envelope_checksum
-        assert_eq!(found[1].payload.prev_checksum, found[0].envelope_checksum.to_vec());
+        assert_eq!(
+            found[1].payload.prev_checksum,
+            found[0].envelope_checksum.to_vec()
+        );
     }
 }

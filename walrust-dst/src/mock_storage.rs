@@ -90,6 +90,11 @@ struct StoredObject {
     data: Vec<u8>,
     checksum: Option<String>,
     created_at: std::time::Instant,
+    /// Deterministic eventual-consistency gate: the global operation count at
+    /// or after which this object becomes visible to reads/lists. `0` means
+    /// immediately visible (no EC fault configured). Derived from the seeded
+    /// RNG at write time so visibility is reproducible, not wall-clock.
+    visible_after_ops: u64,
 }
 
 /// Mock storage backend for testing
@@ -102,6 +107,8 @@ pub struct MockStorageBackend {
     rng: Arc<Mutex<StdRng>>,
     /// Operation log
     operations: Arc<Mutex<Vec<OperationRecord>>>,
+    /// Monotonic operation counter for deterministic eventual consistency.
+    op_counter: Arc<Mutex<u64>>,
 }
 
 impl MockStorageBackend {
@@ -113,7 +120,38 @@ impl MockStorageBackend {
             config,
             rng: Arc::new(Mutex::new(rng)),
             operations: Arc::new(Mutex::new(Vec::new())),
+            op_counter: Arc::new(Mutex::new(0)),
         }
+    }
+
+    /// Advance and return the global operation counter.
+    fn next_op(&self) -> u64 {
+        let mut c = self.op_counter.lock().unwrap();
+        *c += 1;
+        *c
+    }
+
+    /// Current operation counter without advancing it.
+    fn current_op(&self) -> u64 {
+        *self.op_counter.lock().unwrap()
+    }
+
+    /// Compute the operation count at which a freshly written object becomes
+    /// visible, from the Ec config gated on the seeded RNG. Returns `0` (always
+    /// visible) when no EC fault is configured. The `delay_ms` is reinterpreted
+    /// deterministically as a small bounded number of operations.
+    fn eventual_consistency_visible_after(&self) -> u64 {
+        for fault in &self.config.faults {
+            if let StorageFault::EventualConsistency { delay_ms } = fault {
+                // Map the configured delay onto a 1..=N op window, picked from
+                // the seeded RNG so the staleness is reproducible.
+                let max_lag = ((*delay_ms / 10).max(1)).min(16);
+                let mut rng = self.rng.lock().unwrap();
+                let lag = rng.gen_range(1..=max_lag);
+                return self.current_op() + lag;
+            }
+        }
+        0
     }
 
     /// Get all operation records
@@ -197,23 +235,14 @@ impl MockStorageBackend {
         false
     }
 
-    /// Get eventual consistency delay if configured
-    fn get_eventual_consistency_delay(&self) -> Option<Duration> {
-        for fault in &self.config.faults {
-            if let StorageFault::EventualConsistency { delay_ms } = fault {
-                return Some(Duration::from_millis(*delay_ms));
-            }
-        }
-        None
-    }
-
-    /// Check if object is visible (for eventual consistency)
+    /// Check if object is visible (deterministic eventual consistency).
+    ///
+    /// Visibility is gated on the global operation counter, not wall-clock
+    /// time: an object written with `visible_after_ops = N` is invisible to
+    /// reads/lists until the counter reaches `N`. This makes list-after-write
+    /// and read-after-write staleness reproducible under a fixed seed.
     fn is_visible(&self, obj: &StoredObject) -> bool {
-        if let Some(delay) = self.get_eventual_consistency_delay() {
-            obj.created_at.elapsed() >= delay
-        } else {
-            true
-        }
+        obj.visible_after_ops == 0 || self.current_op() >= obj.visible_after_ops
     }
 }
 
@@ -231,11 +260,28 @@ impl StorageBackend for MockStorageBackend {
             tokio::time::sleep(delay).await;
         }
 
-        // Check partial write
+        // Check partial write: a real interrupted PUT leaves the truncated
+        // prefix durable (the object exists but is short / corrupt), then
+        // surfaces the error. Storing nothing made this fault untestable —
+        // downstream readers never saw the torn object.
         if let Some(limit) = self.get_partial_write_limit() {
             if data.len() > limit {
-                self.record("upload_bytes", key, false, Some("PartialWrite"), Some(data.len()));
-                return Err(anyhow!("Storage error: Upload interrupted after {} bytes", limit));
+                let truncated: Vec<u8> = data[..limit].to_vec();
+                let stored_len = truncated.len();
+                self.storage.lock().unwrap().insert(
+                    key.to_string(),
+                    StoredObject {
+                        data: truncated,
+                        checksum: None,
+                        created_at: std::time::Instant::now(),
+                        visible_after_ops: self.eventual_consistency_visible_after(),
+                    },
+                );
+                self.record("upload_bytes", key, false, Some("PartialWrite"), Some(stored_len));
+                return Err(anyhow!(
+                    "Storage error: Upload interrupted after {} bytes (partial object persisted)",
+                    limit
+                ));
             }
         }
 
@@ -249,12 +295,14 @@ impl StorageBackend for MockStorageBackend {
         }
 
         // Store
+        let visible_after = self.eventual_consistency_visible_after();
         self.storage.lock().unwrap().insert(
             key.to_string(),
             StoredObject {
                 data,
                 checksum: None,
                 created_at: std::time::Instant::now(),
+                visible_after_ops: visible_after,
             },
         );
 
@@ -278,8 +326,19 @@ impl StorageBackend for MockStorageBackend {
 
         if let Some(limit) = self.get_partial_write_limit() {
             if data.len() > limit {
-                self.record("upload_bytes_with_checksum", key, false, Some("PartialWrite"), Some(data.len()));
-                return Err(anyhow!("Storage error: Upload interrupted"));
+                let truncated: Vec<u8> = data[..limit].to_vec();
+                let stored_len = truncated.len();
+                self.storage.lock().unwrap().insert(
+                    key.to_string(),
+                    StoredObject {
+                        data: truncated,
+                        checksum: Some(checksum.to_string()),
+                        created_at: std::time::Instant::now(),
+                        visible_after_ops: self.eventual_consistency_visible_after(),
+                    },
+                );
+                self.record("upload_bytes_with_checksum", key, false, Some("PartialWrite"), Some(stored_len));
+                return Err(anyhow!("Storage error: Upload interrupted (partial object persisted)"));
             }
         }
 
@@ -293,12 +352,14 @@ impl StorageBackend for MockStorageBackend {
             Some(data.len()),
         );
 
+        let visible_after = self.eventual_consistency_visible_after();
         self.storage.lock().unwrap().insert(
             key.to_string(),
             StoredObject {
                 data,
                 checksum: Some(checksum.to_string()),
                 created_at: std::time::Instant::now(),
+                visible_after_ops: visible_after,
             },
         );
 
@@ -321,6 +382,9 @@ impl StorageBackend for MockStorageBackend {
     }
 
     async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
+        // Advance the deterministic clock first so eventual-consistency
+        // visibility progresses with each access.
+        self.next_op();
         if self.should_inject_error() {
             self.record("download_bytes", key, false, Some("RandomError"), None);
             return Err(anyhow!("Storage error: Service unavailable (injected)"));
@@ -351,11 +415,15 @@ impl StorageBackend for MockStorageBackend {
     }
 
     async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
+        self.next_op();
         if self.should_inject_error() {
             self.record("list_objects", prefix, false, Some("RandomError"), None);
             return Err(anyhow!("Storage error: Service unavailable (injected)"));
         }
 
+        // list-after-write staleness: an object not yet visible (per the
+        // deterministic EC gate) does NOT appear in the listing, exactly as a
+        // freshly-PUT object can be missing from an eventually-consistent LIST.
         let storage = self.storage.lock().unwrap();
         let mut keys: Vec<String> = storage
             .iter()
@@ -369,6 +437,7 @@ impl StorageBackend for MockStorageBackend {
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
+        self.next_op();
         if self.should_inject_error() {
             self.record("exists", key, false, Some("RandomError"), None);
             return Err(anyhow!("Storage error: Service unavailable (injected)"));
@@ -455,17 +524,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_partial_write() {
+    async fn test_partial_write_persists_truncated_prefix() {
         let config = MockStorageConfig::default()
             .with_fault(StorageFault::PartialWrite { at_bytes: 10 });
         let storage = MockStorageBackend::new(config);
 
-        // Small upload should succeed
+        // Small upload should succeed and round-trip whole.
         storage.upload_bytes("small", vec![1, 2, 3]).await.unwrap();
+        assert_eq!(storage.download_bytes("small").await.unwrap(), vec![1, 2, 3]);
 
-        // Large upload should fail
-        let result = storage.upload_bytes("large", vec![0u8; 100]).await;
-        assert!(result.is_err());
+        // Large upload fails BUT leaves the truncated prefix durable, so a
+        // reader observes a torn object — the fault is now actually exercisable.
+        let result = storage.upload_bytes("large", vec![7u8; 100]).await;
+        assert!(result.is_err(), "partial write must surface an error");
+        let torn = storage
+            .download_bytes("large")
+            .await
+            .expect("partial object must be persisted, not absent");
+        assert_eq!(torn.len(), 10, "only the truncated prefix persists");
+        assert!(torn.iter().all(|&b| b == 7));
+    }
+
+    #[tokio::test]
+    async fn test_eventual_consistency_is_deterministic_not_wallclock() {
+        // A freshly written object is invisible to read/list until enough
+        // operations elapse, and the pattern is reproducible under a seed.
+        let mk = || {
+            MockStorageBackend::new(
+                MockStorageConfig::default()
+                    .with_seed(7)
+                    .with_fault(StorageFault::EventualConsistency { delay_ms: 50 }),
+            )
+        };
+
+        let run = |s: MockStorageBackend| async move {
+            s.upload_bytes("k", vec![1, 2, 3]).await.unwrap();
+            // Drive reads until it becomes visible; record how many ops it took.
+            let mut ops = 0;
+            loop {
+                ops += 1;
+                if let Ok(d) = s.download_bytes("k").await {
+                    assert_eq!(d, vec![1, 2, 3]);
+                    break ops;
+                }
+                if ops > 100 {
+                    panic!("object never became visible");
+                }
+            }
+        };
+
+        let a = run(mk()).await;
+        let b = run(mk()).await;
+        assert_eq!(a, b, "EC visibility must be reproducible under a fixed seed");
+        assert!(a > 1, "object must be stale for at least one read");
+    }
+
+    #[tokio::test]
+    async fn test_list_after_write_staleness() {
+        let storage = MockStorageBackend::new(
+            MockStorageConfig::default()
+                .with_seed(3)
+                .with_fault(StorageFault::EventualConsistency { delay_ms: 100 }),
+        );
+        storage.upload_bytes("p/fresh", vec![1]).await.unwrap();
+        // Immediately after write the object may be missing from LIST.
+        let first = storage.list_objects("p/").await.unwrap();
+        // Drive the clock forward; eventually it appears.
+        let mut appeared = first.contains(&"p/fresh".to_string());
+        for _ in 0..50 {
+            if storage.list_objects("p/").await.unwrap().contains(&"p/fresh".to_string()) {
+                appeared = true;
+                break;
+            }
+        }
+        assert!(appeared, "object must eventually appear in LIST");
     }
 
     #[tokio::test]

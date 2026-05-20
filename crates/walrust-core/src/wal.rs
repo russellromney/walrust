@@ -61,7 +61,10 @@ pub const WAL_MAGIC_LE: u32 = 0x377F_0683;
 ///
 /// Returns the updated `(s0, s1)`.
 pub fn wal_checksum(seed: (u32, u32), data: &[u8], big_endian: bool) -> (u32, u32) {
-    debug_assert!(data.len() % 8 == 0, "checksum input must be 8-byte aligned");
+    debug_assert!(
+        data.len().is_multiple_of(8),
+        "checksum input must be 8-byte aligned"
+    );
     let (mut s0, mut s1) = seed;
     let mut i = 0;
     while i + 8 <= data.len() {
@@ -366,7 +369,14 @@ pub async fn read_frames_as_page_map_checked(
     };
 
     if start_pos >= file_size {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0, chain_seed));
+        return Ok((
+            std::collections::HashMap::new(),
+            0,
+            start_pos,
+            0,
+            0,
+            chain_seed,
+        ));
     }
 
     file.seek(SeekFrom::Start(start_pos)).await?;
@@ -375,7 +385,14 @@ pub async fn read_frames_as_page_map_checked(
     let full_frames = available / frame_size;
 
     if full_frames == 0 {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0, chain_seed));
+        return Ok((
+            std::collections::HashMap::new(),
+            0,
+            start_pos,
+            0,
+            0,
+            chain_seed,
+        ));
     }
 
     // Checksum chain. We can only validate when the header carries a checksum.
@@ -444,7 +461,14 @@ pub async fn read_frames_as_page_map_checked(
         .find(|(_, _, db_size)| *db_size > 0)
         .copied()
     else {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0, chain_seed));
+        return Ok((
+            std::collections::HashMap::new(),
+            0,
+            start_pos,
+            0,
+            0,
+            chain_seed,
+        ));
     };
     let committed_frames = committed_frames as usize;
     let commit_count = frame_headers[..committed_frames]
@@ -462,11 +486,7 @@ pub async fn read_frames_as_page_map_checked(
         _ => chain_seed,
     };
 
-    for (idx, (_, page_number, _)) in frame_headers
-        .into_iter()
-        .take(committed_frames)
-        .enumerate()
-    {
+    for (idx, (_, page_number, _)) in frame_headers.into_iter().take(committed_frames).enumerate() {
         let mut header_buf = [0u8; 24];
         file.read_exact(&mut header_buf).await?;
         file.read_exact(&mut page_data).await?;
@@ -915,7 +935,10 @@ mod tests {
         assert_eq!(commit_count, 1);
         assert_eq!(pages.len(), 1);
         assert!(pages.contains_key(&1));
-        assert!(!pages.contains_key(&2), "corrupt frame's page must be dropped");
+        assert!(
+            !pages.contains_key(&2),
+            "corrupt frame's page must be dropped"
+        );
 
         tokio::fs::remove_file(&path).await.ok();
     }
@@ -931,17 +954,13 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let page_size = 1024u32;
-        let mut wal = build_valid_wal(
-            page_size,
-            (0xDEAD_BEEF, 0xFEED_FACE),
-            &[(1, 1, 0x11)],
-        );
+        let mut wal = build_valid_wal(page_size, (0xDEAD_BEEF, 0xFEED_FACE), &[(1, 1, 0x11)]);
         // Append a hand-built "frame" with a non-zero db_size but a garbage
         // checksum (simulating a partially written commit frame).
         let mut torn = [0u8; 24];
         torn[0..4].copy_from_slice(&2u32.to_be_bytes()); // page 2
         torn[4..8].copy_from_slice(&2u32.to_be_bytes()); // db_size = 2 (looks like commit)
-        // checksum bytes left as a value that will not match
+                                                         // checksum bytes left as a value that will not match
         torn[16..20].copy_from_slice(&0xDEAD_C0DEu32.to_be_bytes());
         torn[20..24].copy_from_slice(&0xC0DE_DEADu32.to_be_bytes());
         wal.extend_from_slice(&torn);

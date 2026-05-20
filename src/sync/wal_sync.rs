@@ -153,20 +153,14 @@ pub(crate) async fn sync_wal_concurrent(
 
     // Read WAL frames with streaming dedup + SQLite checksum-chain validation
     // (a torn tail frame is rejected, not shipped as a commit).
-    let (page_map, frame_count, new_offset, final_db_size, _commit_count, new_chain): (
-        std::collections::HashMap<u32, Vec<u8>>,
-        usize,
-        u64,
-        u32,
-        u64,
-        Option<(u32, u32)>,
-    ) = wal::read_frames_as_page_map_checked(
-        &input.wal_path,
-        header.page_size,
-        wal_offset,
-        chain_seed,
-    )
-    .await?;
+    let (page_map, frame_count, new_offset, final_db_size, _commit_count, new_chain) =
+        wal::read_frames_as_page_map_checked(
+            &input.wal_path,
+            header.page_size,
+            wal_offset,
+            chain_seed,
+        )
+        .await?;
     if let Some(chain) = new_chain {
         wal_checksum_chain = Some(chain);
     }

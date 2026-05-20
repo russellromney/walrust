@@ -46,7 +46,10 @@ pub const WAL_MAGIC_LE: u32 = 0x377F_0683;
 /// `0x377f0683` => little-endian). The seed is the prior checksum: `(0, 0)` for
 /// the header, the header checksum for frame 1, then the prior frame thereafter.
 pub fn wal_checksum(seed: (u32, u32), data: &[u8], big_endian: bool) -> (u32, u32) {
-    debug_assert!(data.len() % 8 == 0, "checksum input must be 8-byte aligned");
+    debug_assert!(
+        data.len().is_multiple_of(8),
+        "checksum input must be 8-byte aligned"
+    );
     let (mut s0, mut s1) = seed;
     let mut i = 0;
     while i + 8 <= data.len() {
@@ -329,7 +332,14 @@ pub async fn read_frames_as_page_map_checked(
     };
 
     if start_pos >= file_size {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0, chain_seed));
+        return Ok((
+            std::collections::HashMap::new(),
+            0,
+            start_pos,
+            0,
+            0,
+            chain_seed,
+        ));
     }
 
     file.seek(SeekFrom::Start(start_pos)).await?;
@@ -338,7 +348,14 @@ pub async fn read_frames_as_page_map_checked(
     let full_frames = available / frame_size;
 
     if full_frames == 0 {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0, chain_seed));
+        return Ok((
+            std::collections::HashMap::new(),
+            0,
+            start_pos,
+            0,
+            0,
+            chain_seed,
+        ));
     }
 
     let (mut running, big_endian, validate) = match header_seed {
@@ -394,7 +411,14 @@ pub async fn read_frames_as_page_map_checked(
         .find(|(_, _, db_size)| *db_size > 0)
         .copied()
     else {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0, chain_seed));
+        return Ok((
+            std::collections::HashMap::new(),
+            0,
+            start_pos,
+            0,
+            0,
+            chain_seed,
+        ));
     };
     let committed_frames = committed_frames as usize;
     let commit_count = frame_headers[..committed_frames]

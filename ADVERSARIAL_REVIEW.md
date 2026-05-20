@@ -2,15 +2,14 @@
 
 A bug-hunt of the WAL shipping / shadow / LTX / sync / restore / DST surface.
 Each finding lists severity, location, the bug, the fix, and a Status:
-**Fixed** (implemented + build green) or **Documented** (verified real; fix
-specified for a focused follow-up). Line numbers are approximate against the
-reviewed revision; re-locate before editing.
+**Fixed** (implemented + build green + tested), **Partial** (safest correct
+fix landed; remainder deferred with a reason), or **Documented** (verified
+real; fix specified). Line numbers are approximate against the reviewed
+revision; re-locate before editing.
 
-This pass landed the three highest-severity crash / data-loss fixes. The
-remaining findings are documented with exact fixes; several are large
-(WAL checksum chain, generation-salt rollover, the DST harness) and warrant a
-dedicated change with their own focused verification rather than being bundled
-in unverified.
+Status: F1–F13, F15 are **Fixed**. F14 is **Partial** — the mock-storage fault
+fixes landed; the rest of the DST harness predates the current crate API and
+needs a dedicated resurrection (details under F14).
 
 ---
 
@@ -48,7 +47,7 @@ in unverified.
 
 ---
 
-## Documented (verified real; fix specified)
+## Hardened in the follow-up pass
 
 ### F2 — [High] WAL frame checksum chain is never validated → torn tail frame shipped — **Fixed**
 - `crates/walrust-core/src/wal.rs` (and `src/wal.rs`)
@@ -173,21 +172,44 @@ in unverified.
   (`generation > 0 || (min == 1 && max == 1)`) and routed `verify`,
   `discover_snapshots_from_s3`, and `discover_all_ltx_from_s3` through it.
 
-### F14 — [High-for-trust] DST harness does not exercise the faults it claims — **Documented**
-- `walrust-dst/src/mock_storage.rs`, `chaos.rs`, `invariants.rs`
-- `PartialWrite` stores nothing on overflow; `EventualConsistency` visibility is
-  wall-clock (non-deterministic); `list_objects` is always consistent;
-  `chaos_silent_corruption` never touches storage; `prop_recovery_under_failure`
-  passes vacuously when paths fail; `prop_point_in_time_restore` snapshots after
-  every insert so never replays an incremental chain.
-- **Fix:** store the truncated prefix on `PartialWrite`; gate EC visibility on
-  the seeded RNG; add a list-after-write staleness fault; add a
-  corruption-detected restore test; make recovery/PITR properties assert real
-  outcomes against an incremental chain.
+### F14 — [High-for-trust] DST harness does not exercise the faults it claims — **Partial**
+- `walrust-dst/src/mock_storage.rs` (+ `chaos.rs`, `invariants.rs`, `properties.rs`)
+- Fault-injection honesty fixes landed in `mock_storage.rs`:
+  - `PartialWrite` now persists the truncated prefix and then surfaces the
+    error, so a torn object is actually observable by readers (was: stored
+    nothing).
+  - `EventualConsistency` is now gated on a deterministic, seeded operation
+    counter (`visible_after_ops`) instead of wall-clock time, so read- and
+    list-after-write staleness is reproducible under a fixed seed.
+  - `list_objects` honours that same visibility gate, modelling
+    list-after-write staleness (was: always consistent).
+  - Added tests: truncated-prefix persistence, deterministic EC visibility,
+    and list-after-write staleness.
+- Not done (reason): the rest of the harness — `chaos.rs`, `invariants.rs`,
+  `properties.rs`, and `main.rs` — does not compile against the current crate.
+  It imports a removed `walrust::testable` module and the mock implements an
+  obsolete `StorageBackend` trait (`upload_bytes`/`download_bytes`/`bucket_name`)
+  rather than the current `put`/`get`/`list`/`delete`/`put_if_absent`/`put_if_match`.
+  The crate also is not a workspace member and fails a standalone build on a
+  `links = "sqlite3"` rusqlite version clash. Resurrecting the `testable` API and
+  porting the mock + property modules to the current trait is a dedicated change;
+  the `chaos_silent_corruption` / `prop_recovery_under_failure` /
+  `prop_point_in_time_restore` rewrites depend on that working harness and are
+  deferred. The mock-level fault fixes above are correct against the trait the
+  mock implements today.
 
 ---
 
 ## Test / build notes
 
-- `cargo build --workspace` green; the Fixed cluster compiles.
-- Live-network integration tests (S3-backed) are gated and not exercised here.
+- `cargo build` (the `walrust` bin + lib) is green for all Fixed findings.
+- `walrust` unit tests pass: WAL checksum golden vectors + torn-tail, the
+  restore/pull chain-break test, the cache durable-cursor / failed-gap / floor
+  tests, the shadow segment-width test, plus the pre-existing suites.
+  `crates/walrust-core` lib tests pass (run in that crate's directory).
+- Live-network integration tests (S3-backed) are gated and not exercised here;
+  `compact` / `replicate` discovery (F6) is verified by construction against the
+  litestream layout, not against a live bucket.
+- `walrust-dst` is not a workspace member and does not compile against the
+  current crate API (see F14); its mock-storage fault fixes are landed but the
+  harness as a whole needs a separate resurrection pass.

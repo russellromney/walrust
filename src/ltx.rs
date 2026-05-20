@@ -91,7 +91,9 @@ pub fn decode_to_db<R: Read>(reader: R, output_path: &Path) -> Result<DecodeResu
     let num_pages = header.commit.into_inner() as usize;
 
     if page_size == 0 {
-        return Err(anyhow!("LTX header page_size is zero (corrupt or malformed LTX)"));
+        return Err(anyhow!(
+            "LTX header page_size is zero (corrupt or malformed LTX)"
+        ));
     }
     // Bound the buffer allocation: `num_pages` and `page_size` come from an
     // untrusted header, so a crafted/corrupt LTX must not overflow usize or
