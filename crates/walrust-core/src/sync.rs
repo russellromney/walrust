@@ -510,6 +510,289 @@ async fn external_same_seq_changeset_checksum(
     Ok(Some(changeset.checksum))
 }
 
+// ============================================================================
+// Phase 004: TLM_DELTA envelope publish + discovery
+// ============================================================================
+
+use crate::external_delta::{self, DeltaPayloadV1};
+
+/// File extension for phase-004 delta envelope objects. Distinct from
+/// the phase-3 `.hadbp` so the two never collide in one prefix and a
+/// follower can tell them apart from a plain listing.
+const DELTA_ENVELOPE_EXT: &str = "tlmd";
+
+/// Key for a phase-004 TLM_DELTA envelope object.
+///
+/// Layout: `{prefix}{db_name}/{generation:04x}/{seq:016x}.tlmd`,
+/// matching hadb-changeset's key shape (zero-padded hex seq sorts
+/// lexicographically = numerically) but with the `.tlmd` extension.
+fn delta_envelope_key(prefix: &str, db_name: &str, seq: u64) -> String {
+    format!(
+        "{}{}/{:04x}/{:016x}.{}",
+        prefix, db_name, GENERATION_LIVE, seq, DELTA_ENVELOPE_EXT
+    )
+}
+
+/// Parse the seq out of a `.tlmd` envelope key. `None` for keys that
+/// aren't delta envelopes (wrong extension, malformed hex).
+fn parse_delta_envelope_seq(key: &str) -> Option<u64> {
+    let file = key.rsplit('/').next()?;
+    let hex = file.strip_suffix(&format!(".{DELTA_ENVELOPE_EXT}"))?;
+    u64::from_str_radix(hex, 16).ok()
+}
+
+/// Parameters the caller supplies to publish one phase-004 delta.
+///
+/// `epoch` + `writer_id` come from the caller's lease; followers use
+/// them to fence stale writers. `prev_envelope_checksum` is the chain
+/// link — the BLAKE3 of the prior object's envelope (the published
+/// base for the first delta after a base, or the prior delta
+/// otherwise). `end_page_count` is computed by walrust from the WAL
+/// commit, not supplied here.
+#[derive(Debug, Clone)]
+pub struct Phase4SyncParams {
+    pub epoch: u64,
+    pub writer_id: String,
+    pub prev_envelope_checksum: [u8; 32],
+}
+
+/// Result of publishing one delta envelope.
+#[derive(Debug, Clone)]
+pub struct DeltaPublishResult {
+    pub seq: u64,
+    /// BLAKE3 of the envelope just written — the caller threads this
+    /// back in as the next delta's `prev_envelope_checksum`.
+    pub envelope_checksum: [u8; 32],
+    /// Page count at the end of this delta (shrink/grow aware).
+    pub end_page_count: u64,
+    pub frame_count: u64,
+}
+
+/// A discovered phase-004 delta envelope (decoded, NOT chain-verified).
+///
+/// The integration layer (haqlite-turbolite, steps 4-6) does the
+/// candidate filter + equivocation detection + chain verification on
+/// these; walrust only provides raw, ordered, decoded access.
+#[derive(Debug, Clone)]
+pub struct DiscoveredDelta {
+    pub key: String,
+    pub seq: u64,
+    pub payload: DeltaPayloadV1,
+    /// BLAKE3 of this envelope's bytes — what the *next* delta's
+    /// `prev_checksum` must equal.
+    pub envelope_checksum: [u8; 32],
+}
+
+/// Publish a phase-004 delta envelope.
+///
+/// Enforces two writer-side invariants:
+/// - **Per-prefix monotonic seq**: the seq is in the object key, so a
+///   second writer at the same seq collides on the same key.
+/// - **No same-seq equivocation**: if `put_if_absent` fails, the
+///   existing object's bytes must match exactly. Identical bytes →
+///   idempotent re-publish (retry safety). Different bytes → bail; the
+///   caller published two different deltas at one seq, which would be
+///   fatal equivocation on the follower side.
+pub async fn publish_delta_envelope(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    payload: &DeltaPayloadV1,
+) -> Result<[u8; 32]> {
+    let envelope =
+        external_delta::encode(payload).map_err(|e| anyhow!("encode delta envelope: {e}"))?;
+    let envelope_checksum = external_delta::checksum(&envelope);
+    let key = delta_envelope_key(prefix, db_name, payload.seq);
+
+    let cas = storage.put_if_absent(&key, &envelope).await?;
+    if !cas.success {
+        let existing = get_existing_after_failed_cas(storage, &key)
+            .await?
+            .ok_or_else(|| {
+                anyhow!(
+                    "{db_name}: delta envelope seq {} vanished after CAS failure at {key}",
+                    payload.seq
+                )
+            })?;
+        if existing != envelope {
+            anyhow::bail!(
+                "{db_name}: delta envelope seq {} already exists with different bytes at {key}; \
+                 refusing overwrite (writer equivocation at the same seq)",
+                payload.seq
+            );
+        }
+        tracing::info!(
+            "{db_name}: delta envelope seq {} already present with identical bytes; idempotent re-publish",
+            payload.seq
+        );
+    }
+    Ok(envelope_checksum)
+}
+
+/// List phase-004 delta envelopes with `seq > after_seq`, ascending.
+///
+/// Decodes each envelope so callers can read the full tuple for
+/// filtering + chain verification. Skips non-`.tlmd` objects (e.g.
+/// phase-3 `.hadbp` leftovers). Does **not** filter by epoch/writer or
+/// verify the chain — that is the integration layer's responsibility.
+pub async fn list_delta_envelopes_after(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    after_seq: u64,
+) -> Result<Vec<DiscoveredDelta>> {
+    let dir_prefix = format!("{}{}/{:04x}/", prefix, db_name, GENERATION_LIVE);
+    let keys = storage.list(&dir_prefix, None).await?;
+
+    let mut out = Vec::new();
+    for key in keys {
+        let Some(seq) = parse_delta_envelope_seq(&key) else {
+            continue; // not a .tlmd object
+        };
+        if seq <= after_seq {
+            continue;
+        }
+        let Some(bytes) = storage.get(&key).await? else {
+            // Listed-then-vanished; skip. A real gap surfaces in chain verify.
+            continue;
+        };
+        let payload =
+            external_delta::decode(&bytes).map_err(|e| anyhow!("decode delta at {key}: {e}"))?;
+        let envelope_checksum = external_delta::checksum(&bytes);
+        out.push(DiscoveredDelta {
+            key,
+            seq,
+            payload,
+            envelope_checksum,
+        });
+    }
+    out.sort_by_key(|d| d.seq);
+    Ok(out)
+}
+
+/// Fetch and decode a single phase-004 delta envelope by seq.
+pub async fn fetch_delta_envelope(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    seq: u64,
+) -> Result<Option<DiscoveredDelta>> {
+    let key = delta_envelope_key(prefix, db_name, seq);
+    let Some(bytes) = storage.get(&key).await? else {
+        return Ok(None);
+    };
+    let payload =
+        external_delta::decode(&bytes).map_err(|e| anyhow!("decode delta at {key}: {e}"))?;
+    let envelope_checksum = external_delta::checksum(&bytes);
+    Ok(Some(DiscoveredDelta {
+        key,
+        seq,
+        payload,
+        envelope_checksum,
+    }))
+}
+
+/// Read pending WAL frames, encode them as an LTX changeset, wrap in a
+/// phase-004 TLM_DELTA envelope, and publish.
+///
+/// This is the phase-004 analogue of [`sync_wal_after_external_base`].
+/// Differences:
+/// - The delta object is a TLMD envelope, not a bare `.hadbp`.
+/// - Each delta carries `(epoch, writer_id, prev_checksum,
+///   end_page_count)`. `prev_checksum` is the BLAKE3 of the prior
+///   envelope (supplied by the caller via `params`); the others are
+///   stamped here.
+/// - `end_page_count` is the WAL commit's database size in pages
+///   (shrink/grow aware), read straight from the commit frame header.
+/// - No `state.json` is written — the replay cursor lives in the
+///   turbolite base manifest, per the phase-004 contract.
+///
+/// Returns `None` when there are no new frames to publish.
+pub async fn sync_wal_phase4(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+    params: &Phase4SyncParams,
+) -> Result<Option<DeltaPublishResult>> {
+    let header = match wal::read_header(&state.wal_path).await? {
+        Some(h) => h,
+        None => return Ok(None),
+    };
+
+    let current_size = wal::get_wal_size(&state.wal_path).await?;
+    if current_size < state.wal_offset {
+        tracing::info!(
+            "{}: WAL checkpoint detected, resetting offset (phase4)",
+            state.name
+        );
+        state.wal_offset = 0;
+        state.wal_generation += 1;
+    }
+
+    let (page_map, frame_count, new_offset, final_db_size, commit_count) =
+        wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
+
+    if page_map.is_empty() {
+        return Ok(None);
+    }
+
+    let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
+
+    let pre_checksum = match state.db_checksum {
+        Some(cs) => cs,
+        None => ltx::compute_checksum_from_file(&state.db_path)?,
+    };
+
+    let max_txid = change_counter_from_pages(&pages)
+        .filter(|&cc| cc > state.current_txid)
+        .unwrap_or(state.current_txid + commit_count.max(1));
+
+    let new_seq = state.current_seq + 1;
+
+    let (ltx_bytes, post_checksum) =
+        ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;
+
+    // `final_db_size` is the database size in pages after the last
+    // commit frame in this batch — the authoritative end_page_count.
+    let end_page_count = final_db_size as u64;
+
+    let payload = DeltaPayloadV1 {
+        seq: new_seq,
+        epoch: params.epoch,
+        writer_id: params.writer_id.clone(),
+        prev_checksum: params.prev_envelope_checksum.to_vec(),
+        end_page_count,
+        ltx_payload: ltx_bytes,
+    };
+
+    let envelope_checksum = publish_delta_envelope(storage, prefix, &state.name, &payload).await?;
+
+    tracing::info!(
+        "{}: published phase-4 delta seq {} ({} frames, epoch {}, writer {}, end_pages {}) -> {}",
+        state.name,
+        new_seq,
+        frame_count,
+        params.epoch,
+        params.writer_id,
+        end_page_count,
+        delta_envelope_key(prefix, &state.name, new_seq)
+    );
+
+    state.wal_offset = new_offset;
+    state.current_seq = new_seq;
+    state.current_txid = max_txid;
+    state.db_checksum = Some(post_checksum);
+    // Intentionally no save_state — phase-4 cursor lives in the
+    // turbolite base manifest, not a remote state.json sidecar.
+
+    Ok(Some(DeltaPublishResult {
+        seq: new_seq,
+        envelope_checksum,
+        end_page_count,
+        frame_count: frame_count as u64,
+    }))
+}
+
 /// Take a full database snapshot as HADBP changeset.
 pub async fn take_snapshot(
     storage: &dyn StorageBackend,
@@ -2342,5 +2625,219 @@ mod tests {
             ev.abort_calls, 1,
             "abort must run after a finalize failure to clean up"
         );
+    }
+
+    // ---- Phase 004 delta envelope publish + discovery ----
+
+    /// Mutable in-memory storage with real `put` / `put_if_absent`
+    /// semantics, for exercising the publish CAS path. The earlier
+    /// `TestStorage` no-ops those, which is fine for the chain-replay
+    /// tests but useless for the equivocation guard.
+    struct MutStorage {
+        objects: Arc<Mutex<StdHashMap<String, Vec<u8>>>>,
+    }
+
+    impl MutStorage {
+        fn new() -> Self {
+            Self {
+                objects: Arc::new(Mutex::new(StdHashMap::new())),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for MutStorage {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.objects.lock().unwrap().get(key).cloned())
+        }
+        async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), data.to_vec());
+            Ok(())
+        }
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+        async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+            let mut keys: Vec<String> = self
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .filter(|k| after.map(|a| k.as_str() > a).unwrap_or(true))
+                .cloned()
+                .collect();
+            keys.sort();
+            Ok(keys)
+        }
+        async fn exists(&self, key: &str) -> Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+        async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+            let mut objs = self.objects.lock().unwrap();
+            if objs.contains_key(key) {
+                return Ok(CasResult {
+                    success: false,
+                    etag: None,
+                });
+            }
+            objs.insert(key.to_string(), data.to_vec());
+            Ok(CasResult {
+                success: true,
+                etag: Some("mut".into()),
+            })
+        }
+        async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), data.to_vec());
+            Ok(CasResult {
+                success: true,
+                etag: Some("mut".into()),
+            })
+        }
+    }
+
+    fn delta_payload(seq: u64, epoch: u64, writer: &str, ltx: Vec<u8>) -> DeltaPayloadV1 {
+        DeltaPayloadV1 {
+            seq,
+            epoch,
+            writer_id: writer.to_string(),
+            prev_checksum: vec![0u8; 32],
+            end_page_count: 100 + seq,
+            ltx_payload: ltx,
+        }
+    }
+
+    #[tokio::test]
+    async fn publish_delta_envelope_is_idempotent_on_identical_bytes() {
+        let storage = MutStorage::new();
+        let payload = delta_payload(1, 5, "w", vec![1, 2, 3]);
+
+        let c1 = publish_delta_envelope(&storage, "wal/", "db", &payload)
+            .await
+            .expect("first publish");
+        // Re-publishing identical bytes is a no-op success (retry safety).
+        let c2 = publish_delta_envelope(&storage, "wal/", "db", &payload)
+            .await
+            .expect("idempotent re-publish");
+        assert_eq!(c1, c2, "idempotent re-publish yields the same checksum");
+    }
+
+    #[tokio::test]
+    async fn publish_delta_envelope_rejects_same_seq_divergent_bytes() {
+        let storage = MutStorage::new();
+        let first = delta_payload(7, 5, "w", vec![1, 1, 1]);
+        publish_delta_envelope(&storage, "wal/", "db", &first)
+            .await
+            .expect("first publish");
+
+        // Same seq, different content = equivocation. Must bail.
+        let divergent = delta_payload(7, 5, "w", vec![2, 2, 2]);
+        let err = publish_delta_envelope(&storage, "wal/", "db", &divergent)
+            .await
+            .expect_err("must refuse divergent same-seq publish");
+        assert!(
+            err.to_string().contains("equivocation"),
+            "error must name equivocation, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_then_list_after_filters_and_sorts() {
+        let storage = MutStorage::new();
+        // Publish out of order to prove the listing sorts.
+        for seq in [3u64, 1, 2] {
+            let p = delta_payload(seq, 5, "w", vec![seq as u8]);
+            publish_delta_envelope(&storage, "wal/", "db", &p)
+                .await
+                .expect("publish");
+        }
+
+        // after_seq = 1 -> only seq 2 and 3, ascending.
+        let found = list_delta_envelopes_after(&storage, "wal/", "db", 1)
+            .await
+            .expect("list");
+        let seqs: Vec<u64> = found.iter().map(|d| d.seq).collect();
+        assert_eq!(seqs, vec![2, 3]);
+        // Decoded payloads carry the stamped fields.
+        assert_eq!(found[0].payload.epoch, 5);
+        assert_eq!(found[0].payload.writer_id, "w");
+        // envelope_checksum matches a fresh hash of the re-encoded payload.
+        let reencoded = external_delta::encode(&found[0].payload).unwrap();
+        assert_eq!(found[0].envelope_checksum, external_delta::checksum(&reencoded));
+    }
+
+    #[tokio::test]
+    async fn list_skips_non_tlmd_objects() {
+        let storage = MutStorage::new();
+        // A phase-3 .hadbp object in the same directory must be ignored.
+        storage
+            .put("wal/db/0000/0000000000000001.hadbp", b"legacy-ltx")
+            .await
+            .unwrap();
+        let p = delta_payload(2, 5, "w", vec![9]);
+        publish_delta_envelope(&storage, "wal/", "db", &p)
+            .await
+            .expect("publish tlmd");
+
+        let found = list_delta_envelopes_after(&storage, "wal/", "db", 0)
+            .await
+            .expect("list");
+        let seqs: Vec<u64> = found.iter().map(|d| d.seq).collect();
+        assert_eq!(seqs, vec![2], "only the .tlmd object is returned");
+    }
+
+    #[tokio::test]
+    async fn fetch_delta_envelope_round_trips() {
+        let storage = MutStorage::new();
+        let p = delta_payload(42, 9, "leader", vec![7, 7, 7]);
+        publish_delta_envelope(&storage, "wal/", "db", &p)
+            .await
+            .expect("publish");
+
+        let fetched = fetch_delta_envelope(&storage, "wal/", "db", 42)
+            .await
+            .expect("fetch ok")
+            .expect("present");
+        assert_eq!(fetched.seq, 42);
+        assert_eq!(fetched.payload, p);
+
+        // Missing seq returns None, not an error.
+        let missing = fetch_delta_envelope(&storage, "wal/", "db", 999)
+            .await
+            .expect("fetch ok");
+        assert!(missing.is_none());
+    }
+
+    /// The chain link from one published envelope to the next is exactly
+    /// BLAKE3 of the prior envelope — the property the follower-side
+    /// chain verifier (step 5) walks. Proven here at the storage layer.
+    #[tokio::test]
+    async fn published_chain_links_by_blake3_of_prior_envelope() {
+        let storage = MutStorage::new();
+
+        let first = delta_payload(1, 5, "w", vec![1]);
+        let first_ck = publish_delta_envelope(&storage, "wal/", "db", &first)
+            .await
+            .expect("publish first");
+
+        let mut second = delta_payload(2, 5, "w", vec![2]);
+        second.prev_checksum = first_ck.to_vec();
+        publish_delta_envelope(&storage, "wal/", "db", &second)
+            .await
+            .expect("publish second");
+
+        let found = list_delta_envelopes_after(&storage, "wal/", "db", 0)
+            .await
+            .expect("list");
+        assert_eq!(found.len(), 2);
+        // second.prev_checksum == BLAKE3(first envelope) == first.envelope_checksum
+        assert_eq!(found[1].payload.prev_checksum, found[0].envelope_checksum.to_vec());
     }
 }
