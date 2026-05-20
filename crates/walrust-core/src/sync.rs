@@ -642,7 +642,19 @@ pub async fn list_delta_envelopes_after(
     after_seq: u64,
 ) -> Result<Vec<DiscoveredDelta>> {
     let dir_prefix = format!("{}{}/{:04x}/", prefix, db_name, GENERATION_LIVE);
-    let keys = storage.list(&dir_prefix, None).await?;
+
+    // Pass an `after` marker so the backend skips already-applied
+    // objects instead of returning the whole prefix every poll. Keys
+    // are `{dir}{seq:016x}.tlmd`; seq is zero-padded hex so lexical
+    // order == numeric order. The marker is the largest key at
+    // `after_seq` (its `.tlmd`), so `list` returns strictly-greater
+    // keys — i.e. seq > after_seq. `None` when after_seq is 0 (start
+    // from the beginning). The `seq <= after_seq` filter below is kept
+    // as a correctness backstop in case a backend's `after` is
+    // inclusive or ignores the marker.
+    let after_marker = (after_seq > 0)
+        .then(|| format!("{}{:016x}.{}", dir_prefix, after_seq, DELTA_ENVELOPE_EXT));
+    let keys = storage.list(&dir_prefix, after_marker.as_deref()).await?;
 
     let mut out = Vec::new();
     for key in keys {
@@ -754,6 +766,18 @@ pub async fn sync_wal_phase4(
 
     // `final_db_size` is the database size in pages after the last
     // commit frame in this batch — the authoritative end_page_count.
+    // Guard against a zero: page_map is non-empty here (we returned
+    // early otherwise), so a committed frame exists and its db-size
+    // field must be positive. A zero means a malformed/incomplete WAL
+    // commit; refuse to publish a delta that would truncate the
+    // follower's database to zero pages.
+    if final_db_size == 0 {
+        anyhow::bail!(
+            "{}: WAL commit produced end_page_count=0 with {} dirty pages; refusing to publish a truncating delta",
+            state.name,
+            pages.len()
+        );
+    }
     let end_page_count = final_db_size as u64;
 
     let payload = DeltaPayloadV1 {
