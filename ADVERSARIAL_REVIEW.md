@@ -50,29 +50,39 @@ in unverified.
 
 ## Documented (verified real; fix specified)
 
-### F2 — [High] WAL frame checksum chain is never validated → torn tail frame shipped — **Documented**
+### F2 — [High] WAL frame checksum chain is never validated → torn tail frame shipped — **Fixed**
 - `crates/walrust-core/src/wal.rs` (and `src/wal.rs`)
-- The production frame readers parse `page_number`/`db_size` but never verify
-  the SQLite WAL cumulative checksum; the commit boundary is "last frame with
-  `db_size > 0`". A torn tail frame whose 24-byte header carries a non-zero
-  `db_size` is accepted as a commit. The salt-aware `read_frames_with_metadata`
-  exists but is **only called from tests** (dead in production — confirmed by
-  the unused-function warning).
-- **Fix:** implement the SQLite WAL checksum (the s0/s1 Fibonacci-weighted sum
-  seeded from the two header salt words, summed big- or little-endian per the
-  WAL magic `0x377f0682`/`0x377f0683`, over the header words then each frame's
-  first 8 header bytes + page body), validate per frame, stop at the first
-  mismatch, and wire it onto the production read path. Exacting (a wrong
-  checksum rejects valid frames) — own change with golden-vector tests.
+- The production frame readers parsed `page_number`/`db_size` but never verified
+  the SQLite WAL cumulative checksum; the commit boundary was "last frame with
+  `db_size > 0`". A torn tail frame whose 24-byte header carried a non-zero
+  `db_size` was accepted as a commit.
+- **Fix:** implemented the SQLite WAL checksum (`wal_checksum` — the s0/s1
+  Fibonacci-weighted sum, big-/little-endian per the WAL magic
+  `0x377f0682`/`0x377f0683`), plus `validate_header_checksum` and
+  `verify_frame_checksum`. The production reader is now
+  `read_frames_as_page_map_checked`, which seeds the chain from the validated
+  header checksum (or the caller's running chain mid-WAL), verifies each frame,
+  and stops at the first mismatch — a torn tail frame with a bogus non-zero
+  `db_size` is no longer treated as a commit. The running chain is threaded
+  through `SyncState` / `DbState` so incremental reads keep validating.
+  Validation is skipped only for synthetic WALs with a zero header checksum
+  (never a real SQLite WAL), so existing hand-built test WALs still parse.
+  Golden-vector tests (`test_wal_checksum_golden_vector`) verify the algorithm
+  against hand-computed values; torn-tail tests prove valid frames are accepted
+  and corrupt ones rejected, in both crates.
 
-### F3 — [High] Generation rollover is size-only; in-place WAL reset (new salt) mis-attributed — **Documented**
-- `crates/walrust-core/src/sync.rs:322-331` (+ `~1119`, `~742`), `src/sync/wal_sync.rs:119-135`
-- Rollover is detected only by `current_size < wal_offset`. SQLite resets the
-  WAL in place with a new salt at same/larger size; that is missed, so
-  new-generation frames are read as a continuation of the old generation and
-  the new prefix is skipped.
-- **Fix:** thread the WAL header salt into `SyncState`; treat any salt change as
-  the rollover trigger via the salt-aware reader. Pairs with F2.
+### F3 — [High] Generation rollover is size-only; in-place WAL reset (new salt) mis-attributed — **Fixed**
+- `crates/walrust-core/src/sync.rs` (all three sync sites), `src/sync/wal_sync.rs`
+- Rollover was detected only by `current_size < wal_offset`. SQLite can reset
+  the WAL in place with a new salt at the same/larger size; that was missed, so
+  new-generation frames were read as a continuation of the old generation and
+  the new prefix was skipped.
+- **Fix:** threaded the WAL header salt into `SyncState` (`wal_salt`) and
+  `DbState`. All three core sync sites now call a shared `read_next_wal_batch`
+  helper that triggers rollover on a size shrink OR a salt change, resets the
+  offset/generation and re-seeds the checksum chain. The binary sync path does
+  the same two-pronged check inline. Salt is persisted in `state.json` and
+  tracked even on no-op syncs.
 
 ### F13 — [High] `restore_with_snapshot_source` / `pull_incremental` apply with no chain verification — **Documented**
 - `crates/walrust-core/src/sync.rs:966-1047`, `1225-1297`

@@ -147,6 +147,8 @@ pub async fn watch_with_independent_tasks(
                 wal_generation,
                 current_txid,
                 db_checksum,
+                wal_salt: None,
+                wal_checksum_chain: None,
             };
             match sync_wal_concurrent_with_retry(
                 Arc::clone(&client),
@@ -207,6 +209,8 @@ pub async fn watch_with_independent_tasks(
                 current_txid,
                 last_snapshot: None,
                 db_checksum,
+                wal_salt: None,
+                wal_checksum_chain: None,
             },
             trigger_state: TriggerState::default(),
             sync_config: db_config.sync.clone(),

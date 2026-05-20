@@ -89,6 +89,9 @@ pub(crate) async fn sync_wal_concurrent(
             new_db_checksum: Some(db_checksum_new.into_inner()),
             checkpoint_detected: false,
             new_wal_generation: input.wal_generation,
+            // Fresh post-snapshot WAL: re-seed salt/chain on the next read.
+            new_wal_salt: None,
+            new_wal_checksum_chain: None,
         });
     }
 
@@ -105,6 +108,8 @@ pub(crate) async fn sync_wal_concurrent(
                 new_db_checksum: input.db_checksum,
                 checkpoint_detected: false,
                 new_wal_generation: input.wal_generation,
+                new_wal_salt: input.wal_salt,
+                new_wal_checksum_chain: input.wal_checksum_chain,
             });
         }
     };
@@ -114,25 +119,57 @@ pub(crate) async fn sync_wal_concurrent(
     let mut wal_generation = input.wal_generation;
     let db_checksum = input.db_checksum;
     let mut checkpoint_detected = false;
+    let mut wal_salt = input.wal_salt;
+    let mut wal_checksum_chain = input.wal_checksum_chain;
 
-    // Check if WAL was reset (checkpoint happened)
+    // Two-pronged rollover detection: a size shrink is the classic checkpoint,
+    // but SQLite can also reset the WAL in place with a new salt at the same or
+    // larger size. Comparing the header salt against the tracked salt catches
+    // that case so the new generation's prefix is read from offset 0.
     let current_size = wal::get_wal_size(&input.wal_path).await?;
-    if current_size < wal_offset {
-        tracing::info!("{}: WAL checkpoint detected, resetting offset", input.name);
+    let current_salt = header.salt();
+    let size_rollover = current_size < wal_offset;
+    let salt_rollover = matches!(wal_salt, Some(prev) if prev != current_salt);
+    if size_rollover || salt_rollover {
+        tracing::info!(
+            "{}: WAL rollover detected (size_rollover={}, salt_rollover={}); resetting offset",
+            input.name,
+            size_rollover,
+            salt_rollover
+        );
         wal_offset = 0;
         wal_generation += 1;
         checkpoint_detected = true;
-        // Chain continues through checkpoints — no need to recompute from file
+        wal_checksum_chain = None;
     }
+    wal_salt = Some(current_salt);
 
-    // Read WAL frames with streaming dedup (peak memory = unique pages, not total frames)
-    let (page_map, frame_count, new_offset, final_db_size, _commit_count): (
+    // Seed the checked read with the running chain only when continuing mid-WAL.
+    let chain_seed = if wal_offset == 0 || wal_offset == wal::WAL_HEADER_SIZE {
+        None
+    } else {
+        wal_checksum_chain
+    };
+
+    // Read WAL frames with streaming dedup + SQLite checksum-chain validation
+    // (a torn tail frame is rejected, not shipped as a commit).
+    let (page_map, frame_count, new_offset, final_db_size, _commit_count, new_chain): (
         std::collections::HashMap<u32, Vec<u8>>,
         usize,
         u64,
         u32,
         u64,
-    ) = wal::read_frames_as_page_map(&input.wal_path, header.page_size, wal_offset).await?;
+        Option<(u32, u32)>,
+    ) = wal::read_frames_as_page_map_checked(
+        &input.wal_path,
+        header.page_size,
+        wal_offset,
+        chain_seed,
+    )
+    .await?;
+    if let Some(chain) = new_chain {
+        wal_checksum_chain = Some(chain);
+    }
 
     if page_map.is_empty() {
         return Ok(SyncOutput {
@@ -143,6 +180,8 @@ pub(crate) async fn sync_wal_concurrent(
             new_db_checksum: db_checksum,
             checkpoint_detected,
             new_wal_generation: wal_generation,
+            new_wal_salt: wal_salt,
+            new_wal_checksum_chain: wal_checksum_chain,
         });
     }
 
@@ -236,6 +275,8 @@ pub(crate) async fn sync_wal_concurrent(
         new_db_checksum: Some(post_checksum.into_inner()),
         checkpoint_detected,
         new_wal_generation: wal_generation,
+        new_wal_salt: wal_salt,
+        new_wal_checksum_chain: wal_checksum_chain,
     })
 }
 
@@ -330,6 +371,16 @@ pub(crate) async fn do_sync(
         )
         .await?
     };
+
+    // Track the WAL salt and running checksum chain even on a no-op sync so a
+    // later in-place WAL reset (new salt) is detected and the chain seed stays
+    // current for the next incremental read.
+    state.db_state.wal_salt = result.new_wal_salt;
+    state.db_state.wal_checksum_chain = result.new_wal_checksum_chain;
+    if result.checkpoint_detected {
+        state.db_state.wal_generation = result.new_wal_generation;
+        state.db_state.wal_offset = result.new_wal_offset;
+    }
 
     if result.frame_count > 0 {
         // Update state
@@ -449,6 +500,8 @@ pub(crate) async fn sync_wal_to_cache(
             new_db_checksum: Some(db_checksum_new.into_inner()),
             checkpoint_detected: false,
             new_wal_generation: input.wal_generation,
+            new_wal_salt: None,
+            new_wal_checksum_chain: None,
         });
     }
 
@@ -483,6 +536,8 @@ pub(crate) async fn sync_wal_to_cache(
             new_db_checksum: db_checksum,
             checkpoint_detected,
             new_wal_generation: wal_generation,
+            new_wal_salt: input.wal_salt,
+            new_wal_checksum_chain: input.wal_checksum_chain,
         });
     }
 
@@ -593,6 +648,8 @@ pub(crate) async fn sync_wal_to_cache(
         new_db_checksum: Some(post_checksum.into_inner()),
         checkpoint_detected,
         new_wal_generation: wal_generation,
+        new_wal_salt: input.wal_salt,
+        new_wal_checksum_chain: input.wal_checksum_chain,
     })
 }
 

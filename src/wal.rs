@@ -34,6 +34,109 @@ impl WalHeader {
 pub const WAL_HEADER_SIZE: u64 = 32;
 pub const FRAME_HEADER_SIZE: u64 = 24;
 
+/// WAL magic for the big-endian checksum variant.
+pub const WAL_MAGIC_BE: u32 = 0x377F_0682;
+/// WAL magic for the little-endian checksum variant.
+pub const WAL_MAGIC_LE: u32 = 0x377F_0683;
+
+/// SQLite WAL cumulative checksum (the s0/s1 Fibonacci-weighted sum).
+///
+/// `data` must be a whole number of 32-bit words. `big_endian` selects word
+/// interpretation, chosen by the WAL magic (`0x377f0682` => big-endian,
+/// `0x377f0683` => little-endian). The seed is the prior checksum: `(0, 0)` for
+/// the header, the header checksum for frame 1, then the prior frame thereafter.
+pub fn wal_checksum(seed: (u32, u32), data: &[u8], big_endian: bool) -> (u32, u32) {
+    debug_assert!(data.len() % 8 == 0, "checksum input must be 8-byte aligned");
+    let (mut s0, mut s1) = seed;
+    let mut i = 0;
+    while i + 8 <= data.len() {
+        let x0 = read_u32(&data[i..i + 4], big_endian);
+        let x1 = read_u32(&data[i + 4..i + 8], big_endian);
+        s0 = s0.wrapping_add(x0).wrapping_add(s1);
+        s1 = s1.wrapping_add(x1).wrapping_add(s0);
+        i += 8;
+    }
+    (s0, s1)
+}
+
+#[inline]
+fn read_u32(b: &[u8], big_endian: bool) -> u32 {
+    let arr = [b[0], b[1], b[2], b[3]];
+    if big_endian {
+        u32::from_be_bytes(arr)
+    } else {
+        u32::from_le_bytes(arr)
+    }
+}
+
+/// True if the WAL magic selects big-endian checksum word interpretation.
+fn magic_is_big_endian(magic: u32) -> bool {
+    magic & 1 == 0
+}
+
+/// Validate the 32-byte WAL header's own checksum (computed over the first 24
+/// bytes, seeded `(0, 0)`, stored big-endian in bytes 24..32). Returns the
+/// header checksum to seed the frame chain when valid; `None` for a synthetic
+/// header with a zero stored checksum (never a real SQLite WAL).
+pub fn validate_header_checksum(header_bytes: &[u8; 32], big_endian: bool) -> Option<(u32, u32)> {
+    let stored = (
+        u32::from_be_bytes([
+            header_bytes[24],
+            header_bytes[25],
+            header_bytes[26],
+            header_bytes[27],
+        ]),
+        u32::from_be_bytes([
+            header_bytes[28],
+            header_bytes[29],
+            header_bytes[30],
+            header_bytes[31],
+        ]),
+    );
+    if stored == (0, 0) {
+        return None;
+    }
+    let computed = wal_checksum((0, 0), &header_bytes[0..24], big_endian);
+    if computed == stored {
+        Some(stored)
+    } else {
+        None
+    }
+}
+
+/// Verify one frame against the running checksum chain. SQLite computes the
+/// frame checksum seeded with the prior cumulative checksum, over the first 8
+/// frame-header bytes then the page body, stored big-endian in frame header
+/// bytes 16..24. Returns the new running checksum, or `None` on mismatch.
+pub fn verify_frame_checksum(
+    seed: (u32, u32),
+    frame_header: &[u8; 24],
+    page_body: &[u8],
+    big_endian: bool,
+) -> Option<(u32, u32)> {
+    let stored = (
+        u32::from_be_bytes([
+            frame_header[16],
+            frame_header[17],
+            frame_header[18],
+            frame_header[19],
+        ]),
+        u32::from_be_bytes([
+            frame_header[20],
+            frame_header[21],
+            frame_header[22],
+            frame_header[23],
+        ]),
+    );
+    let mut running = wal_checksum(seed, &frame_header[0..8], big_endian);
+    running = wal_checksum(running, page_body, big_endian);
+    if running == stored {
+        Some(running)
+    } else {
+        None
+    }
+}
+
 /// Read WAL header
 pub async fn read_header(path: &Path) -> Result<Option<WalHeader>> {
     let mut file = match File::open(path).await {
@@ -166,6 +269,33 @@ pub async fn read_frames_as_page_map(
     u32,
     u64,
 )> {
+    let (map, frames, offset, db_size, commits, _chain) =
+        read_frames_as_page_map_checked(path, page_size, start_offset, None).await?;
+    Ok((map, frames, offset, db_size, commits))
+}
+
+/// Checksum-validating variant of [`read_frames_as_page_map`].
+///
+/// `chain_seed` is the running WAL checksum at `start_offset` (the last frame
+/// already consumed). Pass `None` when starting from the header. A frame whose
+/// stored checksum does not match the chain is treated as a torn / partial tail:
+/// reading stops at the last good committed frame, so a torn tail frame carrying
+/// a bogus non-zero db_size is never mistaken for a commit boundary. Validation
+/// is skipped only for synthetic WALs with a zero header checksum.
+#[allow(clippy::type_complexity)]
+pub async fn read_frames_as_page_map_checked(
+    path: &Path,
+    page_size: u32,
+    start_offset: u64,
+    chain_seed: Option<(u32, u32)>,
+) -> Result<(
+    std::collections::HashMap<u32, Vec<u8>>,
+    usize,
+    u64,
+    u32,
+    u64,
+    Option<(u32, u32)>,
+)> {
     let mut file = File::open(path).await?;
     let file_size = file.metadata().await?.len();
 
@@ -177,8 +307,29 @@ pub async fn read_frames_as_page_map(
         start_offset
     };
 
+    // Read the header to decide endianness and seed for the first frame.
+    let mut header_bytes = [0u8; WAL_HEADER_SIZE as usize];
+    let header_seed = if file_size >= WAL_HEADER_SIZE {
+        file.seek(SeekFrom::Start(0)).await?;
+        file.read_exact(&mut header_bytes).await?;
+        let magic = u32::from_be_bytes([
+            header_bytes[0],
+            header_bytes[1],
+            header_bytes[2],
+            header_bytes[3],
+        ]);
+        if magic == WAL_MAGIC_BE || magic == WAL_MAGIC_LE {
+            let be = magic_is_big_endian(magic);
+            validate_header_checksum(&header_bytes, be).map(|seed| (seed, be))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     if start_pos >= file_size {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0, chain_seed));
     }
 
     file.seek(SeekFrom::Start(start_pos)).await?;
@@ -187,23 +338,55 @@ pub async fn read_frames_as_page_map(
     let full_frames = available / frame_size;
 
     if full_frames == 0 {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0, chain_seed));
     }
 
+    let (mut running, big_endian, validate) = match header_seed {
+        Some((hdr_seed, be)) => {
+            let seed = if start_pos == WAL_HEADER_SIZE {
+                hdr_seed
+            } else {
+                chain_seed.unwrap_or((0, 0))
+            };
+            let validate = start_pos == WAL_HEADER_SIZE || chain_seed.is_some();
+            (seed, be, validate)
+        }
+        None => ((0, 0), true, false),
+    };
+
     let mut frame_headers = Vec::with_capacity(full_frames as usize);
+    let mut page_data = vec![0u8; page_size as usize];
+    let mut valid_frames: u64 = 0;
 
     for frame_index in 0..full_frames {
         let mut header_buf = [0u8; 24];
         file.read_exact(&mut header_buf).await?;
+        file.read_exact(&mut page_data).await?;
+
+        if validate {
+            match verify_frame_checksum(running, &header_buf, &page_data, big_endian) {
+                Some(next) => running = next,
+                None => {
+                    tracing::warn!(
+                        "WAL checksum mismatch at frame {} ({:?}); treating as torn tail",
+                        frame_index + 1,
+                        path
+                    );
+                    break;
+                }
+            }
+        }
 
         let page_number =
             u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
         let db_size =
             u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
 
-        file.seek(SeekFrom::Current(page_size as i64)).await?;
         frame_headers.push((frame_index + 1, page_number, db_size));
+        valid_frames += 1;
     }
+
+    frame_headers.truncate(valid_frames as usize);
 
     let Some((committed_frames, _, final_db_size)) = frame_headers
         .iter()
@@ -211,7 +394,7 @@ pub async fn read_frames_as_page_map(
         .find(|(_, _, db_size)| *db_size > 0)
         .copied()
     else {
-        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0));
+        return Ok((std::collections::HashMap::new(), 0, start_pos, 0, 0, chain_seed));
     };
     let committed_frames = committed_frames as usize;
     let commit_count = frame_headers[..committed_frames]
@@ -222,15 +405,26 @@ pub async fn read_frames_as_page_map(
     file.seek(SeekFrom::Start(start_pos)).await?;
 
     let mut page_map = std::collections::HashMap::new();
-    let mut page_data = vec![0u8; page_size as usize];
+    let mut out_chain = match header_seed {
+        Some((hdr_seed, _)) if start_pos == WAL_HEADER_SIZE => Some(hdr_seed),
+        _ => chain_seed,
+    };
 
     for (_, page_number, _) in frame_headers.into_iter().take(committed_frames) {
         let mut header_buf = [0u8; 24];
         file.read_exact(&mut header_buf).await?;
         file.read_exact(&mut page_data).await?;
 
+        if validate {
+            if let Some(seed) = out_chain {
+                if let Some(next) = verify_frame_checksum(seed, &header_buf, &page_data, big_endian)
+                {
+                    out_chain = Some(next);
+                }
+            }
+        }
+
         // Dedup in-place: overwrite previous version of the same page.
-        // We reuse the buffer and clone only the final committed version into the map.
         page_map.insert(page_number, page_data.clone());
     }
 
@@ -242,6 +436,7 @@ pub async fn read_frames_as_page_map(
         new_offset,
         final_db_size,
         commit_count,
+        out_chain,
     ))
 }
 
@@ -515,6 +710,98 @@ mod tests {
         header[4..8].copy_from_slice(&db_size.to_be_bytes());
         wal.extend_from_slice(&header);
         wal.extend(std::iter::repeat(fill).take(page_size as usize));
+    }
+
+    /// Build a real SQLite-format WAL with correct header + frame checksums.
+    fn build_valid_wal(page_size: u32, salt: (u32, u32), frames: &[(u32, u32, u8)]) -> Vec<u8> {
+        let magic = WAL_MAGIC_BE;
+        let be = magic_is_big_endian(magic);
+        let mut header = [0u8; 32];
+        header[0..4].copy_from_slice(&magic.to_be_bytes());
+        header[4..8].copy_from_slice(&3007000u32.to_be_bytes());
+        header[8..12].copy_from_slice(&page_size.to_be_bytes());
+        header[16..20].copy_from_slice(&salt.0.to_be_bytes());
+        header[20..24].copy_from_slice(&salt.1.to_be_bytes());
+        let hdr_cs = wal_checksum((0, 0), &header[0..24], be);
+        header[24..28].copy_from_slice(&hdr_cs.0.to_be_bytes());
+        header[28..32].copy_from_slice(&hdr_cs.1.to_be_bytes());
+
+        let mut wal = header.to_vec();
+        let mut running = hdr_cs;
+        for &(page_number, db_size, fill) in frames {
+            let mut fh = [0u8; 24];
+            fh[0..4].copy_from_slice(&page_number.to_be_bytes());
+            fh[4..8].copy_from_slice(&db_size.to_be_bytes());
+            fh[8..12].copy_from_slice(&salt.0.to_be_bytes());
+            fh[12..16].copy_from_slice(&salt.1.to_be_bytes());
+            let body = vec![fill; page_size as usize];
+            running = wal_checksum(running, &fh[0..8], be);
+            running = wal_checksum(running, &body, be);
+            fh[16..20].copy_from_slice(&running.0.to_be_bytes());
+            fh[20..24].copy_from_slice(&running.1.to_be_bytes());
+            wal.extend_from_slice(&fh);
+            wal.extend_from_slice(&body);
+        }
+        wal
+    }
+
+    #[test]
+    fn test_wal_checksum_golden_vector() {
+        // [1, 2] big-endian => (1, 3).
+        let data = [0u8, 0, 0, 1, 0, 0, 0, 2];
+        assert_eq!(wal_checksum((0, 0), &data, true), (1, 3));
+        // [1,2,3,4] => (7, 14).
+        let data2 = [0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4];
+        assert_eq!(wal_checksum((0, 0), &data2, true), (7, 14));
+    }
+
+    #[tokio::test]
+    async fn test_checked_reader_accepts_valid_and_rejects_torn() {
+        let page_size = 1024u32;
+        // Valid chain: two frames, second commits.
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-bin-chk-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let wal = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(1, 0, 0xAA), (2, 2, 0xBB)],
+        );
+        tokio::fs::write(&path, &wal).await.unwrap();
+        let (pages, frame_count, _o, db_size, _c, chain) =
+            read_frames_as_page_map_checked(&path, page_size, 0, None)
+                .await
+                .unwrap();
+        assert_eq!(frame_count, 2);
+        assert_eq!(db_size, 2);
+        assert_eq!(pages.len(), 2);
+        assert!(chain.is_some());
+        tokio::fs::remove_file(&path).await.ok();
+
+        // Torn tail: corrupt the second frame body so its checksum fails.
+        let path2 = PathBuf::from(format!(
+            "/tmp/walrust-bin-torn-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let mut wal2 = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(1, 1, 0xAA), (2, 2, 0xBB)],
+        );
+        let second_body = WAL_HEADER_SIZE as usize
+            + (FRAME_HEADER_SIZE as usize + page_size as usize)
+            + FRAME_HEADER_SIZE as usize;
+        wal2[second_body] ^= 0xFF;
+        tokio::fs::write(&path2, &wal2).await.unwrap();
+        let (pages2, fc2, _o2, db2, _c2, _ch2) =
+            read_frames_as_page_map_checked(&path2, page_size, 0, None)
+                .await
+                .unwrap();
+        assert_eq!(fc2, 1, "torn frame rejected");
+        assert_eq!(db2, 1);
+        assert!(!pages2.contains_key(&2));
+        tokio::fs::remove_file(&path2).await.ok();
     }
 
     #[tokio::test]

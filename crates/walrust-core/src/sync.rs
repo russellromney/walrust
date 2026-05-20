@@ -121,6 +121,14 @@ pub struct SyncState {
     pub last_snapshot: Option<chrono::DateTime<Utc>>,
     /// Current database checksum (chained HADBP checksum for incrementals, full-DB hash after snapshots)
     pub db_checksum: Option<u64>,
+    /// WAL header salt of the generation `wal_offset` indexes into. An in-place
+    /// WAL reset re-salts the header at the same/larger size; comparing salt
+    /// (not just size) catches that rollover so the new prefix is not skipped.
+    pub wal_salt: Option<(u32, u32)>,
+    /// Running SQLite WAL checksum `(s0, s1)` at `wal_offset`. Seeds per-frame
+    /// validation for the next incremental read so a torn tail frame is rejected
+    /// rather than shipped.
+    pub wal_checksum_chain: Option<(u32, u32)>,
 }
 
 /// Explicit base cursor for callers whose checkpoint/base state is owned by
@@ -158,6 +166,8 @@ impl SyncState {
             current_txid: 0,
             last_snapshot: None,
             db_checksum: None,
+            wal_salt: None,
+            wal_checksum_chain: None,
         })
     }
 
@@ -252,6 +262,8 @@ pub async fn save_state(
         "current_txid": state.current_txid,
         "db_checksum": state.db_checksum,
         "last_snapshot": state.last_snapshot,
+        "wal_salt": state.wal_salt,
+        "wal_checksum_chain": state.wal_checksum_chain,
     });
     let data = serde_json::to_vec(&state_json)?;
     storage.put(&state_key, &data).await
@@ -307,6 +319,81 @@ async fn get_existing_after_failed_cas(
     Ok(None)
 }
 
+/// Result of reading the next batch of WAL frames for a sync site.
+struct WalBatch {
+    page_map: std::collections::HashMap<u32, Vec<u8>>,
+    frame_count: usize,
+    new_offset: u64,
+    final_db_size: u32,
+    commit_count: u64,
+}
+
+/// Detect WAL rollover (by size *or* salt change) and read the next batch of
+/// committed frames with full SQLite checksum-chain validation.
+///
+/// Rollover detection is two-pronged: a shrink (`current_size <
+/// wal_offset`) is the classic checkpoint, but SQLite can also reset the WAL
+/// in place with a *new salt* at the same or larger size. Comparing the header
+/// salt against `state.wal_salt` catches that case so the new generation's
+/// prefix is read from offset 0 instead of being skipped as a continuation.
+///
+/// The running checksum chain (`state.wal_checksum_chain`) seeds per-frame
+/// validation; a torn tail frame is rejected (see [`wal::read_frames_as_page_map_checked`]).
+async fn read_next_wal_batch(
+    state: &mut SyncState,
+    header: &wal::WalHeader,
+) -> Result<WalBatch> {
+    let current_salt = header.salt();
+
+    // Two-pronged rollover detection: size shrink OR salt change.
+    let size = wal::get_wal_size(&state.wal_path).await?;
+    let size_rollover = size < state.wal_offset;
+    let salt_rollover = matches!(state.wal_salt, Some(prev) if prev != current_salt);
+
+    if size_rollover || salt_rollover {
+        tracing::info!(
+            "{}: WAL rollover detected (size_rollover={}, salt_rollover={}); resetting offset",
+            state.name,
+            size_rollover,
+            salt_rollover
+        );
+        state.wal_offset = 0;
+        state.wal_generation += 1;
+        // New generation: chain must re-seed from the new header.
+        state.wal_checksum_chain = None;
+    }
+    state.wal_salt = Some(current_salt);
+
+    // Seed the checked read with the running chain when continuing mid-WAL.
+    let chain_seed = if state.wal_offset == 0 || state.wal_offset == wal::WAL_HEADER_SIZE {
+        None
+    } else {
+        state.wal_checksum_chain
+    };
+
+    let (page_map, frame_count, new_offset, final_db_size, commit_count, new_chain) =
+        wal::read_frames_as_page_map_checked(
+            &state.wal_path,
+            header.page_size,
+            state.wal_offset,
+            chain_seed,
+        )
+        .await?;
+
+    // Advance the running chain only for the frames actually consumed.
+    if let Some(chain) = new_chain {
+        state.wal_checksum_chain = Some(chain);
+    }
+
+    Ok(WalBatch {
+        page_map,
+        frame_count,
+        new_offset,
+        final_db_size,
+        commit_count,
+    })
+}
+
 async fn sync_wal_with_sequence(
     storage: &dyn StorageBackend,
     prefix: &str,
@@ -318,17 +405,13 @@ async fn sync_wal_with_sequence(
         None => return Ok(0),
     };
 
-    // Check if WAL was reset (checkpoint happened)
-    let current_size = wal::get_wal_size(&state.wal_path).await?;
-    if current_size < state.wal_offset {
-        tracing::info!("{}: WAL checkpoint detected, resetting offset", state.name);
-        state.wal_offset = 0;
-        state.wal_generation += 1;
-        // Chain continues through checkpoints -- no need to recompute from file
-    }
-
-    let (page_map, frame_count, new_offset, _max_db_size, commit_count) =
-        wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
+    let WalBatch {
+        page_map,
+        frame_count,
+        new_offset,
+        final_db_size: _max_db_size,
+        commit_count,
+    } = read_next_wal_batch(state, &header).await?;
 
     if page_map.is_empty() {
         return Ok(0);
@@ -739,18 +822,13 @@ pub async fn sync_wal_phase4(
         None => return Ok(None),
     };
 
-    let current_size = wal::get_wal_size(&state.wal_path).await?;
-    if current_size < state.wal_offset {
-        tracing::info!(
-            "{}: WAL checkpoint detected, resetting offset (phase4)",
-            state.name
-        );
-        state.wal_offset = 0;
-        state.wal_generation += 1;
-    }
-
-    let (page_map, frame_count, new_offset, final_db_size, commit_count) =
-        wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
+    let WalBatch {
+        page_map,
+        frame_count,
+        new_offset,
+        final_db_size,
+        commit_count,
+    } = read_next_wal_batch(state, &header).await?;
 
     if page_map.is_empty() {
         return Ok(None);
@@ -1116,15 +1194,13 @@ pub async fn sync_wal_with_retry(
         None => return Ok(0),
     };
 
-    let current_size = wal::get_wal_size(&state.wal_path).await?;
-    if current_size < state.wal_offset {
-        tracing::info!("{}: WAL checkpoint detected, resetting offset", state.name);
-        state.wal_offset = 0;
-        state.wal_generation += 1;
-    }
-
-    let (page_map, frame_count, new_offset, _max_db_size, commit_count) =
-        wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
+    let WalBatch {
+        page_map,
+        frame_count,
+        new_offset,
+        final_db_size: _max_db_size,
+        commit_count,
+    } = read_next_wal_batch(state, &header).await?;
 
     if page_map.is_empty() {
         return Ok(0);
