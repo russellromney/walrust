@@ -178,6 +178,19 @@ pub async fn restore(
         }
     }
 
+    // The restore must reach exactly the requested target TXID. If it did
+    // not, a missing incremental or a gap left the chain short — fail
+    // loudly rather than reporting success at a lower TXID (which would be
+    // silent data loss). Per-file pre/post checksum chaining is verified in
+    // `apply_ltx_to_db`; this guards the end-of-chain "stopped early" case.
+    if final_txid != target_txid {
+        return Err(anyhow!(
+            "restore incomplete: reached TXID {final_txid} but target is {target_txid}. \
+             An incremental object is missing or the chain has a gap; the restored \
+             database does not reflect the requested point."
+        ));
+    }
+
     println!(
         "Restored {} to {} (TXID: {})",
         name,

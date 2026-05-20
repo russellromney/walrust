@@ -178,16 +178,22 @@ async fn replicate_poll(
     let mut applied = 0;
 
     for ltx_entry in incrementals {
-        // Verify continuity: min_txid should be current_txid + 1
-        // (or we accept any min_txid > current_txid for robustness)
+        // Verify continuity: min_txid must be exactly current_txid + 1.
         if ltx_entry.min_txid != *current_txid + 1 {
-            tracing::warn!(
-                "TXID gap: expected {}, got {}. Skipping to avoid corruption.",
+            // A gap means the local replica is behind or has diverged from
+            // the source chain. Skipping the gapped file (and every later
+            // one, which also fails this check) would silently stall the
+            // replica while reporting success. Fail loudly so the caller
+            // re-bootstraps from the latest snapshot instead of applying a
+            // non-contiguous chain.
+            return Err(anyhow!(
+                "TXID gap in incremental chain: expected {}, got {} (file {}). \
+                 Re-bootstrap from the latest snapshot is required; refusing to \
+                 skip frames.",
                 *current_txid + 1,
-                ltx_entry.min_txid
-            );
-            // Could trigger re-bootstrap here, but for now just warn and continue
-            continue;
+                ltx_entry.min_txid,
+                ltx_entry.filename
+            ));
         }
 
         let ltx_key = format!("{}{}/{}", prefix, db_name, ltx_entry.filename);
