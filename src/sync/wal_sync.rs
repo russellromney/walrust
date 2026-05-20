@@ -473,8 +473,10 @@ pub(crate) async fn sync_wal_to_cache(
 
         let ltx_size = ltx_buffer.len();
 
-        // Write to cache instead of S3
-        cache.write_ltx(new_txid, &ltx_buffer)?;
+        // Write to cache instead of S3. This is the full-DB snapshot base, so
+        // mark it as such — the cleanup floor must never evict the restore base
+        // or its incremental chain (F8).
+        cache.write_snapshot_ltx(new_txid, &ltx_buffer)?;
 
         // Notify uploader
         if let Err(e) = upload_tx.send(UploadMessage::Upload(new_txid)).await {
@@ -769,10 +771,24 @@ pub(crate) async fn take_snapshot(
         ltx_key
     );
 
-    // Update state
+    // Update state. The snapshot folded all WAL frames into the base, so the
+    // WAL cursor must be reset, not left pointing into the pre-checkpoint WAL
+    // (F11). A PASSIVE checkpoint may restart the WAL with a new salt; re-read
+    // the header so the next incremental read re-seeds the salt/checksum chain
+    // and reads from offset 0 of the new generation. The snapshot's db_checksum
+    // becomes the explicit hand-off base for the first incremental.
     state.current_txid = new_txid;
     state.last_snapshot = Some(timestamp);
     state.db_checksum = Some(db_checksum.into_inner());
+    state.wal_offset = 0;
+    state.wal_generation += 1;
+    state.wal_salt = wal::read_header(&state.wal_path)
+        .await
+        .ok()
+        .flatten()
+        .map(|h| h.salt());
+    // Force the next read to re-seed the running checksum from the (new) header.
+    state.wal_checksum_chain = None;
 
     Ok(())
 }

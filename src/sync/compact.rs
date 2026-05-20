@@ -6,7 +6,10 @@ use crate::ltx;
 use crate::retention::{self, RetentionPolicy, SnapshotEntry};
 use crate::s3::{self, create_client, parse_bucket};
 
-use super::manifest::{build_ltx_key, discover_snapshots_from_s3, discover_state_from_s3};
+use super::manifest::{
+    build_ltx_key, discover_snapshots_from_s3, discover_state_from_s3, list_generation_files,
+    GENERATION_LIVE,
+};
 use super::wal_sync::get_page_size;
 
 pub async fn compact(
@@ -47,7 +50,67 @@ pub async fn compact(
     }
 
     let now = Utc::now();
-    let plan = retention::analyze_retention(&snapshot_entries, policy, now);
+    let mut plan = retention::analyze_retention(&snapshot_entries, policy, now);
+
+    // Chain-reachability guard (F7): a restore replays the latest snapshot whose
+    // coverage is <= the target, then the live incrementals after it. Deleting a
+    // snapshot that a retained incremental chain still depends on would orphan
+    // that chain. Protect any snapshot needed as a base:
+    //   - the highest-TXID snapshot overall (the current restore base), and
+    //   - for the earliest retained live incremental, the latest snapshot at or
+    //     below its start.
+    // Such snapshots are pulled out of the delete set even if the time/size
+    // policy would drop them.
+    let live_incrementals =
+        list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE).await?;
+    let earliest_live_min = live_incrementals
+        .iter()
+        .filter(|(_, min, max)| !(*min == 1 && *max == 1)) // skip the gen-0 base
+        .map(|(_, min, _)| *min)
+        .min();
+
+    let max_snapshot_txid = snapshot_entries.iter().map(|e| e.sequence).max();
+    // The base needed for the live chain: the latest snapshot whose coverage
+    // ends at or before the earliest retained incremental's start.
+    let base_for_live_chain = earliest_live_min.and_then(|min| {
+        snapshot_entries
+            .iter()
+            .filter(|e| e.sequence < min)
+            .map(|e| e.sequence)
+            .max()
+            .or_else(|| {
+                // No snapshot strictly before the chain start: the lowest
+                // snapshot is the base.
+                snapshot_entries.iter().map(|e| e.sequence).min()
+            })
+    });
+
+    let protected: std::collections::HashSet<u64> = max_snapshot_txid
+        .into_iter()
+        .chain(base_for_live_chain)
+        .collect();
+
+    let before = plan.delete.len();
+    let rescued: Vec<_> = plan
+        .delete
+        .iter()
+        .filter(|e| protected.contains(&e.sequence))
+        .cloned()
+        .collect();
+    if !rescued.is_empty() {
+        plan.delete.retain(|e| !protected.contains(&e.sequence));
+        for e in &rescued {
+            if !plan.keep.iter().any(|k| k.sequence == e.sequence) {
+                plan.keep.push(e.clone());
+            }
+            // Don't count rescued snapshots' bytes as freed.
+            plan.bytes_freed = plan.bytes_freed.saturating_sub(e.size);
+        }
+        tracing::info!(
+            "Compaction: retained {} snapshot(s) as reachability base for the incremental chain (F7)",
+            before - plan.delete.len()
+        );
+    }
 
     // Print summary
     println!("Compaction plan for '{}':", name);

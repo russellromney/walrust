@@ -66,6 +66,11 @@ pub struct CacheEntry {
     pub uploaded: bool,
     /// When uploaded (if uploaded)
     pub uploaded_at: Option<DateTime<Utc>>,
+    /// True if this LTX is a full-DB snapshot (a restore base), not an
+    /// incremental. The cleanup floor never evicts the latest snapshot or the
+    /// incremental chain built on it (F8).
+    #[serde(default)]
+    pub is_snapshot: bool,
 }
 
 impl Default for CacheManifest {
@@ -217,10 +222,18 @@ impl LocalCache {
         Ok(())
     }
 
-    /// Write LTX to cache atomically
-    ///
-    /// Uses tempfile + rename for atomicity. Updates manifest with pending status.
+    /// Write an incremental LTX to cache atomically.
     pub fn write_ltx(&self, txid: u64, data: &[u8]) -> Result<()> {
+        self.write_ltx_inner(txid, data, false)
+    }
+
+    /// Write a snapshot (full-DB base) LTX to cache atomically. Marked so the
+    /// cleanup floor never evicts the latest restore base (F8).
+    pub fn write_snapshot_ltx(&self, txid: u64, data: &[u8]) -> Result<()> {
+        self.write_ltx_inner(txid, data, true)
+    }
+
+    fn write_ltx_inner(&self, txid: u64, data: &[u8], is_snapshot: bool) -> Result<()> {
         let ltx_path = self.ltx_path(txid);
         let tmp_path = ltx_path.with_extension("tmp");
 
@@ -244,6 +257,7 @@ impl LocalCache {
                 created_at: Utc::now(),
                 uploaded: false,
                 uploaded_at: None,
+                is_snapshot,
             },
         );
 
@@ -367,10 +381,30 @@ impl LocalCache {
         let mut to_delete_age = Vec::new();
         let mut to_delete_size = Vec::new();
 
+        // Floor: always keep the latest snapshot and the incremental chain built
+        // on top of it (every TXID >= that snapshot), regardless of age or size.
+        // Evicting these would leave nothing locally restorable (F8). The floor
+        // engages only when a snapshot base is present in the cache; with no
+        // base there is no safe restore point to anchor on, and the
+        // "never delete pending" guard below still protects un-uploaded data.
+        let floor_txid = manifest
+            .entries
+            .values()
+            .filter(|e| e.is_snapshot)
+            .map(|e| e.txid)
+            .max();
+
         // Collect files to delete based on retention duration
         for (txid, entry) in &manifest.entries {
             if !entry.uploaded {
                 continue; // Never delete pending uploads
+            }
+            // Protect the restore base + its chain (TXIDs at/after the latest
+            // snapshot).
+            if let Some(floor) = floor_txid {
+                if *txid >= floor {
+                    continue;
+                }
             }
 
             let age = now.signed_duration_since(entry.uploaded_at.unwrap_or(entry.created_at));
@@ -787,6 +821,51 @@ mod tests {
 
         assert!(stats.deleted_count >= 2);
         assert!(stats.remaining_bytes <= 250);
+    }
+
+    #[test]
+    fn test_cleanup_floor_keeps_snapshot_and_chain() {
+        // F8: aggressive cleanup must never evict the latest snapshot or the
+        // incrementals built on it, even with zero retention and zero max size.
+        let (cache, _temp) = setup_cache();
+
+        // Snapshot at TXID 1, incrementals at 2 and 3, all uploaded.
+        cache.write_snapshot_ltx(1, &vec![0u8; 1000]).unwrap();
+        cache.mark_uploaded(1).unwrap();
+        cache.write_ltx(2, &vec![0u8; 1000]).unwrap();
+        cache.mark_uploaded(2).unwrap();
+        cache.write_ltx(3, &vec![0u8; 1000]).unwrap();
+        cache.mark_uploaded(3).unwrap();
+
+        // Most aggressive cleanup possible.
+        cache.cleanup(chrono::Duration::zero(), 0).unwrap();
+
+        // The snapshot and its whole chain survive.
+        assert!(cache.ltx_path(1).exists(), "snapshot base must be kept");
+        assert!(cache.ltx_path(2).exists(), "chain TXID 2 must be kept");
+        assert!(cache.ltx_path(3).exists(), "chain TXID 3 must be kept");
+    }
+
+    #[test]
+    fn test_cleanup_floor_evicts_older_snapshot_chain() {
+        // A newer snapshot supersedes an older one; the older base + the
+        // incrementals between them are below the floor and may be evicted.
+        let (cache, _temp) = setup_cache();
+
+        cache.write_snapshot_ltx(1, &vec![0u8; 1000]).unwrap();
+        cache.mark_uploaded(1).unwrap();
+        cache.write_ltx(2, &vec![0u8; 1000]).unwrap();
+        cache.mark_uploaded(2).unwrap();
+        // Newer snapshot at TXID 3 — this is the floor now.
+        cache.write_snapshot_ltx(3, &vec![0u8; 1000]).unwrap();
+        cache.mark_uploaded(3).unwrap();
+
+        let stats = cache.cleanup(chrono::Duration::zero(), 0).unwrap();
+
+        // TXID 1 and 2 (below the latest snapshot) are evictable.
+        assert!(stats.deleted_count >= 1);
+        assert!(cache.ltx_path(3).exists(), "latest snapshot must be kept");
+        assert!(!cache.ltx_path(1).exists(), "superseded snapshot evicted");
     }
 
     #[test]

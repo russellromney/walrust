@@ -484,7 +484,7 @@ mod tests {
         index: u32,
         frames: &[(u32, u32, &[u8])],
     ) {
-        let filename = format!("{:016x}-{:08x}.wal", generation, index);
+        let filename = crate::shadow::format_segment_name(generation, index as u64);
         let path = dir.join(filename);
         let mut file = std::fs::File::create(&path).unwrap();
 

@@ -120,16 +120,23 @@ in unverified.
   contiguous cursor never advances past a failed or missing TXID. Tests cover
   out-of-order uploads, a failed-then-retried gap, and restart persistence.
 
-### F8 — [Med] Cache cleanup can evict the only restorable copy — **Documented**
-- `src/cache.rs:296-355`
-- **Fix:** floor that always retains the latest snapshot + its incremental chain
-  regardless of size; never evict an uploaded file whose S3 object is not
-  confirmed durable.
+### F8 — [Med] Cache cleanup can evict the only restorable copy — **Fixed**
+- `src/cache.rs`, `src/sync/wal_sync.rs`
+- **Fix:** added an `is_snapshot` flag to `CacheEntry` (set via the new
+  `write_snapshot_ltx`, used for the initial base in `wal_sync`). Cleanup now
+  computes a floor at the latest cached snapshot and never evicts it or any
+  TXID at/after it (the restore base + its incremental chain), regardless of
+  age or `max_cache_size`. Pending (not-yet-durable) uploads were already never
+  evicted. Tests cover keeping a snapshot+chain under aggressive cleanup and
+  evicting a superseded older base.
 
-### F7 — [Med] Compaction deletes snapshots with no chain-reachability protection — **Documented**
-- `src/sync/compact.rs:31-46,98-123`
-- **Fix:** before deleting a snapshot, ensure no retained incremental chains from
-  it, or delete dependents atomically and advance the floor.
+### F7 — [Med] Compaction deletes snapshots with no chain-reachability protection — **Fixed**
+- `src/sync/compact.rs`
+- **Fix:** before deleting, `compact` discovers the live incremental chain and
+  pulls any reachability base out of the delete set: the highest-TXID snapshot
+  (current restore base) and the latest snapshot at/below the earliest retained
+  incremental's start. Rescued snapshots move to `keep` and their bytes are not
+  counted as freed, so a retained incremental chain always has a base.
 
 ### F6 — [High] `compact` / `replicate` read a Manifest the watch path never writes — **Fixed**
 - `src/sync/compact.rs`, `src/sync/replicate.rs`, `src/sync/manifest.rs`, `src/s3.rs`
@@ -143,16 +150,22 @@ in unverified.
   no longer reading/writing a manifest. `replicate` discovers all LTX files
   (snapshots + incrementals) from the listing via `DiscoveredLtx`.
 
-### F11 — [Med] `take_snapshot` checkpoints but leaves the WAL cursor untouched — **Documented**
-- `src/sync/wal_sync.rs:664-721`
-- **Fix:** after `checkpoint_wal`, re-read the WAL header salt and reset
-  `wal_offset` / bump generation (ties into F3); make the snapshot→incremental
-  checksum hand-off explicit.
+### F11 — [Med] `take_snapshot` checkpoints but leaves the WAL cursor untouched — **Fixed**
+- `src/sync/wal_sync.rs`
+- **Fix:** after the snapshot folds all WAL frames into the base, `take_snapshot`
+  now resets `wal_offset` to 0, bumps `wal_generation`, re-reads the WAL header
+  salt into `wal_salt`, and clears `wal_checksum_chain` so the next incremental
+  read re-seeds from the new header (ties into F3). The snapshot's `db_checksum`
+  is the explicit hand-off base for the first incremental.
 
-### F12 — [Med] Shadow segment filename generation width mismatch — **Documented**
-- `src/shadow.rs:239-243` uses `{:08x}` (u32) while parser/encoder use `u64` and
-  tests use `{:016x}`; lexical order breaks for generation `> 0xFFFF_FFFF`.
-- **Fix:** one shared 16-hex-digit format constant in writer, parser, tests.
+### F12 — [Med] Shadow segment filename generation width mismatch — **Fixed**
+- `src/shadow.rs`, `src/sync/shadow.rs`
+- The writer used `{:08x}` (u32 width) for the generation while a test encoder
+  used `{:016x}`; lexical order broke for generation `> 0xFFFF_FFFF`.
+- **Fix:** one shared `format_segment_name(generation, index)` /
+  `SEGMENT_HEX_WIDTH = 16` used by the writer and the test encoder. Parsing was
+  already width-agnostic (`u64::from_str_radix`). A test asserts lexical ==
+  numeric order past `u32::MAX`.
 
 ### F15 — [Low] Three inconsistent "is this a snapshot" definitions — **Fixed**
 - `src/sync/manifest.rs`, `verify.rs`
