@@ -50,6 +50,15 @@ sha2 = "0.10"
 # Directory traversal (shadow WAL size)
 walkdir = "2"
 
+# Phase 004 canonical-CBOR delta envelope (TLM_DELTA). Same encoder +
+# hash primitive as turbolite's TLM1 manifest envelope so the chain
+# verifier on the follower side speaks one language across both
+# layers. See `external_delta.rs` for the wire format.
+ciborium = "0.2"
+blake3 = "1"
+serde_bytes = "0.11"
+thiserror = "1"
+
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"

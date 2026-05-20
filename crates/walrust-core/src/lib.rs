@@ -11,6 +11,7 @@
 //! The caller controls scheduling and lifecycle.
 
 pub mod errors;
+pub mod external_delta;
 pub mod ltx;
 pub mod replay_sink;
 pub mod replicator;
