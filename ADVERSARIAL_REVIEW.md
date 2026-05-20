@@ -131,13 +131,17 @@ in unverified.
 - **Fix:** before deleting a snapshot, ensure no retained incremental chains from
   it, or delete dependents atomically and advance the floor.
 
-### F6 — [High] `compact` / `replicate` read a Manifest the watch path never writes — **Documented**
-- `src/sync/compact.rs:24-29`, `src/sync/replicate.rs:118-121`
+### F6 — [High] `compact` / `replicate` read a Manifest the watch path never writes — **Fixed**
+- `src/sync/compact.rs`, `src/sync/replicate.rs`, `src/sync/manifest.rs`, `src/s3.rs`
 - The production watch path discovers by S3 listing and never writes the
-  `Manifest`, so `compact` is a silent no-op and `replicate` errors "No LTX
+  `Manifest`, so `compact` was a silent no-op and `replicate` errored "No LTX
   files found".
-- **Fix:** make both discover from S3 listing (mirror `verify.rs` /
-  `restore.rs`).
+- **Fix:** added `discover_snapshots_from_s3` and `discover_all_ltx_from_s3`
+  to the manifest module (mirroring how `verify` lists generations). `compact`
+  now discovers snapshots from the listing and HEADs each for size/last-modified
+  (`s3::head_object_meta`) to build retention entries, deleting full S3 keys and
+  no longer reading/writing a manifest. `replicate` discovers all LTX files
+  (snapshots + incrementals) from the listing via `DiscoveredLtx`.
 
 ### F11 — [Med] `take_snapshot` checkpoints but leaves the WAL cursor untouched — **Documented**
 - `src/sync/wal_sync.rs:664-721`
@@ -150,9 +154,11 @@ in unverified.
   tests use `{:016x}`; lexical order breaks for generation `> 0xFFFF_FFFF`.
 - **Fix:** one shared 16-hex-digit format constant in writer, parser, tests.
 
-### F15 — [Low] Three inconsistent "is this a snapshot" definitions — **Documented**
-- `src/sync/manifest.rs:104-163`, `verify.rs:208-210`
-- **Fix:** one shared `is_snapshot(generation, min_txid, max_txid)` helper.
+### F15 — [Low] Three inconsistent "is this a snapshot" definitions — **Fixed**
+- `src/sync/manifest.rs`, `verify.rs`
+- **Fix:** added one shared `is_snapshot(generation, min_txid, max_txid)` helper
+  (`generation > 0 || (min == 1 && max == 1)`) and routed `verify`,
+  `discover_snapshots_from_s3`, and `discover_all_ltx_from_s3` through it.
 
 ### F14 — [High-for-trust] DST harness does not exercise the faults it claims — **Documented**
 - `walrust-dst/src/mock_storage.rs`, `chaos.rs`, `invariants.rs`

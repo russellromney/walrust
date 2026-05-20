@@ -6,8 +6,8 @@ use std::time::Duration;
 use crate::ltx;
 use crate::s3::{self, create_client};
 
-use super::manifest::load_manifest;
-use super::types::{Manifest, ReplicaState};
+use super::manifest::{discover_all_ltx_from_s3, DiscoveredLtx};
+use super::types::ReplicaState;
 
 pub async fn replicate(
     source: &str,
@@ -114,19 +114,20 @@ async fn replicate_poll(
     local: &Path,
     current_txid: &mut u64,
 ) -> Result<usize> {
-    // Load manifest from S3
-    let manifest = load_manifest(client, bucket, prefix, db_name).await?;
+    // Discover LTX files from the S3 listing. The production watch path writes
+    // litestream-format objects and never a manifest.json, so reading a
+    // manifest made replicate fail with "No LTX files found" (F6).
+    let files = discover_all_ltx_from_s3(client, bucket, prefix, db_name).await?;
 
-    if manifest.files.is_empty() {
-        return Err(anyhow!("No LTX files found in manifest for '{}'", db_name));
+    if files.is_empty() {
+        return Err(anyhow!("No LTX files found in S3 for '{}'", db_name));
     }
 
     // If we haven't initialized yet (current_txid = 0), bootstrap from snapshot
     if *current_txid == 0 || !local.exists() {
-        bootstrap_replica(client, bucket, prefix, db_name, local, &manifest).await?;
+        bootstrap_replica(client, bucket, local, &files).await?;
         // After bootstrap, current_txid is the snapshot's max_txid
-        let snapshot = manifest
-            .files
+        let snapshot = files
             .iter()
             .filter(|f| f.is_snapshot)
             .max_by_key(|f| f.max_txid)
@@ -137,16 +138,14 @@ async fn replicate_poll(
     }
 
     // Find incremental LTX files we need to apply (min_txid > current_txid)
-    let mut incrementals: Vec<_> = manifest
-        .files
+    let mut incrementals: Vec<_> = files
         .iter()
         .filter(|f| !f.is_snapshot && f.min_txid > *current_txid)
         .collect();
 
     // Also check for newer snapshots that might be more efficient
     // (e.g., if we're very far behind, a snapshot might be faster)
-    let latest_snapshot = manifest
-        .files
+    let latest_snapshot = files
         .iter()
         .filter(|f| f.is_snapshot)
         .max_by_key(|f| f.max_txid);
@@ -161,7 +160,7 @@ async fn replicate_poll(
                 current_txid,
                 snap.max_txid
             );
-            bootstrap_replica(client, bucket, prefix, db_name, local, &manifest).await?;
+            bootstrap_replica(client, bucket, local, &files).await?;
             *current_txid = snap.max_txid;
             save_replica_state(local, *current_txid)?;
             return Ok(1);
@@ -192,14 +191,13 @@ async fn replicate_poll(
                  skip frames.",
                 *current_txid + 1,
                 ltx_entry.min_txid,
-                ltx_entry.filename
+                ltx_entry.key
             ));
         }
 
-        let ltx_key = format!("{}{}/{}", prefix, db_name, ltx_entry.filename);
-        tracing::debug!("Downloading incremental: {}", ltx_key);
+        tracing::debug!("Downloading incremental: {}", ltx_entry.key);
 
-        let ltx_data = s3::download_bytes(client, bucket, &ltx_key).await?;
+        let ltx_data = s3::download_bytes(client, bucket, &ltx_entry.key).await?;
         let cursor = std::io::Cursor::new(ltx_data);
 
         // Apply in-place (verifies checksum chain)
@@ -207,7 +205,7 @@ async fn replicate_poll(
 
         tracing::info!(
             "Applied {} (TXID {}-{}, checksum: {:016x})",
-            ltx_entry.filename,
+            ltx_entry.key,
             apply_result.header.min_txid.into_inner(),
             apply_result.header.max_txid.into_inner(),
             apply_result.post_apply_checksum.into_inner()
@@ -227,27 +225,23 @@ async fn replicate_poll(
 async fn bootstrap_replica(
     client: &aws_sdk_s3::Client,
     bucket: &str,
-    prefix: &str,
-    db_name: &str,
     local: &Path,
-    manifest: &Manifest,
+    files: &[DiscoveredLtx],
 ) -> Result<()> {
     // Find the best (latest) snapshot
-    let snapshot = manifest
-        .files
+    let snapshot = files
         .iter()
         .filter(|f| f.is_snapshot)
         .max_by_key(|f| f.max_txid)
-        .ok_or_else(|| anyhow!("No snapshot found for database '{}'", db_name))?;
+        .ok_or_else(|| anyhow!("No snapshot found for replica bootstrap"))?;
 
     tracing::info!(
         "Bootstrapping replica from snapshot: {} (TXID: {})",
-        snapshot.filename,
+        snapshot.key,
         snapshot.max_txid
     );
 
-    let ltx_key = format!("{}{}/{}", prefix, db_name, snapshot.filename);
-    let ltx_data = s3::download_bytes(client, bucket, &ltx_key).await?;
+    let ltx_data = s3::download_bytes(client, bucket, &snapshot.key).await?;
 
     // Decode snapshot to local database (verifies checksum)
     let cursor = std::io::Cursor::new(ltx_data);

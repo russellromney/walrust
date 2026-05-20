@@ -76,6 +76,53 @@ pub(crate) fn build_ltx_key(
 /// Live incrementals go to generation 0 (0000/)
 pub(crate) const GENERATION_LIVE: u64 = 0;
 
+/// Single definition of "is this LTX file a snapshot (full DB base)".
+///
+/// A snapshot is either any file in a snapshot generation (>= 1), or the
+/// initial base in the live generation, which litestream writes as the
+/// single-TXID file `min_txid == 1 && max_txid == 1`. Incrementals in the live
+/// generation always have `max_txid > 1` (or `min_txid > 1`). Centralizing this
+/// keeps `verify`, `compact`, `replicate`, and manifest construction from
+/// drifting apart (F15).
+pub(crate) fn is_snapshot(generation: u64, min_txid: u64, max_txid: u64) -> bool {
+    generation > 0 || (min_txid == 1 && max_txid == 1)
+}
+
+/// Discover all snapshot LTX files from S3 by listing (no manifest needed).
+///
+/// Returns `(key, generation, min_txid, max_txid)` for every file that
+/// [`is_snapshot`] classifies as a snapshot, across the live generation and all
+/// snapshot generations up to the highest present. Mirrors how `verify` and
+/// `restore` discover state so `compact` no longer depends on a `manifest.json`
+/// the production watch path never writes (F6).
+pub(crate) async fn discover_snapshots_from_s3(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    db_name: &str,
+) -> Result<Vec<(String, u64, u64, u64)>> {
+    let (_current_txid, max_gen, _) =
+        discover_state_from_s3(client, bucket, prefix, db_name).await?;
+
+    let mut snapshots = Vec::new();
+    // Live generation may hold the initial base (min==max==1).
+    for (key, min, max) in
+        list_generation_files(client, bucket, prefix, db_name, GENERATION_LIVE).await?
+    {
+        if is_snapshot(GENERATION_LIVE, min, max) {
+            snapshots.push((key, GENERATION_LIVE, min, max));
+        }
+    }
+    // Snapshot generations 1..=max_gen are snapshots by definition.
+    for gen in 1..=max_gen {
+        for (key, min, max) in list_generation_files(client, bucket, prefix, db_name, gen).await? {
+            snapshots.push((key, gen, min, max));
+        }
+    }
+    snapshots.sort_by_key(|(_, gen, _, max)| (*gen, *max));
+    Ok(snapshots)
+}
+
 /// Discover current state from S3 by listing files (no manifest needed)
 /// Returns (current_txid, latest_generation, last_checksum)
 pub(crate) async fn discover_state_from_s3(
@@ -185,6 +232,59 @@ pub(crate) async fn list_generation_files(
 
     // Sort by min_txid
     files.sort_by_key(|(_, min, _)| *min);
+    Ok(files)
+}
+
+/// A discovered LTX file from S3 listing.
+#[derive(Debug, Clone)]
+pub(crate) struct DiscoveredLtx {
+    /// Full S3 key.
+    pub key: String,
+    pub generation: u64,
+    pub min_txid: u64,
+    pub max_txid: u64,
+    pub is_snapshot: bool,
+}
+
+/// Discover every LTX file (snapshots + incrementals) for a database from the
+/// S3 listing, across the live generation and all snapshot generations.
+///
+/// This is the manifest-free discovery used by `replicate` so it works against
+/// the litestream-format layout the production watch path actually writes (F6).
+/// Returned entries carry the full S3 key and are sorted by `(min_txid, gen)`.
+pub(crate) async fn discover_all_ltx_from_s3(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    db_name: &str,
+) -> Result<Vec<DiscoveredLtx>> {
+    let (_current_txid, max_gen, _) =
+        discover_state_from_s3(client, bucket, prefix, db_name).await?;
+
+    let mut files = Vec::new();
+    for (key, min, max) in
+        list_generation_files(client, bucket, prefix, db_name, GENERATION_LIVE).await?
+    {
+        files.push(DiscoveredLtx {
+            key,
+            generation: GENERATION_LIVE,
+            min_txid: min,
+            max_txid: max,
+            is_snapshot: is_snapshot(GENERATION_LIVE, min, max),
+        });
+    }
+    for gen in 1..=max_gen {
+        for (key, min, max) in list_generation_files(client, bucket, prefix, db_name, gen).await? {
+            files.push(DiscoveredLtx {
+                key,
+                generation: gen,
+                min_txid: min,
+                max_txid: max,
+                is_snapshot: is_snapshot(gen, min, max),
+            });
+        }
+    }
+    files.sort_by_key(|f| (f.min_txid, f.generation));
     Ok(files)
 }
 

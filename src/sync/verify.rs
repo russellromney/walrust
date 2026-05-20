@@ -5,7 +5,7 @@ use crate::ltx;
 use crate::s3::{self, create_client, parse_bucket};
 
 use super::manifest::{
-    discover_state_from_s3, list_generation_files, load_manifest, GENERATION_LIVE,
+    discover_state_from_s3, is_snapshot, list_generation_files, load_manifest, GENERATION_LIVE,
 };
 
 /// Verification issue found during verify
@@ -207,7 +207,7 @@ pub async fn verify(
     // Check for snapshot existence (critical requirement)
     let has_snapshot = all_files
         .iter()
-        .any(|(_, gen, min, max)| *gen > 0 || (*min == 1 && *max == 1));
+        .any(|(_, gen, min, max)| is_snapshot(*gen, *min, *max));
 
     if !has_snapshot {
         println!("CRITICAL: No snapshot found (generation file)");
