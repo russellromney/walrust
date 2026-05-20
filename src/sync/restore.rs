@@ -8,6 +8,39 @@ use super::manifest::{
     discover_state_from_s3, find_latest_snapshot, list_generation_files, GENERATION_LIVE,
 };
 
+/// Decide whether a completed restore actually reached its requested target.
+///
+/// - **Restore-to-latest** (`explicit_pit == false`): `target_txid` is a real
+///   committed boundary discovered from S3, so the restore must reach it
+///   exactly. Falling short means a missing incremental / chain gap and is a
+///   hard error (otherwise we'd report success at a lower TXID — silent data
+///   loss).
+/// - **Explicit point-in-time** (`explicit_pit == true`): the requested TXID
+///   may fall *between* commit boundaries; landing at the latest commit
+///   `<= target` is correct point-in-time behavior, so an exact match is not
+///   required. We only reject an *overshoot* (the only available snapshot/chain
+///   is already past the requested point, so the result includes changes the
+///   caller did not ask for).
+fn restore_reached_target(final_txid: u64, target_txid: u64, explicit_pit: bool) -> Result<()> {
+    if explicit_pit {
+        if final_txid > target_txid {
+            return Err(anyhow!(
+                "restore overshot: reached TXID {final_txid} but point-in-time target is \
+                 {target_txid} (no snapshot/chain at or before the requested point)"
+            ));
+        }
+        return Ok(());
+    }
+    if final_txid != target_txid {
+        return Err(anyhow!(
+            "restore incomplete: reached TXID {final_txid} but latest is {target_txid}. \
+             An incremental object is missing or the chain has a gap; the restored \
+             database does not reflect the latest committed state."
+        ));
+    }
+    Ok(())
+}
+
 pub async fn restore(
     name: &str,
     output: &Path,
@@ -178,18 +211,13 @@ pub async fn restore(
         }
     }
 
-    // The restore must reach exactly the requested target TXID. If it did
-    // not, a missing incremental or a gap left the chain short — fail
-    // loudly rather than reporting success at a lower TXID (which would be
-    // silent data loss). Per-file pre/post checksum chaining is verified in
-    // `apply_ltx_to_db`; this guards the end-of-chain "stopped early" case.
-    if final_txid != target_txid {
-        return Err(anyhow!(
-            "restore incomplete: reached TXID {final_txid} but target is {target_txid}. \
-             An incremental object is missing or the chain has a gap; the restored \
-             database does not reflect the requested point."
-        ));
-    }
+    // The restore must reach the requested target. For "restore to latest"
+    // (no explicit point-in-time) `target_txid` is a real committed boundary
+    // discovered from S3, so falling short means a missing incremental / chain
+    // gap (silent data loss). For an explicit point-in-time the target may fall
+    // *between* commit boundaries, where landing at the latest commit <= target
+    // is correct — so we only reject an overshoot there.
+    restore_reached_target(final_txid, target_txid, point_in_time.is_some())?;
 
     println!(
         "Restored {} to {} (TXID: {})",
@@ -251,4 +279,36 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod restore_target_tests {
+    use super::restore_reached_target;
+
+    #[test]
+    fn latest_restore_must_reach_target_exactly() {
+        // Restore-to-latest: reaching the boundary is OK; falling short is a
+        // hard error (the regression this guards: silently reporting success
+        // at a lower TXID when an incremental is missing).
+        assert!(restore_reached_target(100, 100, false).is_ok());
+        assert!(restore_reached_target(99, 100, false).is_err());
+        assert!(restore_reached_target(0, 1, false).is_err());
+    }
+
+    #[test]
+    fn explicit_pit_between_boundaries_is_ok_not_an_error() {
+        // The regression fix: an explicit point-in-time target that falls
+        // between commit boundaries must land at the latest commit <= target
+        // WITHOUT erroring. Before the fix, the unconditional `final == target`
+        // check wrongly rejected this legitimate PITR.
+        assert!(restore_reached_target(95, 100, true).is_ok()); // landed at 95 for target 100
+        assert!(restore_reached_target(100, 100, true).is_ok()); // exact boundary
+    }
+
+    #[test]
+    fn explicit_pit_overshoot_is_rejected() {
+        // The only available snapshot/chain is past the requested point — the
+        // result would include changes the caller didn't ask for.
+        assert!(restore_reached_target(120, 100, true).is_err());
+    }
 }

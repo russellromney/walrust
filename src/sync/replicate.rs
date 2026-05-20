@@ -179,20 +179,38 @@ async fn replicate_poll(
     for ltx_entry in incrementals {
         // Verify continuity: min_txid must be exactly current_txid + 1.
         if ltx_entry.min_txid != *current_txid + 1 {
-            // A gap means the local replica is behind or has diverged from
-            // the source chain. Skipping the gapped file (and every later
-            // one, which also fails this check) would silently stall the
-            // replica while reporting success. Fail loudly so the caller
-            // re-bootstraps from the latest snapshot instead of applying a
-            // non-contiguous chain.
-            return Err(anyhow!(
-                "TXID gap in incremental chain: expected {}, got {} (file {}). \
-                 Re-bootstrap from the latest snapshot is required; refusing to \
-                 skip frames.",
+            // A gap in the incremental chain: the contiguous next file is
+            // missing (compacted away or lost) even though later files exist.
+            // Skipping would silently stall the replica; applying out of order
+            // would corrupt it. Self-heal by re-bootstrapping from the latest
+            // snapshot rather than erroring on every poll forever. (The
+            // earlier `incrementals.is_empty()` branch only covers the
+            // no-incrementals case; this covers a true mid-chain gap.)
+            let snap_max = files
+                .iter()
+                .filter(|f| f.is_snapshot)
+                .map(|f| f.max_txid)
+                .max()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "TXID gap in incremental chain (expected {}, got {} at {}) and no \
+                         snapshot is available to re-bootstrap from",
+                        *current_txid + 1,
+                        ltx_entry.min_txid,
+                        ltx_entry.key
+                    )
+                })?;
+            tracing::warn!(
+                "TXID gap in incremental chain: expected {}, got {}. Re-bootstrapping from \
+                 snapshot at TXID {}.",
                 *current_txid + 1,
                 ltx_entry.min_txid,
-                ltx_entry.key
-            ));
+                snap_max
+            );
+            bootstrap_replica(client, bucket, local, &files).await?;
+            *current_txid = snap_max;
+            save_replica_state(local, *current_txid)?;
+            return Ok(1);
         }
 
         tracing::debug!("Downloading incremental: {}", ltx_entry.key);
