@@ -1,47 +1,55 @@
-//! Mock storage backend for deterministic simulation testing
+//! Mock storage backend for deterministic simulation testing.
 //!
-//! Provides an in-memory implementation of StorageBackend with:
-//! - Fault injection (random errors, slow writes, corruption)
-//! - Deterministic behavior (seeded RNG for reproducible tests)
+//! In-memory implementation of the current `hadb_storage::StorageBackend`
+//! trait (get/put/delete/list/exists + the CAS primitives put_if_absent /
+//! put_if_match) with:
+//! - Fault injection (random errors, latency, partial writes, silent
+//!   corruption, eventual consistency)
+//! - Deterministic behavior (seeded RNG for reproducible runs)
 //! - Operation logging for test verification
+//!
+//! The fault model is honest: a partial write persists the truncated prefix
+//! then errors (a real torn object a reader can observe), corruption flips a
+//! real bit in stored bytes, and eventual consistency is gated on a seeded
+//! operation counter rather than wall-clock time so staleness is reproducible.
 
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
+use hadb_storage::{CasResult, StorageBackend};
 use rand::prelude::*;
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use hadb_storage::StorageBackend;
 
-/// Fault types that can be injected into storage operations
+/// Fault types that can be injected into storage operations.
 #[derive(Debug, Clone)]
 pub enum StorageFault {
-    /// Random internal server errors
-    /// `rate` is probability 0.0-1.0 of failure per operation
+    /// Random internal server errors. `rate` is probability 0.0-1.0 per op.
     RandomError { rate: f64 },
 
-    /// Artificial latency on operations
+    /// Artificial latency on operations.
     Latency { delay_ms: u64 },
 
-    /// Upload stops after `at_bytes` bytes (simulates network interruption)
+    /// A PUT stops after `at_bytes` bytes (network interruption). The truncated
+    /// prefix is persisted, then the call errors — a torn object a reader sees.
     PartialWrite { at_bytes: usize },
 
-    /// Silent data corruption with given probability
+    /// Silent data corruption with the given per-PUT probability.
     SilentCorruption { rate: f64 },
 
-    /// Object temporarily unavailable after write (eventual consistency)
+    /// Object temporarily unavailable after write (eventual consistency),
+    /// expressed as a deterministic op-count lag derived from `delay_ms`.
     EventualConsistency { delay_ms: u64 },
 }
 
-/// Configuration for the mock storage
+/// Configuration for the mock storage.
 #[derive(Debug, Clone)]
 pub struct MockStorageConfig {
-    /// Faults to inject
+    /// Faults to inject.
     pub faults: Vec<StorageFault>,
-    /// Seed for deterministic RNG
+    /// Seed for deterministic RNG.
     pub seed: u64,
-    /// Bucket name for logging
+    /// Bucket name for logging.
     pub bucket: String,
 }
 
@@ -74,7 +82,7 @@ impl MockStorageConfig {
     }
 }
 
-/// Record of a storage operation for test verification
+/// Record of a storage operation for test verification.
 #[derive(Debug, Clone)]
 pub struct OperationRecord {
     pub operation: String,
@@ -84,35 +92,36 @@ pub struct OperationRecord {
     pub data_size: Option<usize>,
 }
 
-/// Stored object with metadata
+/// Stored object with metadata.
 #[derive(Debug, Clone)]
 struct StoredObject {
     data: Vec<u8>,
-    checksum: Option<String>,
-    created_at: std::time::Instant,
+    etag: u64,
     /// Deterministic eventual-consistency gate: the global operation count at
     /// or after which this object becomes visible to reads/lists. `0` means
-    /// immediately visible (no EC fault configured). Derived from the seeded
-    /// RNG at write time so visibility is reproducible, not wall-clock.
+    /// immediately visible. Derived from the seeded RNG at write time so
+    /// visibility is reproducible, not wall-clock.
     visible_after_ops: u64,
 }
 
-/// Mock storage backend for testing
+/// Mock storage backend for testing.
 pub struct MockStorageBackend {
-    /// In-memory storage
+    /// In-memory storage.
     storage: Arc<Mutex<HashMap<String, StoredObject>>>,
-    /// Configuration
+    /// Configuration.
     config: MockStorageConfig,
-    /// Deterministic RNG
+    /// Deterministic RNG.
     rng: Arc<Mutex<StdRng>>,
-    /// Operation log
+    /// Operation log.
     operations: Arc<Mutex<Vec<OperationRecord>>>,
     /// Monotonic operation counter for deterministic eventual consistency.
     op_counter: Arc<Mutex<u64>>,
+    /// Monotonic etag source for CAS.
+    etag_counter: Arc<Mutex<u64>>,
 }
 
 impl MockStorageBackend {
-    /// Create a new mock storage backend
+    /// Create a new mock storage backend.
     pub fn new(config: MockStorageConfig) -> Self {
         let rng = StdRng::seed_from_u64(config.seed);
         Self {
@@ -121,6 +130,7 @@ impl MockStorageBackend {
             rng: Arc::new(Mutex::new(rng)),
             operations: Arc::new(Mutex::new(Vec::new())),
             op_counter: Arc::new(Mutex::new(0)),
+            etag_counter: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -136,15 +146,18 @@ impl MockStorageBackend {
         *self.op_counter.lock().unwrap()
     }
 
+    fn next_etag(&self) -> u64 {
+        let mut c = self.etag_counter.lock().unwrap();
+        *c += 1;
+        *c
+    }
+
     /// Compute the operation count at which a freshly written object becomes
-    /// visible, from the Ec config gated on the seeded RNG. Returns `0` (always
-    /// visible) when no EC fault is configured. The `delay_ms` is reinterpreted
-    /// deterministically as a small bounded number of operations.
+    /// visible, from the EC config gated on the seeded RNG. Returns `0` (always
+    /// visible) when no EC fault is configured.
     fn eventual_consistency_visible_after(&self) -> u64 {
         for fault in &self.config.faults {
             if let StorageFault::EventualConsistency { delay_ms } = fault {
-                // Map the configured delay onto a 1..=N op window, picked from
-                // the seeded RNG so the staleness is reproducible.
                 let max_lag = ((*delay_ms / 10).max(1)).min(16);
                 let mut rng = self.rng.lock().unwrap();
                 let lag = rng.gen_range(1..=max_lag);
@@ -154,12 +167,12 @@ impl MockStorageBackend {
         0
     }
 
-    /// Get all operation records
+    /// Get all operation records.
     pub fn get_operations(&self) -> Vec<OperationRecord> {
         self.operations.lock().unwrap().clone()
     }
 
-    /// Get error count
+    /// Count of failed operations recorded so far.
     pub fn error_count(&self) -> usize {
         self.operations
             .lock()
@@ -169,14 +182,31 @@ impl MockStorageBackend {
             .count()
     }
 
-    /// Clear all data and operations
+    /// Number of GET-style reads recorded so far.
+    pub fn get_operations_count(&self) -> usize {
+        self.operations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|op| op.operation == "get")
+            .count()
+    }
+
+    /// Clear all data and operation history.
     pub fn reset(&self) {
         self.storage.lock().unwrap().clear();
         self.operations.lock().unwrap().clear();
     }
 
-    /// Record an operation
-    fn record(&self, operation: &str, key: &str, success: bool, fault: Option<&str>, size: Option<usize>) {
+    /// Record an operation.
+    fn record(
+        &self,
+        operation: &str,
+        key: &str,
+        success: bool,
+        fault: Option<&str>,
+        size: Option<usize>,
+    ) {
         self.operations.lock().unwrap().push(OperationRecord {
             operation: operation.to_string(),
             key: key.to_string(),
@@ -186,7 +216,7 @@ impl MockStorageBackend {
         });
     }
 
-    /// Check if we should inject a random error
+    /// Decide whether to inject a random error this op.
     fn should_inject_error(&self) -> bool {
         for fault in &self.config.faults {
             if let StorageFault::RandomError { rate } = fault {
@@ -199,7 +229,7 @@ impl MockStorageBackend {
         false
     }
 
-    /// Get latency delay if configured
+    /// Latency delay if configured.
     fn get_latency(&self) -> Option<Duration> {
         for fault in &self.config.faults {
             if let StorageFault::Latency { delay_ms } = fault {
@@ -209,7 +239,7 @@ impl MockStorageBackend {
         None
     }
 
-    /// Get partial write limit if configured
+    /// Partial-write byte limit if configured.
     fn get_partial_write_limit(&self) -> Option<usize> {
         for fault in &self.config.faults {
             if let StorageFault::PartialWrite { at_bytes } = fault {
@@ -219,7 +249,7 @@ impl MockStorageBackend {
         None
     }
 
-    /// Apply corruption if configured
+    /// Apply corruption to a buffer if configured; returns whether it flipped.
     fn maybe_corrupt(&self, data: &mut [u8]) -> bool {
         for fault in &self.config.faults {
             if let StorageFault::SilentCorruption { rate } = fault {
@@ -235,49 +265,37 @@ impl MockStorageBackend {
         false
     }
 
-    /// Check if object is visible (deterministic eventual consistency).
-    ///
-    /// Visibility is gated on the global operation counter, not wall-clock
-    /// time: an object written with `visible_after_ops = N` is invisible to
-    /// reads/lists until the counter reaches `N`. This makes list-after-write
-    /// and read-after-write staleness reproducible under a fixed seed.
+    /// Visibility under the deterministic eventual-consistency gate.
     fn is_visible(&self, obj: &StoredObject) -> bool {
         obj.visible_after_ops == 0 || self.current_op() >= obj.visible_after_ops
     }
-}
 
-#[async_trait]
-impl StorageBackend for MockStorageBackend {
-    async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()> {
-        // Check for random error
-        if self.should_inject_error() {
-            self.record("upload_bytes", key, false, Some("RandomError"), Some(data.len()));
-            return Err(anyhow!("Storage error: Service unavailable (injected)"));
-        }
-
-        // Apply latency
+    /// Shared write path for `put`/`put_if_*` after the precondition passes.
+    /// Applies latency, partial-write, and corruption faults, then stores.
+    /// Returns the new etag on success, or an error (after persisting the torn
+    /// prefix) on a partial write.
+    async fn write_object(&self, op: &str, key: &str, data: &[u8]) -> Result<u64> {
         if let Some(delay) = self.get_latency() {
             tokio::time::sleep(delay).await;
         }
 
-        // Check partial write: a real interrupted PUT leaves the truncated
-        // prefix durable (the object exists but is short / corrupt), then
-        // surfaces the error. Storing nothing made this fault untestable —
-        // downstream readers never saw the torn object.
+        let visible_after = self.eventual_consistency_visible_after();
+        let etag = self.next_etag();
+
+        // Partial write: persist the truncated prefix, then error.
         if let Some(limit) = self.get_partial_write_limit() {
             if data.len() > limit {
-                let truncated: Vec<u8> = data[..limit].to_vec();
+                let truncated = data[..limit].to_vec();
                 let stored_len = truncated.len();
                 self.storage.lock().unwrap().insert(
                     key.to_string(),
                     StoredObject {
                         data: truncated,
-                        checksum: None,
-                        created_at: std::time::Instant::now(),
-                        visible_after_ops: self.eventual_consistency_visible_after(),
+                        etag,
+                        visible_after_ops: visible_after,
                     },
                 );
-                self.record("upload_bytes", key, false, Some("PartialWrite"), Some(stored_len));
+                self.record(op, key, false, Some("PartialWrite"), Some(stored_len));
                 return Err(anyhow!(
                     "Storage error: Upload interrupted after {} bytes (partial object persisted)",
                     limit
@@ -285,154 +303,102 @@ impl StorageBackend for MockStorageBackend {
             }
         }
 
-        // Apply corruption
-        let mut data = data;
-        let corrupted = self.maybe_corrupt(&mut data);
-        if corrupted {
-            self.record("upload_bytes", key, true, Some("SilentCorruption"), Some(data.len()));
-        } else {
-            self.record("upload_bytes", key, true, None, Some(data.len()));
-        }
-
-        // Store
-        let visible_after = self.eventual_consistency_visible_after();
+        let mut bytes = data.to_vec();
+        let corrupted = self.maybe_corrupt(&mut bytes);
+        let len = bytes.len();
         self.storage.lock().unwrap().insert(
             key.to_string(),
             StoredObject {
-                data,
-                checksum: None,
-                created_at: std::time::Instant::now(),
+                data: bytes,
+                etag,
                 visible_after_ops: visible_after,
             },
         );
-
-        Ok(())
-    }
-
-    async fn upload_bytes_with_checksum(
-        &self,
-        key: &str,
-        data: Vec<u8>,
-        checksum: &str,
-    ) -> Result<()> {
-        if self.should_inject_error() {
-            self.record("upload_bytes_with_checksum", key, false, Some("RandomError"), Some(data.len()));
-            return Err(anyhow!("Storage error: Service unavailable (injected)"));
-        }
-
-        if let Some(delay) = self.get_latency() {
-            tokio::time::sleep(delay).await;
-        }
-
-        if let Some(limit) = self.get_partial_write_limit() {
-            if data.len() > limit {
-                let truncated: Vec<u8> = data[..limit].to_vec();
-                let stored_len = truncated.len();
-                self.storage.lock().unwrap().insert(
-                    key.to_string(),
-                    StoredObject {
-                        data: truncated,
-                        checksum: Some(checksum.to_string()),
-                        created_at: std::time::Instant::now(),
-                        visible_after_ops: self.eventual_consistency_visible_after(),
-                    },
-                );
-                self.record("upload_bytes_with_checksum", key, false, Some("PartialWrite"), Some(stored_len));
-                return Err(anyhow!("Storage error: Upload interrupted (partial object persisted)"));
-            }
-        }
-
-        let mut data = data;
-        let corrupted = self.maybe_corrupt(&mut data);
         self.record(
-            "upload_bytes_with_checksum",
+            op,
             key,
             true,
             if corrupted { Some("SilentCorruption") } else { None },
-            Some(data.len()),
+            Some(len),
         );
-
-        let visible_after = self.eventual_consistency_visible_after();
-        self.storage.lock().unwrap().insert(
-            key.to_string(),
-            StoredObject {
-                data,
-                checksum: Some(checksum.to_string()),
-                created_at: std::time::Instant::now(),
-                visible_after_ops: visible_after,
-            },
-        );
-
-        Ok(())
+        Ok(etag)
     }
+}
 
-    async fn upload_file(&self, key: &str, path: &Path) -> Result<()> {
-        let data = tokio::fs::read(path).await?;
-        self.upload_bytes(key, data).await
-    }
-
-    async fn upload_file_with_checksum(
-        &self,
-        key: &str,
-        path: &Path,
-        checksum: &str,
-    ) -> Result<()> {
-        let data = tokio::fs::read(path).await?;
-        self.upload_bytes_with_checksum(key, data, checksum).await
-    }
-
-    async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
-        // Advance the deterministic clock first so eventual-consistency
-        // visibility progresses with each access.
+#[async_trait]
+impl StorageBackend for MockStorageBackend {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        // Advance the deterministic clock first so EC visibility progresses.
         self.next_op();
         if self.should_inject_error() {
-            self.record("download_bytes", key, false, Some("RandomError"), None);
+            self.record("get", key, false, Some("RandomError"), None);
             return Err(anyhow!("Storage error: Service unavailable (injected)"));
         }
 
         let storage = self.storage.lock().unwrap();
         match storage.get(key) {
-            Some(obj) => {
-                if !self.is_visible(obj) {
-                    drop(storage);
-                    self.record("download_bytes", key, false, Some("EventualConsistency"), None);
-                    return Err(anyhow!("Storage error: Object not found (eventual consistency)"));
-                }
-                self.record("download_bytes", key, true, None, Some(obj.data.len()));
-                Ok(obj.data.clone())
+            Some(obj) if self.is_visible(obj) => {
+                let len = obj.data.len();
+                let data = obj.data.clone();
+                drop(storage);
+                self.record("get", key, true, None, Some(len));
+                Ok(Some(data))
+            }
+            Some(_) => {
+                drop(storage);
+                // Not yet visible under eventual consistency: behaves as absent.
+                self.record("get", key, false, Some("EventualConsistency"), None);
+                Ok(None)
             }
             None => {
-                self.record("download_bytes", key, false, None, None);
-                Err(anyhow!("Storage error: Object not found: {}", key))
+                drop(storage);
+                self.record("get", key, true, None, None);
+                Ok(None)
             }
         }
     }
 
-    async fn download_file(&self, key: &str, path: &Path) -> Result<()> {
-        let data = self.download_bytes(key).await?;
-        tokio::fs::write(path, data).await?;
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.next_op();
+        if self.should_inject_error() {
+            self.record("put", key, false, Some("RandomError"), Some(data.len()));
+            return Err(anyhow!("Storage error: Service unavailable (injected)"));
+        }
+        self.write_object("put", key, data).await?;
         Ok(())
     }
 
-    async fn list_objects(&self, prefix: &str) -> Result<Vec<String>> {
+    async fn delete(&self, key: &str) -> Result<()> {
         self.next_op();
         if self.should_inject_error() {
-            self.record("list_objects", prefix, false, Some("RandomError"), None);
+            self.record("delete", key, false, Some("RandomError"), None);
+            return Err(anyhow!("Storage error: Service unavailable (injected)"));
+        }
+        self.storage.lock().unwrap().remove(key);
+        self.record("delete", key, true, None, None);
+        Ok(())
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.next_op();
+        if self.should_inject_error() {
+            self.record("list", prefix, false, Some("RandomError"), None);
             return Err(anyhow!("Storage error: Service unavailable (injected)"));
         }
 
-        // list-after-write staleness: an object not yet visible (per the
-        // deterministic EC gate) does NOT appear in the listing, exactly as a
-        // freshly-PUT object can be missing from an eventually-consistent LIST.
+        // list-after-write staleness: an object not yet visible under the EC
+        // gate does NOT appear, exactly as a fresh PUT can be missing from LIST.
         let storage = self.storage.lock().unwrap();
         let mut keys: Vec<String> = storage
             .iter()
             .filter(|(k, obj)| k.starts_with(prefix) && self.is_visible(obj))
             .map(|(k, _)| k.clone())
+            .filter(|k| after.map(|a| k.as_str() > a).unwrap_or(true))
             .collect();
         keys.sort();
+        drop(storage);
 
-        self.record("list_objects", prefix, true, None, None);
+        self.record("list", prefix, true, None, None);
         Ok(keys)
     }
 
@@ -442,57 +408,68 @@ impl StorageBackend for MockStorageBackend {
             self.record("exists", key, false, Some("RandomError"), None);
             return Err(anyhow!("Storage error: Service unavailable (injected)"));
         }
-
         let storage = self.storage.lock().unwrap();
-        let exists = storage.get(key).map(|obj| self.is_visible(obj)).unwrap_or(false);
-
+        let exists = storage
+            .get(key)
+            .map(|obj| self.is_visible(obj))
+            .unwrap_or(false);
+        drop(storage);
         self.record("exists", key, true, None, None);
         Ok(exists)
     }
 
-    async fn get_checksum(&self, key: &str) -> Result<Option<String>> {
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.next_op();
         if self.should_inject_error() {
-            self.record("get_checksum", key, false, Some("RandomError"), None);
+            self.record("put_if_absent", key, false, Some("RandomError"), None);
             return Err(anyhow!("Storage error: Service unavailable (injected)"));
         }
-
-        let storage = self.storage.lock().unwrap();
-        let checksum = storage.get(key).and_then(|obj| obj.checksum.clone());
-
-        self.record("get_checksum", key, true, None, None);
-        Ok(checksum)
-    }
-
-    async fn delete_object(&self, key: &str) -> Result<()> {
-        if self.should_inject_error() {
-            self.record("delete_object", key, false, Some("RandomError"), None);
-            return Err(anyhow!("Storage error: Service unavailable (injected)"));
-        }
-
-        self.storage.lock().unwrap().remove(key);
-        self.record("delete_object", key, true, None, None);
-        Ok(())
-    }
-
-    async fn delete_objects(&self, keys: &[String]) -> Result<usize> {
-        if self.should_inject_error() {
-            self.record("delete_objects", &keys.join(","), false, Some("RandomError"), None);
-            return Err(anyhow!("Storage error: Service unavailable (injected)"));
-        }
-
-        let mut storage = self.storage.lock().unwrap();
-        let mut deleted = 0;
-        for key in keys {
-            if storage.remove(key).is_some() {
-                deleted += 1;
+        {
+            let storage = self.storage.lock().unwrap();
+            if storage.contains_key(key) {
+                drop(storage);
+                self.record("put_if_absent", key, true, None, None);
+                return Ok(CasResult {
+                    success: false,
+                    etag: None,
+                });
             }
         }
-
-        self.record("delete_objects", &format!("{} keys", keys.len()), true, None, None);
-        Ok(deleted)
+        let etag = self.write_object("put_if_absent", key, data).await?;
+        Ok(CasResult {
+            success: true,
+            etag: Some(etag.to_string()),
+        })
     }
 
-    fn bucket_name(&self) -> &str {
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.next_op();
+        if self.should_inject_error() {
+            self.record("put_if_match", key, false, Some("RandomError"), None);
+            return Err(anyhow!("Storage error: Service unavailable (injected)"));
+        }
+        {
+            let storage = self.storage.lock().unwrap();
+            match storage.get(key) {
+                Some(obj) if obj.etag.to_string() == etag => {}
+                _ => {
+                    drop(storage);
+                    self.record("put_if_match", key, true, None, None);
+                    return Ok(CasResult {
+                        success: false,
+                        etag: None,
+                    });
+                }
+            }
+        }
+        let new_etag = self.write_object("put_if_match", key, data).await?;
+        Ok(CasResult {
+            success: true,
+            etag: Some(new_etag.to_string()),
+        })
+    }
+
+    fn backend_name(&self) -> &str {
         &self.config.bucket
     }
 }
@@ -502,13 +479,17 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn test_basic_upload_download() {
+    async fn test_basic_put_get() {
         let storage = MockStorageBackend::new(MockStorageConfig::default());
+        storage.put("key", &[1, 2, 3]).await.unwrap();
+        let data = storage.get("key").await.unwrap();
+        assert_eq!(data, Some(vec![1, 2, 3]));
+    }
 
-        storage.upload_bytes("key", vec![1, 2, 3]).await.unwrap();
-        let data = storage.download_bytes("key").await.unwrap();
-
-        assert_eq!(data, vec![1, 2, 3]);
+    #[tokio::test]
+    async fn test_get_missing_is_none() {
+        let storage = MockStorageBackend::new(MockStorageConfig::default());
+        assert_eq!(storage.get("nope").await.unwrap(), None);
     }
 
     #[tokio::test]
@@ -518,7 +499,7 @@ mod tests {
             .with_fault(StorageFault::RandomError { rate: 1.0 });
         let storage = MockStorageBackend::new(config);
 
-        let result = storage.upload_bytes("key", vec![1, 2, 3]).await;
+        let result = storage.put("key", &[1, 2, 3]).await;
         assert!(result.is_err());
         assert_eq!(storage.error_count(), 1);
     }
@@ -529,17 +510,17 @@ mod tests {
             .with_fault(StorageFault::PartialWrite { at_bytes: 10 });
         let storage = MockStorageBackend::new(config);
 
-        // Small upload should succeed and round-trip whole.
-        storage.upload_bytes("small", vec![1, 2, 3]).await.unwrap();
-        assert_eq!(storage.download_bytes("small").await.unwrap(), vec![1, 2, 3]);
+        // Small upload round-trips whole.
+        storage.put("small", &[1, 2, 3]).await.unwrap();
+        assert_eq!(storage.get("small").await.unwrap(), Some(vec![1, 2, 3]));
 
-        // Large upload fails BUT leaves the truncated prefix durable, so a
-        // reader observes a torn object — the fault is now actually exercisable.
-        let result = storage.upload_bytes("large", vec![7u8; 100]).await;
+        // Large upload errors BUT leaves the truncated prefix durable.
+        let result = storage.put("large", &[7u8; 100]).await;
         assert!(result.is_err(), "partial write must surface an error");
         let torn = storage
-            .download_bytes("large")
+            .get("large")
             .await
+            .unwrap()
             .expect("partial object must be persisted, not absent");
         assert_eq!(torn.len(), 10, "only the truncated prefix persists");
         assert!(torn.iter().all(|&b| b == 7));
@@ -547,8 +528,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_eventual_consistency_is_deterministic_not_wallclock() {
-        // A freshly written object is invisible to read/list until enough
-        // operations elapse, and the pattern is reproducible under a seed.
         let mk = || {
             MockStorageBackend::new(
                 MockStorageConfig::default()
@@ -558,12 +537,11 @@ mod tests {
         };
 
         let run = |s: MockStorageBackend| async move {
-            s.upload_bytes("k", vec![1, 2, 3]).await.unwrap();
-            // Drive reads until it becomes visible; record how many ops it took.
+            s.put("k", &[1, 2, 3]).await.unwrap();
             let mut ops = 0;
             loop {
                 ops += 1;
-                if let Ok(d) = s.download_bytes("k").await {
+                if let Some(d) = s.get("k").await.unwrap() {
                     assert_eq!(d, vec![1, 2, 3]);
                     break ops;
                 }
@@ -586,13 +564,16 @@ mod tests {
                 .with_seed(3)
                 .with_fault(StorageFault::EventualConsistency { delay_ms: 100 }),
         );
-        storage.upload_bytes("p/fresh", vec![1]).await.unwrap();
-        // Immediately after write the object may be missing from LIST.
-        let first = storage.list_objects("p/").await.unwrap();
-        // Drive the clock forward; eventually it appears.
+        storage.put("p/fresh", &[1]).await.unwrap();
+        let first = storage.list("p/", None).await.unwrap();
         let mut appeared = first.contains(&"p/fresh".to_string());
         for _ in 0..50 {
-            if storage.list_objects("p/").await.unwrap().contains(&"p/fresh".to_string()) {
+            if storage
+                .list("p/", None)
+                .await
+                .unwrap()
+                .contains(&"p/fresh".to_string())
+            {
                 appeared = true;
                 break;
             }
@@ -608,60 +589,81 @@ mod tests {
         let storage = MockStorageBackend::new(config);
 
         let original = vec![0u8; 100];
-        storage.upload_bytes("key", original.clone()).await.unwrap();
-        let downloaded = storage.download_bytes("key").await.unwrap();
-
+        storage.put("key", &original).await.unwrap();
+        let downloaded = storage.get("key").await.unwrap().unwrap();
         assert_ne!(original, downloaded);
     }
 
     #[tokio::test]
-    async fn test_list_objects() {
+    async fn test_list_prefix_and_after() {
         let storage = MockStorageBackend::new(MockStorageConfig::default());
+        storage.put("prefix/a", &[1]).await.unwrap();
+        storage.put("prefix/b", &[2]).await.unwrap();
+        storage.put("other/c", &[3]).await.unwrap();
 
-        storage.upload_bytes("prefix/a", vec![1]).await.unwrap();
-        storage.upload_bytes("prefix/b", vec![2]).await.unwrap();
-        storage.upload_bytes("other/c", vec![3]).await.unwrap();
-
-        let keys = storage.list_objects("prefix/").await.unwrap();
+        let keys = storage.list("prefix/", None).await.unwrap();
         assert_eq!(keys, vec!["prefix/a", "prefix/b"]);
+
+        let after = storage.list("prefix/", Some("prefix/a")).await.unwrap();
+        assert_eq!(after, vec!["prefix/b"]);
+    }
+
+    #[tokio::test]
+    async fn test_cas_put_if_absent() {
+        let storage = MockStorageBackend::new(MockStorageConfig::default());
+        let first = storage.put_if_absent("k", &[1]).await.unwrap();
+        assert!(first.success);
+        let second = storage.put_if_absent("k", &[2]).await.unwrap();
+        assert!(!second.success, "second put_if_absent must fail");
+        assert_eq!(storage.get("k").await.unwrap(), Some(vec![1]));
+    }
+
+    #[tokio::test]
+    async fn test_cas_put_if_match() {
+        let storage = MockStorageBackend::new(MockStorageConfig::default());
+        let created = storage.put_if_absent("k", &[1]).await.unwrap();
+        let etag = created.etag.unwrap();
+
+        let bad = storage.put_if_match("k", &[2], "999999").await.unwrap();
+        assert!(!bad.success, "stale etag must fail");
+
+        let good = storage.put_if_match("k", &[3], &etag).await.unwrap();
+        assert!(good.success, "matching etag must succeed");
+        assert_eq!(storage.get("k").await.unwrap(), Some(vec![3]));
     }
 
     #[tokio::test]
     async fn test_deterministic_errors() {
-        // Same seed should produce same error pattern
-        let config1 = MockStorageConfig::default()
-            .with_seed(12345)
-            .with_fault(StorageFault::RandomError { rate: 0.5 });
-        let config2 = MockStorageConfig::default()
-            .with_seed(12345)
-            .with_fault(StorageFault::RandomError { rate: 0.5 });
+        let mk = || {
+            MockStorageBackend::new(
+                MockStorageConfig::default()
+                    .with_seed(12345)
+                    .with_fault(StorageFault::RandomError { rate: 0.5 }),
+            )
+        };
+        let s1 = mk();
+        let s2 = mk();
 
-        let storage1 = MockStorageBackend::new(config1);
-        let storage2 = MockStorageBackend::new(config2);
-
-        let mut results1 = Vec::new();
-        let mut results2 = Vec::new();
-
+        let mut r1 = Vec::new();
+        let mut r2 = Vec::new();
         for i in 0..10 {
-            results1.push(storage1.upload_bytes(&format!("k{}", i), vec![]).await.is_ok());
-            results2.push(storage2.upload_bytes(&format!("k{}", i), vec![]).await.is_ok());
+            r1.push(s1.put(&format!("k{}", i), &[]).await.is_ok());
+            r2.push(s2.put(&format!("k{}", i), &[]).await.is_ok());
         }
-
-        assert_eq!(results1, results2);
+        assert_eq!(r1, r2);
     }
 
     #[tokio::test]
     async fn test_operation_logging() {
         let storage = MockStorageBackend::new(MockStorageConfig::default());
-
-        storage.upload_bytes("key1", vec![1]).await.unwrap();
-        storage.download_bytes("key1").await.unwrap();
-        let _ = storage.download_bytes("nonexistent").await;
+        storage.put("key1", &[1]).await.unwrap();
+        storage.get("key1").await.unwrap();
+        let _ = storage.get("nonexistent").await;
 
         let ops = storage.get_operations();
         assert_eq!(ops.len(), 3);
         assert!(ops[0].success);
         assert!(ops[1].success);
-        assert!(!ops[2].success);
+        assert_eq!(storage.get_operations_count(), 2);
     }
 }
