@@ -13,15 +13,15 @@
 
 use anyhow::Result;
 use async_trait::async_trait;
+use hadb_storage::{CasResult, StorageBackend};
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
-use hadb_storage::StorageBackend;
-use walrust::cache::{LocalCache, CacheStats};
-use walrust::retry::{RetryPolicy, RetryConfig};
-use walrust::uploader::{Uploader, UploadMessage, spawn_uploader};
+use walrust::cache::{CacheStats, LocalCache};
+use walrust::retry::{RetryConfig, RetryPolicy};
+use walrust::uploader::{spawn_uploader, UploadMessage, Uploader};
 use walrust::webhook::WebhookSender;
 
 /// Mock S3 storage with controllable failures
@@ -60,7 +60,7 @@ impl FailableStorage {
 
 #[async_trait]
 impl StorageBackend for FailableStorage {
-    async fn upload_bytes(&self, key: &str, data: Vec<u8>) -> Result<()> {
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         // Check availability (network failure simulation)
         if !*self.is_available.lock().unwrap() {
             return Err(anyhow::anyhow!("Network unavailable"));
@@ -72,67 +72,84 @@ impl StorageBackend for FailableStorage {
             return Err(anyhow::anyhow!("Random S3 error"));
         }
 
-        self.objects.lock().unwrap().insert(key.to_string(), data);
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), data.to_vec());
         Ok(())
     }
 
-    async fn upload_bytes_with_checksum(&self, key: &str, data: Vec<u8>, _checksum: &str) -> Result<()> {
-        self.upload_bytes(key, data).await
-    }
-
-    async fn upload_file(&self, _key: &str, _path: &Path) -> Result<()> {
-        unimplemented!("upload_file not needed for tests")
-    }
-
-    async fn upload_file_with_checksum(&self, _key: &str, _path: &Path, _checksum: &str) -> Result<()> {
-        unimplemented!("upload_file_with_checksum not needed for tests")
-    }
-
-    async fn download_bytes(&self, key: &str) -> Result<Vec<u8>> {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
         if !*self.is_available.lock().unwrap() {
             return Err(anyhow::anyhow!("Network unavailable"));
         }
+        Ok(self.objects.lock().unwrap().get(key).cloned())
+    }
 
-        self.objects.lock().unwrap()
-            .get(key)
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        let objects = self.objects.lock().unwrap();
+        let mut keys: Vec<String> = objects
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .filter(|k| after.map(|a| k.as_str() > a).unwrap_or(true))
             .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Object not found: {}", key))
-    }
-
-    async fn download_file(&self, _key: &str, _path: &Path) -> Result<()> {
-        unimplemented!("download_file not needed for tests")
-    }
-
-    async fn list_objects(&self, _prefix: &str) -> Result<Vec<String>> {
-        Ok(self.objects.lock().unwrap().keys().cloned().collect())
+            .collect();
+        keys.sort();
+        Ok(keys)
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
         Ok(self.objects.lock().unwrap().contains_key(key))
     }
 
-    async fn get_checksum(&self, _key: &str) -> Result<Option<String>> {
-        Ok(None)
-    }
-
-    async fn delete_object(&self, key: &str) -> Result<()> {
-        self.objects.lock().unwrap().remove(key);
-        Ok(())
-    }
-
-    async fn delete_objects(&self, keys: &[String]) -> Result<usize> {
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
         let mut objects = self.objects.lock().unwrap();
-        let mut count = 0;
-        for key in keys {
-            if objects.remove(key).is_some() {
-                count += 1;
-            }
+        if objects.contains_key(key) {
+            return Ok(CasResult {
+                success: false,
+                etag: None,
+            });
         }
-        Ok(count)
+        objects.insert(key.to_string(), data.to_vec());
+        Ok(CasResult {
+            success: true,
+            etag: Some("mock".into()),
+        })
     }
 
-    fn bucket_name(&self) -> &str {
+    async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
+        let mut objects = self.objects.lock().unwrap();
+        if !objects.contains_key(key) {
+            return Ok(CasResult {
+                success: false,
+                etag: None,
+            });
+        }
+        objects.insert(key.to_string(), data.to_vec());
+        Ok(CasResult {
+            success: true,
+            etag: Some("mock".into()),
+        })
+    }
+
+    fn backend_name(&self) -> &str {
         "test-bucket"
+    }
+}
+
+/// Wait until `uploader` reports at least `target` successful uploads, polling
+/// rather than sleeping a fixed window. Background upload tasks can run past any
+/// hard-coded sleep on a busy machine; polling keeps these tests stable.
+async fn wait_for_uploads(uploader: &Arc<Uploader>, target: u64) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while uploader.stats().await.uploads_succeeded < target && std::time::Instant::now() < deadline
+    {
+        sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -174,6 +191,7 @@ impl DiskQueueTestFixture {
             "test-prefix".to_string(),
             Arc::new(RetryPolicy::new(retry_config)),
             Arc::new(WebhookSender::new(vec![])),
+            4, // max_concurrent
         ))
     }
 }
@@ -186,7 +204,10 @@ async fn test_crash_recovery_basic() {
 
     // Simulate WAL encoding writing to cache (before crash)
     for i in 1..=10 {
-        fixture.cache.write_ltx(i, format!("data{}", i).as_bytes()).unwrap();
+        fixture
+            .cache
+            .write_ltx(i, format!("data{}", i).as_bytes())
+            .unwrap();
     }
 
     // Verify cache state
@@ -195,10 +216,10 @@ async fn test_crash_recovery_basic() {
 
     // Simulate restart: Create new uploader (will auto-resume pending)
     let uploader = fixture.create_uploader();
-    let tx = spawn_uploader(uploader.clone());
+    let (tx, _handle) = spawn_uploader(uploader.clone());
 
     // Wait for resume to complete
-    sleep(Duration::from_millis(200)).await;
+    wait_for_uploads(&uploader, 10).await;
 
     // Verify all uploaded
     let stats = uploader.stats().await;
@@ -223,7 +244,11 @@ async fn test_crash_recovery_partial() {
     // Upload first 5 manually
     for i in 1..=5 {
         let data = fixture.cache.read_ltx(i).unwrap();
-        fixture.storage.upload_bytes(&format!("test-prefix/{:08}.ltx", i), data).await.unwrap();
+        fixture
+            .storage
+            .put(&format!("test-prefix/{:08}.ltx", i), &data)
+            .await
+            .unwrap();
         fixture.cache.mark_uploaded(i).unwrap();
     }
 
@@ -231,9 +256,9 @@ async fn test_crash_recovery_partial() {
 
     // Simulate restart
     let uploader = fixture.create_uploader();
-    let tx = spawn_uploader(uploader.clone());
+    let (tx, _handle) = spawn_uploader(uploader.clone());
 
-    sleep(Duration::from_millis(200)).await;
+    wait_for_uploads(&uploader, 5).await;
 
     // Verify only remaining 5 uploaded
     let stats = uploader.stats().await;
@@ -250,7 +275,7 @@ async fn test_network_disconnect_recovery() {
 
     let fixture = DiskQueueTestFixture::new().unwrap();
     let uploader = fixture.create_uploader();
-    let tx = spawn_uploader(uploader.clone());
+    let (tx, _handle) = spawn_uploader(uploader.clone());
 
     // Wait for uploader to start and complete auto-resume
     sleep(Duration::from_millis(10)).await;
@@ -262,20 +287,31 @@ async fn test_network_disconnect_recovery() {
     fixture.cache.write_ltx(1, b"data1").unwrap();
     tx.send(UploadMessage::Upload(1)).await.unwrap();
 
-    // Wait for retry loop to exhaust (3 retries with exponential backoff: ~70ms total)
-    sleep(Duration::from_millis(100)).await;
+    // Poll until the retry loop exhausts and records the failure rather than
+    // sleeping a fixed window (the retry backoff can run past any hard-coded
+    // wait on a busy machine, which made the old fixed-100ms sleep flaky).
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while uploader.stats().await.uploads_failed == 0 && std::time::Instant::now() < deadline {
+        sleep(Duration::from_millis(10)).await;
+    }
 
-    // Upload failed, but cache intact
+    // Upload failed, but the LTX is still on disk and the failure is surfaced:
+    // a permanently-failed TXID moves out of `pending` into `failed` (F9), so
+    // the durable gap is visible rather than silently retried forever.
     let stats = uploader.stats().await;
     assert!(stats.uploads_failed > 0);
-    assert_eq!(fixture.cache.pending_uploads(), vec![1]);
+    assert_eq!(fixture.cache.pending_uploads(), Vec::<u64>::new());
+    assert_eq!(fixture.cache.failed_uploads(), vec![1]);
 
     // Reconnect network
     fixture.storage.set_available(true);
 
     // Retry upload
     tx.send(UploadMessage::Upload(1)).await.unwrap();
-    sleep(Duration::from_millis(100)).await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while uploader.stats().await.uploads_succeeded == 0 && std::time::Instant::now() < deadline {
+        sleep(Duration::from_millis(10)).await;
+    }
 
     // Now succeeds
     let stats = uploader.stats().await;
@@ -295,7 +331,7 @@ async fn test_cache_continues_during_s3_failure() {
     fixture.storage.set_available(false);
 
     let uploader = fixture.create_uploader();
-    let tx = spawn_uploader(uploader.clone());
+    let (tx, _handle) = spawn_uploader(uploader.clone());
 
     // Write to cache (should NOT block even with S3 down)
     let start = std::time::Instant::now();
@@ -323,10 +359,13 @@ async fn test_fast_local_restore() {
 
     // Write and upload some LTX files
     let uploader = fixture.create_uploader();
-    let tx = spawn_uploader(uploader.clone());
+    let (tx, _handle) = spawn_uploader(uploader.clone());
 
     for i in 1..=10 {
-        fixture.cache.write_ltx(i, format!("restore_data_{}", i).as_bytes()).unwrap();
+        fixture
+            .cache
+            .write_ltx(i, format!("restore_data_{}", i).as_bytes())
+            .unwrap();
         tx.send(UploadMessage::Upload(i)).await.unwrap();
     }
 
@@ -352,7 +391,7 @@ async fn test_cleanup_retention_policy() {
 
     let fixture = DiskQueueTestFixture::new().unwrap();
     let uploader = fixture.create_uploader();
-    let tx = spawn_uploader(uploader.clone());
+    let (tx, _handle) = spawn_uploader(uploader.clone());
 
     // Wait for uploader to start and complete auto-resume
     sleep(Duration::from_millis(10)).await;
@@ -363,17 +402,25 @@ async fn test_cleanup_retention_policy() {
         tx.send(UploadMessage::Upload(i)).await.unwrap();
     }
 
-    sleep(Duration::from_millis(500)).await;
+    // Poll until all 100 uploads drain rather than sleeping a fixed window,
+    // which raced on a busy machine (occasionally only ~97 finished in time).
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while fixture.cache.stats().uploaded_count < 100 && std::time::Instant::now() < deadline {
+        sleep(Duration::from_millis(20)).await;
+    }
     tx.send(UploadMessage::Shutdown).await.unwrap();
 
     // All uploaded
     assert_eq!(fixture.cache.stats().uploaded_count, 100);
 
     // Cleanup: keep only 10 most recent (size-based cleanup)
-    let cleanup_stats = fixture.cache.cleanup(
-        chrono::Duration::hours(24), // 24 hour retention (all files are fresh)
-        10_000, // Max 10KB (10 files x 1KB) - this is the limiting factor
-    ).unwrap();
+    let cleanup_stats = fixture
+        .cache
+        .cleanup(
+            chrono::Duration::hours(24), // 24 hour retention (all files are fresh)
+            10_000,                      // Max 10KB (10 files x 1KB) - this is the limiting factor
+        )
+        .unwrap();
 
     // Should delete ~90 files to get under size limit
     assert!(cleanup_stats.deleted_count >= 85);
@@ -390,7 +437,7 @@ async fn test_txid_ordering_preserved() {
 
     let fixture = DiskQueueTestFixture::new().unwrap();
     let uploader = fixture.create_uploader();
-    let tx = spawn_uploader(uploader.clone());
+    let (tx, _handle) = spawn_uploader(uploader.clone());
 
     // Write out of order
     fixture.cache.write_ltx(5, b"data5").unwrap();
@@ -423,7 +470,7 @@ async fn test_concurrent_multi_database() {
     for i in 0..10 {
         let fixture = DiskQueueTestFixture::new().unwrap();
         let uploader = fixture.create_uploader();
-        let tx = spawn_uploader(uploader.clone());
+        let (tx, _handle) = spawn_uploader(uploader.clone());
 
         fixtures.push(fixture);
         uploaders.push(uploader);
@@ -436,18 +483,40 @@ async fn test_concurrent_multi_database() {
     // Each database writes 50 TXIDs concurrently
     for (i, fixture) in fixtures.iter().enumerate() {
         for txid in 1..=50 {
-            fixture.cache.write_ltx(txid, format!("db{}_data{}", i, txid).as_bytes()).unwrap();
+            fixture
+                .cache
+                .write_ltx(txid, format!("db{}_data{}", i, txid).as_bytes())
+                .unwrap();
             channels[i].send(UploadMessage::Upload(txid)).await.unwrap();
         }
     }
 
-    // Wait for all uploads
-    sleep(Duration::from_millis(1000)).await;
+    // Wait for all uploads to drain. Poll rather than sleep a fixed window:
+    // 500 uploads across 10 uploaders can take longer than any single hard-coded
+    // sleep on a busy machine, which made the old fixed-1s wait flaky.
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let mut all_done = true;
+        for uploader in &uploaders {
+            if uploader.stats().await.uploads_succeeded < 50 {
+                all_done = false;
+                break;
+            }
+        }
+        if all_done || std::time::Instant::now() >= deadline {
+            break;
+        }
+        sleep(Duration::from_millis(20)).await;
+    }
 
     // Verify all databases uploaded independently
     for (i, uploader) in uploaders.iter().enumerate() {
         let stats = uploader.stats().await;
-        assert_eq!(stats.uploads_succeeded, 50, "DB {} upload count mismatch", i);
+        assert_eq!(
+            stats.uploads_succeeded, 50,
+            "DB {} upload count mismatch",
+            i
+        );
         assert_eq!(fixtures[i].cache.pending_uploads().len(), 0);
     }
 
@@ -467,7 +536,7 @@ async fn test_chaos_random_failures() {
     fixture.storage.set_failure_rate(0.2);
 
     let uploader = fixture.create_uploader();
-    let tx = spawn_uploader(uploader.clone());
+    let (tx, _handle) = spawn_uploader(uploader.clone());
 
     // Write 50 TXIDs
     for i in 1..=50 {
@@ -482,7 +551,10 @@ async fn test_chaos_random_failures() {
     let stats = uploader.stats().await;
 
     // With retries, most/all should eventually succeed
-    assert!(stats.uploads_succeeded >= 45, "Too many failures despite retries");
+    assert!(
+        stats.uploads_succeeded >= 45,
+        "Too many failures despite retries"
+    );
 
     // Some failures expected due to randomness
     assert!(stats.uploads_attempted >= stats.uploads_succeeded);
@@ -510,8 +582,13 @@ async fn test_cache_verify_integrity() {
     assert!(issues.iter().any(|i| i.contains("file missing")));
 
     // Create orphan file (no manifest entry)
-    let orphan_path = fixture.temp_dir.path()
-        .join(format!(".{}-walrust", fixture.db_path.file_name().unwrap().to_string_lossy()))
+    let orphan_path = fixture
+        .temp_dir
+        .path()
+        .join(format!(
+            ".{}-walrust",
+            fixture.db_path.file_name().unwrap().to_string_lossy()
+        ))
         .join("ltx")
         .join("00000099.ltx");
     std::fs::write(&orphan_path, b"orphan").unwrap();
@@ -528,7 +605,7 @@ async fn test_uploader_graceful_shutdown_completes_pending() {
 
     // Slow uploads (via small delays in mock storage)
     let uploader = fixture.create_uploader();
-    let tx = spawn_uploader(uploader.clone());
+    let (tx, _handle) = spawn_uploader(uploader.clone());
 
     // Wait for uploader to start and complete auto-resume
     sleep(Duration::from_millis(10)).await;
@@ -542,8 +619,9 @@ async fn test_uploader_graceful_shutdown_completes_pending() {
     // Immediately send shutdown (uploads in progress)
     tx.send(UploadMessage::Shutdown).await.unwrap();
 
-    // Wait a bit
-    sleep(Duration::from_millis(500)).await;
+    // Graceful shutdown completes the in-flight/pending uploads; poll for the
+    // drain instead of a fixed sleep so the assertion is not timing-dependent.
+    wait_for_uploads(&uploader, 20).await;
 
     // All should complete gracefully
     let stats = uploader.stats().await;
@@ -561,7 +639,9 @@ async fn test_cache_persistence_across_restarts() {
     {
         let cache = LocalCache::new(&db_path).unwrap();
         for i in 1..=10 {
-            cache.write_ltx(i, format!("persistent_{}", i).as_bytes()).unwrap();
+            cache
+                .write_ltx(i, format!("persistent_{}", i).as_bytes())
+                .unwrap();
         }
         cache.mark_uploaded(1).unwrap();
         cache.mark_uploaded(2).unwrap();
@@ -587,7 +667,8 @@ async fn test_cache_persistence_across_restarts() {
 
 // Helper function to get LTX path for tests
 fn get_ltx_path(temp_dir: &TempDir, db_filename: &str, txid: u64) -> PathBuf {
-    temp_dir.path()
+    temp_dir
+        .path()
         .join(format!(".{}-walrust", db_filename))
         .join("ltx")
         .join(format!("{:08}.ltx", txid))
@@ -614,7 +695,8 @@ async fn test_sqlite_to_cache_to_s3_end_to_end() {
             "PRAGMA journal_mode=WAL;
              PRAGMA wal_autocheckpoint=0;
              CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);",
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // Initialize shadow WAL BEFORE writing data (this is the correct sequence)
@@ -626,7 +708,11 @@ async fn test_sqlite_to_cache_to_s3_end_to_end() {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
         for i in 1..=10 {
-            conn.execute("INSERT INTO users (name) VALUES (?1)", [format!("user_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO users (name) VALUES (?1)",
+                [format!("user_{}", i)],
+            )
+            .unwrap();
         }
     }
 
@@ -643,7 +729,8 @@ async fn test_sqlite_to_cache_to_s3_end_to_end() {
 
     // Simulate LTX encoding: each frame batch becomes an LTX file
     let txid = 1u64;
-    let ltx_data = frames.iter()
+    let ltx_data = frames
+        .iter()
         .flat_map(|f| f.data.clone())
         .collect::<Vec<_>>();
     cache.write_ltx(txid, &ltx_data).unwrap();
@@ -667,10 +754,11 @@ async fn test_sqlite_to_cache_to_s3_end_to_end() {
         "test-prefix".to_string(),
         Arc::new(RetryPolicy::new(retry_config)),
         Arc::new(WebhookSender::new(vec![])),
+        4, // max_concurrent
     ));
 
     // Spawn uploader - it will auto-resume the one pending upload
-    let tx = spawn_uploader(uploader.clone());
+    let (tx, _handle) = spawn_uploader(uploader.clone());
 
     // Wait for auto-resume to complete
     sleep(Duration::from_millis(200)).await;
@@ -678,7 +766,10 @@ async fn test_sqlite_to_cache_to_s3_end_to_end() {
 
     // Verify upload succeeded (auto-resume should have uploaded txid 1)
     let stats = uploader.stats().await;
-    assert_eq!(stats.uploads_succeeded, 1, "Should have uploaded 1 item via auto-resume");
+    assert_eq!(
+        stats.uploads_succeeded, 1,
+        "Should have uploaded 1 item via auto-resume"
+    );
     assert_eq!(stats.last_uploaded_txid, 1);
     assert!(stats.bytes_uploaded > 0);
 
@@ -705,7 +796,8 @@ async fn test_checkpoint_safety_no_frame_loss() {
         conn.execute_batch(
             "PRAGMA journal_mode=WAL;
              CREATE TABLE data (id INTEGER PRIMARY KEY, value TEXT);",
-        ).unwrap();
+        )
+        .unwrap();
     }
 
     // Initialize shadow WAL - this starts checkpoint blocker
@@ -720,7 +812,8 @@ async fn test_checkpoint_safety_no_frame_loss() {
                 conn.execute(
                     "INSERT INTO data (value) VALUES (?1)",
                     [format!("batch_{}_item_{}", batch, i)],
-                ).unwrap();
+                )
+                .unwrap();
             }
         }
     }
@@ -728,13 +821,18 @@ async fn test_checkpoint_safety_no_frame_loss() {
     // Copy frames before checkpoint attempt
     let (frames_before, offset_before) = shadow.copy_frames(0).await.unwrap();
     let frame_count_before = frames_before.len();
-    assert!(frame_count_before > 0, "Should have frames before checkpoint");
+    assert!(
+        frame_count_before > 0,
+        "Should have frames before checkpoint"
+    );
 
     // Try to checkpoint from another connection
     // With checkpoint blocker active, PASSIVE checkpoint won't truncate WAL
     {
         let checkpoint_conn = Connection::open(&db_path).unwrap();
-        checkpoint_conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);").unwrap();
+        checkpoint_conn
+            .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+            .unwrap();
     }
 
     // Shadow WAL should still have access to frames
@@ -745,19 +843,31 @@ async fn test_checkpoint_safety_no_frame_loss() {
     {
         let conn = Connection::open(&db_path).unwrap();
         for i in 0..5 {
-            conn.execute("INSERT INTO data (value) VALUES (?1)", [format!("post_checkpoint_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO data (value) VALUES (?1)",
+                [format!("post_checkpoint_{}", i)],
+            )
+            .unwrap();
         }
     }
 
     // Copy new frames - should get frames from same generation
     let (frames_after, offset_after) = shadow.copy_frames(offset_before).await.unwrap();
-    assert!(!frames_after.is_empty(), "Should have new frames after checkpoint attempt");
+    assert!(
+        !frames_after.is_empty(),
+        "Should have new frames after checkpoint attempt"
+    );
     assert!(offset_after > offset_before, "Offset should have increased");
 
     // Total frames should include all writes (no loss)
     let total_frames = frame_count_before + frames_after.len();
-    assert!(total_frames >= 35, "Should have all frames: got {} (before: {}, after: {})",
-        total_frames, frame_count_before, frames_after.len());
+    assert!(
+        total_frames >= 35,
+        "Should have all frames: got {} (before: {}, after: {})",
+        total_frames,
+        frame_count_before,
+        frames_after.len()
+    );
 
     // Verify shadow directory has segment files
     let segments = shadow.list_segments(initial_generation).await.unwrap();
@@ -773,14 +883,17 @@ async fn test_kill_mid_upload_recovery() {
 
     // Write 5 TXIDs to cache
     for i in 1..=5 {
-        fixture.cache.write_ltx(i, format!("data_for_txid_{}", i).as_bytes()).unwrap();
+        fixture
+            .cache
+            .write_ltx(i, format!("data_for_txid_{}", i).as_bytes())
+            .unwrap();
     }
 
     assert_eq!(fixture.cache.pending_uploads(), vec![1, 2, 3, 4, 5]);
 
     // Start uploader
     let uploader1 = fixture.create_uploader();
-    let tx1 = spawn_uploader(uploader1.clone());
+    let (tx1, _handle1) = spawn_uploader(uploader1.clone());
 
     // Wait for uploader to start and complete auto-resume (uploads 1-5)
     // But disconnect network after first 2 uploads
@@ -810,7 +923,7 @@ async fn test_kill_mid_upload_recovery() {
     fixture.storage.set_available(true);
 
     let uploader2 = fixture.create_uploader();
-    let tx2 = spawn_uploader(uploader2.clone());
+    let (tx2, _handle2) = spawn_uploader(uploader2.clone());
 
     // Wait for resume to complete
     sleep(Duration::from_millis(300)).await;
@@ -844,10 +957,15 @@ async fn test_controlled_checkpoint_with_shadow() {
             "PRAGMA journal_mode=WAL;
              PRAGMA wal_autocheckpoint=0;
              CREATE TABLE log (id INTEGER PRIMARY KEY, msg TEXT);",
-        ).unwrap();
+        )
+        .unwrap();
         // Insert enough data to ensure WAL frames are created
         for i in 0..20 {
-            conn.execute("INSERT INTO log (msg) VALUES (?1)", [format!("entry_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO log (msg) VALUES (?1)",
+                [format!("entry_{}", i)],
+            )
+            .unwrap();
         }
     }
 
@@ -869,7 +987,11 @@ async fn test_controlled_checkpoint_with_shadow() {
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch("PRAGMA wal_autocheckpoint=0;").unwrap();
         for i in 20..30 {
-            conn.execute("INSERT INTO log (msg) VALUES (?1)", [format!("entry_{}", i)]).unwrap();
+            conn.execute(
+                "INSERT INTO log (msg) VALUES (?1)",
+                [format!("entry_{}", i)],
+            )
+            .unwrap();
         }
     }
 
@@ -886,7 +1008,9 @@ async fn test_controlled_checkpoint_with_shadow() {
         has_frames || generation_increased,
         "Shadow WAL should have frames or new generation after checkpoint. \
          initial_frames: {}, post_frames: {}, gen: {} -> {}",
-        initial_frames.len(), post_checkpoint_frames.len(),
-        initial_generation, shadow.generation()
+        initial_frames.len(),
+        post_checkpoint_frames.len(),
+        initial_generation,
+        shadow.generation()
     );
 }

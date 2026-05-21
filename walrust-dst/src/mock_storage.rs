@@ -158,9 +158,14 @@ impl MockStorageBackend {
     fn eventual_consistency_visible_after(&self) -> u64 {
         for fault in &self.config.faults {
             if let StorageFault::EventualConsistency { delay_ms } = fault {
-                let max_lag = ((*delay_ms / 10).max(1)).min(16);
+                // Minimum lag is 2 ops: the PUT consumes one op and the first
+                // read-after-write consumes another, so a lag of 2 guarantees
+                // that first read observes the object as not-yet-visible — i.e.
+                // genuine, reproducible read-after-write staleness rather than a
+                // window that closes before anyone can observe it.
+                let max_lag = ((*delay_ms / 10).max(2)).min(16);
                 let mut rng = self.rng.lock().unwrap();
-                let lag = rng.gen_range(1..=max_lag);
+                let lag = rng.gen_range(2..=max_lag);
                 return self.current_op() + lag;
             }
         }
@@ -318,7 +323,11 @@ impl MockStorageBackend {
             op,
             key,
             true,
-            if corrupted { Some("SilentCorruption") } else { None },
+            if corrupted {
+                Some("SilentCorruption")
+            } else {
+                None
+            },
             Some(len),
         );
         Ok(etag)
@@ -506,8 +515,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_partial_write_persists_truncated_prefix() {
-        let config = MockStorageConfig::default()
-            .with_fault(StorageFault::PartialWrite { at_bytes: 10 });
+        let config =
+            MockStorageConfig::default().with_fault(StorageFault::PartialWrite { at_bytes: 10 });
         let storage = MockStorageBackend::new(config);
 
         // Small upload round-trips whole.
@@ -553,7 +562,10 @@ mod tests {
 
         let a = run(mk()).await;
         let b = run(mk()).await;
-        assert_eq!(a, b, "EC visibility must be reproducible under a fixed seed");
+        assert_eq!(
+            a, b,
+            "EC visibility must be reproducible under a fixed seed"
+        );
         assert!(a > 1, "object must be stale for at least one read");
     }
 

@@ -91,7 +91,10 @@ pub fn test_ltx_roundtrip() -> Result<()> {
     // Verify restored database
     let conn = Connection::open(&restored_path)?;
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0))?;
-    assert_eq!(integrity, "ok", "Restored database should pass integrity check");
+    assert_eq!(
+        integrity, "ok",
+        "Restored database should pass integrity check"
+    );
 
     let count: i64 = conn.query_row("SELECT COUNT(*) FROM users", [], |r| r.get(0))?;
     assert_eq!(count, 2, "Should have 2 users");
@@ -115,7 +118,10 @@ pub fn test_wal_frame_reading() -> Result<()> {
 
     // Generate WAL frames
     for i in 0..50 {
-        conn.execute("INSERT INTO test (data) VALUES (?)", [format!("value_{}", i)])?;
+        conn.execute(
+            "INSERT INTO test (data) VALUES (?)",
+            [format!("value_{}", i)],
+        )?;
     }
 
     let wal_path = db_path.with_extension("db-wal");
@@ -315,7 +321,10 @@ pub fn prop_snapshot_integrity() -> Result<()> {
 
             for t in 0..table_count {
                 conn.execute(
-                    &format!("CREATE TABLE table_{} (id INTEGER PRIMARY KEY, data BLOB)", t),
+                    &format!(
+                        "CREATE TABLE table_{} (id INTEGER PRIMARY KEY, data BLOB)",
+                        t
+                    ),
                     [],
                 )
                 .unwrap();
@@ -457,10 +466,7 @@ pub fn prop_large_database_handling() -> Result<()> {
         ltx::encode_snapshot(&mut ltx_buffer, &db_path, page_size, 1).unwrap();
 
         // Should be compressed
-        prop_assert!(
-            ltx_buffer.len() < db_data.len(),
-            "LTX should be compressed"
-        );
+        prop_assert!(ltx_buffer.len() < db_data.len(), "LTX should be compressed");
 
         // Decode
         let cursor = Cursor::new(ltx_buffer);
@@ -481,66 +487,74 @@ pub fn prop_large_database_handling() -> Result<()> {
 pub fn prop_incremental_ltx_chain() -> Result<()> {
     let mut runner = proptest::test_runner::TestRunner::new(get_config());
 
-    let result = runner.run(&(2..10usize, 1..5usize), |(num_incrementals, pages_per_inc)| {
-        let tmpdir = TempDir::new().unwrap();
-        let db_path = tmpdir.path().join("test.db");
+    let result = runner.run(
+        &(2..10usize, 1..5usize),
+        |(num_incrementals, pages_per_inc)| {
+            let tmpdir = TempDir::new().unwrap();
+            let db_path = tmpdir.path().join("test.db");
 
-        let page_size = 4096u32;
-        let total_pages = 10usize;
+            let page_size = 4096u32;
+            let total_pages = 10usize;
 
-        // Create initial database
-        let initial_data: Vec<u8> = (0..total_pages)
-            .flat_map(|i| vec![(i as u8) * 10; page_size as usize])
-            .collect();
-        std::fs::write(&db_path, &initial_data).unwrap();
-
-        // Create snapshot
-        let mut snapshot_buffer = Vec::new();
-        ltx::encode_snapshot(&mut snapshot_buffer, &db_path, page_size, 1).unwrap();
-
-        // Apply incrementals
-        let mut current_txid = 2u64;
-        for inc_num in 0..num_incrementals {
-            let pre_checksum = ltx::compute_checksum_from_file(&db_path).unwrap();
-
-            // Update some pages
-            let pages: Vec<(u32, Vec<u8>)> = (0..pages_per_inc)
-                .map(|p| {
-                    let page_num = ((inc_num * pages_per_inc + p) % total_pages + 1) as u32;
-                    let data = vec![0xA0 + inc_num as u8; page_size as usize];
-                    (page_num, data)
-                })
+            // Create initial database
+            let initial_data: Vec<u8> = (0..total_pages)
+                .flat_map(|i| vec![(i as u8) * 10; page_size as usize])
                 .collect();
+            std::fs::write(&db_path, &initial_data).unwrap();
 
-            let mut inc_buffer = Vec::new();
-            ltx::encode_wal_changes(
-                &mut inc_buffer,
-                &pages,
-                page_size,
-                current_txid,
-                current_txid,
-                total_pages as u32,
-                Some(pre_checksum),
-            )
-            .unwrap();
+            // Create snapshot
+            let mut snapshot_buffer = Vec::new();
+            ltx::encode_snapshot(&mut snapshot_buffer, &db_path, page_size, 1).unwrap();
 
-            // Apply
-            let cursor = Cursor::new(inc_buffer);
-            ltx::apply_ltx_to_db(cursor, &db_path).unwrap();
+            // Apply incrementals
+            let mut current_txid = 2u64;
+            for inc_num in 0..num_incrementals {
+                let pre_checksum = ltx::compute_checksum_from_file(&db_path).unwrap();
 
-            current_txid += 1;
-        }
+                // Update some pages
+                let pages: Vec<(u32, Vec<u8>)> = (0..pages_per_inc)
+                    .map(|p| {
+                        let page_num = ((inc_num * pages_per_inc + p) % total_pages + 1) as u32;
+                        let data = vec![0xA0 + inc_num as u8; page_size as usize];
+                        (page_num, data)
+                    })
+                    .collect();
 
-        // Verify final database is valid (correct size, can be read)
-        let final_data = std::fs::read(&db_path).unwrap();
-        prop_assert_eq!(
-            final_data.len(),
-            total_pages * page_size as usize,
-            "Database size changed"
-        );
+                // The current encoder takes the post-apply checksum explicitly; it
+                // must be the chained hash over (pre || changed pages) so the
+                // restore-side verification in apply_ltx_to_db passes.
+                let post_checksum = ltx::chain_checksum(pre_checksum, &pages);
+                let mut inc_buffer = Vec::new();
+                ltx::encode_wal_changes(
+                    &mut inc_buffer,
+                    &pages,
+                    page_size,
+                    current_txid,
+                    current_txid,
+                    total_pages as u32,
+                    Some(pre_checksum),
+                    post_checksum,
+                )
+                .unwrap();
 
-        Ok(())
-    });
+                // Apply
+                let cursor = Cursor::new(inc_buffer);
+                ltx::apply_ltx_to_db(cursor, &db_path).unwrap();
+
+                current_txid += 1;
+            }
+
+            // Verify final database is valid (correct size, can be read)
+            let final_data = std::fs::read(&db_path).unwrap();
+            prop_assert_eq!(
+                final_data.len(),
+                total_pages * page_size as usize,
+                "Database size changed"
+            );
+
+            Ok(())
+        },
+    );
 
     result.map_err(|e| anyhow::anyhow!("Property test failed: {:?}", e))
 }
@@ -566,8 +580,11 @@ pub fn prop_wal_page_sizes() -> Result<()> {
             // Insert data to generate WAL
             for i in 0..20 {
                 let data = vec![i as u8; 100];
-                conn.execute("INSERT INTO test (data) VALUES (?)", rusqlite::params![data])
-                    .unwrap();
+                conn.execute(
+                    "INSERT INTO test (data) VALUES (?)",
+                    rusqlite::params![data],
+                )
+                .unwrap();
             }
 
             let wal_path = db_path.with_extension("db-wal");
@@ -576,12 +593,8 @@ pub fn prop_wal_page_sizes() -> Result<()> {
 
                 // Verify page size in WAL header
                 if wal_data.len() >= 12 {
-                    let wal_page_size = u32::from_be_bytes([
-                        wal_data[8],
-                        wal_data[9],
-                        wal_data[10],
-                        wal_data[11],
-                    ]);
+                    let wal_page_size =
+                        u32::from_be_bytes([wal_data[8], wal_data[9], wal_data[10], wal_data[11]]);
                     prop_assert_eq!(wal_page_size, page_size, "Page size mismatch in WAL");
                 }
             }

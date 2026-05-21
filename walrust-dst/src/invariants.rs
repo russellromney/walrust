@@ -76,7 +76,9 @@ pub fn prop_transaction_recovery() -> Result<()> {
                 let storage = MockStorageBackend::new(config);
                 let mut state = SyncState::new(db_path.clone()).unwrap();
 
-                testable::take_snapshot(&storage, "", &mut state).await.unwrap();
+                testable::take_snapshot(&storage, "", &mut state)
+                    .await
+                    .unwrap();
 
                 // Restore from storage
                 testable::restore(&storage, "", &state.name, &restored_path, None::<&str>)
@@ -100,11 +102,9 @@ pub fn prop_transaction_recovery() -> Result<()> {
                 // Verify each transaction's data
                 for i in 0..num_transactions {
                     let data: String = restored_conn
-                        .query_row(
-                            "SELECT data FROM txns WHERE id = ?",
-                            [i as i64 + 1],
-                            |r| r.get(0),
-                        )
+                        .query_row("SELECT data FROM txns WHERE id = ?", [i as i64 + 1], |r| {
+                            r.get(0)
+                        })
                         .unwrap();
                     prop_assert_eq!(
                         data,
@@ -155,7 +155,9 @@ pub fn prop_point_in_time_restore() -> Result<()> {
             let mut state = SyncState::new(db_path.clone()).unwrap();
 
             // Take initial snapshot
-            testable::take_snapshot(&storage, "", &mut state).await.unwrap();
+            testable::take_snapshot(&storage, "", &mut state)
+                .await
+                .unwrap();
             let mut txid_to_count: Vec<(u64, usize)> = vec![(state.current_txid, 0)];
 
             // Take snapshots with incrementing data
@@ -170,7 +172,9 @@ pub fn prop_point_in_time_restore() -> Result<()> {
                     .unwrap();
                 drop(conn);
 
-                testable::take_snapshot(&storage, "", &mut state).await.unwrap();
+                testable::take_snapshot(&storage, "", &mut state)
+                    .await
+                    .unwrap();
                 txid_to_count.push((state.current_txid, snapshot_idx));
             }
 
@@ -246,7 +250,9 @@ pub fn prop_wal_batching_no_loss() -> Result<()> {
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                     .unwrap();
                 drop(conn);
-                testable::take_snapshot(&storage, "", &mut state).await.unwrap();
+                testable::take_snapshot(&storage, "", &mut state)
+                    .await
+                    .unwrap();
 
                 // Write in batches, syncing WAL after each batch
                 let mut total_writes = 0;
@@ -276,7 +282,9 @@ pub fn prop_wal_batching_no_loss() -> Result<()> {
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                     .unwrap();
                 drop(conn);
-                testable::take_snapshot(&storage, "", &mut state).await.unwrap();
+                testable::take_snapshot(&storage, "", &mut state)
+                    .await
+                    .unwrap();
 
                 // Restore and verify all writes present
                 testable::restore(&storage, "", &state.name, &restored_path, None::<&str>)
@@ -331,7 +339,10 @@ pub fn prop_snapshot_atomicity() -> Result<()> {
 
                 for t in 0..num_tables {
                     conn.execute(
-                        &format!("CREATE TABLE table_{} (id INTEGER PRIMARY KEY, data BLOB)", t),
+                        &format!(
+                            "CREATE TABLE table_{} (id INTEGER PRIMARY KEY, data BLOB)",
+                            t
+                        ),
                         [],
                     )
                     .unwrap();
@@ -356,7 +367,9 @@ pub fn prop_snapshot_atomicity() -> Result<()> {
                 let config = MockStorageConfig::new("test-bucket");
                 let storage = MockStorageBackend::new(config);
                 let mut state = SyncState::new(db_path.clone()).unwrap();
-                testable::take_snapshot(&storage, "", &mut state).await.unwrap();
+                testable::take_snapshot(&storage, "", &mut state)
+                    .await
+                    .unwrap();
 
                 // Restore
                 testable::restore(&storage, "", &state.name, &restored_path, None::<&str>)
@@ -398,65 +411,72 @@ pub fn prop_txid_monotonicity() -> Result<()> {
     let mut runner = proptest::test_runner::TestRunner::new(get_config());
     let rt = tokio::runtime::Runtime::new()?;
 
-    let result = runner.run(&(5..20usize, 42u64..1000000u64), |(num_operations, seed)| {
-        rt.block_on(async {
-            let tmpdir = TempDir::new().unwrap();
-            let db_path = tmpdir.path().join("test.db");
+    let result = runner.run(
+        &(5..20usize, 42u64..1000000u64),
+        |(num_operations, seed)| {
+            rt.block_on(async {
+                let tmpdir = TempDir::new().unwrap();
+                let db_path = tmpdir.path().join("test.db");
 
-            // Create database
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch(
-                "PRAGMA journal_mode=WAL; PRAGMA page_size=4096;
-                 CREATE TABLE data (id INTEGER PRIMARY KEY);",
-            )
-            .unwrap();
-            conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                .unwrap();
-            drop(conn);
-
-            let config = MockStorageConfig::new("test-bucket").with_seed(seed);
-            let storage = MockStorageBackend::new(config);
-            let mut state = SyncState::new(db_path.clone()).unwrap();
-
-            let mut txids: Vec<u64> = Vec::new();
-
-            // Perform operations and record TXIDs
-            testable::take_snapshot(&storage, "", &mut state).await.unwrap();
-            txids.push(state.current_txid);
-
-            for i in 1..num_operations {
+                // Create database
                 let conn = Connection::open(&db_path).unwrap();
-                conn.execute("INSERT INTO data DEFAULT VALUES", []).unwrap();
+                conn.execute_batch(
+                    "PRAGMA journal_mode=WAL; PRAGMA page_size=4096;
+                 CREATE TABLE data (id INTEGER PRIMARY KEY);",
+                )
+                .unwrap();
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                     .unwrap();
                 drop(conn);
 
-                testable::take_snapshot(&storage, "", &mut state).await.unwrap();
+                let config = MockStorageConfig::new("test-bucket").with_seed(seed);
+                let storage = MockStorageBackend::new(config);
+                let mut state = SyncState::new(db_path.clone()).unwrap();
+
+                let mut txids: Vec<u64> = Vec::new();
+
+                // Perform operations and record TXIDs
+                testable::take_snapshot(&storage, "", &mut state)
+                    .await
+                    .unwrap();
                 txids.push(state.current_txid);
-            }
 
-            // Verify monotonicity
-            for i in 1..txids.len() {
-                prop_assert!(
-                    txids[i] > txids[i - 1],
-                    "TXID not monotonic: {} <= {}",
-                    txids[i],
-                    txids[i - 1]
+                for i in 1..num_operations {
+                    let conn = Connection::open(&db_path).unwrap();
+                    conn.execute("INSERT INTO data DEFAULT VALUES", []).unwrap();
+                    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                        .unwrap();
+                    drop(conn);
+
+                    testable::take_snapshot(&storage, "", &mut state)
+                        .await
+                        .unwrap();
+                    txids.push(state.current_txid);
+                }
+
+                // Verify monotonicity
+                for i in 1..txids.len() {
+                    prop_assert!(
+                        txids[i] > txids[i - 1],
+                        "TXID not monotonic: {} <= {}",
+                        txids[i],
+                        txids[i - 1]
+                    );
+                }
+
+                // Verify no duplicates
+                let unique: HashSet<u64> = txids.iter().cloned().collect();
+                prop_assert_eq!(
+                    unique.len(),
+                    txids.len(),
+                    "Duplicate TXIDs found: {:?}",
+                    txids
                 );
-            }
 
-            // Verify no duplicates
-            let unique: HashSet<u64> = txids.iter().cloned().collect();
-            prop_assert_eq!(
-                unique.len(),
-                txids.len(),
-                "Duplicate TXIDs found: {:?}",
-                txids
-            );
-
-            Ok(())
-        })
-    });
+                Ok(())
+            })
+        },
+    );
 
     result.map_err(|e| anyhow::anyhow!("Property test failed: {:?}", e))
 }
@@ -580,7 +600,8 @@ pub fn prop_recovery_under_failure() -> Result<()> {
             if snapshot_result.is_ok() {
                 // Try to restore (may fail, that's OK for this test)
                 let restore_result =
-                    testable::restore(&storage, "", &state.name, &restored_path, None::<&str>).await;
+                    testable::restore(&storage, "", &state.name, &restored_path, None::<&str>)
+                        .await;
 
                 if restore_result.is_ok() {
                     // If restore succeeded, verify data

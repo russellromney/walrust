@@ -7,9 +7,9 @@ fix landed; remainder deferred with a reason), or **Documented** (verified
 real; fix specified). Line numbers are approximate against the reviewed
 revision; re-locate before editing.
 
-Status: F1–F13, F15 are **Fixed**. F14 is **Partial** — the mock-storage fault
-fixes landed; the rest of the DST harness predates the current crate API and
-needs a dedicated resurrection (details under F14).
+Status: F1–F15 are **Fixed**. The DST harness (F14) now builds and runs its
+property/chaos/invariant tests against the current crate API, exercising real
+storage faults.
 
 ---
 
@@ -172,31 +172,45 @@ needs a dedicated resurrection (details under F14).
   (`generation > 0 || (min == 1 && max == 1)`) and routed `verify`,
   `discover_snapshots_from_s3`, and `discover_all_ltx_from_s3` through it.
 
-### F14 — [High-for-trust] DST harness does not exercise the faults it claims — **Partial**
-- `walrust-dst/src/mock_storage.rs` (+ `chaos.rs`, `invariants.rs`, `properties.rs`)
-- Fault-injection honesty fixes landed in `mock_storage.rs`:
-  - `PartialWrite` now persists the truncated prefix and then surfaces the
-    error, so a torn object is actually observable by readers (was: stored
-    nothing).
-  - `EventualConsistency` is now gated on a deterministic, seeded operation
-    counter (`visible_after_ops`) instead of wall-clock time, so read- and
-    list-after-write staleness is reproducible under a fixed seed.
-  - `list_objects` honours that same visibility gate, modelling
-    list-after-write staleness (was: always consistent).
-  - Added tests: truncated-prefix persistence, deterministic EC visibility,
-    and list-after-write staleness.
-- Not done (reason): the rest of the harness — `chaos.rs`, `invariants.rs`,
-  `properties.rs`, and `main.rs` — does not compile against the current crate.
-  It imports a removed `walrust::testable` module and the mock implements an
-  obsolete `StorageBackend` trait (`upload_bytes`/`download_bytes`/`bucket_name`)
-  rather than the current `put`/`get`/`list`/`delete`/`put_if_absent`/`put_if_match`.
-  The crate also is not a workspace member and fails a standalone build on a
-  `links = "sqlite3"` rusqlite version clash. Resurrecting the `testable` API and
-  porting the mock + property modules to the current trait is a dedicated change;
-  the `chaos_silent_corruption` / `prop_recovery_under_failure` /
-  `prop_point_in_time_restore` rewrites depend on that working harness and are
-  deferred. The mock-level fault fixes above are correct against the trait the
-  mock implements today.
+### F14 — [High-for-trust] DST harness does not exercise the faults it claims — **Fixed**
+- `walrust-dst/src/{mock_storage,chaos,invariants,properties,main,disk_queue_tests}.rs`,
+  `walrust-dst/Cargo.toml`, `src/testable.rs`, `src/lib.rs`
+- The harness now builds and `cargo test -p walrust-dst` runs green (58 tests),
+  injecting real faults through the real codec.
+- Mock rewritten onto the current `hadb_storage::StorageBackend` trait
+  (`get`/`put`/`delete`/`list`/`exists` + `put_if_absent`/`put_if_match`). The
+  fault model is preserved and honest:
+  - `PartialWrite` persists the truncated prefix then surfaces the error, so a
+    torn object is observable on a later `get` (was: stored nothing).
+  - `EventualConsistency` is gated on a deterministic, seeded operation counter
+    (`visible_after_ops`), not wall-clock time, so read- and list-after-write
+    staleness is reproducible under a fixed seed (minimum lag of 2 ops
+    guarantees the first read observes the object as not-yet-visible).
+  - `list` honours the same visibility gate; `get` returns `Ok(None)` for a
+    not-yet-visible object, modelling a stale read.
+  - `SilentCorruption` flips a real bit in the stored bytes; `RandomError`
+    classifies as transient so retry can recover.
+- New `walrust::testable` module: snapshot/sync/restore wired straight onto the
+  `StorageBackend` trait via the real `ltx` encoder/decoder + checksum chain and
+  the litestream key layout. It is not a second watch loop — an injected fault
+  flows through real encode → PUT → GET → decode → checksum, and a corrupt or
+  torn object is caught by the same `apply_ltx_to_db` / `decode_to_db`
+  verification the daemon uses. `_with_retry` variants drive the real retry
+  policy over the fault-prone PUT.
+- The harness now asserts real outcomes: corruption is detected by `verify_ltx`
+  (100% over 20 trials); `chaos_s3_errors` recovers injected transient faults
+  via retry; `prop_point_in_time_restore` restores to a TXID and asserts the
+  exact row count; `prop_wal_batching_no_loss` replays a snapshot+incremental
+  chain and asserts no frames are lost; `prop_recovery_under_failure` snapshots
+  under a 10% error rate and asserts no data loss when restore succeeds.
+- Build-config clash resolved: `walrust-dst` rusqlite pinned to 0.35 (matching
+  `walrust`) and the git `hadb-*` crates patched to the local checkout, so one
+  `libsqlite3-sys` (`links = "sqlite3"`) provider and one `hadb-storage` trait
+  version exist in the graph.
+- The pre-F9 `disk_queue_tests` expectations were updated to the current cache
+  semantics (a permanently-failed upload moves from `pending` into `failed`,
+  surfacing the durable gap) and a fixed-sleep multi-DB count assertion was made
+  to poll-until-drained so it is not timing-flaky.
 
 ---
 
@@ -209,7 +223,8 @@ needs a dedicated resurrection (details under F14).
   `crates/walrust-core` lib tests pass (run in that crate's directory).
 - Live-network integration tests (S3-backed) are gated and not exercised here;
   `compact` / `replicate` discovery (F6) is verified by construction against the
-  litestream layout, not against a live bucket.
-- `walrust-dst` is not a workspace member and does not compile against the
-  current crate API (see F14); its mock-storage fault fixes are landed but the
-  harness as a whole needs a separate resurrection pass.
+  litestream layout, not against a live bucket. `tests/test_verify.rs` requires
+  S3 credentials and is expected to fail without them.
+- `walrust-dst` builds and `cargo test -p walrust-dst` runs green (58 tests),
+  injecting real storage faults through the real `ltx` codec via the new
+  `walrust::testable` driver (see F14).
