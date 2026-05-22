@@ -24,6 +24,10 @@ pub mod s3;
 pub mod shadow;
 #[cfg(feature = "s3")]
 pub mod sync;
+// Test-only sync/snapshot/restore primitives over the StorageBackend trait,
+// used by the DST harness to inject storage faults and assert on the outcome.
+// Depends only on the always-available ltx/retry layers, not the s3 watch path.
+pub mod testable;
 #[cfg(feature = "s3")]
 pub mod uploader;
 pub mod wal;

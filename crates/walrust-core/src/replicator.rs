@@ -234,7 +234,11 @@ impl Replicator {
         )
         .await?;
 
-        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix, phase4: None }));
+        let db_state = Arc::new(AsyncMutex::new(DbState {
+            state,
+            prefix,
+            phase4: None,
+        }));
 
         self.databases
             .write()
@@ -323,7 +327,11 @@ impl Replicator {
             }
         }
 
-        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix, phase4: None }));
+        let db_state = Arc::new(AsyncMutex::new(DbState {
+            state,
+            prefix,
+            phase4: None,
+        }));
 
         self.databases
             .write()
@@ -358,7 +366,11 @@ impl Replicator {
         sync::initialize_external_base_state(self.storage.as_ref(), &prefix, &mut state, base)
             .await?;
 
-        let db_state = Arc::new(AsyncMutex::new(DbState { state, prefix, phase4: None }));
+        let db_state = Arc::new(AsyncMutex::new(DbState {
+            state,
+            prefix,
+            phase4: None,
+        }));
 
         self.databases
             .write()

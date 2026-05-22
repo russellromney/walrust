@@ -244,6 +244,8 @@ pub async fn watch_with_shadow(
                 current_txid: state.current_txid,
                 last_snapshot: state.last_snapshot,
                 db_checksum: state.db_checksum,
+                wal_salt: None,
+                wal_checksum_chain: None,
             };
             if let Err(e) = take_snapshot_with_retry(
                 &client,
@@ -486,6 +488,8 @@ pub async fn watch_with_shadow(
                                             current_txid: state.current_txid,
                                             last_snapshot: state.last_snapshot,
                                             db_checksum: state.db_checksum,
+                                            wal_salt: None,
+                                            wal_checksum_chain: None,
                                         };
                                         if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
                                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
@@ -566,6 +570,8 @@ pub async fn watch_with_shadow(
                             current_txid: state.current_txid,
                             last_snapshot: state.last_snapshot,
                             db_checksum: state.db_checksum,
+                            wal_salt: None,
+                            wal_checksum_chain: None,
                         };
 
                         if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
@@ -595,6 +601,8 @@ pub async fn watch_with_shadow(
                         current_txid: state.current_txid,
                         last_snapshot: state.last_snapshot,
                         db_checksum: state.db_checksum,
+                        wal_salt: None,
+                        wal_checksum_chain: None,
                     };
 
                     if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {

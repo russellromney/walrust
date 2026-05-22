@@ -156,7 +156,10 @@ fn main() -> anyhow::Result<()> {
             iterations,
         } => {
             let seed = seed.unwrap_or_else(|| rand::thread_rng().gen());
-            println!("Running chaos tests with faults: {} (seed: {:#x})\n", faults, seed);
+            println!(
+                "Running chaos tests with faults: {} (seed: {:#x})\n",
+                faults, seed
+            );
             let fault_types: Vec<&str> = faults.split(',').collect();
             run_chaos_tests(&fault_types, seed, iterations)?;
             println!("\nChaos tests completed!");
@@ -171,7 +174,11 @@ fn main() -> anyhow::Result<()> {
                 "Running stress test: {} databases, {} writes/sec, {}s\n",
                 databases, writes_per_sec, duration_secs
             );
-            run_stress_test(databases, writes_per_sec, Duration::from_secs(duration_secs))?;
+            run_stress_test(
+                databases,
+                writes_per_sec,
+                Duration::from_secs(duration_secs),
+            )?;
             println!("\nStress test passed!");
         }
 
@@ -213,12 +220,18 @@ fn main() -> anyhow::Result<()> {
             }
 
             if metrics.failed > 0 {
-                println!("\nWARNING: {} failures detected. Use --seed to replay failure seeds.", metrics.failed);
+                println!(
+                    "\nWARNING: {} failures detected. Use --seed to replay failure seeds.",
+                    metrics.failed
+                );
             }
         }
 
         Commands::Invariants { cases, invariant } => {
-            println!("Running invariant tests ({} cases per property)...\n", cases);
+            println!(
+                "Running invariant tests ({} cases per property)...\n",
+                cases
+            );
             std::env::set_var("PROPTEST_CASES", cases.to_string());
 
             if let Some(inv) = invariant {
@@ -337,7 +350,8 @@ fn run_chaos_tests(fault_types: &[&str], seed: u64, iterations: u32) -> anyhow::
 
     // Summary
     if !results.is_empty() {
-        println!("\n  Summary: {}/{} tests passed",
+        println!(
+            "\n  Summary: {}/{} tests passed",
             results.iter().filter(|r| r.passed).count(),
             results.len()
         );
@@ -385,8 +399,11 @@ fn run_stress_test(
     let baseline_memory = get_memory_usage().unwrap_or(0);
     let baseline_fds = get_open_fds().unwrap_or(0);
 
-    println!("  Baseline: Memory={:.2}MB, FDs={}",
-             baseline_memory as f64 / 1024.0 / 1024.0, baseline_fds);
+    println!(
+        "  Baseline: Memory={:.2}MB, FDs={}",
+        baseline_memory as f64 / 1024.0 / 1024.0,
+        baseline_fds
+    );
     println!("  Creating {} databases...", databases);
 
     // Create databases and mock storage
@@ -464,8 +481,12 @@ fn run_stress_test(
             // Sync every 10 writes
             if write_count % 10 == 0 {
                 match testable::sync_wal_with_retry(storage, "", state, &retry_policy).await {
-                    Ok(_) => { syncs.fetch_add(1, Ordering::SeqCst); }
-                    Err(_) => { errors.fetch_add(1, Ordering::SeqCst); }
+                    Ok(_) => {
+                        syncs.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(_) => {
+                        errors.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
 
@@ -478,8 +499,12 @@ fn run_stress_test(
                 }
 
                 match testable::take_snapshot_with_retry(storage, "", state, &retry_policy).await {
-                    Ok(_) => { syncs.fetch_add(1, Ordering::SeqCst); }
-                    Err(_) => { errors.fetch_add(1, Ordering::SeqCst); }
+                    Ok(_) => {
+                        syncs.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(_) => {
+                        errors.fetch_add(1, Ordering::SeqCst);
+                    }
                 }
             }
 
@@ -502,25 +527,39 @@ fn run_stress_test(
     let writes_per_sec_actual = writes_done as f64 / elapsed.as_secs_f64();
     let error_rate = if syncs_done > 0 {
         errors_count as f64 / (syncs_done + errors_count) as f64 * 100.0
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     println!("\n  Results:");
     println!("    Duration:      {:?}", elapsed);
-    println!("    Writes:        {} ({:.1}/sec)", writes_done, writes_per_sec_actual);
+    println!(
+        "    Writes:        {} ({:.1}/sec)",
+        writes_done, writes_per_sec_actual
+    );
     println!("    Syncs:         {}", syncs_done);
     println!("    Errors:        {} ({:.1}%)", errors_count, error_rate);
-    println!("    Memory:        {:.2}MB -> {:.2}MB (delta: {:+.2}MB)",
-             baseline_memory as f64 / 1024.0 / 1024.0,
-             final_memory as f64 / 1024.0 / 1024.0,
-             (final_memory as i64 - baseline_memory as i64) as f64 / 1024.0 / 1024.0);
-    println!("    FDs:           {} -> {} (delta: {:+})",
-             baseline_fds, final_fds, final_fds as i32 - baseline_fds as i32);
+    println!(
+        "    Memory:        {:.2}MB -> {:.2}MB (delta: {:+.2}MB)",
+        baseline_memory as f64 / 1024.0 / 1024.0,
+        final_memory as f64 / 1024.0 / 1024.0,
+        (final_memory as i64 - baseline_memory as i64) as f64 / 1024.0 / 1024.0
+    );
+    println!(
+        "    FDs:           {} -> {} (delta: {:+})",
+        baseline_fds,
+        final_fds,
+        final_fds as i32 - baseline_fds as i32
+    );
 
     // Success criteria: <10% error rate under 20% fault injection
     if error_rate < 10.0 {
         println!("\n  [PASS] Error rate {:.1}% < 10% threshold", error_rate);
     } else {
-        println!("\n  [WARN] Error rate {:.1}% exceeds 10% threshold", error_rate);
+        println!(
+            "\n  [WARN] Error rate {:.1}% exceeds 10% threshold",
+            error_rate
+        );
     }
 
     Ok(())
@@ -554,8 +593,11 @@ fn run_soak_test(duration: Duration) -> anyhow::Result<()> {
     memory_samples.push((Duration::ZERO, baseline_memory));
     fd_samples.push((Duration::ZERO, baseline_fds));
 
-    println!("  Baseline: Memory={:.2}MB, FDs={}",
-             baseline_memory as f64 / 1024.0 / 1024.0, baseline_fds);
+    println!(
+        "  Baseline: Memory={:.2}MB, FDs={}",
+        baseline_memory as f64 / 1024.0 / 1024.0,
+        baseline_fds
+    );
     println!("  Starting soak test for {:?}...", duration);
     println!("  (Checkpoints every {:?})", checkpoint_interval);
 
@@ -618,7 +660,9 @@ fn run_soak_test(duration: Duration) -> anyhow::Result<()> {
             }
 
             // Sync WAL
-            if let Err(_) = testable::sync_wal_with_retry(&storage, "", &mut state, &retry_policy).await {
+            if let Err(_) =
+                testable::sync_wal_with_retry(&storage, "", &mut state, &retry_policy).await
+            {
                 errs.fetch_add(1, Ordering::SeqCst);
             }
 
@@ -628,7 +672,10 @@ fn run_soak_test(duration: Duration) -> anyhow::Result<()> {
                 conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
                 drop(conn);
 
-                if let Err(_) = testable::take_snapshot_with_retry(&storage, "", &mut state, &retry_policy).await {
+                if let Err(_) =
+                    testable::take_snapshot_with_retry(&storage, "", &mut state, &retry_policy)
+                        .await
+                {
                     errs.fetch_add(1, Ordering::SeqCst);
                 }
             }
@@ -644,13 +691,23 @@ fn run_soak_test(duration: Duration) -> anyhow::Result<()> {
                 memory_samples.push((elapsed, mem));
                 fd_samples.push((elapsed, fds));
 
-                let mem_delta = (mem as i64 - baseline_memory as i64) as f64 / baseline_memory as f64 * 100.0;
-                println!("  [{:?}] Ops: {}, Memory: {:.2}MB ({:+.1}%), FDs: {}",
-                         elapsed, op_count, mem as f64 / 1024.0 / 1024.0, mem_delta, fds);
+                let mem_delta =
+                    (mem as i64 - baseline_memory as i64) as f64 / baseline_memory as f64 * 100.0;
+                println!(
+                    "  [{:?}] Ops: {}, Memory: {:.2}MB ({:+.1}%), FDs: {}",
+                    elapsed,
+                    op_count,
+                    mem as f64 / 1024.0 / 1024.0,
+                    mem_delta,
+                    fds
+                );
 
                 // Check for memory leak (>50% growth is concerning)
                 if mem_delta > 50.0 {
-                    println!("  [WARN] Possible memory leak detected: {:+.1}% growth", mem_delta);
+                    println!(
+                        "  [WARN] Possible memory leak detected: {:+.1}% growth",
+                        mem_delta
+                    );
                 }
 
                 last_checkpoint = Instant::now();
@@ -670,31 +727,53 @@ fn run_soak_test(duration: Duration) -> anyhow::Result<()> {
     let ops_done = total_operations.load(Ordering::SeqCst);
     let errors_count = total_errors.load(Ordering::SeqCst);
 
-    let memory_growth = (final_memory as i64 - baseline_memory as i64) as f64 / baseline_memory as f64 * 100.0;
+    let memory_growth =
+        (final_memory as i64 - baseline_memory as i64) as f64 / baseline_memory as f64 * 100.0;
     let fd_growth = final_fds as i32 - baseline_fds as i32;
 
     println!("\n  Soak Test Results:");
     println!("    Duration:      {:?}", elapsed);
-    println!("    Operations:    {} ({:.1}/sec)", ops_done, ops_done as f64 / elapsed.as_secs_f64());
+    println!(
+        "    Operations:    {} ({:.1}/sec)",
+        ops_done,
+        ops_done as f64 / elapsed.as_secs_f64()
+    );
     println!("    Errors:        {}", errors_count);
-    println!("    Memory:        {:.2}MB -> {:.2}MB ({:+.1}%)",
-             baseline_memory as f64 / 1024.0 / 1024.0,
-             final_memory as f64 / 1024.0 / 1024.0,
-             memory_growth);
-    println!("    FDs:           {} -> {} ({:+})", baseline_fds, final_fds, fd_growth);
+    println!(
+        "    Memory:        {:.2}MB -> {:.2}MB ({:+.1}%)",
+        baseline_memory as f64 / 1024.0 / 1024.0,
+        final_memory as f64 / 1024.0 / 1024.0,
+        memory_growth
+    );
+    println!(
+        "    FDs:           {} -> {} ({:+})",
+        baseline_fds, final_fds, fd_growth
+    );
 
     // Memory trend analysis
     if memory_samples.len() >= 3 {
-        let first_half_avg: f64 = memory_samples[..memory_samples.len()/2]
-            .iter().map(|(_, m)| *m as f64).sum::<f64>() / (memory_samples.len()/2) as f64;
-        let second_half_avg: f64 = memory_samples[memory_samples.len()/2..]
-            .iter().map(|(_, m)| *m as f64).sum::<f64>() / (memory_samples.len() - memory_samples.len()/2) as f64;
+        let first_half_avg: f64 = memory_samples[..memory_samples.len() / 2]
+            .iter()
+            .map(|(_, m)| *m as f64)
+            .sum::<f64>()
+            / (memory_samples.len() / 2) as f64;
+        let second_half_avg: f64 = memory_samples[memory_samples.len() / 2..]
+            .iter()
+            .map(|(_, m)| *m as f64)
+            .sum::<f64>()
+            / (memory_samples.len() - memory_samples.len() / 2) as f64;
         let trend = (second_half_avg - first_half_avg) / first_half_avg * 100.0;
 
-        println!("    Memory Trend:  {:+.1}% (first half avg vs second half avg)", trend);
+        println!(
+            "    Memory Trend:  {:+.1}% (first half avg vs second half avg)",
+            trend
+        );
 
         if trend > 10.0 {
-            println!("\n  [WARN] Memory trending upward by {:.1}% - possible leak", trend);
+            println!(
+                "\n  [WARN] Memory trending upward by {:.1}% - possible leak",
+                trend
+            );
         } else {
             println!("\n  [PASS] Memory stable (trend: {:+.1}%)", trend);
         }
@@ -702,9 +781,15 @@ fn run_soak_test(duration: Duration) -> anyhow::Result<()> {
 
     // Success criteria: <10% memory growth overall
     if memory_growth.abs() < 10.0 {
-        println!("  [PASS] Memory growth {:.1}% within 10% threshold", memory_growth);
+        println!(
+            "  [PASS] Memory growth {:.1}% within 10% threshold",
+            memory_growth
+        );
     } else {
-        println!("  [WARN] Memory growth {:.1}% exceeds 10% threshold", memory_growth);
+        println!(
+            "  [WARN] Memory growth {:.1}% exceeds 10% threshold",
+            memory_growth
+        );
     }
 
     Ok(())
@@ -746,7 +831,11 @@ fn run_continuous_chaos(
         let iter_seed = seed.wrapping_add(i);
         let start = Instant::now();
 
-        let result = rt.block_on(run_single_chaos_iteration(iter_seed, error_rate, run_invariants));
+        let result = rt.block_on(run_single_chaos_iteration(
+            iter_seed,
+            error_rate,
+            run_invariants,
+        ));
 
         let duration_ms = start.elapsed().as_millis() as u64;
         let (passed, error) = match result {
@@ -845,7 +934,8 @@ async fn run_single_chaos_iteration(
         anyhow::bail!("Integrity check failed: {}", integrity);
     }
 
-    let count: i64 = restored_conn.query_row("SELECT COUNT(*) FROM chaos_test", [], |r| r.get(0))?;
+    let count: i64 =
+        restored_conn.query_row("SELECT COUNT(*) FROM chaos_test", [], |r| r.get(0))?;
     if count as usize != num_rows {
         anyhow::bail!("Data loss: expected {} rows, got {}", num_rows, count);
     }
@@ -866,7 +956,12 @@ async fn run_single_chaos_iteration(
                 |r| r.get(0),
             )?;
             if actual != expected_data {
-                anyhow::bail!("Data mismatch at row {}: expected '{}', got '{}'", i, expected_data, actual);
+                anyhow::bail!(
+                    "Data mismatch at row {}: expected '{}', got '{}'",
+                    i,
+                    expected_data,
+                    actual
+                );
             }
         }
     }
@@ -899,7 +994,10 @@ fn run_single_invariant(name: &str) -> anyhow::Result<()> {
 
 fn run_all_invariants() -> anyhow::Result<()> {
     let invariants = [
-        ("transaction_recovery", "Every transaction recoverable from S3"),
+        (
+            "transaction_recovery",
+            "Every transaction recoverable from S3",
+        ),
         ("point_in_time", "Point-in-time restore gives exact state"),
         ("wal_batching", "WAL batching never loses frames"),
         ("snapshot_atomicity", "Snapshots are atomic"),

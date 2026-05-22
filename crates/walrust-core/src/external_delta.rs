@@ -157,9 +157,7 @@ pub fn decode(bytes: &[u8]) -> Result<DeltaPayloadV1, DeltaPayloadError> {
         return Err(DeltaPayloadError::Truncated(bytes.len()));
     }
 
-    let got: [u8; 4] = bytes[..MAGIC.len()]
-        .try_into()
-        .expect("len-checked above");
+    let got: [u8; 4] = bytes[..MAGIC.len()].try_into().expect("len-checked above");
     if got != MAGIC {
         return Err(DeltaPayloadError::MagicMismatch { got });
     }
@@ -176,8 +174,8 @@ pub fn decode(bytes: &[u8]) -> Result<DeltaPayloadV1, DeltaPayloadError> {
     }
 
     let body = &bytes[MAGIC.len() + 2..];
-    let payload: DeltaPayloadV1 = ciborium::from_reader(body)
-        .map_err(|e| DeltaPayloadError::BodyDecode(e.to_string()))?;
+    let payload: DeltaPayloadV1 =
+        ciborium::from_reader(body).map_err(|e| DeltaPayloadError::BodyDecode(e.to_string()))?;
     Ok(payload)
 }
 

@@ -83,19 +83,34 @@ pub fn decode_to_db(data: &[u8], output_path: &Path) -> Result<DecodeResult> {
         .map(|p| p.page_id.to_u64())
         .max()
         .unwrap_or(0);
-    let db_size = max_page as usize * page_size;
+    // Bound the allocation against an untrusted/corrupt max page id.
+    let db_size = (max_page as usize).checked_mul(page_size).ok_or_else(|| {
+        anyhow!("changeset max_page * page_size overflows usize (corrupt changeset)")
+    })?;
 
     let mut db_data = vec![0u8; db_size];
 
     for page in &changeset.pages {
-        let page_num = page.page_id.to_u64() as usize;
-        // SQLite uses 1-based page numbers: page 1 is at offset 0
-        let idx = page_num - 1;
+        let page_num = page.page_id.to_u64();
+        // SQLite uses 1-based page numbers: page 1 is at offset 0. A
+        // page id of 0 is invalid; reject rather than underflow. A page
+        // beyond the image is corruption — reject rather than silently
+        // drop it (which would produce a wrong byte image).
+        if page_num < 1 {
+            return Err(anyhow!("changeset contains invalid page number 0"));
+        }
+        let idx = (page_num - 1) as usize;
         let start = idx * page_size;
         let end = start + page.data.len();
-        if end <= db_data.len() {
-            db_data[start..end].copy_from_slice(&page.data);
+        if end > db_data.len() {
+            return Err(anyhow!(
+                "changeset page {page_num} (len {}) exceeds db image size {}; \
+                 refusing to decode (corrupt changeset)",
+                page.data.len(),
+                db_data.len()
+            ));
         }
+        db_data[start..end].copy_from_slice(&page.data);
     }
 
     std::fs::write(output_path, &db_data)?;

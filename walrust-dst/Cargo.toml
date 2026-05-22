@@ -14,21 +14,21 @@ path = "src/main.rs"
 # Walrust (path dependency for testing)
 walrust = { path = ".." }
 
-# Storage trait — DST mock + tests implement it directly.
-hadb-storage = { path = "../../hadb/hadb-storage" }
+# Storage trait — DST mock + tests implement it directly. Pulled from the same
+# git source walrust uses, then redirected to the local path by the [patch]
+# below so it resolves to exactly one copy (the same trait version walrust
+# links against — no split trait surface, one `links = "sqlite3"` provider).
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", branch = "hoist-prereq-internal-lease-store" }
 
 # Property-based testing
 proptest = "1.4"
 
-# SQLite for test databases
-rusqlite = { version = "0.32", features = ["bundled"] }
+# SQLite for test databases — pinned to walrust's version so only one
+# libsqlite3-sys (`links = "sqlite3"`) provider exists in the graph.
+rusqlite = { version = "0.35", features = ["bundled"] }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
-
-# AWS SDK for S3 testing
-aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-s3 = "1"
 
 # Async trait support (must match walrust's version)
 async-trait = "0.1"
@@ -52,3 +52,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 uuid = { version = "1", features = ["v4"] }
+
+# Redirect the git hadb crates to the local checkout, mirroring walrust's own
+# [patch]. This is what aligns the hadb-storage trait + libsqlite3-sys provider
+# between this standalone crate and the walrust path dependency it builds on.
+[patch."https://github.com/russellromney/hadb.git"]
+hadb-changeset = { path = "../../hadb/hadb-changeset" }
+hadb-io = { path = "../../hadb/hadb-io" }
+hadb-storage = { path = "../../hadb/hadb-storage" }
+hadb-storage-s3 = { path = "../../hadb/hadb-storage-s3" }

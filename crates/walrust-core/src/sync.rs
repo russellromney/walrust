@@ -121,6 +121,14 @@ pub struct SyncState {
     pub last_snapshot: Option<chrono::DateTime<Utc>>,
     /// Current database checksum (chained HADBP checksum for incrementals, full-DB hash after snapshots)
     pub db_checksum: Option<u64>,
+    /// WAL header salt of the generation `wal_offset` indexes into. An in-place
+    /// WAL reset re-salts the header at the same/larger size; comparing salt
+    /// (not just size) catches that rollover so the new prefix is not skipped.
+    pub wal_salt: Option<(u32, u32)>,
+    /// Running SQLite WAL checksum `(s0, s1)` at `wal_offset`. Seeds per-frame
+    /// validation for the next incremental read so a torn tail frame is rejected
+    /// rather than shipped.
+    pub wal_checksum_chain: Option<(u32, u32)>,
 }
 
 /// Explicit base cursor for callers whose checkpoint/base state is owned by
@@ -158,6 +166,8 @@ impl SyncState {
             current_txid: 0,
             last_snapshot: None,
             db_checksum: None,
+            wal_salt: None,
+            wal_checksum_chain: None,
         })
     }
 
@@ -252,6 +262,8 @@ pub async fn save_state(
         "current_txid": state.current_txid,
         "db_checksum": state.db_checksum,
         "last_snapshot": state.last_snapshot,
+        "wal_salt": state.wal_salt,
+        "wal_checksum_chain": state.wal_checksum_chain,
     });
     let data = serde_json::to_vec(&state_json)?;
     storage.put(&state_key, &data).await
@@ -307,6 +319,78 @@ async fn get_existing_after_failed_cas(
     Ok(None)
 }
 
+/// Result of reading the next batch of WAL frames for a sync site.
+struct WalBatch {
+    page_map: std::collections::HashMap<u32, Vec<u8>>,
+    frame_count: usize,
+    new_offset: u64,
+    final_db_size: u32,
+    commit_count: u64,
+}
+
+/// Detect WAL rollover (by size *or* salt change) and read the next batch of
+/// committed frames with full SQLite checksum-chain validation.
+///
+/// Rollover detection is two-pronged: a shrink (`current_size <
+/// wal_offset`) is the classic checkpoint, but SQLite can also reset the WAL
+/// in place with a *new salt* at the same or larger size. Comparing the header
+/// salt against `state.wal_salt` catches that case so the new generation's
+/// prefix is read from offset 0 instead of being skipped as a continuation.
+///
+/// The running checksum chain (`state.wal_checksum_chain`) seeds per-frame
+/// validation; a torn tail frame is rejected (see [`wal::read_frames_as_page_map_checked`]).
+async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> Result<WalBatch> {
+    let current_salt = header.salt();
+
+    // Two-pronged rollover detection: size shrink OR salt change.
+    let size = wal::get_wal_size(&state.wal_path).await?;
+    let size_rollover = size < state.wal_offset;
+    let salt_rollover = matches!(state.wal_salt, Some(prev) if prev != current_salt);
+
+    if size_rollover || salt_rollover {
+        tracing::info!(
+            "{}: WAL rollover detected (size_rollover={}, salt_rollover={}); resetting offset",
+            state.name,
+            size_rollover,
+            salt_rollover
+        );
+        state.wal_offset = 0;
+        state.wal_generation += 1;
+        // New generation: chain must re-seed from the new header.
+        state.wal_checksum_chain = None;
+    }
+    state.wal_salt = Some(current_salt);
+
+    // Seed the checked read with the running chain when continuing mid-WAL.
+    let chain_seed = if state.wal_offset == 0 || state.wal_offset == wal::WAL_HEADER_SIZE {
+        None
+    } else {
+        state.wal_checksum_chain
+    };
+
+    let (page_map, frame_count, new_offset, final_db_size, commit_count, new_chain) =
+        wal::read_frames_as_page_map_checked(
+            &state.wal_path,
+            header.page_size,
+            state.wal_offset,
+            chain_seed,
+        )
+        .await?;
+
+    // Advance the running chain only for the frames actually consumed.
+    if let Some(chain) = new_chain {
+        state.wal_checksum_chain = Some(chain);
+    }
+
+    Ok(WalBatch {
+        page_map,
+        frame_count,
+        new_offset,
+        final_db_size,
+        commit_count,
+    })
+}
+
 async fn sync_wal_with_sequence(
     storage: &dyn StorageBackend,
     prefix: &str,
@@ -318,17 +402,13 @@ async fn sync_wal_with_sequence(
         None => return Ok(0),
     };
 
-    // Check if WAL was reset (checkpoint happened)
-    let current_size = wal::get_wal_size(&state.wal_path).await?;
-    if current_size < state.wal_offset {
-        tracing::info!("{}: WAL checkpoint detected, resetting offset", state.name);
-        state.wal_offset = 0;
-        state.wal_generation += 1;
-        // Chain continues through checkpoints -- no need to recompute from file
-    }
-
-    let (page_map, frame_count, new_offset, _max_db_size, commit_count) =
-        wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
+    let WalBatch {
+        page_map,
+        frame_count,
+        new_offset,
+        final_db_size: _max_db_size,
+        commit_count,
+    } = read_next_wal_batch(state, &header).await?;
 
     if page_map.is_empty() {
         return Ok(0);
@@ -660,8 +740,8 @@ pub async fn list_delta_envelopes_after(
     // from the beginning). The `seq <= after_seq` filter below is kept
     // as a correctness backstop in case a backend's `after` is
     // inclusive or ignores the marker.
-    let after_marker = (after_seq > 0)
-        .then(|| format!("{}{:016x}.{}", dir_prefix, after_seq, DELTA_ENVELOPE_EXT));
+    let after_marker =
+        (after_seq > 0).then(|| format!("{}{:016x}.{}", dir_prefix, after_seq, DELTA_ENVELOPE_EXT));
     let keys = storage.list(&dir_prefix, after_marker.as_deref()).await?;
 
     let mut out = Vec::new();
@@ -739,18 +819,13 @@ pub async fn sync_wal_phase4(
         None => return Ok(None),
     };
 
-    let current_size = wal::get_wal_size(&state.wal_path).await?;
-    if current_size < state.wal_offset {
-        tracing::info!(
-            "{}: WAL checkpoint detected, resetting offset (phase4)",
-            state.name
-        );
-        state.wal_offset = 0;
-        state.wal_generation += 1;
-    }
-
-    let (page_map, frame_count, new_offset, final_db_size, commit_count) =
-        wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
+    let WalBatch {
+        page_map,
+        frame_count,
+        new_offset,
+        final_db_size,
+        commit_count,
+    } = read_next_wal_batch(state, &header).await?;
 
     if page_map.is_empty() {
         return Ok(None);
@@ -1001,21 +1076,36 @@ pub async fn restore_with_snapshot_source(
         checkpoint_version,
     );
 
-    // Step 3: apply incrementals in order
-    // Note: when restoring with an external snapshot source, we don't have
-    // the HADBP checksum chain from the snapshot. We skip chain verification
-    // for the first incremental and let it establish the chain.
+    // Step 3: apply incrementals in order, verifying the HADBP checksum chain.
+    //
+    // When restoring from an external snapshot source we do not have the HADBP
+    // checksum of the materialized base, so the *first* incremental cannot be
+    // chain-verified against the snapshot — it establishes the chain. Every
+    // subsequent incremental must chain from the prior one; a break means the
+    // object belongs to a different lineage (e.g. a stale delta from a prior
+    // leader sitting at an in-range seq) and must NOT be applied wholesale.
     let mut restored_seq = checkpoint_version;
+    let mut current_checksum: Option<u64> = None;
     for inc in incrementals.iter() {
         let data = storage
             .get(&inc.key)
             .await?
             .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
-        // For external snapshot sources, we can't verify the chain for the first
-        // incremental since the snapshot wasn't encoded as HADBP. Decode without
-        // chain verification and let subsequent incrementals verify against each other.
         let changeset = hadb_changeset::physical::decode(&data)
             .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", inc.key, e))?;
+
+        // Verify the chain for every incremental after the first one.
+        if let Some(prev) = current_checksum {
+            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
+                tracing::warn!(
+                    "Stopping restore at seq {}: checksum chain broken ({}); \
+                     remaining incrementals are from a different lineage",
+                    inc.seq,
+                    e
+                );
+                break;
+            }
+        }
 
         // Apply pages directly (SQLite 1-based page offsets)
         use std::fs::OpenOptions;
@@ -1041,6 +1131,7 @@ pub async fn restore_with_snapshot_source(
             changeset.checksum
         );
         restored_seq = inc.seq;
+        current_checksum = Some(changeset.checksum);
     }
 
     Ok(restored_seq)
@@ -1116,15 +1207,13 @@ pub async fn sync_wal_with_retry(
         None => return Ok(0),
     };
 
-    let current_size = wal::get_wal_size(&state.wal_path).await?;
-    if current_size < state.wal_offset {
-        tracing::info!("{}: WAL checkpoint detected, resetting offset", state.name);
-        state.wal_offset = 0;
-        state.wal_generation += 1;
-    }
-
-    let (page_map, frame_count, new_offset, _max_db_size, commit_count) =
-        wal::read_frames_as_page_map(&state.wal_path, header.page_size, state.wal_offset).await?;
+    let WalBatch {
+        page_map,
+        frame_count,
+        new_offset,
+        final_db_size: _max_db_size,
+        commit_count,
+    } = read_next_wal_batch(state, &header).await?;
 
     if page_map.is_empty() {
         return Ok(0);
@@ -1247,11 +1336,14 @@ pub async fn pull_incremental(
 
     let mut applied_seq = current_seq;
     let mut applied_count = 0u64;
-    let stale_count = 0u64;
+    let mut stale_count = 0u64;
 
-    // For followers pulling incrementals, we don't have a prev_checksum from the
-    // last applied changeset. We decode and apply directly, relying on the
-    // changeset's internal integrity (decode verifies checksum).
+    // For followers pulling incrementals we don't have the prev_checksum of the
+    // base, so the first changeset establishes the chain. Every changeset after
+    // it must chain from the prior one; a break means a stale object from a
+    // different lineage is sitting at an in-range seq and must NOT be applied —
+    // we stop rather than corrupting the follower's database.
+    let mut current_checksum: Option<u64> = None;
     for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
         let data = data?;
         let changeset = match hadb_changeset::physical::decode(&data) {
@@ -1261,6 +1353,19 @@ pub async fn pull_incremental(
                 return Err(anyhow!("Failed to decode changeset: {}", e));
             }
         };
+
+        if let Some(prev) = current_checksum {
+            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
+                tracing::warn!(
+                    "Stopping pull at seq {}: checksum chain broken ({}); \
+                     remaining changesets are from a different lineage",
+                    file.seq,
+                    e
+                );
+                stale_count = new_files.len() as u64 - applied_count;
+                break;
+            }
+        }
 
         // Apply pages (SQLite 1-based page offsets)
         use std::fs::OpenOptions;
@@ -1281,6 +1386,7 @@ pub async fn pull_incremental(
 
         applied_seq = file.seq;
         applied_count += 1;
+        current_checksum = Some(changeset.checksum);
     }
 
     if applied_count > 0 {
@@ -1396,10 +1502,28 @@ async fn pull_incremental_into_sink_inner(
     let mut applied_seq = current_seq;
     let mut applied_count = 0u64;
 
+    // The first changeset establishes the chain; each subsequent one must chain
+    // from the prior. A break means a stale object from a different lineage at
+    // an in-range seq — stop before routing its pages into the sink (the sink
+    // commits per changeset, so a mis-chained changeset must be rejected whole,
+    // not partially applied).
+    let mut current_checksum: Option<u64> = None;
     for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
         let data = data?;
         let changeset = hadb_changeset::physical::decode(&data)
             .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", file.key, e))?;
+
+        if let Some(prev) = current_checksum {
+            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
+                tracing::warn!(
+                    "pull_incremental_into_sink: stopping at seq {}: checksum chain broken \
+                     ({}); remaining changesets are from a different lineage",
+                    file.seq,
+                    e
+                );
+                break;
+            }
+        }
 
         for page in &changeset.pages {
             // SQLite 1-based page id straight from the HADBP changeset.
@@ -1415,6 +1539,7 @@ async fn pull_incremental_into_sink_inner(
 
         applied_seq = file.seq;
         applied_count += 1;
+        current_checksum = Some(changeset.checksum);
     }
 
     if applied_count > 0 {
@@ -2432,27 +2557,31 @@ mod tests {
     async fn pull_into_sink_drives_lifecycle_across_multiple_changesets() {
         let mut storage = TestStorage::new();
         let page_size = 4096u32;
-        seed_changeset(
+        // Properly chained changesets: each prev_checksum is the prior post.
+        let ck1 = seed_chained_changeset(
             &mut storage,
             "test/",
             "mydb",
             1,
+            0,
             page_size,
             &[(1, page_payload(page_size as usize, 0x11))],
         );
-        seed_changeset(
+        let ck2 = seed_chained_changeset(
             &mut storage,
             "test/",
             "mydb",
             2,
+            ck1,
             page_size,
             &[(2, page_payload(page_size as usize, 0x22))],
         );
-        seed_changeset(
+        seed_chained_changeset(
             &mut storage,
             "test/",
             "mydb",
             3,
+            ck2,
             page_size,
             &[(3, page_payload(page_size as usize, 0x33))],
         );
@@ -2474,6 +2603,57 @@ mod tests {
         assert_eq!(ev.applied[0].0, 1);
         assert_eq!(ev.applied[1].0, 2);
         assert_eq!(ev.applied[2].0, 3);
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_stops_on_broken_chain() {
+        // F13: a stale changeset from a different lineage sitting at an in-range
+        // seq must NOT be applied. Seq 1 and 2 chain; seq 3 carries a bogus
+        // prev_checksum (a prior leader's lineage). Pull must apply 1 and 2,
+        // then stop at 3.
+        let mut storage = TestStorage::new();
+        let page_size = 4096u32;
+        let ck1 = seed_chained_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            1,
+            0,
+            page_size,
+            &[(1, page_payload(page_size as usize, 0x11))],
+        );
+        let _ck2 = seed_chained_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            2,
+            ck1,
+            page_size,
+            &[(2, page_payload(page_size as usize, 0x22))],
+        );
+        // Seq 3 chains from a wrong prev (different lineage).
+        seed_chained_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            3,
+            0xDEAD_BEEF_DEAD_BEEF,
+            page_size,
+            &[(3, page_payload(page_size as usize, 0x33))],
+        );
+
+        let mut sink = RecordingSink::new();
+        let final_seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0)
+            .await
+            .expect("pull");
+        assert_eq!(final_seq, 2, "must stop before the mis-chained seq 3");
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.committed_seqs, vec![1, 2], "seq 3 rejected");
+        assert_eq!(ev.applied.len(), 2);
+        // The valid prefix still finalizes cleanly (no abort).
+        assert_eq!(ev.finalize_calls, 1);
+        assert_eq!(ev.abort_calls, 0);
     }
 
     #[tokio::test]
@@ -2802,7 +2982,10 @@ mod tests {
         assert_eq!(found[0].payload.writer_id, "w");
         // envelope_checksum matches a fresh hash of the re-encoded payload.
         let reencoded = external_delta::encode(&found[0].payload).unwrap();
-        assert_eq!(found[0].envelope_checksum, external_delta::checksum(&reencoded));
+        assert_eq!(
+            found[0].envelope_checksum,
+            external_delta::checksum(&reencoded)
+        );
     }
 
     #[tokio::test]
@@ -2870,6 +3053,9 @@ mod tests {
             .expect("list");
         assert_eq!(found.len(), 2);
         // second.prev_checksum == BLAKE3(first envelope) == first.envelope_checksum
-        assert_eq!(found[1].payload.prev_checksum, found[0].envelope_checksum.to_vec());
+        assert_eq!(
+            found[1].payload.prev_checksum,
+            found[0].envelope_checksum.to_vec()
+        );
     }
 }

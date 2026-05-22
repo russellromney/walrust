@@ -368,9 +368,7 @@ pub fn format_report(metrics: &ChaosMetrics) -> String {
     }
 
     if !metrics.failure_seeds.is_empty() {
-        report.push_str(&format!(
-            "\n  Failure Seeds (for replay):\n"
-        ));
+        report.push_str(&format!("\n  Failure Seeds (for replay):\n"));
         for (i, seed) in metrics.failure_seeds.iter().take(10).enumerate() {
             report.push_str(&format!("    {}. {:#x}\n", i + 1, seed));
         }

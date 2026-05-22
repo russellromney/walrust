@@ -27,6 +27,13 @@ pub(crate) struct DbState {
     /// Current database checksum (for incremental LTX chaining)
     /// Computed from database on startup, updated after each LTX upload
     pub(crate) db_checksum: Option<u64>,
+    /// WAL header salt of the generation `wal_offset` indexes into. Comparing
+    /// salt (not just size) detects an in-place WAL reset that re-salts the
+    /// header at the same/larger size, so the new prefix is not skipped.
+    pub(crate) wal_salt: Option<(u32, u32)>,
+    /// Running SQLite WAL checksum at `wal_offset`; seeds per-frame validation
+    /// so a torn tail frame is rejected rather than shipped.
+    pub(crate) wal_checksum_chain: Option<(u32, u32)>,
 }
 
 /// Input for concurrent WAL sync (immutable snapshot of state)
@@ -39,6 +46,8 @@ pub(crate) struct SyncInput {
     pub(crate) wal_generation: u64,
     pub(crate) current_txid: u64,
     pub(crate) db_checksum: Option<u64>,
+    pub(crate) wal_salt: Option<(u32, u32)>,
+    pub(crate) wal_checksum_chain: Option<(u32, u32)>,
 }
 
 impl From<&DbState> for SyncInput {
@@ -51,6 +60,8 @@ impl From<&DbState> for SyncInput {
             wal_generation: state.wal_generation,
             current_txid: state.current_txid,
             db_checksum: state.db_checksum,
+            wal_salt: state.wal_salt,
+            wal_checksum_chain: state.wal_checksum_chain,
         }
     }
 }
@@ -65,6 +76,8 @@ pub(crate) struct SyncOutput {
     /// If checkpoint was detected, new generation
     pub(crate) checkpoint_detected: bool,
     pub(crate) new_wal_generation: u64,
+    pub(crate) new_wal_salt: Option<(u32, u32)>,
+    pub(crate) new_wal_checksum_chain: Option<(u32, u32)>,
 }
 
 /// Entry in the manifest tracking LTX files

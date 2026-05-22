@@ -115,17 +115,18 @@ pub async fn chaos_silent_corruption(seed: u64, iterations: u32) -> Result<Chaos
 // Chaos Test: S3 Random Errors (using MockStorageBackend)
 // ============================================================================
 
-/// Test that walrust handles transient S3 errors gracefully.
+/// Test that walrust recovers from transient storage errors via retry.
 ///
-/// This test uses MockStorageBackend with fault injection to simulate
-/// random S3 failures, testing walrust's actual sync_wal and take_snapshot
-/// functions.
-///
-/// Current behavior: walrust has NO retry logic, so this will FAIL.
-/// This is intentional - it shows we need to add retry logic.
-pub async fn chaos_s3_errors(seed: u64, error_rate: f64, iterations: u32) -> Result<ChaosTestResult> {
+/// Drives `take_snapshot_with_retry` through the MockStorageBackend with
+/// `RandomError` injected on every operation at `error_rate`. The retry policy
+/// classifies the injected error as transient, so the snapshot should land
+/// despite the faults — a real recovery property over the real PUT path.
+pub async fn chaos_s3_errors(
+    seed: u64,
+    error_rate: f64,
+    iterations: u32,
+) -> Result<ChaosTestResult> {
     let mut successful_syncs = 0;
-    let mut failed_syncs = 0;
     let mut total_errors_injected = 0;
 
     for i in 0..iterations {
@@ -141,7 +142,10 @@ pub async fn chaos_s3_errors(seed: u64, error_rate: f64, iterations: u32) -> Res
 
         // Insert some data to create WAL frames
         for j in 0..5 {
-            conn.execute("INSERT INTO data (value) VALUES (?)", [format!("value_{}", j)])?;
+            conn.execute(
+                "INSERT INTO data (value) VALUES (?)",
+                [format!("value_{}", j)],
+            )?;
         }
         drop(conn);
 
@@ -166,27 +170,35 @@ pub async fn chaos_s3_errors(seed: u64, error_rate: f64, iterations: u32) -> Res
             }
         };
 
-        // Try to take a snapshot - this may fail due to injected errors
-        let result = testable::take_snapshot(&storage, "", &mut state).await;
+        // Take a snapshot WITH retry. The mock injects RandomError on PUT at
+        // `error_rate`; the retry policy classifies "service unavailable
+        // (injected)" as transient and retries, so recovery should succeed
+        // despite the injected faults. This exercises the real
+        // encode -> PUT(retry) -> backend path, not a mock stub.
+        let retry_config = walrust::retry::RetryConfig {
+            max_retries: 6,
+            base_delay_ms: 1,
+            max_delay_ms: 10,
+            circuit_breaker_enabled: false,
+            ..Default::default()
+        };
+        let retry_policy = walrust::retry::RetryPolicy::new(retry_config);
+        let result =
+            testable::take_snapshot_with_retry(&storage, "", &mut state, &retry_policy).await;
 
         let errors_this_iteration = storage.error_count();
         total_errors_injected += errors_this_iteration as u32;
 
         if result.is_ok() {
             successful_syncs += 1;
-        } else {
-            failed_syncs += 1;
         }
     }
 
-    // With retry logic, we'd expect high success rate even with errors
-    // Without retry logic, failures should roughly match error_rate
+    // Retry should recover transient injected errors: with a bounded number of
+    // attempts and a per-op error rate well below 1.0, nearly every snapshot
+    // eventually lands. A high success rate here is the recovery property.
     let success_rate = successful_syncs as f64 / iterations as f64 * 100.0;
-
-    // Currently, walrust has NO retry logic, so we expect failures
-    // This test documents the current behavior (will fail often)
-    // After adding retry logic, this test should pass with high success rate
-    let passed = success_rate >= 80.0; // Expect 80%+ success with retry logic
+    let passed = success_rate >= 80.0;
 
     Ok(ChaosTestResult {
         name: "chaos_s3_errors".to_string(),
@@ -195,13 +207,13 @@ pub async fn chaos_s3_errors(seed: u64, error_rate: f64, iterations: u32) -> Res
         errors_injected: total_errors_injected,
         errors_recovered: successful_syncs,
         message: format!(
-            "Success rate: {:.1}% ({}/{} syncs). {} errors injected. \
-             NOTE: {} because walrust lacks retry logic.",
+            "Success rate: {:.1}% ({}/{} syncs) under {:.0}% injected error rate; \
+             {} errors injected, recovered via retry.",
             success_rate,
             successful_syncs,
             iterations,
+            error_rate * 100.0,
             total_errors_injected,
-            if passed { "Passed unexpectedly" } else { "Expected failure" }
         ),
     })
 }
@@ -214,7 +226,10 @@ pub async fn chaos_s3_errors(seed: u64, error_rate: f64, iterations: u32) -> Res
 ///
 /// This verifies the testable module integration is correct before
 /// we add chaos/fault injection.
-pub async fn test_snapshot_with_mock_storage(seed: u64, iterations: u32) -> Result<ChaosTestResult> {
+pub async fn test_snapshot_with_mock_storage(
+    seed: u64,
+    iterations: u32,
+) -> Result<ChaosTestResult> {
     let mut successful_snapshots = 0;
     let mut failed_snapshots = 0;
 
@@ -229,7 +244,10 @@ pub async fn test_snapshot_with_mock_storage(seed: u64, iterations: u32) -> Resu
              CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);",
         )?;
         for j in 0..10 {
-            conn.execute("INSERT INTO users (name) VALUES (?)", [format!("user_{}", j)])?;
+            conn.execute(
+                "INSERT INTO users (name) VALUES (?)",
+                [format!("user_{}", j)],
+            )?;
         }
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         drop(conn);
@@ -283,7 +301,11 @@ pub async fn test_snapshot_with_mock_storage(seed: u64, iterations: u32) -> Resu
 ///
 /// After uploading, immediately trying to download may fail temporarily.
 /// This tests if walrust can handle "object not found" errors gracefully.
-pub async fn chaos_eventual_consistency(seed: u64, delay_ms: u64, iterations: u32) -> Result<ChaosTestResult> {
+pub async fn chaos_eventual_consistency(
+    seed: u64,
+    delay_ms: u64,
+    iterations: u32,
+) -> Result<ChaosTestResult> {
     let mut visibility_failures = 0;
     let mut successful_reads = 0;
 
@@ -430,7 +452,10 @@ pub async fn chaos_disk_queue_atomic_writes(seed: u64, iterations: u32) -> Resul
         let result = cache.write_ltx(1, &ltx_data);
 
         // Verify atomicity: either complete file exists or nothing
-        let cache_dir = tmpdir.path().join(format!(".{}-walrust", db_path.file_name().unwrap().to_string_lossy()));
+        let cache_dir = tmpdir.path().join(format!(
+            ".{}-walrust",
+            db_path.file_name().unwrap().to_string_lossy()
+        ));
         let ltx_path = cache_dir.join("ltx").join("00000001.ltx");
         let tmp_path = ltx_path.with_extension("tmp");
 
@@ -483,7 +508,10 @@ pub async fn chaos_disk_queue_atomic_writes(seed: u64, iterations: u32) -> Resul
 /// 5. Verify remaining N-M upload automatically
 ///
 /// Property: "All pending uploads eventually succeed after restart"
-pub async fn chaos_disk_queue_crash_recovery(seed: u64, iterations: u32) -> Result<ChaosTestResult> {
+pub async fn chaos_disk_queue_crash_recovery(
+    seed: u64,
+    iterations: u32,
+) -> Result<ChaosTestResult> {
     use rand::prelude::*;
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -547,7 +575,10 @@ pub async fn chaos_disk_queue_crash_recovery(seed: u64, iterations: u32) -> Resu
 /// - Inconsistent state (pending vs entries mismatch)
 ///
 /// Property: "Corrupted manifest is detected via cache.verify()"
-pub async fn chaos_disk_queue_manifest_corruption(seed: u64, iterations: u32) -> Result<ChaosTestResult> {
+pub async fn chaos_disk_queue_manifest_corruption(
+    seed: u64,
+    iterations: u32,
+) -> Result<ChaosTestResult> {
     use rand::prelude::*;
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -567,7 +598,10 @@ pub async fn chaos_disk_queue_manifest_corruption(seed: u64, iterations: u32) ->
         }
 
         // Corrupt manifest
-        let cache_dir = tmpdir.path().join(format!(".{}-walrust", db_path.file_name().unwrap().to_string_lossy()));
+        let cache_dir = tmpdir.path().join(format!(
+            ".{}-walrust",
+            db_path.file_name().unwrap().to_string_lossy()
+        ));
         let manifest_path = cache_dir.join("manifest.json");
 
         let corruption_type = rng.gen_range(0..3);
@@ -582,7 +616,10 @@ pub async fn chaos_disk_queue_manifest_corruption(seed: u64, iterations: u32) ->
             }
             2 => {
                 // Partial corruption (valid JSON but wrong data)
-                std::fs::write(&manifest_path, r#"{"last_uploaded_txid":99999,"pending_txids":[],"cache_size_bytes":0,"last_cleanup":"2024-01-01T00:00:00Z","entries":{}}"#)?;
+                std::fs::write(
+                    &manifest_path,
+                    r#"{"last_uploaded_txid":99999,"pending_txids":[],"cache_size_bytes":0,"last_cleanup":"2024-01-01T00:00:00Z","entries":{}}"#,
+                )?;
             }
             _ => {}
         }
@@ -648,7 +685,10 @@ pub async fn chaos_disk_queue_manifest_corruption(seed: u64, iterations: u32) ->
 /// - Verify isolation (one DB failure doesn't affect others)
 ///
 /// Property: "Database caches are isolated - failures don't cascade"
-pub async fn chaos_disk_queue_concurrent_isolation(seed: u64, iterations: u32) -> Result<ChaosTestResult> {
+pub async fn chaos_disk_queue_concurrent_isolation(
+    seed: u64,
+    iterations: u32,
+) -> Result<ChaosTestResult> {
     use rand::prelude::*;
 
     let mut rng = StdRng::seed_from_u64(seed);
@@ -764,7 +804,11 @@ mod tests {
     #[tokio::test]
     async fn test_disk_queue_atomic_writes() {
         let result = chaos_disk_queue_atomic_writes(42, 100).await.unwrap();
-        assert!(result.passed, "Atomic write violations detected: {}", result.message);
+        assert!(
+            result.passed,
+            "Atomic write violations detected: {}",
+            result.message
+        );
     }
 
     #[tokio::test]
@@ -776,12 +820,20 @@ mod tests {
     #[tokio::test]
     async fn test_disk_queue_manifest_corruption() {
         let result = chaos_disk_queue_manifest_corruption(42, 100).await.unwrap();
-        assert!(result.passed, "Manifest corruption detection failed: {}", result.message);
+        assert!(
+            result.passed,
+            "Manifest corruption detection failed: {}",
+            result.message
+        );
     }
 
     #[tokio::test]
     async fn test_disk_queue_concurrent_isolation() {
         let result = chaos_disk_queue_concurrent_isolation(42, 20).await.unwrap();
-        assert!(result.passed, "Multi-DB isolation failed: {}", result.message);
+        assert!(
+            result.passed,
+            "Multi-DB isolation failed: {}",
+            result.message
+        );
     }
 }

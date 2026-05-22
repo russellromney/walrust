@@ -90,11 +90,32 @@ pub fn decode_to_db<R: Read>(reader: R, output_path: &Path) -> Result<DecodeResu
     let page_size = header.page_size.into_inner() as usize;
     let num_pages = header.commit.into_inner() as usize;
 
-    let mut db_data = vec![0u8; num_pages * page_size];
+    if page_size == 0 {
+        return Err(anyhow!(
+            "LTX header page_size is zero (corrupt or malformed LTX)"
+        ));
+    }
+    // Bound the buffer allocation: `num_pages` and `page_size` come from an
+    // untrusted header, so a crafted/corrupt LTX must not overflow usize or
+    // request a multi-GB allocation past what the body can hold.
+    let db_len = num_pages
+        .checked_mul(page_size)
+        .ok_or_else(|| anyhow!("LTX page_count * page_size overflows usize (malformed LTX)"))?;
+    let mut db_data = vec![0u8; db_len];
     let mut page_buf = vec![0u8; page_size];
 
     while let Some(page_num) = decoder.decode_page(&mut page_buf)? {
-        let idx = (page_num.into_inner() - 1) as usize;
+        // Validate the per-page number against the declared commit size
+        // BEFORE indexing. A page_num of 0 (underflow) or > num_pages
+        // (out of bounds) is corruption — reject it rather than panic.
+        let pn = page_num.into_inner();
+        if pn < 1 || (pn as usize) > num_pages {
+            return Err(anyhow!(
+                "LTX page number {pn} out of range 1..={num_pages}; refusing to decode \
+                 (corrupt or malformed LTX)"
+            ));
+        }
+        let idx = (pn - 1) as usize;
         let start = idx * page_size;
         db_data[start..start + page_size].copy_from_slice(&page_buf);
     }
