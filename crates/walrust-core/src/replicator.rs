@@ -23,18 +23,18 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
 
-use crate::sync::{self, ExternalBaseCursor, Phase4SyncParams, ReplicationConfig, SyncState};
+use crate::sync::{self, ExternalBaseCursor, FencedDeltaSyncParams, ReplicationConfig, SyncState};
 use hadb_storage::StorageBackend;
 
-/// Phase 004 delta-shipping state for a database.
+/// Fenced external delta-shipping state for a database.
 ///
-/// When present on a [`DbState`], the replicator ships TLM_DELTA
-/// envelopes via [`sync::sync_wal_phase4`] instead of phase-3 `.hadbp`
+/// When present on a [`DbState`], the replicator ships fenced TLM_DELTA
+/// envelopes via [`sync::sync_wal_fenced_delta`] instead of legacy `.hadbp`
 /// changesets. `epoch` + `writer_id` are constant for a leadership term
-/// (set by the integration layer at base publish); `prev_checksum`
-/// advances after each delta to the published envelope's BLAKE3.
+/// (set by the integration layer at base publish); `prev_checksum` advances
+/// after each delta to the published envelope's BLAKE3.
 #[derive(Debug, Clone)]
-struct Phase4DeltaState {
+struct FencedDeltaChainState {
     epoch: u64,
     writer_id: String,
     /// BLAKE3 of the prior object's envelope — the base anchor for the
@@ -46,14 +46,14 @@ struct Phase4DeltaState {
 struct DbState {
     state: SyncState,
     prefix: String,
-    /// `Some` when this database ships phase-004 TLM_DELTA envelopes.
-    /// `None` = phase-3 behavior (walrust-owned or external `.hadbp`).
-    phase4: Option<Phase4DeltaState>,
+    /// `Some` when this database ships fenced TLM_DELTA envelopes.
+    /// `None` = legacy behavior (walrust-owned or external `.hadbp`).
+    fenced_delta_chain: Option<FencedDeltaChainState>,
 }
 
-/// Dispatch one sync for a database: phase-4 TLM_DELTA when configured,
-/// else phase-3 (external `.hadbp` or walrust-owned). Centralises the
-/// three call sites (background loop, flush, remove) so the phase-4
+/// Dispatch one sync for a database: fenced TLM_DELTA when configured,
+/// else legacy WAL sync (external `.hadbp` or walrust-owned). Centralises
+/// the three call sites (background loop, flush, remove) so the envelope
 /// branch lives in one place. Returns the frame count.
 async fn sync_one_db(
     storage: &dyn StorageBackend,
@@ -61,16 +61,16 @@ async fn sync_one_db(
     db: &mut DbState,
     external_base_state: bool,
 ) -> Result<u64> {
-    if let Some(p4) = db.phase4.as_mut() {
-        let params = Phase4SyncParams {
-            epoch: p4.epoch,
-            writer_id: p4.writer_id.clone(),
-            prev_envelope_checksum: p4.prev_checksum,
+    if let Some(chain) = db.fenced_delta_chain.as_mut() {
+        let params = FencedDeltaSyncParams {
+            epoch: chain.epoch,
+            writer_id: chain.writer_id.clone(),
+            prev_envelope_checksum: chain.prev_checksum,
         };
-        match sync::sync_wal_phase4(storage, prefix, &mut db.state, &params).await? {
+        match sync::sync_wal_fenced_delta(storage, prefix, &mut db.state, &params).await? {
             Some(result) => {
                 // Advance the chain anchor to the just-published envelope.
-                p4.prev_checksum = result.envelope_checksum;
+                chain.prev_checksum = result.envelope_checksum;
                 Ok(result.frame_count)
             }
             None => Ok(0),
@@ -237,7 +237,7 @@ impl Replicator {
         let db_state = Arc::new(AsyncMutex::new(DbState {
             state,
             prefix,
-            phase4: None,
+            fenced_delta_chain: None,
         }));
 
         self.databases
@@ -330,7 +330,7 @@ impl Replicator {
         let db_state = Arc::new(AsyncMutex::new(DbState {
             state,
             prefix,
-            phase4: None,
+            fenced_delta_chain: None,
         }));
 
         self.databases
@@ -369,7 +369,7 @@ impl Replicator {
         let db_state = Arc::new(AsyncMutex::new(DbState {
             state,
             prefix,
-            phase4: None,
+            fenced_delta_chain: None,
         }));
 
         self.databases
@@ -529,8 +529,8 @@ impl Replicator {
         Ok(true)
     }
 
-    /// Phase 004: enable (or re-anchor) TLM_DELTA delta shipping for a
-    /// database after publishing a base.
+    /// Enable or re-anchor fenced TLM_DELTA shipping for a database after
+    /// publishing an externally owned base.
     ///
     /// `epoch` + `writer_id` are the leadership term's fencing identity;
     /// `base_anchor` is the BLAKE3 of the just-published base manifest
@@ -539,17 +539,17 @@ impl Replicator {
     /// each prior envelope automatically. Also aligns the SyncState seq
     /// to `base_seq` so the first delta is `base_seq + 1`.
     ///
-    /// Calling this is what flips a database from the phase-3 `.hadbp`
-    /// path to the phase-4 `.tlmd` path. Until it is called, the
-    /// database stays on phase-3 (the shipped failover behavior).
+    /// Calling this switches a database from legacy `.hadbp` deltas to
+    /// fenced `.tlmd` deltas. Until it is called, the database stays on
+    /// the legacy external-base path.
     ///
     /// Returns `Ok(false)` if the database is not registered yet. Callers
     /// MUST treat `false` as a hard failure: ignoring it silently leaves
-    /// the database on the phase-3 `.hadbp` path forever (the cutover
-    /// no-op bug). Re-call after the db is registered.
-    #[must_use = "set_phase4_base returns false when the db is not registered; \
-                  ignoring it leaves the database on the phase-3 path"]
-    pub async fn set_phase4_base(
+    /// the database on the legacy `.hadbp` path forever. Re-call after the
+    /// db is registered.
+    #[must_use = "set_external_delta_base returns false when the db is not registered; \
+                  ignoring it leaves the database on the legacy delta path"]
+    pub async fn set_external_delta_base(
         &self,
         name: &str,
         epoch: u64,
@@ -558,11 +558,11 @@ impl Replicator {
         base_anchor: [u8; 32],
     ) -> Result<bool> {
         if !self.config.snapshot_ownership.is_external() {
-            anyhow::bail!("set_phase4_base requires external snapshot ownership");
+            anyhow::bail!("set_external_delta_base requires external snapshot ownership");
         }
         if writer_id.is_empty() {
             anyhow::bail!(
-                "set_phase4_base requires a non-empty writer_id (it fences the delta chain)"
+                "set_external_delta_base requires a non-empty writer_id (it fences the delta chain)"
             );
         }
         let databases = self.databases.read().await;
@@ -574,7 +574,7 @@ impl Replicator {
         let mut state = db_state.lock().await;
         if base_seq < state.state.current_seq {
             anyhow::bail!(
-                "{}: refused to set phase4 base seq {} behind current seq {}",
+                "{}: refused to set external delta base seq {} behind current seq {}",
                 name,
                 base_seq,
                 state.state.current_seq
@@ -582,19 +582,35 @@ impl Replicator {
         }
         state.state.current_seq = base_seq;
         state.state.current_txid = base_seq;
-        state.phase4 = Some(Phase4DeltaState {
+        state.fenced_delta_chain = Some(FencedDeltaChainState {
             epoch,
             writer_id: writer_id.to_string(),
             prev_checksum: base_anchor,
         });
         tracing::info!(
-            "{}: phase4 delta shipping enabled (epoch {}, writer {}, base_seq {})",
+            "{}: fenced external delta shipping enabled (epoch {}, writer {}, base_seq {})",
             name,
             epoch,
             writer_id,
             base_seq,
         );
         Ok(true)
+    }
+
+    #[deprecated(
+        since = "0.3.2",
+        note = "use set_external_delta_base; this compatibility name will be removed"
+    )]
+    pub async fn set_phase4_base(
+        &self,
+        name: &str,
+        epoch: u64,
+        writer_id: &str,
+        base_seq: u64,
+        base_anchor: [u8; 32],
+    ) -> Result<bool> {
+        self.set_external_delta_base(name, epoch, writer_id, base_seq, base_anchor)
+            .await
     }
 
     // ========================================================================

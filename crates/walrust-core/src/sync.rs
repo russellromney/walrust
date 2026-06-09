@@ -591,17 +591,17 @@ async fn external_same_seq_changeset_checksum(
 }
 
 // ============================================================================
-// Phase 004: TLM_DELTA envelope publish + discovery
+// Fenced TLM_DELTA envelope publish + discovery
 // ============================================================================
 
 use crate::external_delta::{self, DeltaPayloadV1};
 
-/// File extension for phase-004 delta envelope objects. Distinct from
-/// the phase-3 `.hadbp` so the two never collide in one prefix and a
+/// File extension for fenced delta envelope objects. Distinct from the
+/// legacy `.hadbp` extension so the two never collide in one prefix and a
 /// follower can tell them apart from a plain listing.
 const DELTA_ENVELOPE_EXT: &str = "tlmd";
 
-/// Key for a phase-004 TLM_DELTA envelope object.
+/// Key for a fenced TLM_DELTA envelope object.
 ///
 /// Layout: `{prefix}{db_name}/{generation:04x}/{seq:016x}.tlmd`,
 /// matching hadb-changeset's key shape (zero-padded hex seq sorts
@@ -629,7 +629,7 @@ fn parse_delta_envelope_seq(key: &str) -> Option<u64> {
     u64::from_str_radix(hex, 16).ok()
 }
 
-/// Parameters the caller supplies to publish one phase-004 delta.
+/// Parameters the caller supplies to publish one fenced delta.
 ///
 /// `epoch` + `writer_id` come from the caller's lease; followers use
 /// them to fence stale writers. `prev_envelope_checksum` is the chain
@@ -638,7 +638,7 @@ fn parse_delta_envelope_seq(key: &str) -> Option<u64> {
 /// otherwise). `end_page_count` is computed by walrust from the WAL
 /// commit, not supplied here.
 #[derive(Debug, Clone)]
-pub struct Phase4SyncParams {
+pub struct FencedDeltaSyncParams {
     pub epoch: u64,
     pub writer_id: String,
     pub prev_envelope_checksum: [u8; 32],
@@ -656,11 +656,11 @@ pub struct DeltaPublishResult {
     pub frame_count: u64,
 }
 
-/// A discovered phase-004 delta envelope (decoded, NOT chain-verified).
+/// A discovered fenced delta envelope (decoded, NOT chain-verified).
 ///
-/// The integration layer (haqlite-turbolite, steps 4-6) does the
-/// candidate filter + equivocation detection + chain verification on
-/// these; walrust only provides raw, ordered, decoded access.
+/// The integration layer does the candidate filter + equivocation detection
+/// + chain verification on these; walrust only provides raw, ordered,
+/// decoded access.
 #[derive(Debug, Clone)]
 pub struct DiscoveredDelta {
     pub key: String,
@@ -671,7 +671,7 @@ pub struct DiscoveredDelta {
     pub envelope_checksum: [u8; 32],
 }
 
-/// Publish a phase-004 delta envelope.
+/// Publish a fenced delta envelope.
 ///
 /// Enforces two writer-side invariants:
 /// - **Per-prefix monotonic seq**: the seq is in the object key, so a
@@ -717,11 +717,11 @@ pub async fn publish_delta_envelope(
     Ok(envelope_checksum)
 }
 
-/// List phase-004 delta envelopes with `seq > after_seq`, ascending.
+/// List fenced delta envelopes with `seq > after_seq`, ascending.
 ///
 /// Decodes each envelope so callers can read the full tuple for
 /// filtering + chain verification. Skips non-`.tlmd` objects (e.g.
-/// phase-3 `.hadbp` leftovers). Does **not** filter by epoch/writer or
+/// legacy `.hadbp` leftovers). Does **not** filter by epoch/writer or
 /// verify the chain — that is the integration layer's responsibility.
 pub async fn list_delta_envelopes_after(
     storage: &dyn StorageBackend,
@@ -770,7 +770,7 @@ pub async fn list_delta_envelopes_after(
     Ok(out)
 }
 
-/// Fetch and decode a single phase-004 delta envelope by seq.
+/// Fetch and decode a single fenced delta envelope by seq.
 pub async fn fetch_delta_envelope(
     storage: &dyn StorageBackend,
     prefix: &str,
@@ -793,9 +793,9 @@ pub async fn fetch_delta_envelope(
 }
 
 /// Read pending WAL frames, encode them as an LTX changeset, wrap in a
-/// phase-004 TLM_DELTA envelope, and publish.
+/// fenced TLM_DELTA envelope, and publish.
 ///
-/// This is the phase-004 analogue of [`sync_wal_after_external_base`].
+/// This is the fenced-envelope analogue of [`sync_wal_after_external_base`].
 /// Differences:
 /// - The delta object is a TLMD envelope, not a bare `.hadbp`.
 /// - Each delta carries `(epoch, writer_id, prev_checksum,
@@ -805,14 +805,14 @@ pub async fn fetch_delta_envelope(
 /// - `end_page_count` is the WAL commit's database size in pages
 ///   (shrink/grow aware), read straight from the commit frame header.
 /// - No `state.json` is written — the replay cursor lives in the
-///   turbolite base manifest, per the phase-004 contract.
+///   externally owned base manifest.
 ///
 /// Returns `None` when there are no new frames to publish.
-pub async fn sync_wal_phase4(
+pub async fn sync_wal_fenced_delta(
     storage: &dyn StorageBackend,
     prefix: &str,
     state: &mut SyncState,
-    params: &Phase4SyncParams,
+    params: &FencedDeltaSyncParams,
 ) -> Result<Option<DeltaPublishResult>> {
     let header = match wal::read_header(&state.wal_path).await? {
         Some(h) => h,
@@ -875,7 +875,7 @@ pub async fn sync_wal_phase4(
     let envelope_checksum = publish_delta_envelope(storage, prefix, &state.name, &payload).await?;
 
     tracing::info!(
-        "{}: published phase-4 delta seq {} ({} frames, epoch {}, writer {}, end_pages {}) -> {}",
+        "{}: published fenced delta seq {} ({} frames, epoch {}, writer {}, end_pages {}) -> {}",
         state.name,
         new_seq,
         frame_count,
@@ -889,8 +889,8 @@ pub async fn sync_wal_phase4(
     state.current_seq = new_seq;
     state.current_txid = max_txid;
     state.db_checksum = Some(post_checksum);
-    // Intentionally no save_state — phase-4 cursor lives in the
-    // turbolite base manifest, not a remote state.json sidecar.
+    // Intentionally no save_state: the replay cursor lives in the externally
+    // owned base manifest, not a remote state.json sidecar.
 
     Ok(Some(DeltaPublishResult {
         seq: new_seq,
@@ -2839,7 +2839,7 @@ mod tests {
         );
     }
 
-    // ---- Phase 004 delta envelope publish + discovery ----
+    // ---- Fenced delta envelope publish + discovery ----
 
     /// Mutable in-memory storage with real `put` / `put_if_absent`
     /// semantics, for exercising the publish CAS path. The earlier
@@ -2991,7 +2991,7 @@ mod tests {
     #[tokio::test]
     async fn list_skips_non_tlmd_objects() {
         let storage = MutStorage::new();
-        // A phase-3 .hadbp object in the same directory must be ignored.
+        // A legacy .hadbp object in the same directory must be ignored.
         storage
             .put("wal/db/0000/0000000000000001.hadbp", b"legacy-ltx")
             .await
