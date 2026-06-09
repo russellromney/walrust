@@ -97,7 +97,7 @@ pub enum DeltaPayloadError {
 /// byte string and a length-prefixed array of small integers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeltaPayloadV1 {
-    /// Strictly monotonic per `(prefix, db_name)`. Phase 004 followers
+    /// Strictly monotonic per `(prefix, db_name)`. Fenced-delta followers
     /// list objects with `seq > cursor.last_applied_seq`.
     pub seq: u64,
 
