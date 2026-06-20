@@ -22,16 +22,19 @@ tokio = { version = "1", features = ["full"] }
 # Async trait support
 async-trait = "0.1"
 
-# Storage substrate (trait)
-hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", branch = "hoist-prereq-internal-lease-store" }
+# Storage substrate (trait). Use the published 0.4.1 release so consumers that
+# also depend on hadb-storage from crates.io resolve to a single trait def.
+hadb-storage = "0.4.1"
 
 # Legacy retry/checksum helpers; replaced in step i.
 # default-features off so consumers can build walrust-core with no AWS deps;
 # the outer walrust crate's `s3` feature re-enables hadb-io/s3.
-hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", branch = "hoist-prereq-internal-lease-store", default-features = false }
+# Pinned to the revision compatible with the published hadb-storage 0.4.1 API.
+hadb-io = { git = "https://github.com/russellromney/hadb.git", rev = "6bf02111d555b2e495fd737c2074876424b2875d", package = "hadb-io", default-features = false }
 
-# HADBP changeset format
-hadb-changeset = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-changeset", branch = "hoist-prereq-internal-lease-store" }
+# HADBP changeset format. Pinned to the revision compatible with the published
+# hadb-storage 0.4.1 API.
+hadb-changeset = { git = "https://github.com/russellromney/hadb.git", rev = "6bf02111d555b2e495fd737c2074876424b2875d", package = "hadb-changeset" }
 
 # SQLite for checkpointing (shadow WAL)
 rusqlite = { version = "0.35", features = ["bundled"] }
@@ -54,4 +57,4 @@ walkdir = "2"
 uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 # Integration tests use the S3 impl directly for compile-time usability checks.
-hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", branch = "hoist-prereq-internal-lease-store" }
+hadb-storage-s3 = "0.4.1"
