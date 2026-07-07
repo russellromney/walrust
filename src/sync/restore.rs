@@ -2,7 +2,8 @@ use crate::cache::LocalCache;
 use crate::ltx;
 use crate::s3::{self, create_client, parse_bucket};
 use anyhow::{anyhow, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::manifest::{
     discover_state_from_s3, find_latest_snapshot, list_generation_files, GENERATION_LIVE,
@@ -53,6 +54,56 @@ fn verify_sqlite_integrity(path: &Path) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+struct AtomicRestore {
+    path: PathBuf,
+    published: bool,
+}
+
+impl AtomicRestore {
+    fn new(output: &Path) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("restored.db");
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{file_name}.restore-{}-{id}.tmp",
+            std::process::id()
+        ));
+        Self {
+            path,
+            published: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn publish(mut self, output: &Path) -> Result<()> {
+        std::fs::rename(&self.path, output).map_err(|e| {
+            anyhow!(
+                "failed to atomically publish restored database {} over {}: {e}",
+                self.path.display(),
+                output.display()
+            )
+        })?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for AtomicRestore {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
 }
 
 pub async fn restore(
@@ -134,8 +185,11 @@ pub async fn restore(
         s3::download_bytes(&client, &bucket_name, &snapshot_key).await?
     };
 
+    let staged_restore = AtomicRestore::new(output);
+    let staged_output = staged_restore.path();
+
     let cursor = std::io::Cursor::new(ltx_data);
-    let decode_result = ltx::decode_to_db(cursor, output).map_err(|e| {
+    let decode_result = ltx::decode_to_db(cursor, staged_output).map_err(|e| {
         if let Some(webhook) = webhook {
             let error_msg = format!("LTX decode failed for snapshot: {}", e);
             let webhook = webhook.clone();
@@ -203,7 +257,8 @@ pub async fn restore(
             };
 
             let cursor = std::io::Cursor::new(ltx_data);
-            let apply_result = ltx::apply_ltx_to_db_checked(cursor, output, expected_pre_checksum)?;
+            let apply_result =
+                ltx::apply_ltx_to_db_checked(cursor, staged_output, expected_pre_checksum)?;
 
             tracing::debug!(
                 "Applied {} (TXID: {}-{}, checksum: {:016x})",
@@ -241,7 +296,8 @@ pub async fn restore(
     // *between* commit boundaries, where landing at the latest commit <= target
     // is correct — so we only reject an overshoot there.
     restore_reached_target(final_txid, target_txid, point_in_time.is_some())?;
-    verify_sqlite_integrity(output)?;
+    verify_sqlite_integrity(staged_output)?;
+    staged_restore.publish(output)?;
 
     println!(
         "Restored {} to {} (TXID: {})",

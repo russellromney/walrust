@@ -264,6 +264,13 @@ fix removes that divergent lineage.
   listing-based path; align exit codes.
 
 ### A14 — Restore/replica destroy existing local data before success is known
+Status: Partial — restore-half fixed in root and core. Root production restore
+is proven by `failed_restore_preserves_existing_output_database`; core restore
+is proven by `sync::tests::restore_failure_preserves_existing_output_database`
+and
+`sync::tests::restore_with_snapshot_source_failure_preserves_existing_output_database`.
+Replica in-place apply/bootstrap remains open for the Phase 2 replica-half.
+
 - `src/ltx.rs:127` writes the full DB image THEN checks the trailer; every
   incremental applies in place to the output. A failed restore leaves the
   operator's existing DB destroyed and a half-applied file in place.

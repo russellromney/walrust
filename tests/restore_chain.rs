@@ -34,6 +34,16 @@ fn create_sqlite_db(path: &Path) -> Result<u32> {
     Ok(page_size)
 }
 
+fn create_marker_db(path: &Path, marker: &str) -> Result<()> {
+    let conn = Connection::open(path)?;
+    conn.execute("CREATE TABLE marker (value TEXT NOT NULL);", [])?;
+    conn.execute(
+        "INSERT INTO marker (value) VALUES (?1)",
+        rusqlite::params![marker],
+    )?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn restore_rejects_incremental_without_prior_chain_link() -> Result<()> {
     let (bucket_arg, endpoint) = test_bucket_config();
@@ -85,6 +95,63 @@ async fn restore_rejects_incremental_without_prior_chain_link() -> Result<()> {
     assert!(
         msg.contains("pre-apply checksum") || msg.contains("gap") || msg.contains("chain"),
         "expected restore to reject the missing chain link, got: {msg}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn failed_restore_preserves_existing_output_database() -> Result<()> {
+    let (bucket_arg, endpoint) = test_bucket_config();
+    let (bucket, prefix) = walrust::s3::parse_bucket(&bucket_arg);
+    let client = walrust::s3::create_client(endpoint.as_deref()).await?;
+    let name = unique_name("restore-preserve-output");
+    let tmp = tempfile::tempdir()?;
+    let source = tmp.path().join(format!("{name}.db"));
+    let restored = tmp.path().join("restored.db");
+    let page_size = create_sqlite_db(&source)?;
+    create_marker_db(&restored, "must-survive")?;
+    let original_output = std::fs::read(&restored)?;
+
+    let mut snapshot = Vec::new();
+    walrust::ltx::encode_snapshot(&mut snapshot, &source, page_size, 1)?;
+    let snapshot_key = format!("{prefix}{name}/0001/0000000000000001-0000000000000001.ltx");
+    walrust::s3::upload_bytes(&client, &bucket, &snapshot_key, snapshot).await?;
+
+    let snapshot_checksum = walrust::ltx::compute_checksum_from_file(&source)?;
+    let missing_pages = vec![(1, vec![0x44; page_size as usize])];
+    let missing_post = walrust::ltx::chain_checksum(snapshot_checksum, &missing_pages);
+    let skipped_pages = vec![(2, vec![0x55; page_size as usize])];
+    let skipped_post = walrust::ltx::chain_checksum(missing_post, &skipped_pages);
+    let mut skipped_incremental = Vec::new();
+    walrust::ltx::encode_wal_changes(
+        &mut skipped_incremental,
+        &skipped_pages,
+        page_size,
+        3,
+        3,
+        2,
+        Some(missing_post),
+        skipped_post,
+    )?;
+    let skipped_key = format!("{prefix}{name}/0000/0000000000000003-0000000000000003.ltx");
+    walrust::s3::upload_bytes(&client, &bucket, &skipped_key, skipped_incremental).await?;
+
+    walrust::sync::restore(
+        &name,
+        &restored,
+        &bucket_arg,
+        endpoint.as_deref(),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect_err("restore must fail before publishing over the existing output");
+
+    assert_eq!(
+        std::fs::read(&restored)?,
+        original_output,
+        "failed restore must leave the existing output database untouched"
     );
     Ok(())
 }

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
 use std::process::{Child, Command};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
 fn test_bucket() -> String {
@@ -91,6 +91,31 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn wait_for_live_incremental(bucket_arg: &str, endpoint: Option<&str>, name: &str) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let (bucket, prefix) = walrust::s3::parse_bucket(bucket_arg);
+        let client = walrust::s3::create_client(endpoint).await?;
+        let db_prefix = format!("{prefix}{name}/0000/");
+        let deadline = Instant::now() + Duration::from_secs(20);
+
+        loop {
+            let objects = walrust::s3::list_objects(&client, &bucket, &db_prefix).await?;
+            if objects.iter().any(|key| key.ends_with(".ltx")) {
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for live incremental under s3://{bucket}/{db_prefix}"
+                );
+            }
+
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+}
+
 fn spawn_cli_watch(
     db_path: &Path,
     bucket_arg: &str,
@@ -156,7 +181,7 @@ fn e2e_cli_watch_restore_round_trips_sqlite_rows() -> Result<()> {
 
     std::thread::sleep(Duration::from_secs(2));
     append_rows(&writer, 6, 10, "watch")?;
-    std::thread::sleep(Duration::from_secs(3));
+    wait_for_live_incremental(&bucket_arg, endpoint.as_deref(), &name)?;
     stop_child(&mut child);
 
     run_cli_restore(&name, &bucket_arg, endpoint.as_deref(), &restored_path)?;
@@ -188,6 +213,7 @@ fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
 
     let mut second = spawn_cli_watch(&db_path, &bucket_arg, endpoint.as_deref(), true)?;
     std::thread::sleep(Duration::from_secs(2));
+    wait_for_live_incremental(&bucket_arg, endpoint.as_deref(), &name)?;
     stop_child(&mut second);
 
     run_cli_restore(&name, &bucket_arg, endpoint.as_deref(), &restored_path)?;

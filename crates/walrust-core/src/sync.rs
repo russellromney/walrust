@@ -9,6 +9,7 @@ use chrono::Utc;
 use hadb_changeset::storage::{self as cs_storage, ChangesetKind, DiscoveredChangeset};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::ltx;
 use crate::wal;
@@ -18,6 +19,56 @@ use hadb_storage::StorageBackend;
 // ============================================================================
 // Helpers
 // ============================================================================
+
+struct AtomicRestore {
+    path: PathBuf,
+    published: bool,
+}
+
+impl AtomicRestore {
+    fn new(output: &Path) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("restored.db");
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{file_name}.restore-{}-{id}.tmp",
+            std::process::id()
+        ));
+        Self {
+            path,
+            published: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn publish(mut self, output: &Path) -> Result<()> {
+        std::fs::rename(&self.path, output).map_err(|e| {
+            anyhow!(
+                "failed to atomically publish restored database {} over {}: {e}",
+                self.path.display(),
+                output.display()
+            )
+        })?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for AtomicRestore {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 /// Extract SQLite's file change counter from WAL page data.
 ///
@@ -980,15 +1031,18 @@ pub async fn restore(
         incrementals.len()
     );
 
+    let staged_restore = AtomicRestore::new(output);
+    let staged_output = staged_restore.path();
+
     // Apply snapshot
     let snapshot_data = storage
         .get(&snapshot.key)
         .await?
         .ok_or_else(|| anyhow!("snapshot key {} not found", snapshot.key))?;
-    let decode_result = ltx::decode_to_db(&snapshot_data, output)?;
+    let decode_result = ltx::decode_to_db(&snapshot_data, staged_output)?;
     tracing::info!(
         "Restored snapshot to {} (checksum: {:016x})",
-        output.display(),
+        staged_output.display(),
         decode_result.checksum
     );
 
@@ -1011,7 +1065,7 @@ pub async fn restore(
             .get(&inc.key)
             .await?
             .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
-        let result = ltx::apply_changeset_to_db(&data, output, current_checksum)?;
+        let result = ltx::apply_changeset_to_db(&data, staged_output, current_checksum)?;
         tracing::info!(
             "Applied incremental (seq {}, checksum: {:016x})",
             inc.seq,
@@ -1021,7 +1075,8 @@ pub async fn restore(
         current_checksum = result.checksum;
     }
 
-    verify_sqlite_integrity(output)?;
+    verify_sqlite_integrity(staged_output)?;
+    staged_restore.publish(output)?;
     Ok(restored_seq)
 }
 
@@ -1039,8 +1094,11 @@ pub async fn restore_with_snapshot_source(
     output: &Path,
     snapshot_source: &dyn crate::snapshot_source::SnapshotSource,
 ) -> Result<u64> {
+    let staged_restore = AtomicRestore::new(output);
+    let staged_output = staged_restore.path();
+
     // Step 1: materialize the base DB from the external snapshot source
-    let checkpoint_version = snapshot_source.materialize(output).await?;
+    let checkpoint_version = snapshot_source.materialize(staged_output).await?;
     tracing::info!(
         "Materialized base DB from snapshot source (checkpoint version {})",
         checkpoint_version,
@@ -1061,6 +1119,8 @@ pub async fn restore_with_snapshot_source(
             "No incremental changesets to apply (up to date at version {})",
             checkpoint_version
         );
+        verify_sqlite_integrity(staged_output)?;
+        staged_restore.publish(output)?;
         return Ok(checkpoint_version);
     }
 
@@ -1109,7 +1169,7 @@ pub async fn restore_with_snapshot_source(
         let page_size = changeset.header.page_size as u64;
         let mut file = OpenOptions::new()
             .write(true)
-            .open(output)
+            .open(staged_output)
             .map_err(|e| anyhow!("Failed to open database for apply: {}", e))?;
 
         for page in &changeset.pages {
@@ -1129,7 +1189,8 @@ pub async fn restore_with_snapshot_source(
         current_checksum = Some(changeset.checksum);
     }
 
-    verify_sqlite_integrity(output)?;
+    verify_sqlite_integrity(staged_output)?;
+    staged_restore.publish(output)?;
     Ok(restored_seq)
 }
 
@@ -2180,6 +2241,30 @@ mod tests {
         }
     }
 
+    fn create_sqlite_source(path: &Path) -> Result<u32> {
+        let conn = rusqlite::Connection::open(path)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+            INSERT INTO data (id, val) VALUES (1, 'base-1');
+            INSERT INTO data (id, val) VALUES (2, 'base-2');
+            ",
+        )?;
+        let page_size = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        drop(conn);
+        Ok(page_size)
+    }
+
+    fn create_marker_db(path: &Path, marker: &str) -> Result<()> {
+        let conn = rusqlite::Connection::open(path)?;
+        conn.execute("CREATE TABLE marker (value TEXT NOT NULL);", [])?;
+        conn.execute(
+            "INSERT INTO marker (value) VALUES (?1)",
+            rusqlite::params![marker],
+        )?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn test_restore_with_snapshot_source_no_incrementals() {
         let storage = TestStorage::new();
@@ -2319,6 +2404,65 @@ mod tests {
         assert!(
             msg.contains("gap") || msg.contains("contiguous") || msg.contains("seq"),
             "expected gap/contiguity error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_failure_preserves_existing_output_database() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let output = dir.path().join("restored.db");
+        let page_size = create_sqlite_source(&source).unwrap();
+        create_marker_db(&output, "must-survive").unwrap();
+        let original_output = std::fs::read(&output).unwrap();
+
+        let snapshot = ltx::encode_snapshot(&source, page_size, 1, 0).unwrap();
+        let snapshot_key = build_changeset_key("test/", "mydb", GENERATION_SNAPSHOT, 1);
+        storage.insert(&snapshot_key, snapshot);
+
+        let snapshot_checksum = ltx::compute_checksum_from_file(&source).unwrap();
+        let pages = vec![(1, vec![0x66; page_size as usize])];
+        let (incremental, _) =
+            ltx::encode_wal_changes(&pages, page_size, 3, snapshot_checksum).unwrap();
+        let incremental_key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 3);
+        storage.insert(&incremental_key, incremental);
+
+        restore(&storage, "test/", "mydb", &output, None)
+            .await
+            .expect_err("restore must fail before publishing over the existing output");
+
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            original_output,
+            "failed restore must leave the existing output database untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_with_snapshot_source_failure_preserves_existing_output_database() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("restored.db");
+        create_marker_db(&output, "must-survive").unwrap();
+        let original_output = std::fs::read(&output).unwrap();
+
+        let incremental_key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 7);
+        storage.insert(&incremental_key, vec![0xff]);
+        let source = MockSnapshotSource {
+            version: 5,
+            row_count: 2,
+            fail: None,
+        };
+
+        restore_with_snapshot_source(&storage, "test/", "mydb", &output, &source)
+            .await
+            .expect_err("restore must fail before publishing over the existing output");
+
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            original_output,
+            "failed snapshot-source restore must leave the existing output database untouched"
         );
     }
 
