@@ -475,11 +475,15 @@ fn write_rows(conn: &rusqlite::Connection, start: u32, count: u32) {
 }
 
 fn snapshot_keys(storage: &MemStorage, prefix: &str, db_name: &str) -> Vec<String> {
-    let snapshot_prefix = format!("{prefix}{db_name}/0001/");
+    let db_prefix = format!("{prefix}{db_name}/");
     storage
         .keys()
         .into_iter()
-        .filter(|key| key.starts_with(&snapshot_prefix) && key.ends_with(".hadbp"))
+        .filter(|key| {
+            key.starts_with(&db_prefix)
+                && key.ends_with(".hadbp")
+                && (key.starts_with(&format!("{db_prefix}0001/")) || key.contains("/0001/"))
+        })
         .collect()
 }
 
@@ -1490,6 +1494,97 @@ async fn test_walrust_owned_reopen_uses_legacy_state_json() {
         duplicate, 0,
         "walrust-owned reopen should not re-encode old WAL frames"
     );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_walrust_owned_new_stream_writes_lineage_state_and_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("walrust-owned-lineage.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let storage = MemStorage::new();
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    replicator.add("owned-lineage", &db_path).await.unwrap();
+    write_rows(&conn, 100, 2);
+    let frames = replicator.flush("owned-lineage").await.unwrap();
+    assert!(frames > 0, "flush should publish live WAL frames");
+
+    let saved_state = storage.value("wal/owned-lineage/state.json").await;
+    let lineage_id = saved_state
+        .get("lineage_id")
+        .and_then(|value| value.as_str())
+        .expect("walrust-owned mode must persist lineage_id");
+    assert!(
+        !lineage_id.is_empty() && !lineage_id.contains('/'),
+        "lineage_id must be a single path segment, got {lineage_id:?}"
+    );
+
+    let lineage_prefix = format!("wal/owned-lineage/lineages/{lineage_id}/");
+    let keys = storage.keys();
+    assert!(
+        keys.iter().any(
+            |key| key.starts_with(&format!("{lineage_prefix}0001/")) && key.ends_with(".hadbp")
+        ),
+        "initial snapshot must be written under the lineage namespace; keys={keys:?}"
+    );
+    assert!(
+        keys.iter().any(
+            |key| key.starts_with(&format!("{lineage_prefix}0000/")) && key.ends_with(".hadbp")
+        ),
+        "live WAL changeset must be written under the lineage namespace; keys={keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|key| {
+            (key.starts_with("wal/owned-lineage/0000/")
+                || key.starts_with("wal/owned-lineage/0001/"))
+                && key.ends_with(".hadbp")
+        }),
+        "new walrust-owned streams must not write legacy unlineaged HADBP keys; keys={keys:?}"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_walrust_owned_restore_uses_active_lineage_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("walrust-owned-lineage-restore.db");
+    let restore_path = dir.path().join("restored.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let storage = MemStorage::new();
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    replicator
+        .add("owned-lineage-restore", &db_path)
+        .await
+        .unwrap();
+    write_rows(&conn, 100, 2);
+    replicator.flush("owned-lineage-restore").await.unwrap();
+
+    let restored_seq = walrust::sync::restore(
+        storage.as_ref(),
+        "wal/",
+        "owned-lineage-restore",
+        &restore_path,
+        None,
+    )
+    .await
+    .expect("restore must discover active lineage from state.json");
+    assert_eq!(
+        restored_seq,
+        replicator
+            .current_seq("owned-lineage-restore")
+            .await
+            .unwrap()
+    );
+
+    let restored = rusqlite::Connection::open(&restore_path).unwrap();
+    let count: i64 = restored
+        .query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 5, "restore must include snapshot and lineaged WAL");
 
     drop(conn);
 }

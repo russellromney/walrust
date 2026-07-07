@@ -62,6 +62,8 @@ struct SavedSyncState {
     #[serde(default)]
     current_seq: Option<u64>,
     #[serde(default)]
+    lineage_id: Option<String>,
+    #[serde(default)]
     current_txid: Option<u64>,
     #[serde(default)]
     db_checksum: Option<u64>,
@@ -248,6 +250,7 @@ impl Replicator {
             state.current_txid = base_change_counter;
         }
 
+        state.ensure_lineage_id();
         sync::take_snapshot_with_retry(
             self.storage.as_ref(),
             &prefix,
@@ -255,6 +258,7 @@ impl Replicator {
             &self.config.retry_policy,
         )
         .await?;
+        sync::save_state(self.storage.as_ref(), &prefix, &state).await?;
 
         let db_state = Arc::new(AsyncMutex::new(DbState {
             state,
@@ -330,6 +334,7 @@ impl Replicator {
             if let Some(seq) = saved.current_seq {
                 state.current_seq = seq;
             }
+            state.lineage_id = saved.lineage_id;
             if let Some(offset) = saved.wal_offset {
                 state.wal_offset = offset;
             }

@@ -166,6 +166,9 @@ pub struct SyncState {
     pub wal_generation: u64,
     /// Current sequence number (HADBP seq, increments per sync)
     pub current_seq: u64,
+    /// Walrust-owned stream lineage. When set, HADBP objects are written under
+    /// a lineage namespace so cold starts cannot silently reuse an old chain.
+    pub lineage_id: Option<String>,
     /// Current transaction ID (SQLite change counter, for change detection only)
     pub current_txid: u64,
     /// Last snapshot time
@@ -214,12 +217,20 @@ impl SyncState {
             wal_offset: 0,
             wal_generation: 0,
             current_seq: 0,
+            lineage_id: None,
             current_txid: 0,
             last_snapshot: None,
             db_checksum: None,
             wal_salt: None,
             wal_checksum_chain: None,
         })
+    }
+
+    /// Ensure this walrust-owned stream has a durable object namespace.
+    pub fn ensure_lineage_id(&mut self) -> &str {
+        self.lineage_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().simple().to_string())
+            .as_str()
     }
 
     /// Initialize checksum from database file.
@@ -247,6 +258,141 @@ const GENERATION_SNAPSHOT: u64 = cs_storage::GENERATION_SNAPSHOT;
 /// Build S3 key for a changeset file.
 fn build_changeset_key(prefix: &str, db_name: &str, generation: u64, seq: u64) -> String {
     cs_storage::format_key(prefix, db_name, generation, seq, ChangesetKind::Physical)
+}
+
+fn build_lineage_changeset_key(
+    prefix: &str,
+    db_name: &str,
+    lineage_id: &str,
+    generation: u64,
+    seq: u64,
+) -> String {
+    format!(
+        "{}{}/lineages/{}/{:04x}/{:016x}.{}",
+        prefix,
+        db_name,
+        lineage_id,
+        generation,
+        seq,
+        ChangesetKind::Physical.extension()
+    )
+}
+
+fn build_state_changeset_key(prefix: &str, state: &SyncState, generation: u64, seq: u64) -> String {
+    match state.lineage_id.as_deref() {
+        Some(lineage_id) => {
+            build_lineage_changeset_key(prefix, &state.name, lineage_id, generation, seq)
+        }
+        None => build_changeset_key(prefix, &state.name, generation, seq),
+    }
+}
+
+fn lineage_generation_prefix(
+    prefix: &str,
+    db_name: &str,
+    lineage_id: &str,
+    generation: u64,
+) -> String {
+    format!(
+        "{}{}/lineages/{}/{:04x}/",
+        prefix, db_name, lineage_id, generation
+    )
+}
+
+fn state_key(prefix: &str, db_name: &str) -> String {
+    format!("{}{}/state.json", prefix, db_name)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RemoteSyncState {
+    #[serde(default)]
+    lineage_id: Option<String>,
+}
+
+async fn active_lineage_id(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+) -> Result<Option<String>> {
+    let key = state_key(prefix, db_name);
+    let Some(data) = storage
+        .get(&key)
+        .await
+        .map_err(|e| anyhow!("failed to load replication state {key}: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let remote = serde_json::from_slice::<RemoteSyncState>(&data)
+        .map_err(|e| anyhow!("failed to parse replication state {key}: {e}"))?;
+    Ok(remote.lineage_id)
+}
+
+async fn discover_after_in_namespace(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    lineage_id: Option<&str>,
+    generation: u64,
+    after_seq: u64,
+    kind: ChangesetKind,
+) -> Result<Vec<DiscoveredChangeset>> {
+    if generation == GENERATION_LIVE && lineage_id.is_none() {
+        return cs_storage::discover_after(storage, prefix, db_name, after_seq, kind).await;
+    }
+
+    let ext = kind.extension();
+    let gen_prefix = match lineage_id {
+        Some(lineage_id) => lineage_generation_prefix(prefix, db_name, lineage_id, generation),
+        None => format!("{}{}/{:04x}/", prefix, db_name, generation),
+    };
+    let start_after_key = format!("{}{:016x}.{}", gen_prefix, after_seq, ext);
+    let keys = storage.list(&gen_prefix, Some(&start_after_key)).await?;
+
+    let mut changesets = Vec::new();
+    for key in keys {
+        let Some(filename) = key.strip_prefix(&gen_prefix) else {
+            continue;
+        };
+        if !filename.ends_with(&format!(".{}", ext)) {
+            continue;
+        }
+        let hex_part = &filename[..filename.len() - ext.len() - 1];
+        let Ok(seq) = u64::from_str_radix(hex_part, 16) else {
+            continue;
+        };
+        if seq <= after_seq {
+            continue;
+        }
+        changesets.push(DiscoveredChangeset { key, seq, kind });
+    }
+
+    changesets.sort_by_key(|c| c.seq);
+    Ok(changesets)
+}
+
+async fn discover_latest_snapshot_in_namespace(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    lineage_id: Option<&str>,
+    kind: ChangesetKind,
+) -> Result<Option<DiscoveredChangeset>> {
+    if lineage_id.is_none() {
+        return cs_storage::discover_latest_snapshot(storage, prefix, db_name, kind).await;
+    }
+
+    let mut snapshots = discover_after_in_namespace(
+        storage,
+        prefix,
+        db_name,
+        lineage_id,
+        GENERATION_SNAPSHOT,
+        0,
+        kind,
+    )
+    .await?;
+    snapshots.sort_by_key(|c| c.seq);
+    Ok(snapshots.pop())
 }
 
 /// Get SQLite database page size from header.
@@ -339,11 +485,12 @@ pub async fn save_state(
     prefix: &str,
     state: &SyncState,
 ) -> Result<()> {
-    let state_key = format!("{}{}/state.json", prefix, state.name);
+    let state_key = state_key(prefix, &state.name);
     let state_json = serde_json::json!({
         "wal_offset": state.wal_offset,
         "wal_generation": state.wal_generation,
         "current_seq": state.current_seq,
+        "lineage_id": state.lineage_id.as_deref(),
         "current_txid": state.current_txid,
         "db_checksum": state.db_checksum,
         "last_snapshot": state.last_snapshot,
@@ -620,7 +767,7 @@ async fn sync_wal_with_sequence(
         ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;
 
     let changeset_size = changeset_bytes.len() as u64;
-    let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_LIVE, new_seq);
+    let changeset_key = build_state_changeset_key(prefix, state, GENERATION_LIVE, new_seq);
 
     match sequence {
         DeltaSequence::ExternalChangeCounter => {
@@ -1121,7 +1268,7 @@ pub async fn take_snapshot(
     let changeset_bytes = snapshot.bytes;
 
     let changeset_size = changeset_bytes.len() as u64;
-    let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_SNAPSHOT, new_seq);
+    let changeset_key = build_state_changeset_key(prefix, state, GENERATION_SNAPSHOT, new_seq);
 
     put_changeset_if_absent(
         storage,
@@ -1162,16 +1309,24 @@ pub async fn restore(
     _point_in_time: Option<&str>,
 ) -> Result<u64> {
     // Find latest snapshot
-    let snapshot =
-        cs_storage::discover_latest_snapshot(storage, prefix, db_name, ChangesetKind::Physical)
-            .await?
-            .ok_or_else(|| anyhow!("No snapshot found for database '{}'", db_name))?;
-
-    // Find incrementals after the snapshot
-    let incrementals = cs_storage::discover_after(
+    let lineage_id = active_lineage_id(storage, prefix, db_name).await?;
+    let snapshot = discover_latest_snapshot_in_namespace(
         storage,
         prefix,
         db_name,
+        lineage_id.as_deref(),
+        ChangesetKind::Physical,
+    )
+    .await?
+    .ok_or_else(|| anyhow!("No snapshot found for database '{}'", db_name))?;
+
+    // Find incrementals after the snapshot
+    let incrementals = discover_after_in_namespace(
+        storage,
+        prefix,
+        db_name,
+        lineage_id.as_deref(),
+        GENERATION_LIVE,
         snapshot.seq,
         ChangesetKind::Physical,
     )
@@ -1390,7 +1545,7 @@ pub async fn take_snapshot_with_retry(
     let changeset_bytes = snapshot.bytes;
 
     let changeset_size = changeset_bytes.len() as u64;
-    let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_SNAPSHOT, new_seq);
+    let changeset_key = build_state_changeset_key(prefix, state, GENERATION_SNAPSHOT, new_seq);
 
     // Share buffer across retry attempts via Arc to avoid per-attempt clones
     let upload_buffer = std::sync::Arc::new(changeset_bytes);
@@ -1487,7 +1642,7 @@ pub async fn sync_wal_with_retry(
         ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;
 
     let changeset_size = changeset_bytes.len() as u64;
-    let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_LIVE, new_seq);
+    let changeset_key = build_state_changeset_key(prefix, state, GENERATION_LIVE, new_seq);
 
     let upload_buffer = std::sync::Arc::new(changeset_bytes);
     let upload_key = changeset_key.clone();
@@ -1545,7 +1700,7 @@ pub async fn sync_wal_and_manifest(
 
     if frames > 0 {
         let new_seq = state.current_seq;
-        let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_LIVE, new_seq);
+        let changeset_key = build_state_changeset_key(prefix, state, GENERATION_LIVE, new_seq);
 
         manifest.files.push(LtxEntry {
             filename: changeset_key,
@@ -1581,10 +1736,13 @@ pub async fn pull_incremental(
     db_path: &Path,
     current_seq: u64,
 ) -> Result<u64> {
-    let new_files = cs_storage::discover_after(
+    let lineage_id = active_lineage_id(storage, prefix, db_name).await?;
+    let new_files = discover_after_in_namespace(
         storage,
         prefix,
         db_name,
+        lineage_id.as_deref(),
+        GENERATION_LIVE,
         current_seq,
         ChangesetKind::Physical,
     )
@@ -1747,10 +1905,13 @@ async fn pull_incremental_into_sink_inner(
     sink: &mut dyn crate::replay_sink::PageReplaySink,
     current_seq: u64,
 ) -> Result<u64> {
-    let new_files = cs_storage::discover_after(
+    let lineage_id = active_lineage_id(storage, prefix, db_name).await?;
+    let new_files = discover_after_in_namespace(
         storage,
         prefix,
         db_name,
+        lineage_id.as_deref(),
+        GENERATION_LIVE,
         current_seq,
         ChangesetKind::Physical,
     )
@@ -1975,7 +2136,9 @@ pub async fn run_replication(
         state.init_checksum()?;
     }
 
+    state.ensure_lineage_id();
     take_snapshot_with_retry(storage, prefix, &mut state, &config.retry_policy).await?;
+    save_state(storage, prefix, &state).await?;
     tracing::info!(
         "{}: Initial snapshot taken, starting replication loop",
         state.name

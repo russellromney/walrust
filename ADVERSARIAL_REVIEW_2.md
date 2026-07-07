@@ -237,17 +237,21 @@ by `uploader::tests::test_uploader_basic_upload` and
 ### A10 — Replication progress state is not durable / not fenced
 Status: Partial — Phase 1.5 reload-half fixed in core, and Phase 2.5
 walrust-owned object publication now uses CAS/idempotence checks for snapshots
-and live WAL changesets. Saved `state.json` now round-trips `wal_salt` and
-`wal_checksum_chain`, and read/parse failures propagate instead of becoming a
-cold start. Proven by
+and live WAL changesets. New walrust-owned streams now mint a `lineage_id`,
+persist it in `state.json`, write HADBP objects under a lineage namespace, and
+restore from that active namespace. Saved `state.json` now round-trips
+`wal_salt` and `wal_checksum_chain`, and read/parse failures propagate instead
+of becoming a cold start. Proven by
 `test_walrust_owned_reload_restores_saved_wal_salt`,
 `test_walrust_owned_reload_restores_saved_wal_checksum_chain`, and
 `test_walrust_owned_reload_state_transport_error_is_hard_error`, plus
 `walrust_owned_sync_rejects_divergent_existing_changeset` and
-`walrust_owned_snapshot_rejects_divergent_existing_changeset`. The root CLI
-watch path has no equivalent remote `state.json` reload path; its durable
-progress gap plus walrust-owned lineage/fencing and the external-base WAL
-offset assumption remain open for Phase 2.5.
+`walrust_owned_snapshot_rejects_divergent_existing_changeset`,
+`test_walrust_owned_new_stream_writes_lineage_state_and_keys`, and
+`test_walrust_owned_restore_uses_active_lineage_namespace`. The root CLI watch
+path has no equivalent remote `state.json` reload path; its durable progress
+gap plus walrust-owned fencing and the external-base WAL offset assumption
+remain open for Phase 2.5.
 
 - `state.json` save/load asymmetry: `save_state` persists `wal_salt` +
   `wal_checksum_chain` (`crates/walrust-core/src/sync.rs:258-267`) but reload
@@ -258,14 +262,14 @@ offset assumption remain open for Phase 2.5.
   load_manifest; same discipline needed here).
 - Walrust-owned mode: blind changeset `storage.put()` is fixed in core via
   `put_changeset_if_absent` (`crates/walrust-core/src/sync.rs:407-446`,
-  `:638-646`, `:1126-1135`, `:1405-1414`, `:1501-1510`). Remaining: seq
-  re-seeded from the SQLite change counter on every `add()`
-  (`replicator.rs:222-227`), which barely moves in WAL mode => routine restart
-  overwrites the previous run's objects with a divergent lineage; two
-  instances on one prefix silently interleave. No lease/fence (external mode
-  has CAS + epoch fencing; walrust-owned has none). No lineage/generation ID
-  anywhere in keys => stream resets are undetectable by replicas
-  (`replicate.rs:141-170` stalls forever, silently, if S3 is re-seeded).
+  `:638-646`, `:1126-1135`, `:1405-1414`, `:1501-1510`). New walrust-owned
+  streams now carry `lineage_id` in state and keys via
+  `SyncState::ensure_lineage_id` (`crates/walrust-core/src/sync.rs:230-234`),
+  lineaged key builders/discovery (`sync.rs:263-396`), initial replicator
+  mint/save (`crates/walrust-core/src/replicator.rs:253-263`), and state reload
+  (`replicator.rs:337`). Remaining: two instances on one prefix can still race
+  within the same active lineage because walrust-owned mode has no lease/fence
+  comparable to external mode's epoch fencing.
 - Sidecar watch path persists nothing: `current_txid` in memory only;
   production never writes `manifest.json`; restart re-mints TXIDs and
   overwrites remote history (`src/sync/watch_shadow.rs:103-111`).
