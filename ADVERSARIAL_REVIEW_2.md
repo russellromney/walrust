@@ -869,3 +869,20 @@ and
     engine/state transitions to core.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.
+    Status: Fixed — root `src/errors.rs` and core
+    `crates/walrust-core/src/errors.rs` now classify only typed
+    `WalrustError` values found in the `anyhow` error chain, and untyped
+    messages no longer receive category-specific exit statuses from substring
+    matches. Root config/database validation now returns typed config/database
+    errors, restore no-snapshot/PIT failures return typed restore errors, and
+    verify hard-failures return typed integrity errors at the production CLI
+    boundary. Proven first by failing root/core
+    `errors::tests::test_untyped_messages_are_not_classified_by_substring`
+    (plain `anyhow!("Checksum mismatch...")` incorrectly classified as
+    integrity), by failing `test_verify_no_backup_found` (printed exit 5 but
+    process exited 1), by failing
+    `invalid_replicate_interval_exits_with_config_status` (invalid production
+    `replicate --interval` exited 1 instead of 2), and by failing
+    `missing_restore_backup_exits_with_restore_status` (missing production
+    restore exited 1 instead of 6). The fixed tests now pass along with the
+    root/core typed classifier tests.

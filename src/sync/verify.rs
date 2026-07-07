@@ -1,3 +1,4 @@
+use crate::errors::WalrustError;
 use crate::ltx::Checksum;
 use anyhow::{anyhow, Result};
 use std::sync::Arc;
@@ -262,10 +263,11 @@ pub async fn verify(
     if current_txid == 0 {
         println!("No LTX files found for database: {}", name);
         println!("Exit code: 5 (integrity issues found)");
-        return Err(anyhow!(
+        return Err(WalrustError::integrity(format!(
             "Integrity verification failed: No LTX files found for database: {}",
             name
-        ));
+        ))
+        .into());
     }
 
     // Collect all files from all generations
@@ -303,7 +305,7 @@ pub async fn verify(
         println!();
         println!("Cannot verify backup without a base snapshot.");
         println!("Recommendation: Run 'walrust snapshot' to create initial snapshot.");
-        anyhow::bail!("No snapshot found - backup is incomplete");
+        return Err(WalrustError::integrity("No snapshot found - backup is incomplete").into());
     }
 
     println!(
@@ -477,11 +479,11 @@ pub async fn verify(
         println!("Recommendation: Re-snapshot database to repair backup chain");
         println!();
         println!("Exit code: 5 (integrity errors - data may be unrecoverable)");
-        anyhow::bail!("Critical integrity issues detected")
+        Err(WalrustError::integrity("Critical integrity issues detected").into())
     } else {
         println!("Recommendation: Investigate checksum failures or re-upload affected files");
         println!();
         println!("Exit code: 5 (integrity issues found)");
-        anyhow::bail!("Integrity issues detected")
+        Err(WalrustError::integrity("Integrity issues detected").into())
     }
 }

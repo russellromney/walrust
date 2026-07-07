@@ -2,7 +2,8 @@
 //!
 //! Loads walrust.toml from current directory with CLI override support.
 
-use anyhow::{anyhow, Result};
+use crate::errors::WalrustError;
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -238,7 +239,11 @@ impl Config {
             Some(p) => {
                 // Explicit path provided - must exist
                 if !p.exists() {
-                    return Err(anyhow!("Config file not found: {}", p.display()));
+                    return Err(WalrustError::config(format!(
+                        "Config file not found: {}",
+                        p.display()
+                    ))
+                    .into());
                 }
                 p.to_path_buf()
             }
@@ -252,11 +257,13 @@ impl Config {
             }
         };
 
-        let content = std::fs::read_to_string(&config_path)
-            .map_err(|e| anyhow!("Failed to read {}: {}", config_path.display(), e))?;
+        let content = std::fs::read_to_string(&config_path).map_err(|e| {
+            WalrustError::config(format!("Failed to read {}: {}", config_path.display(), e))
+        })?;
 
-        let config: Config = toml::from_str(&content)
-            .map_err(|e| anyhow!("Failed to parse {}: {}", config_path.display(), e))?;
+        let config: Config = toml::from_str(&content).map_err(|e| {
+            WalrustError::config(format!("Failed to parse {}: {}", config_path.display(), e))
+        })?;
 
         config.validate()?;
 
@@ -272,32 +279,39 @@ impl Config {
             && self.retention.weekly == 0
             && self.retention.monthly == 0
         {
-            return Err(anyhow!("[retention]: at least one tier must be > 0"));
+            return Err(WalrustError::config("[retention]: at least one tier must be > 0").into());
         }
 
         // Validate S3 bucket format if specified
         if let Some(ref bucket) = self.s3.bucket {
             if bucket.is_empty() {
-                return Err(anyhow!("[s3].bucket cannot be empty string"));
+                return Err(WalrustError::config("[s3].bucket cannot be empty string").into());
             }
             // Bucket should not contain spaces or invalid characters
             if bucket.contains(' ') {
-                return Err(anyhow!("[s3].bucket cannot contain spaces: '{}'", bucket));
+                return Err(WalrustError::config(format!(
+                    "[s3].bucket cannot contain spaces: '{}'",
+                    bucket
+                ))
+                .into());
             }
         }
 
         for (i, db) in self.databases.iter().enumerate() {
             if db.path.is_empty() {
-                return Err(anyhow!("databases[{}].path cannot be empty", i));
+                return Err(
+                    WalrustError::config(format!("databases[{}].path cannot be empty", i)).into(),
+                );
             }
 
             // Validate retention values if overridden
             if let Some(ref ret) = db.retention {
                 if ret.hourly == 0 && ret.daily == 0 && ret.weekly == 0 && ret.monthly == 0 {
-                    return Err(anyhow!(
+                    return Err(WalrustError::config(format!(
                         "databases[{}].retention: at least one tier must be > 0",
                         i
-                    ));
+                    ))
+                    .into());
                 }
             }
         }
@@ -389,13 +403,13 @@ fn expand_glob(pattern: &str) -> Result<Vec<PathBuf>> {
         if path.exists() {
             return Ok(vec![path]);
         } else {
-            return Err(anyhow!("Database not found: {}", pattern));
+            return Err(WalrustError::database(format!("Database not found: {}", pattern)).into());
         }
     }
 
     // Expand glob pattern
     let paths: Vec<PathBuf> = glob::glob(pattern)
-        .map_err(|e| anyhow!("Invalid glob pattern '{}': {}", pattern, e))?
+        .map_err(|e| WalrustError::config(format!("Invalid glob pattern '{}': {}", pattern, e)))?
         .filter_map(|entry| entry.ok())
         .filter(|p| p.is_file())
         .collect();

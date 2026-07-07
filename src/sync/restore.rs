@@ -1,6 +1,7 @@
 use crate::cache::LocalCache;
+use crate::errors::WalrustError;
 use crate::s3::{self, create_client, parse_bucket};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use async_trait::async_trait;
 use hadb_storage::{CasResult, StorageBackend};
 use hadb_storage_s3::S3Storage;
@@ -94,10 +95,9 @@ pub async fn restore(
 
     // Parse point in time if provided (TXID only for litestream format).
     let parsed_point_in_time = if let Some(pit) = point_in_time {
-        Some(
-            pit.parse::<u64>()
-                .map_err(|_| anyhow!("Invalid point_in_time format. Use TXID (number)"))?,
-        )
+        Some(pit.parse::<u64>().map_err(|_| {
+            WalrustError::restore("Invalid point_in_time format. Use TXID (number)")
+        })?)
     } else {
         None
     };
@@ -120,7 +120,7 @@ pub async fn restore(
                     webhook.notify_corruption(&name, &error_msg).await;
                 });
             }
-            return Err(e);
+            return Err(WalrustError::restore(e.to_string()).into());
         }
     };
 

@@ -191,6 +191,11 @@ fn test_verify_no_backup_found() -> Result<()> {
         !verify_output.status.success(),
         "verify must fail closed when no LTX files exist"
     );
+    assert_eq!(
+        verify_output.status.code(),
+        Some(5),
+        "missing backups are integrity failures, not generic errors; stdout={stdout}; stderr={stderr}"
+    );
     assert!(
         stdout.contains("No LTX files found") || stderr.contains("No LTX files found"),
         "Should report no files found"

@@ -107,76 +107,12 @@ impl fmt::Display for WalrustError {
 
 impl std::error::Error for WalrustError {}
 
-/// Classify an anyhow error into a WalrustError based on its message
-///
-/// This allows gradual migration - existing code can continue using anyhow,
-/// and we classify errors at the boundary (main.rs) for exit codes.
+/// Classify an anyhow error into an exit status from typed walrust errors.
 pub fn classify_error(err: &anyhow::Error) -> ExitStatus {
-    let msg = err.to_string().to_lowercase();
-    let chain = format!("{:?}", err).to_lowercase();
-
-    // Config errors (check early - CLI/config validation)
-    // These patterns indicate user configuration issues, not runtime S3 failures
-    if msg.contains("config")
-        || msg.contains("--bucket")
-        || msg.contains("required")
-        || msg.contains("invalid glob")
-        || msg.contains("duration")
-        || msg.contains("toml")
-        || (msg.contains("parse") && !msg.contains("s3"))
-    {
-        return ExitStatus::Config;
-    }
-
-    // S3 errors (runtime S3 operation failures)
-    if chain.contains("sdk")
-        || chain.contains("s3error")
-        || chain.contains("aws")
-        || msg.contains("s3://")
-        || msg.contains("credential")
-        || msg.contains("accessdenied")
-        || msg.contains("nosuchbucket")
-        || msg.contains("nosuchkey")
-        || (msg.contains("bucket") && !msg.contains("required"))
-        || (msg.contains("endpoint") && !msg.contains("required"))
-    {
-        return ExitStatus::S3;
-    }
-
-    // Integrity errors
-    if msg.contains("checksum")
-        || msg.contains("integrity")
-        || msg.contains("corrupt")
-        || msg.contains("invalid ltx")
-        || msg.contains("txid continuity")
-        || msg.contains("verification failed")
-    {
-        return ExitStatus::Integrity;
-    }
-
-    // Restore errors
-    if msg.contains("no snapshot")
-        || msg.contains("no ltx")
-        || msg.contains("point in time")
-        || msg.contains("pitr")
-        || msg.contains("not found for database")
-        || msg.contains("no snapshots found")
-        || msg.contains("bootstrap")
-    {
-        return ExitStatus::Restore;
-    }
-
-    // Database errors
-    if msg.contains("database not found")
-        || msg.contains("invalid database")
-        || msg.contains("wal magic")
-        || msg.contains("sqlite")
-        || msg.contains(".db")
-        || msg.contains("db-wal")
-        || msg.contains("page size")
-        || msg.contains("page num")
-    {
-        return ExitStatus::Database;
+    for cause in err.chain() {
+        if let Some(err) = cause.downcast_ref::<WalrustError>() {
+            return err.exit_status();
+        }
     }
 
     ExitStatus::General
@@ -225,61 +161,44 @@ mod tests {
 
     #[test]
     fn test_classify_config_errors() {
-        let err = anyhow!("--bucket is required when no config file is present");
-        assert_eq!(classify_error(&err), ExitStatus::Config);
-
-        let err = anyhow!("Failed to parse walrust.toml: invalid key");
-        assert_eq!(classify_error(&err), ExitStatus::Config);
-
-        let err = anyhow!("Invalid duration '5x'. Use format like '5s'");
+        let err = anyhow::Error::new(WalrustError::config("--bucket is required"));
         assert_eq!(classify_error(&err), ExitStatus::Config);
     }
 
     #[test]
     fn test_classify_database_errors() {
-        let err = anyhow!("Database not found: /path/to/test.db");
-        assert_eq!(classify_error(&err), ExitStatus::Database);
-
-        let err = anyhow!("Invalid WAL magic number: 0x12345678");
-        assert_eq!(classify_error(&err), ExitStatus::Database);
-
-        let err = anyhow!("Invalid page size: 123");
+        let err = anyhow::Error::new(WalrustError::database("database unavailable"));
         assert_eq!(classify_error(&err), ExitStatus::Database);
     }
 
     #[test]
     fn test_classify_s3_errors() {
-        let err = anyhow!("Failed to upload to s3://bucket/key");
-        assert_eq!(classify_error(&err), ExitStatus::S3);
-
-        let err = anyhow!("NoSuchBucket: The specified bucket does not exist");
-        assert_eq!(classify_error(&err), ExitStatus::S3);
-
-        let err = anyhow!("AccessDenied: Access to bucket denied");
+        let err = anyhow::Error::new(WalrustError::s3("upload failed"));
         assert_eq!(classify_error(&err), ExitStatus::S3);
     }
 
     #[test]
     fn test_classify_integrity_errors() {
-        let err = anyhow!("Checksum mismatch: expected 0x123, got 0x456");
-        assert_eq!(classify_error(&err), ExitStatus::Integrity);
-
-        let err = anyhow!("TXID continuity broken at file 5");
+        let err = anyhow::Error::new(WalrustError::integrity("chain broken"))
+            .context("while verifying backup");
         assert_eq!(classify_error(&err), ExitStatus::Integrity);
     }
 
     #[test]
     fn test_classify_restore_errors() {
-        let err = anyhow!("No snapshot found for database 'mydb'");
-        assert_eq!(classify_error(&err), ExitStatus::Restore);
-
-        let err = anyhow!("No LTX files found in manifest");
+        let err = anyhow::Error::new(WalrustError::restore("snapshot unavailable"));
         assert_eq!(classify_error(&err), ExitStatus::Restore);
     }
 
     #[test]
     fn test_classify_general_errors() {
         let err = anyhow!("Something unexpected happened");
+        assert_eq!(classify_error(&err), ExitStatus::General);
+    }
+
+    #[test]
+    fn test_untyped_messages_are_not_classified_by_substring() {
+        let err = anyhow!("Checksum mismatch: expected 0x123, got 0x456");
         assert_eq!(classify_error(&err), ExitStatus::General);
     }
 
