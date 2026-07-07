@@ -788,9 +788,17 @@ and
     `walrust-core::legacy_cache`; root `src/cache.rs` is now a compatibility
     shim. The moved cache keeps its original unit coverage under
     `walrust-core::legacy_cache::tests::*`.
-    Remaining work: root `src/uploader.rs` and root `src/sync/*` still own the
-    CLI watch/upload orchestration over the legacy LTX object layout, while
-    core owns the HADBP engine. That workflow/API migration is still required
-    before duplicate sync implementations can be deleted.
+    Legacy uploader ownership was then reproduced with
+    `legacy_uploader_is_owned_by_core_and_uploads_cached_ltx` (failed because
+    `walrust_core::legacy_uploader` did not exist), then fixed by moving the
+    cache-to-storage uploader, retry handling, corrupt-cache rejection,
+    durable cursor advancement, failed-upload shutdown posture, and concurrent
+    drain behavior into `walrust-core::legacy_uploader`; root
+    `src/uploader.rs` is now a compatibility shim. The moved uploader keeps
+    its original unit coverage under `walrust-core::legacy_uploader::tests::*`.
+    Remaining work: root `src/sync/*` still owns the CLI watch/upload
+    orchestration over the legacy LTX object layout, while core owns the HADBP
+    engine. That workflow/API migration is still required before duplicate
+    sync implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.
