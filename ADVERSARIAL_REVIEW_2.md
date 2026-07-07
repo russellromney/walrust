@@ -724,5 +724,17 @@ and
 4.1 Decide the surviving stack (likely walrust-core as the engine, src/ as
     thin CLI over it); delete the duplicate WAL/LTX/sync/restore
     implementations so invariants live in exactly one place.
+    Status: Partial — `walrust-core` is now the canonical WAL and shadow-WAL
+    implementation. Root `src/wal.rs` and `src/shadow.rs` are compatibility
+    shims over `walrust-core`, preserving the root module paths while deleting
+    the duplicate root implementations. Before shimming shadow, the missing
+    core segment-name regression was reproduced by
+    `shadow::tests::test_segment_name_width_keeps_lexical_order_past_u32`
+    (failed with 8-hex variable-width names), then fixed by porting the
+    16-hex formatter into core. Remaining work: root `src/ltx.rs` still uses
+    the legacy Litestream-compatible LTX API/format while core uses HADBP, and
+    root `src/sync/*` still owns the CLI watch/restore/compact/replicate
+    workflow. Those require a larger API/format migration before the duplicate
+    LTX/sync/restore implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.

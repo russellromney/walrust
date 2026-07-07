@@ -20,6 +20,21 @@ use tokio::sync::Mutex;
 
 use crate::wal::{self, ParsedFrame, FRAME_HEADER_SIZE};
 
+/// Hex width for both the generation and index components of a shadow segment
+/// filename. Both are `u64`, so 16 hex digits keeps lexical order == numeric
+/// order across the full range.
+pub(crate) const SEGMENT_HEX_WIDTH: usize = 16;
+
+/// Format a shadow segment filename: `{generation:016x}-{index:016x}.wal`.
+fn format_segment_name(generation: u64, index: u64) -> String {
+    format!(
+        "{:0width$x}-{:0width$x}.wal",
+        generation,
+        index,
+        width = SEGMENT_HEX_WIDTH
+    )
+}
+
 fn ensure_connection_in_wal_mode(conn: &Connection, db_path: &Path) -> Result<()> {
     let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
     if mode.eq_ignore_ascii_case("wal") {
@@ -271,10 +286,8 @@ impl ShadowWal {
 
     /// Get path to current shadow segment file
     fn current_segment_path(&self) -> PathBuf {
-        self.shadow_dir.join(format!(
-            "{:08x}-{:08x}.wal",
-            self.generation, self.segment_index
-        ))
+        self.shadow_dir
+            .join(format_segment_name(self.generation, self.segment_index))
     }
 
     /// List all shadow segments for a generation
@@ -502,6 +515,36 @@ mod tests {
         let db_path = PathBuf::from("/data/myapp.db");
         let shadow_dir = ShadowWal::shadow_dir_for(&db_path);
         assert_eq!(shadow_dir, PathBuf::from("/data/.walrust-myapp"));
+    }
+
+    #[test]
+    fn test_segment_name_width_keeps_lexical_order_past_u32() {
+        fn segment_name(generation: u64) -> String {
+            let shadow = ShadowWal {
+                db_path: PathBuf::from("test.db"),
+                shadow_dir: PathBuf::from(".walrust-test"),
+                generation,
+                segment_index: 0,
+                segment_offset: 0,
+                page_size: 4096,
+                checkpoint_blocker: None,
+                wal_salt: (0, 0),
+            };
+            shadow
+                .current_segment_path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        let before_wrap = segment_name(0xffff_ffff);
+        let after_wrap = segment_name(0x1_0000_0000);
+        assert!(
+            before_wrap < after_wrap,
+            "lexical order must follow numeric order: {before_wrap} vs {after_wrap}"
+        );
+        assert_eq!(before_wrap.len(), after_wrap.len(), "fixed width");
     }
 
     #[tokio::test]
