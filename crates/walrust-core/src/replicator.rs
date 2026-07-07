@@ -563,6 +563,7 @@ impl Replicator {
         state.state.current_seq = base.seq;
         state.state.current_txid = base.seq;
         state.state.db_checksum = Some(base.checksum);
+        state.state.external_base = Some(base);
         tracing::info!(
             "{}: adopted external base cursor seq {} checksum {:016x}",
             name,

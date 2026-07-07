@@ -8,6 +8,8 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use hadb_changeset::storage::{self as cs_storage, ChangesetKind, DiscoveredChangeset};
 use serde::{Deserialize, Serialize};
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -151,6 +153,16 @@ pub struct Manifest {
     pub last_checksum: Option<u64>,
 }
 
+/// Explicit base cursor for callers whose checkpoint/base state is owned by
+/// another layer, such as Turbolite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalBaseCursor {
+    /// The durable base replay sequence. Delta objects must start at `seq + 1`.
+    pub seq: u64,
+    /// Checksum of the materialized base. The first delta must chain from this.
+    pub checksum: u64,
+}
+
 /// State for a single database being synced.
 #[derive(Debug, Clone)]
 pub struct SyncState {
@@ -169,6 +181,10 @@ pub struct SyncState {
     /// Walrust-owned stream lineage. When set, HADBP objects are written under
     /// a lineage namespace so cold starts cannot silently reuse an old chain.
     pub lineage_id: Option<String>,
+    /// External-base cursor this state is anchored to, if snapshot ownership is
+    /// outside walrust. Used to persist a local WAL-offset proof for the remote
+    /// object-chain head without writing remote `state.json`.
+    pub external_base: Option<ExternalBaseCursor>,
     /// Current transaction ID (SQLite change counter, for change detection only)
     pub current_txid: u64,
     /// Last snapshot time
@@ -183,16 +199,6 @@ pub struct SyncState {
     /// validation for the next incremental read so a torn tail frame is rejected
     /// rather than shipped.
     pub wal_checksum_chain: Option<(u32, u32)>,
-}
-
-/// Explicit base cursor for callers whose checkpoint/base state is owned by
-/// another layer, such as Turbolite.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExternalBaseCursor {
-    /// The durable base replay sequence. Delta objects must start at `seq + 1`.
-    pub seq: u64,
-    /// Checksum of the materialized base. The first delta must chain from this.
-    pub checksum: u64,
 }
 
 impl SyncState {
@@ -218,6 +224,7 @@ impl SyncState {
             wal_generation: 0,
             current_seq: 0,
             lineage_id: None,
+            external_base: None,
             current_txid: 0,
             last_snapshot: None,
             db_checksum: None,
@@ -553,6 +560,160 @@ pub async fn save_initial_state(
     );
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExternalBaseLocalProgress {
+    version: u32,
+    base_seq: u64,
+    base_checksum: u64,
+    current_seq: u64,
+    db_checksum: u64,
+    wal_offset: u64,
+    wal_generation: u64,
+    wal_salt: Option<(u32, u32)>,
+    wal_checksum_chain: Option<(u32, u32)>,
+}
+
+impl ExternalBaseLocalProgress {
+    fn from_state(state: &SyncState) -> Result<Self> {
+        let base = state.external_base.ok_or_else(|| {
+            anyhow!(
+                "{}: cannot save external-base progress without an external base anchor",
+                state.name
+            )
+        })?;
+        let db_checksum = state.db_checksum.ok_or_else(|| {
+            anyhow!(
+                "{}: cannot save external-base progress without current checksum",
+                state.name
+            )
+        })?;
+        Ok(Self {
+            version: 1,
+            base_seq: base.seq,
+            base_checksum: base.checksum,
+            current_seq: state.current_seq,
+            db_checksum,
+            wal_offset: state.wal_offset,
+            wal_generation: state.wal_generation,
+            wal_salt: state.wal_salt,
+            wal_checksum_chain: state.wal_checksum_chain,
+        })
+    }
+}
+
+fn local_progress_dir_for(db_path: &Path) -> PathBuf {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = db_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("database");
+    parent.join(format!(".walrust-{stem}"))
+}
+
+fn external_base_progress_path(state: &SyncState) -> PathBuf {
+    local_progress_dir_for(&state.db_path).join("external-base-progress.json")
+}
+
+fn fsync_dir(path: &Path) -> Result<()> {
+    File::open(path)?
+        .sync_all()
+        .map_err(|e| anyhow!("failed to fsync directory {}: {}", path.display(), e))
+}
+
+fn save_external_base_progress(state: &SyncState) -> Result<()> {
+    let progress_path = external_base_progress_path(state);
+    let progress_dir = progress_path.parent().ok_or_else(|| {
+        anyhow!(
+            "invalid external-base progress path {}",
+            progress_path.display()
+        )
+    })?;
+    fs::create_dir_all(progress_dir).map_err(|e| {
+        anyhow!(
+            "{}: failed to create local external-base progress directory {}: {}",
+            state.name,
+            progress_dir.display(),
+            e
+        )
+    })?;
+
+    let tmp_path = progress_path.with_extension("json.tmp");
+    let progress = ExternalBaseLocalProgress::from_state(state)?;
+    let bytes = serde_json::to_vec_pretty(&progress)?;
+
+    {
+        let mut file = File::create(&tmp_path).map_err(|e| {
+            anyhow!(
+                "{}: failed to create temporary local external-base progress file {}: {}",
+                state.name,
+                tmp_path.display(),
+                e
+            )
+        })?;
+        file.write_all(&bytes).map_err(|e| {
+            anyhow!(
+                "{}: failed to write temporary local external-base progress file {}: {}",
+                state.name,
+                tmp_path.display(),
+                e
+            )
+        })?;
+        file.sync_all().map_err(|e| {
+            anyhow!(
+                "{}: failed to fsync temporary local external-base progress file {}: {}",
+                state.name,
+                tmp_path.display(),
+                e
+            )
+        })?;
+    }
+
+    fs::rename(&tmp_path, &progress_path).map_err(|e| {
+        anyhow!(
+            "{}: failed to install local external-base progress file {}: {}",
+            state.name,
+            progress_path.display(),
+            e
+        )
+    })?;
+    fsync_dir(progress_dir)?;
+    Ok(())
+}
+
+fn load_external_base_progress(state: &SyncState) -> Result<Option<ExternalBaseLocalProgress>> {
+    let progress_path = external_base_progress_path(state);
+    let bytes = match fs::read(&progress_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow!(
+                "{}: failed to read local external-base progress file {}: {}",
+                state.name,
+                progress_path.display(),
+                e
+            ));
+        }
+    };
+
+    let progress: ExternalBaseLocalProgress = serde_json::from_slice(&bytes).map_err(|e| {
+        anyhow!(
+            "{}: failed to parse local external-base progress file {}: {}",
+            state.name,
+            progress_path.display(),
+            e
+        )
+    })?;
+    if progress.version != 1 {
+        anyhow::bail!(
+            "{}: unsupported local external-base progress version {} in {}",
+            state.name,
+            progress.version,
+            progress_path.display()
+        );
+    }
+    Ok(Some(progress))
+}
+
 // ============================================================================
 // Core sync operations
 // ============================================================================
@@ -860,8 +1021,15 @@ async fn sync_wal_with_sequence(
     state.current_txid = max_txid;
     state.db_checksum = Some(post_checksum);
 
-    if matches!(sequence, DeltaSequence::WalrustOwned) {
-        save_state(storage, prefix, state).await?;
+    match sequence {
+        DeltaSequence::WalrustOwned => {
+            save_state(storage, prefix, state).await?;
+        }
+        DeltaSequence::ExternalChangeCounter => {
+            if state.external_base.is_some() {
+                save_external_base_progress(state)?;
+            }
+        }
     }
 
     Ok(frame_count as u64)
@@ -881,6 +1049,7 @@ pub async fn initialize_external_base_state(
     state.db_checksum = Some(base.checksum);
     state.wal_offset = 0;
     state.wal_generation = 0;
+    state.external_base = Some(base);
 
     let head = match cs_storage::discover_strict_physical_chain(
         storage,
@@ -924,17 +1093,48 @@ pub async fn initialize_external_base_state(
 
     // The object chain is authoritative for seq/checksum. If no external
     // delta object exists after the base, locally present WAL bytes are not
-    // proven durable remotely and must be read from the beginning. If a chain
-    // does exist, this reopen path preserves the legacy cursor heuristic until
-    // Phase 2.5's durable local progress record can map an object-chain head
-    // to an exact WAL offset.
-    state.wal_offset = if head.count == 0 {
-        0
+    // proven durable remotely and must be read from the beginning. If the
+    // chain is ahead, a local fsynced progress record must map that exact
+    // chain head to the local WAL cursor; guessing from current WAL size would
+    // skip unpublished bytes after restart.
+    if head.count == 0 {
+        state.wal_offset = 0;
+        state.wal_generation = 0;
+        state.wal_salt = None;
+        state.wal_checksum_chain = None;
     } else {
-        crate::wal::get_wal_size(&state.wal_path)
-            .await
-            .map_err(|e| anyhow!("{}: failed to read WAL size: {}", state.name, e))?
-    };
+        let progress = load_external_base_progress(state)?.ok_or_else(|| {
+            anyhow!(
+                "{}: remote external-base chain is at seq {} but no matching local external-base progress file exists; refusing to guess WAL offset",
+                state.name,
+                head.seq
+            )
+        })?;
+        if progress.base_seq != base.seq || progress.base_checksum != base.checksum {
+            anyhow::bail!(
+                "{}: local external-base progress anchor mismatch (progress base seq/checksum {}:{:016x}, requested {}:{:016x})",
+                state.name,
+                progress.base_seq,
+                progress.base_checksum,
+                base.seq,
+                base.checksum
+            );
+        }
+        if progress.current_seq != head.seq || progress.db_checksum != head.checksum {
+            anyhow::bail!(
+                "{}: local external-base progress does not match remote chain head (progress seq/checksum {}:{:016x}, remote {}:{:016x})",
+                state.name,
+                progress.current_seq,
+                progress.db_checksum,
+                head.seq,
+                head.checksum
+            );
+        }
+        state.wal_offset = progress.wal_offset;
+        state.wal_generation = progress.wal_generation;
+        state.wal_salt = progress.wal_salt;
+        state.wal_checksum_chain = progress.wal_checksum_chain;
+    }
 
     Ok(())
 }
@@ -3044,18 +3244,18 @@ mod tests {
             SyncState::new_with_paths(dir.path().join("mydb.db"), dir.path().join("mydb.db-wal"))
                 .expect("sync state");
         state.name = "mydb".to_string();
+        let base = ExternalBaseCursor {
+            seq: 3,
+            checksum: checksum_from_current_page_base,
+        };
+        state.external_base = Some(base);
+        state.current_seq = 4;
+        state.db_checksum = Some(checksum4);
+        save_external_base_progress(&state).expect("seed local external progress");
 
-        initialize_external_base_state(
-            &storage,
-            "test/",
-            &mut state,
-            ExternalBaseCursor {
-                seq: 3,
-                checksum: checksum_from_current_page_base,
-            },
-        )
-        .await
-        .expect("external base init should chain from the external page-base checksum");
+        initialize_external_base_state(&storage, "test/", &mut state, base)
+            .await
+            .expect("external base init should chain from the external page-base checksum");
 
         assert_eq!(state.current_seq, 4);
         assert_eq!(
@@ -3093,18 +3293,18 @@ mod tests {
             SyncState::new_with_paths(dir.path().join("mydb.db"), dir.path().join("mydb.db-wal"))
                 .expect("sync state");
         state.name = "mydb".to_string();
+        let base = ExternalBaseCursor {
+            seq: 3,
+            checksum: 0x2222,
+        };
+        state.external_base = Some(base);
+        state.current_seq = 4;
+        state.db_checksum = Some(checksum4);
+        save_external_base_progress(&state).expect("seed local external progress");
 
-        initialize_external_base_state(
-            &storage,
-            "test/",
-            &mut state,
-            ExternalBaseCursor {
-                seq: 3,
-                checksum: 0x2222,
-            },
-        )
-        .await
-        .expect("same-seq checksum should be accepted only when it extends the chain");
+        initialize_external_base_state(&storage, "test/", &mut state, base)
+            .await
+            .expect("same-seq checksum should be accepted only when it extends the chain");
 
         assert_eq!(state.current_seq, 4);
         assert_eq!(state.db_checksum, Some(checksum4));

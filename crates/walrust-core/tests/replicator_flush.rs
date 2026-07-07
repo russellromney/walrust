@@ -1328,6 +1328,40 @@ async fn test_external_mode_registration_does_not_skip_unpublished_wal_bytes() {
 }
 
 #[tokio::test]
+async fn test_external_mode_rejects_remote_chain_without_local_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-missing-progress.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+    let base_checksum = walrust::ltx::compute_checksum_from_file(&db_path).unwrap();
+
+    let storage = MemStorage::new();
+    seed_physical_delta(&storage, "wal/", "external", base_seq + 1, base_checksum).await;
+
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    let err = replicator
+        .add_external_base_with_wal_path(
+            "external",
+            &db_path,
+            &db_path.with_extension("db-wal"),
+            walrust::ExternalBaseCursor {
+                seq: base_seq,
+                checksum: base_checksum,
+            },
+        )
+        .await
+        .expect_err("remote chain head without local WAL progress proof must fail closed");
+    assert!(
+        err.to_string().contains("local external-base progress"),
+        "expected local progress proof error, got {err}"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
 async fn test_external_mode_does_not_read_or_write_remote_state_json() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("external-no-state-access.db");

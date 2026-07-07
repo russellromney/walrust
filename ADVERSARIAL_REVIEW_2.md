@@ -235,7 +235,7 @@ by `uploader::tests::test_uploader_basic_upload` and
   timestamp PITR (needs commit-time metadata) or fix the docs/help.
 
 ### A10 — Replication progress state is not durable / not fenced
-Status: Partial — Phase 1.5 reload-half fixed in core, and Phase 2.5
+Status: Fixed — Phase 1.5 reload-half fixed in core, and Phase 2.5
 walrust-owned object publication now uses CAS/idempotence checks for snapshots
 and live WAL changesets. New walrust-owned streams now mint a `lineage_id`,
 persist it in `state.json`, write HADBP objects under a lineage namespace, and
@@ -259,8 +259,12 @@ persisted. Proven by
 Fresh walrust-owned lineage creation now refuses an existing active
 `state.json` and publishes initial state with CAS, preventing competing
 `add()` calls from replacing the active lineage. Proven by
-`test_walrust_owned_add_refuses_existing_active_state`. Exact external-base
-head-to-WAL-offset persistence remains open for Phase 2.5.
+`test_walrust_owned_add_refuses_existing_active_state`. External-base mode now
+writes a local fsynced progress record after successful HADBP delta publication
+and refuses to reopen a remote chain head without a matching local WAL cursor
+proof. Proven by
+`test_external_mode_rejects_remote_chain_without_local_progress` and
+`test_external_mode_reopen_derives_head_without_remote_state`.
 
 - `state.json` save/load asymmetry: `save_state` persists `wal_salt` +
   `wal_checksum_chain` (`crates/walrust-core/src/sync.rs:258-267`) but reload
@@ -284,9 +288,8 @@ head-to-WAL-offset persistence remains open for Phase 2.5.
   overwrites remote history (`src/sync/watch_shadow.rs:103-111`).
 - `initialize_external_base_state` no longer skips local WAL bytes when the
   external base has no published delta chain (`crates/walrust-core/src/sync.rs:879-884`);
-  WAL-size I/O errors now propagate. Remaining: when a remote delta chain
-  already exists, exact head-to-local-WAL-offset proof still depends on the
-  durable fsynced local progress record below.
+  WAL-size guessing for non-empty remote chains has been removed. A matching
+  fsynced local progress record is required before reusing a local WAL cursor.
 - Fix: symmetrical state round-trip; transport errors propagate; CAS
   (`put_if_absent`/`put_if_match`) in walrust-owned mode; a lineage ID minted
   at bootstrap and embedded in keys + state; one durable fsynced local
