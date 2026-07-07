@@ -1,9 +1,12 @@
-use crate::ltx::Decoder;
 use anyhow::Result;
-use std::io::Cursor;
+use hadb_storage_s3::S3Storage;
 pub(crate) use walrust_core::legacy_manifest::{
-    build_ltx_key, database_prefix, format_generation, is_snapshot, parse_generation,
-    parse_legacy_flat_ltx_filename, parse_ltx_filename, DiscoveredLtx, GENERATION_LIVE,
+    build_ltx_key, database_prefix, is_snapshot, DiscoveredLtx, GENERATION_LIVE,
+};
+use walrust_core::legacy_manifest::{
+    discover_all_legacy_ltx, discover_legacy_snapshots, discover_legacy_state,
+    find_latest_legacy_snapshot, find_latest_legacy_snapshot_at_or_before,
+    list_legacy_generation_files,
 };
 
 use super::types::Manifest;
@@ -18,19 +21,8 @@ use crate::s3;
 //   db_name/0002/...                         <- generation 2, etc.
 // TXIDs are 16-char lowercase hex (e.g., 0000000000000001)
 
-async fn legacy_flat_ltx_range(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    key: &str,
-    txid: u64,
-) -> (u64, u64) {
-    let Ok(bytes) = s3::download_bytes(client, bucket, key).await else {
-        return (txid, txid);
-    };
-    let Ok((_, header)) = Decoder::new(Cursor::new(bytes)) else {
-        return (txid, txid);
-    };
-    (header.min_txid.into_inner(), header.max_txid.into_inner())
+fn s3_storage(client: &aws_sdk_s3::Client, bucket: &str) -> S3Storage {
+    S3Storage::new(client.clone(), bucket.to_string())
 }
 
 /// Discover all snapshot LTX files from S3 by listing (no manifest needed).
@@ -46,26 +38,12 @@ pub(crate) async fn discover_snapshots_from_s3(
     prefix: &str,
     db_name: &str,
 ) -> Result<Vec<(String, u64, u64, u64)>> {
-    let (_current_txid, max_gen, _) =
-        discover_state_from_s3(client, bucket, prefix, db_name).await?;
-
-    let mut snapshots = Vec::new();
-    // Live generation may hold the initial base (min==max==1).
-    for (key, min, max) in
-        list_generation_files(client, bucket, prefix, db_name, GENERATION_LIVE).await?
-    {
-        if is_snapshot(GENERATION_LIVE, min, max) {
-            snapshots.push((key, GENERATION_LIVE, min, max));
-        }
-    }
-    // Snapshot generations 1..=max_gen are snapshots by definition.
-    for gen in 1..=max_gen {
-        for (key, min, max) in list_generation_files(client, bucket, prefix, db_name, gen).await? {
-            snapshots.push((key, gen, min, max));
-        }
-    }
-    snapshots.sort_by_key(|(_, gen, _, max)| (*gen, *max));
-    Ok(snapshots)
+    let storage = s3_storage(client, bucket);
+    Ok(discover_legacy_snapshots(&storage, prefix, db_name)
+        .await?
+        .into_iter()
+        .map(|file| (file.key, file.generation, file.min_txid, file.max_txid))
+        .collect())
 }
 
 /// Discover current state from S3 by listing files (no manifest needed)
@@ -76,46 +54,9 @@ pub(crate) async fn discover_state_from_s3(
     prefix: &str,
     db_name: &str,
 ) -> Result<(u64, u64, Option<u64>)> {
-    // List all objects under db_name/
-    let db_prefix = database_prefix(prefix, db_name);
-    let objects = s3::list_objects(client, bucket, &db_prefix).await?;
-
-    if objects.is_empty() {
-        return Ok((0, 0, None));
-    }
-
-    let mut max_txid: u64 = 0;
-    let mut max_generation: u64 = 0;
-
-    for key in &objects {
-        // Extract generation and filename from key
-        // Key format: prefix/db_name/GGGG/min-max.ltx
-        let relative = key.strip_prefix(&db_prefix).unwrap_or(key);
-        let parts: Vec<&str> = relative.split('/').collect();
-
-        if parts.len() == 2 {
-            if let Some(gen) = parse_generation(parts[0]) {
-                if gen > max_generation && gen > 0 {
-                    max_generation = gen;
-                }
-                if let Some((_, file_max_txid)) = parse_ltx_filename(parts[1]) {
-                    if file_max_txid > max_txid {
-                        max_txid = file_max_txid;
-                    }
-                }
-            }
-        } else if parts.len() == 1 {
-            if let Some(file_max_txid) = parse_legacy_flat_ltx_filename(parts[0]) {
-                if file_max_txid > max_txid {
-                    max_txid = file_max_txid;
-                }
-            }
-        }
-    }
-
-    // For checksum, we'd need to read the latest LTX header
-    // For now, return None - we'll compute from local DB on startup
-    Ok((max_txid, max_generation, None))
+    let storage = s3_storage(client, bucket);
+    let (current_txid, max_generation) = discover_legacy_state(&storage, prefix, db_name).await?;
+    Ok((current_txid, max_generation, None))
 }
 
 /// Find the latest snapshot in S3 (file with min_txid = 1 in highest generation)
@@ -125,7 +66,10 @@ pub(crate) async fn find_latest_snapshot(
     prefix: &str,
     db_name: &str,
 ) -> Result<Option<(u64, String, u64, u64)>> {
-    find_latest_snapshot_matching(client, bucket, prefix, db_name, |_| true).await
+    let storage = s3_storage(client, bucket);
+    Ok(find_latest_legacy_snapshot(&storage, prefix, db_name)
+        .await?
+        .map(|file| (file.generation, file.key, file.min_txid, file.max_txid)))
 }
 
 /// Find the latest snapshot whose max TXID is not after `target_txid`.
@@ -136,71 +80,12 @@ pub(crate) async fn find_latest_snapshot_at_or_before(
     db_name: &str,
     target_txid: u64,
 ) -> Result<Option<(u64, String, u64, u64)>> {
-    find_latest_snapshot_matching(client, bucket, prefix, db_name, |max_txid| {
-        max_txid <= target_txid
-    })
-    .await
-}
-
-async fn find_latest_snapshot_matching(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    prefix: &str,
-    db_name: &str,
-    include_max_txid: impl Fn(u64) -> bool,
-) -> Result<Option<(u64, String, u64, u64)>> {
-    // Returns: (generation, key, min_txid, max_txid)
-    let db_prefix = database_prefix(prefix, db_name);
-    let objects = s3::list_objects(client, bucket, &db_prefix).await?;
-
-    let mut best_snapshot: Option<(u64, String, u64, u64)> = None;
-
-    for key in &objects {
-        let relative = key.strip_prefix(&db_prefix).unwrap_or(key);
-        let parts: Vec<&str> = relative.split('/').collect();
-
-        if parts.len() == 2 {
-            if let Some(gen) = parse_generation(parts[0]) {
-                if let Some((min_txid, max_txid)) = parse_ltx_filename(parts[1]) {
-                    // A snapshot has min_txid = 1
-                    // Look in all generations (litestream puts initial snapshot in gen 0)
-                    if min_txid == 1 && include_max_txid(max_txid) {
-                        match &best_snapshot {
-                            None => {
-                                best_snapshot = Some((gen, key.clone(), min_txid, max_txid));
-                            }
-                            Some((best_gen, _, _, best_max)) => {
-                                // Prefer higher generation, or higher max_txid in same generation
-                                if gen > *best_gen || (gen == *best_gen && max_txid > *best_max) {
-                                    best_snapshot = Some((gen, key.clone(), min_txid, max_txid));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        } else if parts.len() == 1 {
-            if let Some(txid) = parse_legacy_flat_ltx_filename(parts[0]) {
-                let (min_txid, max_txid) = legacy_flat_ltx_range(client, bucket, key, txid).await;
-                if min_txid == 1 && include_max_txid(max_txid) {
-                    match &best_snapshot {
-                        None => {
-                            best_snapshot =
-                                Some((GENERATION_LIVE, key.clone(), min_txid, max_txid));
-                        }
-                        Some((best_gen, _, _, best_max)) => {
-                            if *best_gen == GENERATION_LIVE && max_txid > *best_max {
-                                best_snapshot =
-                                    Some((GENERATION_LIVE, key.clone(), min_txid, max_txid));
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(best_snapshot)
+    let storage = s3_storage(client, bucket);
+    Ok(
+        find_latest_legacy_snapshot_at_or_before(&storage, prefix, db_name, target_txid)
+            .await?
+            .map(|file| (file.generation, file.key, file.min_txid, file.max_txid)),
+    )
 }
 
 /// List all LTX files in a generation folder
@@ -211,42 +96,8 @@ pub(crate) async fn list_generation_files(
     db_name: &str,
     generation: u64,
 ) -> Result<Vec<(String, u64, u64)>> {
-    // Returns: Vec<(key, min_txid, max_txid)>
-    let gen_prefix = format!(
-        "{}{}/",
-        database_prefix(prefix, db_name),
-        format_generation(generation)
-    );
-    let objects = s3::list_objects(client, bucket, &gen_prefix).await?;
-
-    let mut files = Vec::new();
-    for key in objects {
-        let filename = key.rsplit('/').next().unwrap_or(&key);
-        if let Some((min_txid, max_txid)) = parse_ltx_filename(filename) {
-            files.push((key, min_txid, max_txid));
-        }
-    }
-
-    if generation == GENERATION_LIVE {
-        let db_prefix = database_prefix(prefix, db_name);
-        let legacy_objects = s3::list_objects(client, bucket, &db_prefix).await?;
-        for key in legacy_objects {
-            let relative = key.strip_prefix(&db_prefix).unwrap_or(&key);
-            let parts: Vec<&str> = relative.split('/').collect();
-            if parts.len() != 1 {
-                continue;
-            }
-            let Some(txid) = parse_legacy_flat_ltx_filename(parts[0]) else {
-                continue;
-            };
-            let (min_txid, max_txid) = legacy_flat_ltx_range(client, bucket, &key, txid).await;
-            files.push((key, min_txid, max_txid));
-        }
-    }
-
-    // Sort by min_txid
-    files.sort_by_key(|(_, min, _)| *min);
-    Ok(files)
+    let storage = s3_storage(client, bucket);
+    list_legacy_generation_files(&storage, prefix, db_name, generation).await
 }
 
 /// Discover every LTX file (snapshots + incrementals) for a database from the
@@ -261,34 +112,8 @@ pub(crate) async fn discover_all_ltx_from_s3(
     prefix: &str,
     db_name: &str,
 ) -> Result<Vec<DiscoveredLtx>> {
-    let (_current_txid, max_gen, _) =
-        discover_state_from_s3(client, bucket, prefix, db_name).await?;
-
-    let mut files = Vec::new();
-    for (key, min, max) in
-        list_generation_files(client, bucket, prefix, db_name, GENERATION_LIVE).await?
-    {
-        files.push(DiscoveredLtx {
-            key,
-            generation: GENERATION_LIVE,
-            min_txid: min,
-            max_txid: max,
-            is_snapshot: is_snapshot(GENERATION_LIVE, min, max),
-        });
-    }
-    for gen in 1..=max_gen {
-        for (key, min, max) in list_generation_files(client, bucket, prefix, db_name, gen).await? {
-            files.push(DiscoveredLtx {
-                key,
-                generation: gen,
-                min_txid: min,
-                max_txid: max,
-                is_snapshot: is_snapshot(gen, min, max),
-            });
-        }
-    }
-    files.sort_by_key(|f| (f.min_txid, f.generation));
-    Ok(files)
+    let storage = s3_storage(client, bucket);
+    discover_all_legacy_ltx(&storage, prefix, db_name).await
 }
 
 /// Load manifest from S3
@@ -329,6 +154,7 @@ pub(crate) async fn save_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use walrust_core::legacy_manifest::parse_legacy_flat_ltx_filename;
 
     #[test]
     fn build_ltx_key_normalizes_prefix_separator() {

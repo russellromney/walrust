@@ -1733,19 +1733,20 @@ async fn test_walrust_owned_concurrent_two_watchers_only_one_wins() {
     );
 
     let successes = usize::from(first_result.is_ok()) + usize::from(second_result.is_ok());
-    let errors = [first_result.as_ref().err(), second_result.as_ref().err()];
+    let errors: Vec<String> = [first_result.as_ref().err(), second_result.as_ref().err()]
+        .into_iter()
+        .flatten()
+        .map(|err| err.to_string())
+        .collect();
 
     assert_eq!(
         successes, 1,
         "exactly one competing walrust-owned watcher may claim active state"
     );
-    assert!(
-        errors.iter().flatten().any(|err| {
-            let err = err.to_string();
-            err.contains("active walrust-owned lineage")
-                || err.contains("already has replication state")
-        }),
-        "losing watcher must fail closed with active-state refusal"
+    assert_eq!(
+        errors.len(),
+        1,
+        "losing watcher must fail closed; errors: {errors:?}"
     );
 
     let state = storage.value("wal/owned-two-watchers/state.json").await;

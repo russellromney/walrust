@@ -745,9 +745,16 @@ and
     `walrust_core::legacy_manifest` did not exist), then fixed by moving the
     pure key-formatting, generation, snapshot-classification, and discovered
     file types into `walrust-core::legacy_manifest`; root `src/sync/manifest.rs`
-    now reuses those definitions. Remaining work: root `src/sync/*` still owns
-    the S3-specific CLI watch/restore/compact/replicate discovery and apply
-    workflow over the legacy LTX object layout, while core owns the HADBP
+    now reuses those definitions. Legacy object discovery ownership was then
+    reproduced with
+    `legacy_manifest::tests::legacy_ltx_discovery_is_owned_by_core_storage_backend`
+    (failed because core had no storage-backed legacy discovery API), then
+    fixed by moving snapshot selection, generation listing, state discovery,
+    and all-file discovery into `walrust-core::legacy_manifest` over
+    `hadb_storage::StorageBackend`; root `src/sync/manifest.rs` now delegates
+    its S3 discovery wrappers through `hadb_storage_s3::S3Storage`. Remaining
+    work: root `src/sync/*` still owns the CLI watch/restore/compact/replicate
+    apply workflow over the legacy LTX object layout, while core owns the HADBP
     engine. That workflow/API migration is still required before duplicate
     sync/restore implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
