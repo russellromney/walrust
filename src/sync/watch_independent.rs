@@ -498,8 +498,12 @@ async fn run_db_task(
                             last_synced_wal_size = current_wal_size;
                         }
                         Err(e) => {
-                            tracing::error!("{}: Sync failed: {}", db_name, e);
-                            // Don't update last_synced_wal_size on failure - will retry next tick
+                            let error_msg = e.to_string();
+                            tracing::error!("{}: Sync failed: {}", db_name, error_msg);
+                            webhook_sender
+                                .notify_upload_failed(&db_name, &error_msg, 1)
+                                .await;
+                            return Err(anyhow!("{}: sync failed: {}", db_name, error_msg));
                         }
                     }
                 }

@@ -379,6 +379,29 @@ Replica in-place apply/bootstrap remains open for the Phase 2 replica-half.
   (0 frames forever, no error/webhook) (`wal_sync.rs:99-115`,
   `sync.rs:400-403`). `open_checkpoint_blocker` silently converts DELETE-mode
   DBs to WAL as a side effect (`src/shadow.rs:120`).
+  Status: Fixed. Current refs: root WAL sync now checks `PRAGMA journal_mode`
+  before accepting no-WAL no-ops and hard-errors if SQLite is not in WAL mode
+  (`src/sync/wal_sync.rs:43-48`, `src/sync/wal_sync.rs:102-118`,
+  `src/sync/wal_sync.rs:829-847`); root shadow construction/copy now rejects
+  non-WAL mode without converting it (`src/shadow.rs:39-50`,
+  `src/shadow.rs:129-135`, `src/shadow.rs:187-202`). Root watch loops return
+  hard errors and emit `upload_failed` webhooks on WAL/shadow sync failure
+  (`src/sync/watch_independent.rs:500-506`,
+  `src/sync/watch_shadow.rs:572-582`). Core has the same hard WAL-mode and
+  shadow conversion guards (`crates/walrust-core/src/sync.rs:445-463`,
+  `crates/walrust-core/src/sync.rs:471-476`,
+  `crates/walrust-core/src/sync.rs:891-896`,
+  `crates/walrust-core/src/sync.rs:1302-1307`,
+  `crates/walrust-core/src/sync.rs:1842-1854`,
+  `crates/walrust-core/src/sync.rs:1920-1931`,
+  `crates/walrust-core/src/shadow.rs:22-33`,
+  `crates/walrust-core/src/shadow.rs:111-118`,
+  `crates/walrust-core/src/shadow.rs:170-183`). Proven by
+  `sync::wal_sync::tests::test_sync_wal_concurrent_rejects_database_out_of_wal_mode`,
+  `sync::wal_sync::tests::test_sync_wal_retry_notifies_webhook_when_database_leaves_wal_mode`,
+  `shadow::tests::test_shadow_wal_new_rejects_delete_mode_without_converting`,
+  `sync::tests::sync_wal_rejects_database_out_of_wal_mode`, and core
+  `shadow::tests::test_shadow_wal_new_rejects_delete_mode_without_converting`.
 - B13 — Restore cache substitution keyed by bare TXID, no lineage/etag binding
   (`restore.rs:108-118`); NO_CHECKSUM litestream files skip even internal
   checks.

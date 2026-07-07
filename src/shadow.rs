@@ -9,7 +9,7 @@
 //! 3. Preserved history - shadow keeps frames even after checkpoint
 //! 4. Decoupled I/O - upload doesn't block write path
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -34,6 +34,19 @@ pub(crate) fn format_segment_name(generation: u64, index: u64) -> String {
         index,
         width = SEGMENT_HEX_WIDTH
     )
+}
+
+fn ensure_connection_in_wal_mode(conn: &Connection, db_path: &Path) -> Result<()> {
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{}: SQLite journal_mode is '{}', expected WAL; shadow replication cannot continue",
+            db_path.display(),
+            mode
+        ))
+    }
 }
 
 /// Shadow WAL manager for a single database
@@ -116,11 +129,10 @@ impl ShadowWal {
     fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
         let conn = Connection::open(db_path)?;
 
-        // Set WAL mode and disable auto-checkpoint on this connection
-        conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA wal_autocheckpoint=0;",
-        )?;
+        ensure_connection_in_wal_mode(&conn, db_path)?;
+
+        // Disable auto-checkpoint on this connection without changing journal_mode.
+        conn.execute_batch("PRAGMA wal_autocheckpoint=0;")?;
 
         // Start a read transaction that will block checkpointing
         // We use a simple query that keeps the transaction open
@@ -132,6 +144,15 @@ impl ShadowWal {
         tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
 
         Ok(conn)
+    }
+
+    async fn ensure_database_in_wal_mode(db_path: &Path) -> Result<()> {
+        let db_path = db_path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = Connection::open(&db_path)?;
+            ensure_connection_in_wal_mode(&conn, &db_path)
+        })
+        .await?
     }
 
     /// Find the latest generation number in the shadow directory
@@ -168,13 +189,17 @@ impl ShadowWal {
 
         // Check if WAL exists
         if !wal_path.exists() {
+            Self::ensure_database_in_wal_mode(&self.db_path).await?;
             return Ok((Vec::new(), offset));
         }
 
         // Read WAL header to check for checkpoint (salt change)
         let header = match wal::read_header(&wal_path).await? {
             Some(h) => h,
-            None => return Ok((Vec::new(), offset)),
+            None => {
+                Self::ensure_database_in_wal_mode(&self.db_path).await?;
+                return Ok((Vec::new(), offset));
+            }
         };
 
         // Detect checkpoint by salt change
@@ -491,5 +516,36 @@ mod tests {
         let shadow = ShadowWal::new(&db_path).await.unwrap();
         assert!(shadow.shadow_dir().exists());
         assert_eq!(shadow.generation(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_shadow_wal_new_rejects_delete_mode_without_converting() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("delete-mode.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=DELETE;
+            CREATE TABLE test (id INTEGER PRIMARY KEY);
+            INSERT INTO test VALUES (1);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = match ShadowWal::new(&db_path).await {
+            Ok(_) => panic!("shadow mode must fail closed instead of converting DELETE to WAL"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("journal_mode"), "{msg}");
+        assert!(msg.contains("WAL"), "{msg}");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "delete");
     }
 }

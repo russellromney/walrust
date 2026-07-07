@@ -442,6 +442,26 @@ async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> 
     })
 }
 
+async fn ensure_database_in_wal_mode(db_path: &Path, db_name: &str) -> Result<()> {
+    let db_path = db_path.to_path_buf();
+    let mode = tokio::task::spawn_blocking(move || -> Result<String> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        Ok(mode)
+    })
+    .await??;
+
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{}: SQLite journal_mode is '{}', expected WAL; replication cannot continue",
+            db_name,
+            mode
+        ))
+    }
+}
+
 async fn sync_wal_with_sequence(
     storage: &dyn StorageBackend,
     prefix: &str,
@@ -450,7 +470,10 @@ async fn sync_wal_with_sequence(
 ) -> Result<u64> {
     let header = match wal::read_header(&state.wal_path).await? {
         Some(h) => h,
-        None => return Ok(0),
+        None => {
+            ensure_database_in_wal_mode(&state.db_path, &state.name).await?;
+            return Ok(0);
+        }
     };
 
     let WalBatch {
@@ -867,7 +890,10 @@ pub async fn sync_wal_fenced_delta(
 ) -> Result<Option<DeltaPublishResult>> {
     let header = match wal::read_header(&state.wal_path).await? {
         Some(h) => h,
-        None => return Ok(None),
+        None => {
+            ensure_database_in_wal_mode(&state.db_path, &state.name).await?;
+            return Ok(None);
+        }
     };
 
     let WalBatch {
@@ -1275,7 +1301,10 @@ pub async fn sync_wal_with_retry(
 ) -> Result<u64> {
     let header = match wal::read_header(&state.wal_path).await? {
         Some(h) => h,
-        None => return Ok(0),
+        None => {
+            ensure_database_in_wal_mode(&state.db_path, &state.name).await?;
+            return Ok(0);
+        }
     };
 
     let WalBatch {
@@ -1791,6 +1820,7 @@ pub async fn run_replication(
 
     let mut sync_timer = tokio::time::interval(config.sync_interval);
     let mut snapshot_timer = tokio::time::interval(config.snapshot_interval);
+    sync_timer.tick().await;
     snapshot_timer.tick().await;
 
     loop {
@@ -1820,7 +1850,7 @@ pub async fn run_replication(
                         }
                     }
                     Err(e) => {
-                        tracing::error!("{}: WAL sync failed: {}", state.name, e);
+                        return Err(anyhow!("{}: WAL sync failed: {}", state.name, e));
                     }
                 }
             }
@@ -1869,6 +1899,7 @@ pub async fn run_wal_replication(
     );
 
     let mut sync_timer = tokio::time::interval(config.sync_interval);
+    sync_timer.tick().await;
 
     loop {
         tokio::select! {
@@ -1897,7 +1928,7 @@ pub async fn run_wal_replication(
                         }
                     }
                     Err(e) => {
-                        tracing::error!("{}: WAL sync failed: {}", state.name, e);
+                        return Err(anyhow!("{}: WAL sync failed: {}", state.name, e));
                     }
                 }
             }
@@ -2263,6 +2294,42 @@ mod tests {
             rusqlite::params![marker],
         )?;
         Ok(())
+    }
+
+    fn create_delete_journal_db(path: &Path) -> Result<()> {
+        let conn = rusqlite::Connection::open(path)?;
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=DELETE;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (value) VALUES ('base');
+            ",
+        )?;
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if mode.to_lowercase() == "wal" {
+            return Err(anyhow!("test database unexpectedly in WAL mode"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_wal_rejects_database_out_of_wal_mode() {
+        let storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("delete-mode.db");
+        create_delete_journal_db(&db_path).unwrap();
+
+        let mut state = SyncState::new(db_path).unwrap();
+        state.current_seq = 1;
+        state.current_txid = 1;
+        state.db_checksum = Some(0);
+
+        let err = sync_wal(&storage, "test/", &mut state)
+            .await
+            .expect_err("sync must fail closed when SQLite is not in WAL mode");
+        let msg = err.to_string();
+        assert!(msg.contains("journal_mode"), "{msg}");
+        assert!(msg.contains("WAL"), "{msg}");
     }
 
     #[tokio::test]

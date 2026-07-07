@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use std::path::Path;
 use std::sync::Arc;
@@ -42,7 +42,10 @@ pub(crate) async fn sync_wal_concurrent(
         // Get page size from WAL header if available, otherwise use default
         let page_size = match wal::read_header(&input.wal_path).await? {
             Some(h) => h.page_size,
-            None => 4096, // SQLite default page size
+            None => {
+                ensure_database_in_wal_mode(&input.db_path, &input.name).await?;
+                4096 // SQLite default page size
+            }
         };
 
         let db_path_for_encode = input.db_path.clone();
@@ -99,6 +102,7 @@ pub(crate) async fn sync_wal_concurrent(
     let header = match wal::read_header(&input.wal_path).await? {
         Some(h) => h,
         None => {
+            ensure_database_in_wal_mode(&input.db_path, &input.name).await?;
             // No WAL file - return no-op output
             return Ok(SyncOutput {
                 db_path: input.db_path,
@@ -820,4 +824,193 @@ pub(crate) async fn get_page_size(db_path: &Path) -> Result<u32> {
     let page_size = if page_size == 1 { 65536 } else { page_size };
 
     Ok(page_size)
+}
+
+async fn ensure_database_in_wal_mode(db_path: &Path, db_name: &str) -> Result<()> {
+    let db_path = db_path.to_path_buf();
+    let mode = tokio::task::spawn_blocking(move || -> Result<String> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        Ok(mode)
+    })
+    .await??;
+
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{}: SQLite journal_mode is '{}', expected WAL; replication cannot continue",
+            db_name,
+            mode
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::WebhookConfig;
+    use crate::retry::{RetryConfig, RetryPolicy};
+    use rusqlite::Connection;
+    use serde_json::Value;
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn capture_one_webhook() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "webhook connection closed before request body");
+                buffer.extend_from_slice(&chunk[..n]);
+
+                if let Some(header_end) = find_header_end(&buffer) {
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    if buffer.len() >= body_start + content_length {
+                        let body = String::from_utf8(
+                            buffer[body_start..body_start + content_length].to_vec(),
+                        )
+                        .unwrap();
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .unwrap();
+                        return body;
+                    }
+                }
+            }
+        });
+
+        (url, handle)
+    }
+
+    fn find_header_end(bytes: &[u8]) -> Option<usize> {
+        bytes.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    #[tokio::test]
+    async fn test_sync_wal_concurrent_rejects_database_out_of_wal_mode() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("delete-mode.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=DELETE;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (value) VALUES ('base');
+            ",
+        )
+        .unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(mode.to_lowercase(), "wal");
+        drop(conn);
+
+        let input = SyncInput {
+            db_path: db_path.clone(),
+            name: "delete-mode".to_string(),
+            wal_path: db_path.with_extension("db-wal"),
+            wal_offset: 0,
+            wal_generation: 0,
+            current_txid: 1,
+            db_checksum: Some(0),
+            wal_salt: None,
+            wal_checksum_chain: None,
+        };
+        let client = crate::s3::create_client(None).await.unwrap();
+
+        let err = match sync_wal_concurrent(&client, "unused", "", input).await {
+            Ok(_) => panic!("sync must fail closed when SQLite is not in WAL mode"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("journal_mode"), "{msg}");
+        assert!(msg.contains("WAL"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn test_sync_wal_retry_notifies_webhook_when_database_leaves_wal_mode() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("delete-mode-webhook.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=DELETE;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (value) VALUES ('base');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let input = SyncInput {
+            db_path: db_path.clone(),
+            name: "delete-mode-webhook".to_string(),
+            wal_path: db_path.with_extension("db-wal"),
+            wal_offset: 0,
+            wal_generation: 0,
+            current_txid: 1,
+            db_checksum: Some(0),
+            wal_salt: None,
+            wal_checksum_chain: None,
+        };
+        let client = Arc::new(crate::s3::create_client(None).await.unwrap());
+        let (url, webhook_body) = capture_one_webhook().await;
+        let webhook_sender = Arc::new(WebhookSender::new(vec![WebhookConfig {
+            url,
+            events: vec!["upload_failed".to_string()],
+            secret: None,
+        }]));
+        let retry_policy = RetryPolicy::new(RetryConfig {
+            max_retries: 0,
+            base_delay_ms: 1,
+            max_delay_ms: 1,
+            circuit_breaker_enabled: false,
+            circuit_breaker_threshold: 10,
+            circuit_breaker_cooldown_ms: 1,
+        });
+
+        let err = match sync_wal_concurrent_with_retry(
+            client,
+            "unused".to_string(),
+            "".to_string(),
+            input,
+            retry_policy,
+            webhook_sender,
+        )
+        .await
+        {
+            Ok(_) => panic!("retry wrapper must fail closed when SQLite is not in WAL mode"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("journal_mode"));
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(2), webhook_body)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["event"], "upload_failed");
+        assert_eq!(payload["database"], "delete-mode-webhook");
+        assert!(
+            payload["error"].as_str().unwrap().contains("journal_mode"),
+            "{payload:?}"
+        );
+    }
 }

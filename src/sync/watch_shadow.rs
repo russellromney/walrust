@@ -556,23 +556,30 @@ pub async fn watch_with_shadow(
             _ = wal_sync_timer.tick() => {
                 // Copy any new WAL frames to shadow for all databases
                 for state in db_states.values_mut() {
-                    if state.wal_path.exists() {
-                        match state.shadow.copy_frames(state.wal_copy_offset).await {
-                            Ok((frames, new_offset)) => {
-                                if !frames.is_empty() {
-                                    tracing::debug!(
-                                        "{}: Copied {} frames to shadow (offset {} -> {})",
-                                        state.name,
-                                        frames.len(),
-                                        state.wal_copy_offset,
-                                        new_offset
-                                    );
-                                    state.wal_copy_offset = new_offset;
-                                }
+                    match state.shadow.copy_frames(state.wal_copy_offset).await {
+                        Ok((frames, new_offset)) => {
+                            if !frames.is_empty() {
+                                tracing::debug!(
+                                    "{}: Copied {} frames to shadow (offset {} -> {})",
+                                    state.name,
+                                    frames.len(),
+                                    state.wal_copy_offset,
+                                    new_offset
+                                );
+                                state.wal_copy_offset = new_offset;
                             }
-                            Err(e) => {
-                                tracing::error!("{}: Shadow copy failed: {}", state.name, e);
-                            }
+                        }
+                        Err(e) => {
+                            let error_msg = e.to_string();
+                            tracing::error!("{}: Shadow copy failed: {}", state.name, error_msg);
+                            webhook_sender
+                                .notify_upload_failed(&state.name, &error_msg, 1)
+                                .await;
+                            return Err(anyhow!(
+                                "{}: Shadow copy failed: {}",
+                                state.name,
+                                error_msg
+                            ));
                         }
                     }
                 }
