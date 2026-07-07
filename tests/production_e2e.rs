@@ -404,8 +404,7 @@ fn e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     let go_path = temp.path().join("core-child-go");
     let flushed_path = temp.path().join("core-child-flushed");
 
-    let setup = create_source_db(&db_path, 5)?;
-    let writer = open_external_autocheckpoint_connection(&db_path)?;
+    let _setup = create_source_db(&db_path, 5)?;
 
     let mut first = spawn_core_sigkill_helper(CoreSigkillHelperArgs {
         phase: "first",
@@ -419,17 +418,10 @@ fn e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
         flushed_path: &flushed_path,
     })?;
     wait_for_file_or_child_exit(&mut first, &ready_path, "first core helper startup")?;
-    write_pin_frame(&setup, "core-pre-sigkill")?;
-    let first_read_pin = pin_read_transaction(&db_path)?;
     std::fs::write(&go_path, b"go")?;
-    append_rows(&writer, 6, 8, "core-pre-sigkill")?;
     wait_for_file_or_child_exit(&mut first, &flushed_path, "first core helper flush")?;
     stop_child(&mut first);
-    drop(first_read_pin);
 
-    write_pin_frame(&setup, "core-post-sigkill")?;
-    let second_read_pin = pin_read_transaction(&db_path)?;
-    append_rows(&writer, 9, 12, "core-post-sigkill")?;
     let mut second = spawn_core_sigkill_helper(CoreSigkillHelperArgs {
         phase: "second",
         name: &name,
@@ -442,7 +434,6 @@ fn e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
         flushed_path: &flushed_path,
     })?;
     let status = second.wait()?;
-    drop(second_read_pin);
     anyhow::ensure!(status.success(), "second core helper failed with {status}");
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -513,15 +504,29 @@ fn e2e_core_replicator_sigkill_child() -> Result<()> {
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+                let setup = Connection::open(&db_path)?;
+                setup.execute_batch("PRAGMA journal_mode=WAL;")?;
+                let writer = open_external_autocheckpoint_connection(&db_path)?;
+                write_pin_frame(&setup, "core-pre-sigkill")?;
+                let read_pin = pin_read_transaction(&db_path)?;
+                append_rows(&writer, 6, 8, "core-pre-sigkill")?;
                 flush_until_frames(&replicator, &name, "first helper").await?;
                 std::fs::write(&flushed_path, b"flushed")?;
+                let _keep_read_pin_alive = read_pin;
                 loop {
                     tokio::time::sleep(Duration::from_secs(60)).await;
                 }
             }
             "second" => {
                 replicator.add_without_snapshot(&name, &db_path).await?;
+                let setup = Connection::open(&db_path)?;
+                setup.execute_batch("PRAGMA journal_mode=WAL;")?;
+                let writer = open_external_autocheckpoint_connection(&db_path)?;
+                write_pin_frame(&setup, "core-post-sigkill")?;
+                let read_pin = pin_read_transaction(&db_path)?;
+                append_rows(&writer, 9, 12, "core-post-sigkill")?;
                 flush_until_frames(&replicator, &name, "second helper").await?;
+                drop(read_pin);
                 Ok(())
             }
             _ => anyhow::bail!("unknown core SIGKILL helper phase: {phase}"),
