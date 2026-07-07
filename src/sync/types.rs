@@ -145,6 +145,8 @@ pub(crate) struct ShadowDbState {
     pub(crate) db_checksum: Option<u64>,
     /// Shadow WAL manager (owns the checkpoint blocker)
     pub(crate) shadow: ShadowWal,
+    /// Shadow WAL generation currently being uploaded.
+    pub(crate) shadow_sync_generation: u64,
     /// Offset within shadow segments for upload tracking
     pub(crate) shadow_sync_offset: u64,
     /// WAL offset for copy_frames tracking

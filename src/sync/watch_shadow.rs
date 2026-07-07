@@ -47,7 +47,7 @@ fn shadow_sync_input(state: &ShadowDbState) -> ShadowSyncInput {
         name: state.name.clone(),
         current_txid: state.current_txid,
         db_checksum: state.db_checksum,
-        generation: state.shadow.generation(),
+        generation: state.shadow_sync_generation,
         shadow_sync_offset: state.shadow_sync_offset,
         page_size: state.shadow.page_size(),
         shadow_dir: state.shadow.shadow_dir().to_path_buf(),
@@ -114,6 +114,40 @@ fn apply_shadow_sync_output(
     }
 }
 
+async fn advance_shadow_sync_cursor_if_drained(state: &mut ShadowDbState) -> Result<()> {
+    loop {
+        let live_generation = state.shadow.generation();
+        if state.shadow_sync_generation >= live_generation {
+            return Ok(());
+        }
+
+        let segments = state
+            .shadow
+            .list_segments(state.shadow_sync_generation)
+            .await
+            .with_context(|| {
+                format!(
+                    "{}: failed to list shadow generation {}",
+                    state.name, state.shadow_sync_generation
+                )
+            })?;
+        let generation_size: u64 = segments.iter().map(|segment| segment.size).sum();
+        if state.shadow_sync_offset < generation_size {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "{}: shadow generation {} fully synced ({} bytes); advancing upload cursor to generation {}",
+            state.name,
+            state.shadow_sync_generation,
+            generation_size,
+            state.shadow_sync_generation + 1
+        );
+        state.shadow_sync_generation += 1;
+        state.shadow_sync_offset = 0;
+    }
+}
+
 fn apply_shadow_sync_output_to_state(
     state: &mut ShadowDbState,
     output: &super::types::ShadowSyncOutput,
@@ -127,7 +161,7 @@ fn apply_shadow_sync_output_to_state(
     state.db_checksum = output.new_db_checksum;
 }
 
-fn apply_shadow_sync_results_strict(
+async fn apply_shadow_sync_results_strict(
     db_states: &mut HashMap<PathBuf, ShadowDbState>,
     results: Vec<Result<super::types::ShadowSyncOutput>>,
 ) -> Result<()> {
@@ -135,7 +169,12 @@ fn apply_shadow_sync_results_strict(
 
     for result in results {
         match result {
-            Ok(output) => apply_shadow_sync_output(db_states, &output),
+            Ok(output) => {
+                apply_shadow_sync_output(db_states, &output);
+                if let Some(state) = db_states.get_mut(&output.db_path) {
+                    advance_shadow_sync_cursor_if_drained(state).await?;
+                }
+            }
             Err(e) => {
                 if first_error.is_none() {
                     first_error = Some(e);
@@ -261,6 +300,7 @@ async fn checkpoint_shadow_after_durable_sync(
         );
     };
     apply_shadow_sync_output_to_state(state, &output);
+    advance_shadow_sync_cursor_if_drained(state).await?;
 
     if let Some((cache, _)) = cache_state {
         wait_for_cache_checkpoint_durability(cache, &state.name, state.current_txid, drain_timeout)
@@ -273,11 +313,11 @@ async fn checkpoint_shadow_after_durable_sync(
         .await
         .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
 
-    let current_gen = state.shadow.generation();
-    if current_gen > 0 {
+    let cleanup_before_gen = state.shadow_sync_generation;
+    if cleanup_before_gen > 0 {
         state
             .shadow
-            .cleanup_segments(current_gen)
+            .cleanup_segments(cleanup_before_gen)
             .await
             .with_context(|| format!("{}: shadow cleanup failed", state.name))?;
     }
@@ -502,6 +542,7 @@ pub async fn watch_with_shadow(
                 last_snapshot: None,
                 db_checksum,
                 shadow,
+                shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: 0,
             },
@@ -728,10 +769,16 @@ pub async fn watch_with_shadow(
                 // Phase 3: Apply results sequentially
                 for result in results {
                     match result {
-                        Ok(output) if output.frame_count > 0 => {
+                        Ok(output) => {
+                            let frame_count = output.frame_count;
                             apply_shadow_sync_output(&mut db_states, &output);
 
                             if let Some(state) = db_states.get_mut(&output.db_path) {
+                                advance_shadow_sync_cursor_if_drained(state).await?;
+
+                                if frame_count == 0 {
+                                    continue;
+                                }
 
                                 // Update dashboard
                                 let shadow_size = walkdir::WalkDir::new(state.shadow.shadow_dir())
@@ -756,7 +803,7 @@ pub async fn watch_with_shadow(
 
                                 // Update trigger state
                                 if let Some(trigger) = trigger_states.get_mut(&output.db_path) {
-                                    trigger.frames_since_snapshot += output.frame_count;
+                                    trigger.frames_since_snapshot += frame_count;
                                     trigger.last_wal_activity = Some(std::time::Instant::now());
                                     if trigger.first_change_time.is_none() {
                                         trigger.first_change_time = Some(std::time::Instant::now());
@@ -800,7 +847,6 @@ pub async fn watch_with_shadow(
                                 }
                             }
                         }
-                        Ok(_) => {} // No frames synced
                         Err(e) => {
                             tracing::error!("Shadow sync failed: {}", e);
                         }
@@ -1077,7 +1123,7 @@ pub async fn watch_with_shadow(
         Arc::clone(&webhook_sender),
     )
     .await;
-    apply_shadow_sync_results_strict(&mut db_states, final_results)?;
+    apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
 
     shutdown_shadow_uploaders(&cache_states, &db_states, uploader_handles).await?;
 
@@ -1088,7 +1134,9 @@ pub async fn watch_with_shadow(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shadow::format_segment_name;
     use rusqlite::Connection;
+    use std::io::{Read, Write};
     use tempfile::TempDir;
 
     fn create_real_wal_db() -> (TempDir, PathBuf, Connection) {
@@ -1113,6 +1161,22 @@ mod tests {
         (temp, db_path, conn)
     }
 
+    fn write_shadow_segment(
+        shadow_dir: &std::path::Path,
+        generation: u64,
+        page_size: usize,
+        page_data: &[u8],
+    ) {
+        std::fs::create_dir_all(shadow_dir).unwrap();
+        let path = shadow_dir.join(format_segment_name(generation, 0));
+        let mut file = std::fs::File::create(path).unwrap();
+        let mut header = [0u8; 24];
+        header[0..4].copy_from_slice(&1u32.to_be_bytes());
+        header[4..8].copy_from_slice(&1u32.to_be_bytes());
+        file.write_all(&header).unwrap();
+        file.write_all(&page_data[..page_size]).unwrap();
+    }
+
     #[tokio::test]
     async fn test_shadow_shutdown_syncs_final_real_wal_frames_to_cache() {
         let (_temp, db_path, _conn) = create_real_wal_db();
@@ -1130,6 +1194,7 @@ mod tests {
                 last_snapshot: None,
                 db_checksum: None,
                 shadow,
+                shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: 0,
             },
@@ -1154,7 +1219,9 @@ mod tests {
             Arc::new(WebhookSender::new(vec![])),
         )
         .await;
-        apply_shadow_sync_results_strict(&mut db_states, results).unwrap();
+        apply_shadow_sync_results_strict(&mut db_states, results)
+            .await
+            .unwrap();
 
         let pending = cache.pending_uploads();
         assert_eq!(
@@ -1174,6 +1241,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_shadow_sync_cursor_resets_offset_when_advancing_generation() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow_dir = ShadowWal::shadow_dir_for(&db_path);
+        let page_size = 4096usize;
+        let mut page = vec![0u8; page_size];
+        std::fs::File::open(&db_path)
+            .unwrap()
+            .read_exact(&mut page)
+            .unwrap();
+
+        write_shadow_segment(&shadow_dir, 0, page_size, &page);
+        write_shadow_segment(&shadow_dir, 1, page_size, &page);
+
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        assert_eq!(
+            shadow.generation(),
+            1,
+            "test setup must start with a newer live shadow generation"
+        );
+        let frame_size = 24 + page_size as u64;
+        let wal_path = db_path.with_extension("db-wal");
+        let mut db_states = HashMap::new();
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name: "generation_cursor".to_string(),
+                db_path: db_path.clone(),
+                wal_path,
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                shadow,
+                shadow_sync_generation: 0,
+                shadow_sync_offset: frame_size,
+                wal_copy_offset: 0,
+            },
+        );
+
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+        let (upload_tx, _upload_rx) = mpsc::channel(10);
+        let mut cache_states = HashMap::new();
+        cache_states.insert(db_path.clone(), (Arc::clone(&cache), upload_tx));
+
+        let drained_old_generation = run_shadow_syncs(
+            &db_states,
+            &cache_states,
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+        )
+        .await;
+        apply_shadow_sync_results_strict(&mut db_states, drained_old_generation)
+            .await
+            .unwrap();
+        let state = db_states.get(&db_path).unwrap();
+        assert_eq!(state.shadow_sync_generation, 1);
+        assert_eq!(
+            state.shadow_sync_offset, 0,
+            "offset must reset when advancing to the new shadow generation"
+        );
+        assert!(
+            cache.pending_uploads().is_empty(),
+            "draining the old generation at EOF should not upload anything"
+        );
+
+        let synced_new_generation = run_shadow_syncs(
+            &db_states,
+            &cache_states,
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+        )
+        .await;
+        apply_shadow_sync_results_strict(&mut db_states, synced_new_generation)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.pending_uploads().len(),
+            1,
+            "new generation frames must be read from offset 0, not skipped by the prior generation offset"
+        );
+    }
+
+    #[tokio::test]
     async fn test_shadow_checkpoint_copies_syncs_and_waits_for_cache_upload() {
         let (_temp, db_path, _conn) = create_real_wal_db();
         let shadow = ShadowWal::new(&db_path).await.unwrap();
@@ -1186,6 +1337,7 @@ mod tests {
             last_snapshot: None,
             db_checksum: None,
             shadow,
+            shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
         };
@@ -1244,6 +1396,7 @@ mod tests {
             last_snapshot: None,
             db_checksum: None,
             shadow,
+            shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
         };

@@ -133,6 +133,14 @@ and
   change; encode remaining old-gen segments before switching); refuse to
   delete segments not fully encoded+uploaded.
 
+Status: Fixed — root shadow watch state now tracks
+`shadow_sync_generation` separately from `shadow_sync_offset`, drains the old
+generation before switching, resets offset to 0 on generation advance, and
+cleans up only generations below the synced cursor. `walrust-core` has the
+segment primitive but no shadow watch/uploader cursor, so this drift is root
+only. Proven by
+`sync::watch_shadow::tests::test_shadow_sync_cursor_resets_offset_when_advancing_generation`.
+
 ### A6 — Restore chain verification is self-referential; gaps/wrong-lineage apply cleanly as success
 Status: Fixed — root restore is proven by
 `restore_rejects_incremental_without_prior_chain_link`; core restore is proven
