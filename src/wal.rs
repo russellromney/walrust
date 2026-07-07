@@ -34,16 +34,16 @@ impl WalHeader {
 pub const WAL_HEADER_SIZE: u64 = 32;
 pub const FRAME_HEADER_SIZE: u64 = 24;
 
-/// WAL magic for the big-endian checksum variant.
-pub const WAL_MAGIC_BE: u32 = 0x377F_0682;
 /// WAL magic for the little-endian checksum variant.
-pub const WAL_MAGIC_LE: u32 = 0x377F_0683;
+pub const WAL_MAGIC_LE: u32 = 0x377F_0682;
+/// WAL magic for the big-endian checksum variant.
+pub const WAL_MAGIC_BE: u32 = 0x377F_0683;
 
 /// SQLite WAL cumulative checksum (the s0/s1 Fibonacci-weighted sum).
 ///
 /// `data` must be a whole number of 32-bit words. `big_endian` selects word
-/// interpretation, chosen by the WAL magic (`0x377f0682` => big-endian,
-/// `0x377f0683` => little-endian). The seed is the prior checksum: `(0, 0)` for
+/// interpretation, chosen by the WAL magic (`0x377f0682` => little-endian,
+/// `0x377f0683` => big-endian). The seed is the prior checksum: `(0, 0)` for
 /// the header, the header checksum for frame 1, then the prior frame thereafter.
 pub fn wal_checksum(seed: (u32, u32), data: &[u8], big_endian: bool) -> (u32, u32) {
     debug_assert!(
@@ -74,7 +74,7 @@ fn read_u32(b: &[u8], big_endian: bool) -> u32 {
 
 /// True if the WAL magic selects big-endian checksum word interpretation.
 fn magic_is_big_endian(magic: u32) -> bool {
-    magic & 1 == 0
+    magic & 1 == 1
 }
 
 /// Validate the 32-byte WAL header's own checksum (computed over the first 24
@@ -831,6 +831,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_real_sqlite_wal_checked_reader_validates_checksum_chain() {
+        let fixture = build_real_sqlite_wal();
+        let header = read_header(&fixture.wal_path).await.unwrap().unwrap();
+
+        let (pages, frame_count, offset, db_size, commit_count, chain) =
+            read_frames_as_page_map_checked(&fixture.wal_path, header.page_size, 0, None)
+                .await
+                .unwrap();
+
+        assert!(!pages.is_empty(), "real SQLite WAL should yield pages");
+        assert!(frame_count > 0, "real SQLite WAL should yield frames");
+        assert!(
+            offset > WAL_HEADER_SIZE,
+            "reader should consume committed frames"
+        );
+        assert!(db_size > 0, "real SQLite WAL should include a commit frame");
+        assert!(commit_count > 0, "real SQLite WAL should count commits");
+        assert!(
+            chain.is_some(),
+            "real SQLite WAL checksum chain must validate"
+        );
+    }
+
+    #[tokio::test]
     async fn test_checked_reader_accepts_valid_and_rejects_torn() {
         let page_size = 1024u32;
         // Valid chain: two frames, second commits.
@@ -926,10 +950,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_header_valid_magic_big_endian() {
+    async fn test_read_header_valid_magic_little_endian() {
         let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
 
-        // Create valid WAL header with magic 0x377F0682 (big-endian checksum)
+        // Create valid WAL header with magic 0x377F0682 (little-endian checksum)
         let mut header = [0u8; 32];
         header[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes()); // magic
         header[4..8].copy_from_slice(&3007000u32.to_be_bytes()); // format version
@@ -946,10 +970,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_header_valid_magic_little_endian() {
+    async fn test_read_header_valid_magic_big_endian() {
         let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
 
-        // Create valid WAL header with magic 0x377F0683 (little-endian checksum)
+        // Create valid WAL header with magic 0x377F0683 (big-endian checksum)
         let mut header = [0u8; 32];
         header[0..4].copy_from_slice(&0x377F0683u32.to_be_bytes()); // magic
         header[4..8].copy_from_slice(&3007000u32.to_be_bytes()); // format version

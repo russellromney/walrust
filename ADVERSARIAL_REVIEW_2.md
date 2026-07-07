@@ -20,6 +20,10 @@ Line numbers are approximate against commit e556bd5 — re-locate before editing
 ## CRITICAL
 
 ### A1 — WAL checksum endianness inverted; frame validation never runs on real WALs
+Status: Fixed — proven by
+`wal::tests::test_real_sqlite_wal_checked_reader_validates_checksum_chain`
+in both `src/` and `crates/walrust-core/`.
+
 - `crates/walrust-core/src/wal.rs:91-94`, `src/wal.rs:76-78`
 - `magic_is_big_endian` returns true for `0x377f0682`. SQLite writes
   `WAL_MAGIC | SQLITE_BIGENDIAN`: `0x377f0682` = little-endian checksums (all
