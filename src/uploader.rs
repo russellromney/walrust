@@ -31,6 +31,7 @@ use crate::sync::manifest::build_ltx_key;
 use crate::webhook::WebhookSender;
 use anyhow::{anyhow, Context, Result};
 use hadb_storage::StorageBackend;
+use std::io::Cursor;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
@@ -96,6 +97,22 @@ impl UploadTaskContext {
             .with_context(|| format!("Failed to read TXID {} from cache", txid))?;
 
         let data_len = data.len() as u64;
+
+        if let Err(e) = crate::ltx::verify_ltx(Cursor::new(&data))
+            .with_context(|| format!("Cached LTX verification failed for TXID {txid}"))
+        {
+            if let Err(mark_err) = self.cache.mark_failed(txid) {
+                error!(
+                    "[{}] Failed to record corrupt cached LTX for TXID {}: {}",
+                    self.db_name, txid, mark_err
+                );
+            }
+
+            let mut stats = self.stats.lock().await;
+            stats.uploads_failed += 1;
+
+            return Err(e);
+        }
 
         let (generation, min_txid, max_txid) = self.cache.remote_key_parts(txid);
         let key = build_ltx_key(&self.prefix, &self.db_name, generation, min_txid, max_txid);
@@ -620,6 +637,30 @@ mod tests {
         (uploader, cache, temp_dir)
     }
 
+    fn test_ltx(txid: u64) -> Vec<u8> {
+        use crate::ltx::{chain_checksum, encode_wal_changes};
+        use litepages::Checksum;
+
+        let fill = (txid % 251) as u8;
+        let pages = vec![(1u32, vec![fill; 4096])];
+        let pre_checksum = (txid > 1).then(|| Checksum::new(txid - 1));
+        let checksum_seed = pre_checksum.unwrap_or_else(|| Checksum::new(1));
+        let post_checksum = chain_checksum(checksum_seed, &pages);
+        let mut ltx = Vec::new();
+        encode_wal_changes(
+            &mut ltx,
+            &pages,
+            4096,
+            txid,
+            txid,
+            1,
+            pre_checksum,
+            post_checksum,
+        )
+        .unwrap();
+        ltx
+    }
+
     // ============================================
     // Basic upload tests (ported from sequential)
     // ============================================
@@ -685,7 +726,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         for i in 1..=5 {
-            cache.write_ltx(i, format!("data{}", i).as_bytes()).unwrap();
+            cache.write_ltx(i, &test_ltx(i)).unwrap();
         }
         for i in 1..=5 {
             tx.send(UploadMessage::Upload(i)).await.unwrap();
@@ -709,9 +750,9 @@ mod tests {
         let storage = Arc::new(MockStorage::new());
 
         // Simulate interrupted upload
-        cache.write_ltx(1, b"data1").unwrap();
-        cache.write_ltx(2, b"data2").unwrap();
-        cache.write_ltx(3, b"data3").unwrap();
+        cache.write_ltx(1, &test_ltx(1)).unwrap();
+        cache.write_ltx(2, &test_ltx(2)).unwrap();
+        cache.write_ltx(3, &test_ltx(3)).unwrap();
 
         let uploader = Arc::new(Uploader::new(
             "test_db".to_string(),
@@ -748,7 +789,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        cache.write_ltx(1, b"data").unwrap();
+        cache.write_ltx(1, &test_ltx(1)).unwrap();
         tx.send(UploadMessage::Upload(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;
         tx.send(UploadMessage::Shutdown).await.unwrap();
@@ -770,7 +811,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         for i in 1..=100 {
-            cache.write_ltx(i, b"data").unwrap();
+            cache.write_ltx(i, &test_ltx(i)).unwrap();
         }
         for i in 1..=100 {
             tx.send(UploadMessage::Upload(i)).await.unwrap();
@@ -791,8 +832,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        cache.write_ltx(1, b"data1").unwrap();
-        cache.write_ltx(2, b"data2").unwrap();
+        cache.write_ltx(1, &test_ltx(1)).unwrap();
+        cache.write_ltx(2, &test_ltx(2)).unwrap();
 
         tx.send(UploadMessage::Upload(1)).await.unwrap();
         tx.send(UploadMessage::Upload(2)).await.unwrap();
@@ -816,7 +857,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        cache.write_ltx(1, b"data").unwrap();
+        cache.write_ltx(1, &test_ltx(1)).unwrap();
         tx.send(UploadMessage::Upload(1)).await.unwrap();
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
@@ -844,9 +885,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         for txid in 1..=3 {
-            cache
-                .write_ltx(txid, format!("data{txid}").as_bytes())
-                .unwrap();
+            cache.write_ltx(txid, &test_ltx(txid)).unwrap();
             tx.send(UploadMessage::Upload(txid)).await.unwrap();
         }
 
@@ -870,6 +909,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_uploader_rejects_corrupt_cached_ltx_before_put() {
+        let (uploader, cache, storage, _temp) = setup_uploader_with_concurrency(1);
+
+        let (tx, rx) = mpsc::channel(10);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        cache.write_ltx(1, b"not an ltx file").unwrap();
+        tx.send(UploadMessage::Upload(1)).await.unwrap();
+
+        let err = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("uploader should reject corrupt LTX before upload")
+            .unwrap()
+            .expect_err("corrupt cached LTX must fail the uploader");
+
+        assert!(
+            err.to_string().contains("verify")
+                || err.to_string().contains("decode")
+                || err.to_string().contains("LTX"),
+            "error should identify LTX verification failure: {err}"
+        );
+        assert_eq!(
+            storage.object_count(),
+            0,
+            "corrupt cached bytes must not be PUT to storage"
+        );
+        assert_eq!(cache.failed_uploads(), vec![1]);
+    }
+
+    #[tokio::test]
     async fn test_uploader_stats_tracking() {
         let (uploader, cache, _storage, _temp) = setup_uploader();
 
@@ -879,22 +951,24 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        cache.write_ltx(1, &vec![0u8; 100]).unwrap();
-        cache.write_ltx(2, &vec![0u8; 200]).unwrap();
+        let ltx1 = test_ltx(1);
+        let ltx2 = test_ltx(2);
+        cache.write_ltx(1, &ltx1).unwrap();
+        cache.write_ltx(2, &ltx2).unwrap();
 
         tx.send(UploadMessage::Upload(1)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let stats = uploader.stats().await;
         assert_eq!(stats.uploads_attempted, 1);
-        assert_eq!(stats.bytes_uploaded, 100);
+        assert_eq!(stats.bytes_uploaded, ltx1.len() as u64);
 
         tx.send(UploadMessage::Upload(2)).await.unwrap();
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         let stats = uploader.stats().await;
         assert_eq!(stats.uploads_attempted, 2);
-        assert_eq!(stats.bytes_uploaded, 300);
+        assert_eq!(stats.bytes_uploaded, (ltx1.len() + ltx2.len()) as u64);
         assert_eq!(stats.last_uploaded_txid, 2);
 
         tx.send(UploadMessage::Shutdown).await.unwrap();
@@ -904,7 +978,7 @@ mod tests {
     async fn test_spawn_uploader_helper() {
         let (uploader, cache, storage, _temp) = setup_uploader();
 
-        cache.write_ltx(1, b"test").unwrap();
+        cache.write_ltx(1, &test_ltx(1)).unwrap();
 
         let (tx, handle) = spawn_uploader(uploader.clone());
 
@@ -935,7 +1009,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         for i in 1..=10 {
-            cache.write_ltx(i, format!("data{}", i).as_bytes()).unwrap();
+            cache.write_ltx(i, &test_ltx(i)).unwrap();
         }
         for i in 1..=10 {
             tx.send(UploadMessage::Upload(i)).await.unwrap();
@@ -966,7 +1040,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         for i in 1..=6 {
-            cache.write_ltx(i, b"data").unwrap();
+            cache.write_ltx(i, &test_ltx(i)).unwrap();
         }
         for i in 1..=6 {
             tx.send(UploadMessage::Upload(i)).await.unwrap();
@@ -996,7 +1070,7 @@ mod tests {
         let cache = Arc::new(LocalCache::new(&db_path).unwrap());
 
         for i in 1..=5 {
-            cache.write_ltx(i, format!("data{}", i).as_bytes()).unwrap();
+            cache.write_ltx(i, &test_ltx(i)).unwrap();
         }
 
         let uploader = Arc::new(Uploader::new(
@@ -1046,7 +1120,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         for i in 1..=4 {
-            cache.write_ltx(i, b"data").unwrap();
+            cache.write_ltx(i, &test_ltx(i)).unwrap();
             tx.send(UploadMessage::Upload(i)).await.unwrap();
         }
 
@@ -1080,7 +1154,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         for i in 1..=5 {
-            cache.write_ltx(i, b"data").unwrap();
+            cache.write_ltx(i, &test_ltx(i)).unwrap();
             tx.send(UploadMessage::Upload(i)).await.unwrap();
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();
@@ -1098,7 +1172,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_concurrent_is_faster_than_sequential() {
-        // With slow uploads, concurrent should be measurably faster
+        // With slow uploads, verify the uploader actually keeps multiple PUTs
+        // in flight. Avoid wall-clock speed assertions: durable cache writes
+        // and machine load can dominate timing without changing concurrency.
         let storage = Arc::new(MockStorage::with_delay(Duration::from_millis(100)));
         let (uploader, cache, _temp) = setup_uploader_with_storage(storage.clone(), 4);
 
@@ -1108,27 +1184,22 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        let n = 8;
+        let n: u64 = 8;
         for i in 1..=n {
-            cache.write_ltx(i, b"data").unwrap();
+            cache.write_ltx(i, &test_ltx(i)).unwrap();
             tx.send(UploadMessage::Upload(i)).await.unwrap();
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
-        let start = tokio::time::Instant::now();
         let stats = task.await.unwrap().unwrap();
-        let elapsed = start.elapsed();
 
-        assert_eq!(stats.uploads_succeeded, n as u64);
-
-        // Sequential: 8 * 100ms = 800ms minimum
-        // Concurrent(4): 2 batches * 100ms = ~200ms
-        // Be generous: just check it's faster than sequential
+        assert_eq!(stats.uploads_succeeded, n);
         assert!(
-            elapsed < Duration::from_millis(600),
-            "concurrent should be faster than sequential, took {:?}",
-            elapsed
+            storage.peak_concurrent() > 1,
+            "uploader should run uploads concurrently"
         );
+        assert!(storage.peak_concurrent() <= 4);
+        assert_eq!(storage.object_count(), n as usize);
     }
 
     // ============================================
@@ -1146,7 +1217,7 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        cache.write_ltx(1, b"data").unwrap();
+        cache.write_ltx(1, &test_ltx(1)).unwrap();
         tx.send(UploadMessage::Upload(1)).await.unwrap();
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
@@ -1168,7 +1239,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(10)).await;
 
         for i in 1..=3 {
-            cache.write_ltx(i, b"data").unwrap();
+            cache.write_ltx(i, &test_ltx(i)).unwrap();
             tx.send(UploadMessage::Upload(i)).await.unwrap();
         }
 
@@ -1199,7 +1270,7 @@ mod tests {
 
         // Write in reverse order
         for i in (1..=5).rev() {
-            cache.write_ltx(i, b"data").unwrap();
+            cache.write_ltx(i, &test_ltx(i)).unwrap();
             tx.send(UploadMessage::Upload(i)).await.unwrap();
         }
         tx.send(UploadMessage::Shutdown).await.unwrap();

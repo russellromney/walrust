@@ -258,6 +258,14 @@ impl ShadowWal {
         }
 
         file.flush().await?;
+        file.sync_all().await?;
+        Self::fsync_dir(&self.shadow_dir).await?;
+        Ok(())
+    }
+
+    async fn fsync_dir(path: &Path) -> Result<()> {
+        let dir = File::open(path).await?;
+        dir.sync_all().await?;
         Ok(())
     }
 

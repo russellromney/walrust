@@ -22,7 +22,7 @@ use litepages::Decoder;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -128,16 +128,11 @@ impl LocalCache {
         // Create cache directory structure
         fs::create_dir_all(cache_dir.join("ltx")).context("Failed to create cache directory")?;
 
-        // Load or create manifest
-        let manifest = if manifest_path.exists() {
+        let manifest_exists = manifest_path.exists();
+        let manifest = if manifest_exists {
             Self::load_manifest(&manifest_path)?
         } else {
-            let default_manifest = CacheManifest::default();
-            // Save default manifest to disk
-            let json = serde_json::to_string_pretty(&default_manifest)
-                .context("Failed to serialize default manifest")?;
-            fs::write(&manifest_path, json).context("Failed to write default manifest")?;
-            default_manifest
+            CacheManifest::default()
         };
 
         let cache = Self {
@@ -145,6 +140,10 @@ impl LocalCache {
             manifest_path,
             manifest: Arc::new(Mutex::new(manifest)),
         };
+        if !manifest_exists {
+            let manifest = cache.manifest.lock().unwrap();
+            cache.save_manifest(&manifest)?;
+        }
         cache.reenqueue_failed_uploads_on_startup()?;
         Ok(cache)
     }
@@ -231,14 +230,35 @@ impl LocalCache {
     fn save_manifest(&self, manifest: &CacheManifest) -> Result<()> {
         let tmp_path = self.manifest_path.with_extension("tmp");
 
-        // Write to temp file
         let json =
             serde_json::to_string_pretty(manifest).context("Failed to serialize manifest")?;
-        fs::write(&tmp_path, json).context("Failed to write temporary manifest")?;
-
-        // Atomic rename
+        Self::write_file_durable(&tmp_path, json.as_bytes())
+            .context("Failed to write durable temporary manifest")?;
         fs::rename(&tmp_path, &self.manifest_path).context("Failed to rename manifest")?;
+        Self::fsync_parent_dir(&self.manifest_path)
+            .context("Failed to fsync manifest directory")?;
 
+        Ok(())
+    }
+
+    fn write_file_durable(path: &Path, data: &[u8]) -> Result<()> {
+        let mut file = fs::File::create(path)
+            .with_context(|| format!("Failed to create {}", path.display()))?;
+        file.write_all(data)
+            .with_context(|| format!("Failed to write {}", path.display()))?;
+        file.sync_all()
+            .with_context(|| format!("Failed to fsync {}", path.display()))?;
+        Ok(())
+    }
+
+    fn fsync_parent_dir(path: &Path) -> Result<()> {
+        let parent = path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("path has no parent: {}", path.display()))?;
+        let dir = fs::File::open(parent)
+            .with_context(|| format!("Failed to open directory {}", parent.display()))?;
+        dir.sync_all()
+            .with_context(|| format!("Failed to fsync directory {}", parent.display()))?;
         Ok(())
     }
 
@@ -287,13 +307,12 @@ impl LocalCache {
         let tmp_path = ltx_path.with_extension("tmp");
         let (min_txid, max_txid) = ltx_txid_range(data).unwrap_or((txid, txid));
 
-        // Write to temp file
-        fs::write(&tmp_path, data)
-            .with_context(|| format!("Failed to write LTX temp file for TXID {}", txid))?;
-
-        // Atomic rename
+        Self::write_file_durable(&tmp_path, data)
+            .with_context(|| format!("Failed to write durable LTX temp file for TXID {}", txid))?;
         fs::rename(&tmp_path, &ltx_path)
             .with_context(|| format!("Failed to rename LTX file for TXID {}", txid))?;
+        Self::fsync_parent_dir(&ltx_path)
+            .with_context(|| format!("Failed to fsync LTX directory for TXID {}", txid))?;
 
         // Update manifest
         let mut manifest = self.manifest.lock().unwrap();

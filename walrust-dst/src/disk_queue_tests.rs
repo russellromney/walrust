@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;
 use tokio::time::{sleep, Duration};
-use walrust::cache::{CacheStats, LocalCache};
+use walrust::cache::LocalCache;
 use walrust::retry::{RetryConfig, RetryPolicy};
 use walrust::uploader::{spawn_uploader, UploadMessage, Uploader};
 use walrust::webhook::WebhookSender;
@@ -30,6 +30,7 @@ pub struct FailableStorage {
     objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
     is_available: Arc<Mutex<bool>>,
     failure_rate: Arc<Mutex<f64>>,
+    transient_failures_remaining: Arc<Mutex<usize>>,
 }
 
 impl FailableStorage {
@@ -38,6 +39,7 @@ impl FailableStorage {
             objects: Arc::new(Mutex::new(HashMap::new())),
             is_available: Arc::new(Mutex::new(true)),
             failure_rate: Arc::new(Mutex::new(0.0)),
+            transient_failures_remaining: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -45,16 +47,12 @@ impl FailableStorage {
         *self.is_available.lock().unwrap() = available;
     }
 
-    pub fn set_failure_rate(&self, rate: f64) {
-        *self.failure_rate.lock().unwrap() = rate;
+    pub fn fail_next_puts(&self, failures: usize) {
+        *self.transient_failures_remaining.lock().unwrap() = failures;
     }
 
     pub fn object_count(&self) -> usize {
         self.objects.lock().unwrap().len()
-    }
-
-    pub fn clear(&self) {
-        self.objects.lock().unwrap().clear();
     }
 }
 
@@ -64,6 +62,14 @@ impl StorageBackend for FailableStorage {
         // Check availability (network failure simulation)
         if !*self.is_available.lock().unwrap() {
             return Err(anyhow::anyhow!("Network unavailable"));
+        }
+
+        {
+            let mut failures = self.transient_failures_remaining.lock().unwrap();
+            if *failures > 0 {
+                *failures -= 1;
+                return Err(anyhow::anyhow!("Transient S3 error"));
+            }
         }
 
         // Random failure injection
@@ -153,6 +159,15 @@ async fn wait_for_uploads(uploader: &Arc<Uploader>, target: u64) {
     }
 }
 
+fn test_ltx(txid: u64) -> Vec<u8> {
+    let temp_dir = TempDir::new().unwrap();
+    let db_path = temp_dir.path().join("fixture.db");
+    std::fs::write(&db_path, vec![(txid % 251) as u8; 4096]).unwrap();
+    let mut ltx = Vec::new();
+    walrust::ltx::encode_snapshot(&mut ltx, &db_path, 4096, txid).unwrap();
+    ltx
+}
+
 /// Test fixture for disk queue tests
 struct DiskQueueTestFixture {
     temp_dir: TempDir,
@@ -204,10 +219,7 @@ async fn test_crash_recovery_basic() {
 
     // Simulate WAL encoding writing to cache (before crash)
     for i in 1..=10 {
-        fixture
-            .cache
-            .write_ltx(i, format!("data{}", i).as_bytes())
-            .unwrap();
+        fixture.cache.write_ltx(i, &test_ltx(i)).unwrap();
     }
 
     // Verify cache state
@@ -238,7 +250,7 @@ async fn test_crash_recovery_partial() {
 
     // Write 10 TXIDs
     for i in 1..=10 {
-        fixture.cache.write_ltx(i, b"data").unwrap();
+        fixture.cache.write_ltx(i, &test_ltx(i)).unwrap();
     }
 
     // Upload first 5 manually
@@ -284,7 +296,7 @@ async fn test_network_disconnect_recovery() {
     fixture.storage.set_available(false);
 
     // Try to upload (should fail but cache continues)
-    fixture.cache.write_ltx(1, b"data1").unwrap();
+    fixture.cache.write_ltx(1, &test_ltx(1)).unwrap();
     tx.send(UploadMessage::Upload(1)).await.unwrap();
 
     // Poll until the retry loop exhausts and records the failure rather than
@@ -362,20 +374,23 @@ async fn test_cache_continues_during_s3_failure() {
 
     let uploader = fixture.create_uploader();
     let (tx, _handle) = spawn_uploader(uploader.clone());
+    let fixtures = (1..=20)
+        .map(|txid| (txid, test_ltx(txid)))
+        .collect::<Vec<_>>();
 
     // Write to cache (should NOT block even with S3 down)
     let start = std::time::Instant::now();
-    for i in 1..=100 {
-        fixture.cache.write_ltx(i, b"data").unwrap();
-        tx.send(UploadMessage::Upload(i)).await.unwrap();
+    for (txid, ltx) in fixtures {
+        fixture.cache.write_ltx(txid, &ltx).unwrap();
+        let _ = tx.send(UploadMessage::Upload(txid)).await;
     }
     let elapsed = start.elapsed();
 
-    // Cache writes should be fast (< 1 second for 100 writes)
-    assert!(elapsed.as_secs() < 1, "Cache writes blocked on S3");
+    // Cache writes are durably fsynced, but they should not wait on S3.
+    assert!(elapsed.as_secs() < 30, "Cache writes blocked on S3");
 
     // All in cache, none uploaded
-    assert_eq!(fixture.cache.pending_uploads().len(), 100);
+    assert_eq!(fixture.cache.pending_uploads().len(), 20);
     assert_eq!(fixture.storage.object_count(), 0);
 
     tx.send(UploadMessage::Shutdown).await.unwrap();
@@ -391,11 +406,11 @@ async fn test_fast_local_restore() {
     let uploader = fixture.create_uploader();
     let (tx, _handle) = spawn_uploader(uploader.clone());
 
+    let mut expected = Vec::new();
     for i in 1..=10 {
-        fixture
-            .cache
-            .write_ltx(i, format!("restore_data_{}", i).as_bytes())
-            .unwrap();
+        let ltx = test_ltx(i);
+        fixture.cache.write_ltx(i, &ltx).unwrap();
+        expected.push((i, ltx));
         tx.send(UploadMessage::Upload(i)).await.unwrap();
     }
 
@@ -406,9 +421,9 @@ async fn test_fast_local_restore() {
     fixture.storage.set_available(false);
 
     // Restore from local cache (should work without S3)
-    for i in 1..=10 {
+    for (i, expected_ltx) in expected {
         let data = fixture.cache.read_ltx(i).unwrap();
-        assert_eq!(data, format!("restore_data_{}", i).as_bytes());
+        assert_eq!(data, expected_ltx);
     }
 
     // Verify S3 was never accessed
@@ -428,7 +443,7 @@ async fn test_cleanup_retention_policy() {
 
     // Write and upload 100 files
     for i in 1..=100 {
-        fixture.cache.write_ltx(i, &vec![0u8; 1000]).unwrap();
+        fixture.cache.write_ltx(i, &test_ltx(i)).unwrap();
         tx.send(UploadMessage::Upload(i)).await.unwrap();
     }
 
@@ -447,8 +462,8 @@ async fn test_cleanup_retention_policy() {
     let cleanup_stats = fixture
         .cache
         .cleanup(
-            chrono::Duration::hours(24), // 24 hour retention (all files are fresh)
-            10_000,                      // Max 10KB (10 files x 1KB) - this is the limiting factor
+            chrono::Duration::hours(24),   // 24 hour retention (all files are fresh)
+            test_ltx(1).len() as u64 * 10, // Keep roughly 10 valid LTX files.
         )
         .unwrap();
 
@@ -470,10 +485,10 @@ async fn test_txid_ordering_preserved() {
     let (tx, _handle) = spawn_uploader(uploader.clone());
 
     // Write out of order
-    fixture.cache.write_ltx(5, b"data5").unwrap();
-    fixture.cache.write_ltx(2, b"data2").unwrap();
-    fixture.cache.write_ltx(8, b"data8").unwrap();
-    fixture.cache.write_ltx(1, b"data1").unwrap();
+    fixture.cache.write_ltx(5, &test_ltx(5)).unwrap();
+    fixture.cache.write_ltx(2, &test_ltx(2)).unwrap();
+    fixture.cache.write_ltx(8, &test_ltx(8)).unwrap();
+    fixture.cache.write_ltx(1, &test_ltx(1)).unwrap();
 
     // Send upload messages in order (uploader should process sequentially)
     let pending = fixture.cache.pending_uploads(); // Returns sorted
@@ -513,10 +528,7 @@ async fn test_concurrent_multi_database() {
     // Each database writes 50 TXIDs concurrently
     for (i, fixture) in fixtures.iter().enumerate() {
         for txid in 1..=50 {
-            fixture
-                .cache
-                .write_ltx(txid, format!("db{}_data{}", i, txid).as_bytes())
-                .unwrap();
+            fixture.cache.write_ltx(txid, &test_ltx(txid)).unwrap();
             channels[i].send(UploadMessage::Upload(txid)).await.unwrap();
         }
     }
@@ -558,35 +570,30 @@ async fn test_concurrent_multi_database() {
 
 #[tokio::test]
 async fn test_chaos_random_failures() {
-    // Scenario: 20% S3 failure rate, verify retries succeed
+    // Scenario: transient S3 failures, verify retries succeed without shipping
+    // invalid/corrupt data or reporting success before the PUT is confirmed.
 
     let fixture = DiskQueueTestFixture::new().unwrap();
 
-    // Enable 20% random failures
-    fixture.storage.set_failure_rate(0.2);
+    // Fail the first two attempts across the initial concurrency window; all
+    // failures are within the retry budget and should recover deterministically.
+    fixture.storage.fail_next_puts(8);
 
-    let uploader = fixture.create_uploader();
-    let (tx, _handle) = spawn_uploader(uploader.clone());
-
-    // Write 50 TXIDs
     for i in 1..=50 {
-        fixture.cache.write_ltx(i, b"data").unwrap();
-        tx.send(UploadMessage::Upload(i)).await.unwrap();
+        fixture.cache.write_ltx(i, &test_ltx(i)).unwrap();
     }
 
-    // Wait for retries to complete
-    sleep(Duration::from_millis(1000)).await;
+    let uploader = fixture.create_uploader();
+    let (tx, handle) = spawn_uploader(uploader.clone());
+
+    wait_for_uploads(&uploader, 50).await;
     tx.send(UploadMessage::Shutdown).await.unwrap();
+    handle.await.unwrap().unwrap();
 
     let stats = uploader.stats().await;
 
-    // With retries, most/all should eventually succeed
-    assert!(
-        stats.uploads_succeeded >= 45,
-        "Too many failures despite retries"
-    );
-
-    // Some failures expected due to randomness
+    assert_eq!(stats.uploads_succeeded, 50);
+    assert_eq!(stats.uploads_failed, 0);
     assert!(stats.uploads_attempted >= stats.uploads_succeeded);
 }
 
@@ -597,8 +604,8 @@ async fn test_cache_verify_integrity() {
     let fixture = DiskQueueTestFixture::new().unwrap();
 
     // Write normal data
-    fixture.cache.write_ltx(1, b"data1").unwrap();
-    fixture.cache.write_ltx(2, b"data2").unwrap();
+    fixture.cache.write_ltx(1, &test_ltx(1)).unwrap();
+    fixture.cache.write_ltx(2, &test_ltx(2)).unwrap();
 
     // Verify clean
     let issues = fixture.cache.verify().unwrap();
@@ -642,7 +649,7 @@ async fn test_uploader_graceful_shutdown_completes_pending() {
 
     // Queue many uploads
     for i in 1..=20 {
-        fixture.cache.write_ltx(i, b"data").unwrap();
+        fixture.cache.write_ltx(i, &test_ltx(i)).unwrap();
         tx.send(UploadMessage::Upload(i)).await.unwrap();
     }
 
@@ -664,14 +671,18 @@ async fn test_cache_persistence_across_restarts() {
 
     let temp_dir = TempDir::new().unwrap();
     let db_path = temp_dir.path().join("test.db");
+    let expected_five = test_ltx(5);
 
     // First session: write data
     {
         let cache = LocalCache::new(&db_path).unwrap();
         for i in 1..=10 {
-            cache
-                .write_ltx(i, format!("persistent_{}", i).as_bytes())
-                .unwrap();
+            let ltx = if i == 5 {
+                expected_five.clone()
+            } else {
+                test_ltx(i)
+            };
+            cache.write_ltx(i, &ltx).unwrap();
         }
         cache.mark_uploaded(1).unwrap();
         cache.mark_uploaded(2).unwrap();
@@ -686,7 +697,7 @@ async fn test_cache_persistence_across_restarts() {
         assert_eq!(cache.pending_uploads(), vec![3, 4, 5, 6, 7, 8, 9, 10]);
 
         // Files readable
-        assert_eq!(cache.read_ltx(5).unwrap(), b"persistent_5");
+        assert_eq!(cache.read_ltx(5).unwrap(), expected_five);
 
         let stats = cache.stats();
         assert_eq!(stats.total_entries, 10);
@@ -759,10 +770,7 @@ async fn test_sqlite_to_cache_to_s3_end_to_end() {
 
     // Simulate LTX encoding: each frame batch becomes an LTX file
     let txid = 1u64;
-    let ltx_data = frames
-        .iter()
-        .flat_map(|f| f.data.clone())
-        .collect::<Vec<_>>();
+    let ltx_data = test_ltx(txid);
     cache.write_ltx(txid, &ltx_data).unwrap();
 
     // Verify cache state
@@ -913,10 +921,7 @@ async fn test_kill_mid_upload_recovery() {
 
     // Write 5 TXIDs to cache
     for i in 1..=5 {
-        fixture
-            .cache
-            .write_ltx(i, format!("data_for_txid_{}", i).as_bytes())
-            .unwrap();
+        fixture.cache.write_ltx(i, &test_ltx(i)).unwrap();
     }
 
     assert_eq!(fixture.cache.pending_uploads(), vec![1, 2, 3, 4, 5]);

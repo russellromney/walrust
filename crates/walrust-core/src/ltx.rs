@@ -199,7 +199,7 @@ pub fn decode_to_db(data: &[u8], output_path: &Path) -> Result<DecodeResult> {
         db_data[start..end].copy_from_slice(&page.data);
     }
 
-    std::fs::write(output_path, &db_data)?;
+    write_db_atomically(output_path, &db_data)?;
 
     // Verify actual checksum matches what was computed
     let actual_checksum = compute_db_checksum_raw(&db_data);
@@ -213,6 +213,29 @@ pub fn decode_to_db(data: &[u8], output_path: &Path) -> Result<DecodeResult> {
         header: changeset.header,
         checksum: actual_checksum,
     })
+}
+
+fn write_db_atomically(output_path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    let tmp_path = output_path.with_extension("tmp");
+    {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+    }
+    std::fs::rename(&tmp_path, output_path)?;
+    fsync_parent_dir(output_path)?;
+    Ok(())
+}
+
+fn fsync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    let dir = std::fs::File::open(parent)?;
+    dir.sync_all()?;
+    Ok(())
 }
 
 /// Result of applying an HADBP changeset to an existing database.

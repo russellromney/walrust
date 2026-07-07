@@ -325,6 +325,19 @@ corresponding local-cache uploader tree.
   never continue around a hole; re-enqueue failed on restart.
 
 ### A12 — Nothing on the ack path is fsynced
+Status: Fixed — root cache LTX and manifest writes now use temp-file
+write+`sync_all`, atomic rename, and parent-directory fsync before publishing
+the cache/manifest ack; root and core shadow segment writers now flush,
+`sync_all`, and fsync the shadow directory; core `decode_to_db` writes a synced
+temp DB, renames it into place, and fsyncs the parent directory. Root uploader
+now re-verifies cached LTX bytes with the production decoder before S3 PUT and
+hard-fails/marks the TXID failed if cached bytes are corrupt, preventing
+truncated cache entries from becoming remote backups. Proven by
+`test_uploader_rejects_corrupt_cached_ltx_before_put`; `disk_queue_tests`
+were converted to production-valid LTX fixtures so uploader/cache integration
+continues through the real LTX path. Power-loss fsync behavior is not directly
+simulated in unit tests, but the production ack paths now issue the required
+file and directory fsyncs.
 - `src/cache.rs:236-246` (`write_ltx_inner`) and `:211-222` (`save_manifest`):
   `fs::write` + `rename`, no `File::sync_all`, no directory fsync. Shadow
   segments only `flush()` (`src/shadow.rs:251`). Core shadow same
