@@ -844,9 +844,15 @@ and
     watched database cursor mutation for cache-mode WAL sync into
     `walrust-core::legacy_wal_sync`; root `src/sync/wal_sync.rs::do_sync`
     now delegates cache-mode state advancement to core and uses the same core
-    transition after direct-upload retry success. Remaining work: root shadow
-    watch orchestration still owns durable shadow progress, checkpoint drain,
-    and multi-DB shadow sync lifecycle control. That workflow/API migration is
+    transition after direct-upload retry success. Legacy shadow progress
+    ownership was then reproduced with
+    `legacy_shadow_progress_persistence_is_owned_by_core` (failed because
+    `walrust_core::legacy_shadow_watch` did not exist), then fixed by moving
+    atomic/fsynced `progress.json` save/load and stale-generation validation
+    into `walrust-core::legacy_shadow_watch`; root `src/sync/watch_shadow.rs`
+    now only adapts `ShadowDbState` into the core progress DTO. Remaining
+    work: root shadow watch orchestration still owns checkpoint drain and
+    multi-DB shadow sync lifecycle control. That workflow/API migration is
     still required before duplicate sync implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.

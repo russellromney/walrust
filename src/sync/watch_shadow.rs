@@ -1,11 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs::{self, File};
 use std::future::Future;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +21,9 @@ use crate::uploader::{spawn_uploader, UploadMessage, Uploader, UploaderStats};
 use crate::webhook::WebhookSender;
 use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
+use walrust_core::legacy_shadow_watch::{
+    load_shadow_progress, save_shadow_progress as save_shadow_progress_file, ShadowProgress,
+};
 
 use super::shadow::{
     run_compaction, sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry,
@@ -36,7 +36,6 @@ type ShadowSyncFuture =
     Pin<Box<dyn Future<Output = Result<super::types::ShadowSyncOutput>> + Send>>;
 
 const CHECKPOINT_UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-const SHADOW_PROGRESS_FILE: &str = "progress.json";
 
 #[derive(Clone)]
 struct DirectShadowSyncTarget {
@@ -45,141 +44,23 @@ struct DirectShadowSyncTarget {
     prefix: String,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ShadowProgress {
-    version: u32,
-    current_txid: u64,
-    last_snapshot: Option<chrono::DateTime<chrono::Utc>>,
-    db_checksum: Option<u64>,
-    shadow_sync_generation: u64,
-    shadow_sync_offset: u64,
-}
-
-impl ShadowProgress {
-    fn from_state(state: &ShadowDbState) -> Self {
-        Self {
-            version: 1,
-            current_txid: state.current_txid,
-            last_snapshot: state.last_snapshot,
-            db_checksum: state.db_checksum,
-            shadow_sync_generation: state.shadow_sync_generation,
-            shadow_sync_offset: state.shadow_sync_offset,
-        }
+fn shadow_progress_from_state(state: &ShadowDbState) -> ShadowProgress {
+    ShadowProgress {
+        version: 1,
+        current_txid: state.current_txid,
+        last_snapshot: state.last_snapshot,
+        db_checksum: state.db_checksum,
+        shadow_sync_generation: state.shadow_sync_generation,
+        shadow_sync_offset: state.shadow_sync_offset,
     }
-}
-
-fn shadow_progress_path(shadow_dir: &Path) -> PathBuf {
-    shadow_dir.join(SHADOW_PROGRESS_FILE)
-}
-
-fn fsync_dir(path: &Path) -> Result<()> {
-    File::open(path)
-        .with_context(|| format!("failed to open directory {} for fsync", path.display()))?
-        .sync_all()
-        .with_context(|| format!("failed to fsync directory {}", path.display()))
 }
 
 fn save_shadow_progress(state: &ShadowDbState) -> Result<()> {
-    let shadow_dir = state.shadow.shadow_dir();
-    fs::create_dir_all(shadow_dir).with_context(|| {
-        format!(
-            "{}: failed to create shadow progress directory {}",
-            state.name,
-            shadow_dir.display()
-        )
-    })?;
-
-    let progress_path = shadow_progress_path(shadow_dir);
-    let tmp_path = progress_path.with_extension("json.tmp");
-    let progress = ShadowProgress::from_state(state);
-    let json = serde_json::to_vec_pretty(&progress)
-        .with_context(|| format!("{}: failed to serialize shadow progress", state.name))?;
-
-    {
-        let mut file = File::create(&tmp_path).with_context(|| {
-            format!(
-                "{}: failed to create temporary shadow progress file {}",
-                state.name,
-                tmp_path.display()
-            )
-        })?;
-        file.write_all(&json).with_context(|| {
-            format!(
-                "{}: failed to write temporary shadow progress file {}",
-                state.name,
-                tmp_path.display()
-            )
-        })?;
-        file.sync_all().with_context(|| {
-            format!(
-                "{}: failed to fsync temporary shadow progress file {}",
-                state.name,
-                tmp_path.display()
-            )
-        })?;
-    }
-
-    fs::rename(&tmp_path, &progress_path).with_context(|| {
-        format!(
-            "{}: failed to install shadow progress file {}",
-            state.name,
-            progress_path.display()
-        )
-    })?;
-    fsync_dir(shadow_dir).with_context(|| {
-        format!(
-            "{}: failed to durably commit shadow progress file {}",
-            state.name,
-            progress_path.display()
-        )
-    })?;
-
-    Ok(())
-}
-
-fn load_shadow_progress(shadow: &ShadowWal, db_name: &str) -> Result<Option<ShadowProgress>> {
-    let progress_path = shadow_progress_path(shadow.shadow_dir());
-    let data = match fs::read(&progress_path) {
-        Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => {
-            return Err(e).with_context(|| {
-                format!(
-                    "{}: failed to read shadow progress file {}",
-                    db_name,
-                    progress_path.display()
-                )
-            });
-        }
-    };
-
-    let progress: ShadowProgress = serde_json::from_slice(&data).with_context(|| {
-        format!(
-            "{}: failed to parse shadow progress file {}",
-            db_name,
-            progress_path.display()
-        )
-    })?;
-
-    if progress.version != 1 {
-        anyhow::bail!(
-            "{}: unsupported shadow progress version {} in {}",
-            db_name,
-            progress.version,
-            progress_path.display()
-        );
-    }
-    if progress.shadow_sync_generation > shadow.generation() {
-        anyhow::bail!(
-            "{}: shadow progress generation {} is ahead of live generation {} in {}",
-            db_name,
-            progress.shadow_sync_generation,
-            shadow.generation(),
-            progress_path.display()
-        );
-    }
-
-    Ok(Some(progress))
+    save_shadow_progress_file(
+        state.shadow.shadow_dir(),
+        &state.name,
+        &shadow_progress_from_state(state),
+    )
 }
 
 fn shadow_sync_input(state: &ShadowDbState) -> ShadowSyncInput {

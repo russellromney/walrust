@@ -18,6 +18,7 @@ pub mod legacy_manifest;
 pub mod legacy_replica;
 pub mod legacy_restore;
 pub mod legacy_shadow;
+pub mod legacy_shadow_watch;
 pub mod legacy_uploader;
 pub mod legacy_wal_sync;
 pub mod ltx;
