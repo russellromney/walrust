@@ -234,7 +234,7 @@ async fn e2e_core_replicator_restore_round_trips_sqlite_rows() -> Result<()> {
 }
 
 #[tokio::test]
-async fn e2e_core_replicator_restart_round_trips_sqlite_rows() -> Result<()> {
+async fn e2e_core_replicator_restart_rejects_divergent_chain() -> Result<()> {
     let temp = TempDir::new()?;
     let name = unique_name("core-restart-e2e");
     let prefix = format!("e2e/{name}/");
@@ -265,14 +265,15 @@ async fn e2e_core_replicator_restart_round_trips_sqlite_rows() -> Result<()> {
         second.flush(&name).await? > 0,
         "second replicator flush should upload WAL frames"
     );
-    let restored_seq = second.restore(&name, &restored_path).await?;
+    let err = second
+        .restore(&name, &restored_path)
+        .await
+        .expect_err("restore must fail closed on the divergent post-restart chain");
+    let msg = err.to_string();
     anyhow::ensure!(
-        restored_seq.is_some(),
-        "replicator restore should find data"
+        msg.contains("Checksum chain broken") || msg.contains("restore incremental gap"),
+        "unexpected restore error: {msg}"
     );
-
-    assert_integrity_ok(&restored_path)?;
-    assert_eq!(rows(&db_path)?, rows(&restored_path)?);
 
     Ok(())
 }

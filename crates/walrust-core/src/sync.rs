@@ -995,39 +995,33 @@ pub async fn restore(
     let mut restored_seq = snapshot.seq;
     let mut current_checksum = decode_result.checksum;
 
-    // Apply incrementals in order. If a checksum chain doesn't match,
-    // it's from a previous lineage (e.g., a prior leader). Stop applying.
+    // Apply incrementals in order. A gap or checksum-chain break means the
+    // restore cannot prove success, so it is a hard error.
     for inc in &incrementals {
+        let expected_seq = restored_seq + 1;
+        if inc.seq != expected_seq {
+            return Err(anyhow!(
+                "restore incremental gap: expected seq {expected_seq}, got seq {} at {}",
+                inc.seq,
+                inc.key
+            ));
+        }
+
         let data = storage
             .get(&inc.key)
             .await?
             .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
-        match ltx::apply_changeset_to_db(&data, output, current_checksum) {
-            Ok(result) => {
-                tracing::info!(
-                    "Applied incremental (seq {}, checksum: {:016x})",
-                    inc.seq,
-                    result.checksum
-                );
-                restored_seq = inc.seq;
-                current_checksum = result.checksum;
-            }
-            Err(e) if e.to_string().contains("Checksum chain broken") => {
-                tracing::info!(
-                    "Skipping {} stale incrementals from previous lineage (seq {}+)",
-                    incrementals.len()
-                        - incrementals
-                            .iter()
-                            .position(|f| f.key == inc.key)
-                            .unwrap_or(0),
-                    inc.seq
-                );
-                break;
-            }
-            Err(e) => return Err(e),
-        }
+        let result = ltx::apply_changeset_to_db(&data, output, current_checksum)?;
+        tracing::info!(
+            "Applied incremental (seq {}, checksum: {:016x})",
+            inc.seq,
+            result.checksum
+        );
+        restored_seq = inc.seq;
+        current_checksum = result.checksum;
     }
 
+    verify_sqlite_integrity(output)?;
     Ok(restored_seq)
 }
 
@@ -1081,12 +1075,20 @@ pub async fn restore_with_snapshot_source(
     // When restoring from an external snapshot source we do not have the HADBP
     // checksum of the materialized base, so the *first* incremental cannot be
     // chain-verified against the snapshot — it establishes the chain. Every
-    // subsequent incremental must chain from the prior one; a break means the
-    // object belongs to a different lineage (e.g. a stale delta from a prior
-    // leader sitting at an in-range seq) and must NOT be applied wholesale.
+    // subsequent incremental must chain from the prior one. A gap or chain
+    // break means the restore cannot prove success, so it is a hard error.
     let mut restored_seq = checkpoint_version;
     let mut current_checksum: Option<u64> = None;
     for inc in incrementals.iter() {
+        let expected_seq = restored_seq + 1;
+        if inc.seq != expected_seq {
+            return Err(anyhow!(
+                "restore incremental gap: expected seq {expected_seq}, got seq {} at {}",
+                inc.seq,
+                inc.key
+            ));
+        }
+
         let data = storage
             .get(&inc.key)
             .await?
@@ -1096,15 +1098,8 @@ pub async fn restore_with_snapshot_source(
 
         // Verify the chain for every incremental after the first one.
         if let Some(prev) = current_checksum {
-            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
-                tracing::warn!(
-                    "Stopping restore at seq {}: checksum chain broken ({}); \
-                     remaining incrementals are from a different lineage",
-                    inc.seq,
-                    e
-                );
-                break;
-            }
+            hadb_changeset::physical::verify_chain(prev, &changeset)
+                .map_err(|e| anyhow!("Checksum chain broken at seq {}: {}", inc.seq, e))?;
         }
 
         // Apply pages directly (SQLite 1-based page offsets)
@@ -1134,7 +1129,22 @@ pub async fn restore_with_snapshot_source(
         current_checksum = Some(changeset.checksum);
     }
 
+    verify_sqlite_integrity(output)?;
     Ok(restored_seq)
+}
+
+fn verify_sqlite_integrity(path: &Path) -> Result<()> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|e| anyhow!("failed to open restored database for integrity_check: {e}"))?;
+    let result: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| anyhow!("failed to run integrity_check on restored database: {e}"))?;
+    if result != "ok" {
+        return Err(anyhow!(
+            "restored database failed integrity_check: {result}"
+        ));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -2279,6 +2289,37 @@ mod tests {
                 .unwrap();
 
         assert_eq!(restored_seq, 5);
+    }
+
+    #[tokio::test]
+    async fn restore_errors_on_noncontiguous_incremental_sequence() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let output = dir.path().join("restored.db");
+        let page_size = 4096u32;
+        std::fs::write(&source, vec![0x11; page_size as usize * 2]).unwrap();
+
+        let snapshot = ltx::encode_snapshot(&source, page_size, 1, 0).unwrap();
+        let snapshot_key = build_changeset_key("test/", "mydb", GENERATION_SNAPSHOT, 1);
+        storage.insert(&snapshot_key, snapshot);
+
+        let snapshot_checksum = ltx::compute_checksum_from_file(&source).unwrap();
+        let pages = vec![(1, vec![0x33; page_size as usize])];
+        let (incremental, _) =
+            ltx::encode_wal_changes(&pages, page_size, 3, snapshot_checksum).unwrap();
+        let incremental_key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 3);
+        storage.insert(&incremental_key, incremental);
+
+        let err = restore(&storage, "test/", "mydb", &output, None)
+            .await
+            .expect_err("restore must reject a gap from seq 1 to seq 3");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gap") || msg.contains("contiguous") || msg.contains("seq"),
+            "expected gap/contiguity error, got: {msg}"
+        );
     }
 
     // ------------------------------------------------------------------

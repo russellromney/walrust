@@ -41,6 +41,20 @@ fn restore_reached_target(final_txid: u64, target_txid: u64, explicit_pit: bool)
     Ok(())
 }
 
+fn verify_sqlite_integrity(path: &Path) -> Result<()> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|e| anyhow!("failed to open restored database for integrity_check: {e}"))?;
+    let result: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| anyhow!("failed to run integrity_check on restored database: {e}"))?;
+    if result != "ok" {
+        return Err(anyhow!(
+            "restored database failed integrity_check: {result}"
+        ));
+    }
+    Ok(())
+}
+
 pub async fn restore(
     name: &str,
     output: &Path,
@@ -144,6 +158,7 @@ pub async fn restore(
     );
 
     let mut final_txid = snapshot_max_txid;
+    let mut expected_pre_checksum = decode_result.post_apply_checksum;
 
     // Get incrementals from generation 0 (live folder)
     let incrementals =
@@ -162,7 +177,15 @@ pub async fn restore(
         let mut cache_hits = 0;
         let mut s3_fetches = 0;
 
-        for (key, _min_txid, max_txid) in &applicable {
+        for (key, min_txid, max_txid) in &applicable {
+            let expected_min = final_txid + 1;
+            if *min_txid != expected_min {
+                return Err(anyhow!(
+                    "restore incremental gap: expected next TXID {expected_min}, got \
+                     {min_txid}-{max_txid} at {key}"
+                ));
+            }
+
             // Try to read from cache first using max_txid as the key
             let ltx_data = if let Some(ref cache) = cache {
                 if cache.has_txid(*max_txid) {
@@ -180,8 +203,7 @@ pub async fn restore(
             };
 
             let cursor = std::io::Cursor::new(ltx_data);
-            // apply_ltx_to_db now verifies pre_apply and post_apply checksums
-            let apply_result = ltx::apply_ltx_to_db(cursor, output)?;
+            let apply_result = ltx::apply_ltx_to_db_checked(cursor, output, expected_pre_checksum)?;
 
             tracing::debug!(
                 "Applied {} (TXID: {}-{}, checksum: {:016x})",
@@ -192,6 +214,7 @@ pub async fn restore(
             );
 
             final_txid = *max_txid;
+            expected_pre_checksum = apply_result.post_apply_checksum;
         }
 
         if cache.is_some() {
@@ -218,6 +241,7 @@ pub async fn restore(
     // *between* commit boundaries, where landing at the latest commit <= target
     // is correct — so we only reject an overshoot there.
     restore_reached_target(final_txid, target_txid, point_in_time.is_some())?;
+    verify_sqlite_integrity(output)?;
 
     println!(
         "Restored {} to {} (TXID: {})",

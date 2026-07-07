@@ -115,6 +115,13 @@ and `crates/walrust-core/`.
   delete segments not fully encoded+uploaded.
 
 ### A6 — Restore chain verification is self-referential; gaps/wrong-lineage apply cleanly as success
+Status: Fixed — root restore is proven by
+`restore_rejects_incremental_without_prior_chain_link`; core restore is proven
+by `sync::tests::restore_errors_on_noncontiguous_incremental_sequence`. The
+production restart E2E now asserts fail-closed behavior with
+`e2e_core_replicator_restart_rejects_divergent_chain` until A10's state reload
+fix removes that divergent lineage.
+
 - `src/ltx.rs:177-250` `apply_ltx_to_db`: chain hasher is seeded from the LTX
   file's OWN `pre_apply_checksum`, hashes the file's OWN pages, compares to
   the file's OWN trailer. `pre_apply_checksum` is logged, never compared to
@@ -399,10 +406,11 @@ and `crates/walrust-core/`.
     `e2e_cli_watch_restore_round_trips_sqlite_rows`,
     `e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows`,
     `e2e_core_replicator_restore_round_trips_sqlite_rows`, and
-    `e2e_core_replicator_restart_round_trips_sqlite_rows`. Note: a stricter
+    `e2e_core_replicator_restart_rejects_divergent_chain`. Note: a stricter
     CLI restart variant that writes rows while/down after restart reproduced
-    missing restored rows; leave that as A10/A11 evidence rather than masking
-    it in Phase 0.
+    missing restored rows; the core restart variant now hard-errors on the
+    divergent chain after A6. Leave those as A10/A11 evidence rather than
+    masking them in Phase 0.
 
 ### Phase 1 — Stop lying (small diffs, loud errors)
 1.1 A1: flip endianness predicate (both crates), rename constants, golden

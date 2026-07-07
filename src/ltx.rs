@@ -175,6 +175,24 @@ pub struct ApplyResult {
 ///
 /// Returns the header and post_apply_checksum for chain tracking.
 pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult> {
+    apply_ltx_to_db_inner(reader, db_path, None)
+}
+
+/// Apply an incremental LTX file to an existing database, anchored to the
+/// caller's expected checksum chain head.
+pub fn apply_ltx_to_db_checked<R: Read>(
+    reader: R,
+    db_path: &Path,
+    expected_pre_checksum: Checksum,
+) -> Result<ApplyResult> {
+    apply_ltx_to_db_inner(reader, db_path, Some(expected_pre_checksum))
+}
+
+fn apply_ltx_to_db_inner<R: Read>(
+    reader: R,
+    db_path: &Path,
+    expected_pre_checksum: Option<Checksum>,
+) -> Result<ApplyResult> {
     use std::fs::OpenOptions;
     use std::io::{Seek, SeekFrom, Write as IoWrite};
 
@@ -191,6 +209,25 @@ pub fn apply_ltx_to_db<R: Read>(reader: R, db_path: &Path) -> Result<ApplyResult
 
     let page_size = header.page_size.into_inner() as usize;
     let mut page_buf = vec![0u8; page_size];
+
+    if !skip_checksums {
+        if let Some(expected_pre) = expected_pre_checksum {
+            let actual_pre = header.pre_apply_checksum.ok_or_else(|| {
+                anyhow!(
+                    "Missing pre-apply checksum: expected {:016x}",
+                    expected_pre.into_inner()
+                )
+            })?;
+            if actual_pre != expected_pre {
+                return Err(anyhow!(
+                    "Pre-apply checksum mismatch: expected {:016x}, got {:016x}. \
+                     The incremental does not chain from the restored database state.",
+                    expected_pre.into_inner(),
+                    actual_pre.into_inner()
+                ));
+            }
+        }
+    }
 
     // Open existing db file for page-level writes
     let mut file = OpenOptions::new()
