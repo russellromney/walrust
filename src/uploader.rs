@@ -346,9 +346,9 @@ impl Uploader {
 
     /// Handle a JoinSet result during steady-state operation.
     ///
-    /// Upload failures are recorded in the cache and stats by `upload_txid`;
-    /// keep the uploader alive so operators/recovery paths can retry them.
-    /// Task panics still tear down the uploader because task state is unknown.
+    /// Upload failures are recorded in the cache and stats by `upload_txid`.
+    /// A permanent failure means the backup stream has an unconfirmed gap, so
+    /// halt instead of uploading later TXIDs around it.
     fn handle_join_result_nonfatal(
         db_name: &str,
         result: Result<Result<UploadResult>, tokio::task::JoinError>,
@@ -357,7 +357,7 @@ impl Uploader {
             Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
                 error!("[{}] Upload task failed: {}", db_name, e);
-                Ok(())
+                Err(e)
             }
             Err(e) => {
                 error!("[{}] Upload task panicked: {}", db_name, e);
@@ -830,6 +830,43 @@ mod tests {
             err.to_string().contains("Failed to upload TXID 1"),
             "error should identify the failed upload: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_uploader_halts_after_permanent_failure_without_shipping_later_txids() {
+        let storage = Arc::new(MockStorage::with_failures(5));
+        let (uploader, cache, _temp) = setup_uploader_with_storage(storage.clone(), 1);
+
+        let (tx, rx) = mpsc::channel(10);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        for txid in 1..=3 {
+            cache
+                .write_ltx(txid, format!("data{txid}").as_bytes())
+                .unwrap();
+            tx.send(UploadMessage::Upload(txid)).await.unwrap();
+        }
+
+        let err = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("uploader should halt after the permanent failure")
+            .unwrap()
+            .expect_err("permanent upload failure must stop the uploader");
+
+        assert!(
+            err.to_string().contains("TXID 1"),
+            "halt error should identify the failed upload: {err}"
+        );
+        assert_eq!(
+            storage.object_count(),
+            0,
+            "later TXIDs must not upload around the failed TXID"
+        );
+        assert_eq!(cache.failed_uploads(), vec![1]);
+        assert_eq!(cache.pending_uploads(), vec![2, 3]);
     }
 
     #[tokio::test]

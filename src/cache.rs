@@ -140,11 +140,13 @@ impl LocalCache {
             default_manifest
         };
 
-        Ok(Self {
+        let cache = Self {
             cache_dir: cache_dir.to_path_buf(),
             manifest_path,
             manifest: Arc::new(Mutex::new(manifest)),
-        })
+        };
+        cache.reenqueue_failed_uploads_on_startup()?;
+        Ok(cache)
     }
 
     /// Get cache directory path for a database
@@ -240,6 +242,35 @@ impl LocalCache {
         Ok(())
     }
 
+    fn reenqueue_failed_uploads_on_startup(&self) -> Result<()> {
+        let mut manifest = self.manifest.lock().unwrap();
+        if manifest.failed_txids.is_empty() {
+            return Ok(());
+        }
+
+        for txid in manifest.failed_txids.iter().copied().collect::<Vec<_>>() {
+            let entry = manifest.entries.get(&txid).with_context(|| {
+                format!("failed upload TXID {txid} has no cache manifest entry")
+            })?;
+            if entry.uploaded {
+                anyhow::bail!("failed upload TXID {txid} is also marked uploaded");
+            }
+            let ltx_path = self.ltx_path(txid);
+            if !ltx_path.exists() {
+                anyhow::bail!(
+                    "failed upload TXID {txid} cannot be retried because {} is missing",
+                    ltx_path.display()
+                );
+            }
+            manifest.pending_txids.insert(txid);
+        }
+
+        manifest.failed_txids.clear();
+        Self::recompute_contiguous(&mut manifest);
+        self.save_manifest(&manifest)?;
+        Ok(())
+    }
+
     /// Write an incremental LTX to cache atomically.
     pub fn write_ltx(&self, txid: u64, data: &[u8]) -> Result<()> {
         self.write_ltx_inner(txid, data, false)
@@ -300,16 +331,7 @@ impl LocalCache {
             return (0, txid, txid);
         };
         let generation = if entry.is_snapshot { 1 } else { 0 };
-        let min_txid = if entry.min_txid > 0 {
-            entry.min_txid
-        } else {
-            txid
-        };
-        let max_txid = if entry.max_txid > 0 {
-            entry.max_txid
-        } else {
-            txid
-        };
+        let (min_txid, max_txid) = Self::entry_txid_range(txid, entry);
         (generation, min_txid, max_txid)
     }
 
@@ -358,18 +380,60 @@ impl LocalCache {
     /// of confirmed-uploaded TXIDs starting just after the current cursor.
     /// Stops at the first TXID that is missing, still pending, or failed.
     fn recompute_contiguous(manifest: &mut CacheManifest) {
-        let mut next = manifest.last_contiguous_uploaded_txid + 1;
+        let mut cursor = manifest.last_contiguous_uploaded_txid;
         loop {
-            if manifest.failed_txids.contains(&next) {
+            let Some(next) = cursor.checked_add(1) else {
+                break;
+            };
+            if Self::failed_upload_covers(manifest, next) {
                 break;
             }
-            match manifest.entries.get(&next) {
-                Some(entry) if entry.uploaded => {
-                    manifest.last_contiguous_uploaded_txid = next;
-                    next += 1;
+            let mut next_cursor = cursor;
+            for (txid, entry) in &manifest.entries {
+                if !entry.uploaded {
+                    continue;
                 }
-                _ => break,
+                let (min_txid, max_txid) = Self::entry_txid_range(*txid, entry);
+                if min_txid <= next && next <= max_txid {
+                    next_cursor = next_cursor.max(max_txid);
+                }
             }
+            if next_cursor == cursor {
+                break;
+            }
+            cursor = next_cursor;
+        }
+        manifest.last_contiguous_uploaded_txid = cursor;
+    }
+
+    fn failed_upload_covers(manifest: &CacheManifest, txid: u64) -> bool {
+        manifest.failed_txids.iter().any(|failed_txid| {
+            manifest
+                .entries
+                .get(failed_txid)
+                .map(|entry| {
+                    let (min_txid, max_txid) = Self::entry_txid_range(*failed_txid, entry);
+                    min_txid <= txid && txid <= max_txid
+                })
+                .unwrap_or(*failed_txid == txid)
+        })
+    }
+
+    fn entry_txid_range(txid: u64, entry: &CacheEntry) -> (u64, u64) {
+        let min_txid = if entry.min_txid > 0 {
+            entry.min_txid
+        } else {
+            txid
+        };
+        let max_txid = if entry.max_txid > 0 {
+            entry.max_txid
+        } else {
+            txid
+        };
+        if min_txid <= max_txid {
+            (min_txid, max_txid)
+        } else {
+            (txid, txid)
         }
     }
 
@@ -439,6 +503,10 @@ impl LocalCache {
         for (txid, entry) in &manifest.entries {
             if !entry.uploaded {
                 continue; // Never delete pending uploads
+            }
+            let (_, entry_max_txid) = Self::entry_txid_range(*txid, entry);
+            if entry_max_txid > manifest.last_contiguous_uploaded_txid {
+                continue; // Keep proof above the durable cursor until gaps close.
             }
             // Protect the restore base + its chain (TXIDs at/after the latest
             // snapshot).
@@ -777,6 +845,41 @@ mod tests {
     }
 
     #[test]
+    fn test_contiguous_cursor_advances_over_uploaded_ltx_intervals() {
+        use crate::ltx::{chain_checksum, encode_wal_changes};
+        use litepages::Checksum;
+
+        let (cache, _temp) = setup_cache();
+        cache.write_snapshot_ltx(1, b"snapshot").unwrap();
+        cache.mark_uploaded(1).unwrap();
+
+        let pages = vec![(1u32, vec![0x11; 4096]), (2u32, vec![0x22; 4096])];
+        let pre_checksum = Checksum::new(1);
+        let post_checksum = chain_checksum(pre_checksum, &pages);
+        let mut ltx = Vec::new();
+        encode_wal_changes(
+            &mut ltx,
+            &pages,
+            4096,
+            2,
+            3,
+            2,
+            Some(pre_checksum),
+            post_checksum,
+        )
+        .unwrap();
+
+        cache.write_ltx(3, &ltx).unwrap();
+        cache.mark_uploaded(3).unwrap();
+
+        assert_eq!(
+            cache.last_contiguous_uploaded_txid(),
+            3,
+            "an uploaded LTX covering TXID 2-3 must advance the durable cursor across the interval"
+        );
+    }
+
+    #[test]
     fn test_failed_upload_surfaces_gap_and_blocks_cursor() {
         // F9: a permanently failed upload is a durable gap. The contiguous
         // cursor must not advance past it even if later TXIDs upload fine.
@@ -801,6 +904,54 @@ mod tests {
         cache.mark_uploaded(2).unwrap();
         assert_eq!(cache.failed_uploads(), Vec::<u64>::new());
         assert_eq!(cache.last_contiguous_uploaded_txid(), 4);
+    }
+
+    #[test]
+    fn test_failed_uploads_reenqueue_on_restart() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("test.db");
+        {
+            let cache = LocalCache::new(&db_path).unwrap();
+            cache.write_ltx(1, b"data1").unwrap();
+            cache.mark_failed(1).unwrap();
+            assert_eq!(cache.pending_uploads(), Vec::<u64>::new());
+            assert_eq!(cache.failed_uploads(), vec![1]);
+        }
+
+        let cache = LocalCache::new(&db_path).unwrap();
+        assert_eq!(
+            cache.pending_uploads(),
+            vec![1],
+            "restart must re-enqueue failed uploads for another attempt"
+        );
+        assert_eq!(
+            cache.failed_uploads(),
+            Vec::<u64>::new(),
+            "restart retry should clear the stale failed marker"
+        );
+    }
+
+    #[test]
+    fn test_cleanup_keeps_uploaded_entries_above_contiguous_cursor() {
+        let (cache, _temp) = setup_cache();
+        for txid in 1..=3 {
+            cache
+                .write_ltx(txid, format!("data{txid}").as_bytes())
+                .unwrap();
+        }
+
+        cache.mark_uploaded(1).unwrap();
+        cache.mark_uploaded(3).unwrap();
+        assert_eq!(cache.last_contiguous_uploaded_txid(), 1);
+
+        cache.cleanup(chrono::Duration::zero(), 0).unwrap();
+        cache.mark_uploaded(2).unwrap();
+
+        assert_eq!(
+            cache.last_contiguous_uploaded_txid(),
+            3,
+            "cleanup must not remove uploaded proof above the durable cursor"
+        );
     }
 
     #[test]

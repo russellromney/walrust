@@ -296,6 +296,18 @@ proof. Proven by
   progress record written only after durability events.
 
 ### A11 — Failed uploads create permanent holes; pipeline ships around them; durable cursor is broken
+Status: Fixed — root `LocalCache` now persists `(min_txid, max_txid)` interval
+metadata from production LTX bytes, advances the durable cursor across uploaded
+intervals, protects uploaded proof above the contiguous cursor from cleanup,
+re-enqueues failed uploads on cache restart, and the uploader halts on a
+permanent upload failure instead of shipping later TXIDs around the hole. Proven
+by `test_contiguous_cursor_advances_over_uploaded_ltx_intervals`,
+`test_failed_uploads_reenqueue_on_restart`,
+`test_cleanup_keeps_uploaded_entries_above_contiguous_cursor`, and
+`test_uploader_halts_after_permanent_failure_without_shipping_later_txids`.
+`walrust-dst` uses this root cache/uploader pipeline; `walrust-core` has no
+corresponding local-cache uploader tree.
+
 - `src/uploader.rs:164-185` + `src/cache.rs:305-314`: permanently-failed TXID
   is removed from pending; restart resume reads only `pending_uploads()` —
   failed TXIDs are never re-enqueued by anyone (`failed_uploads()` has zero

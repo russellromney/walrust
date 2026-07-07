@@ -271,11 +271,11 @@ async fn test_crash_recovery_partial() {
 
 #[tokio::test]
 async fn test_network_disconnect_recovery() {
-    // Scenario: Start uploader, disconnect network, cache continues, reconnect, verify upload
+    // Scenario: Start uploader, disconnect network, fail closed, restart after reconnect.
 
     let fixture = DiskQueueTestFixture::new().unwrap();
     let uploader = fixture.create_uploader();
-    let (tx, _handle) = spawn_uploader(uploader.clone());
+    let (tx, handle) = spawn_uploader(uploader.clone());
 
     // Wait for uploader to start and complete auto-resume
     sleep(Duration::from_millis(10)).await;
@@ -295,19 +295,48 @@ async fn test_network_disconnect_recovery() {
         sleep(Duration::from_millis(10)).await;
     }
 
-    // Upload failed, but the LTX is still on disk and the failure is surfaced:
-    // a permanently-failed TXID moves out of `pending` into `failed` (F9), so
-    // the durable gap is visible rather than silently retried forever.
+    // Upload failed, but the LTX is still on disk and the failure is surfaced.
     let stats = uploader.stats().await;
     assert!(stats.uploads_failed > 0);
     assert_eq!(fixture.cache.pending_uploads(), Vec::<u64>::new());
     assert_eq!(fixture.cache.failed_uploads(), vec![1]);
 
+    let err = tokio::time::timeout(Duration::from_secs(5), handle)
+        .await
+        .expect("uploader must halt after a permanent upload failure")
+        .unwrap()
+        .expect_err("uploader must return the failed upload");
+    assert!(
+        err.to_string().contains("TXID 1"),
+        "halt error should identify the failed TXID: {err}"
+    );
+
     // Reconnect network
     fixture.storage.set_available(true);
 
-    // Retry upload
-    tx.send(UploadMessage::Upload(1)).await.unwrap();
+    // Restart recovery reopens the cache, re-enqueues the failed upload, and
+    // lets a fresh uploader resume it.
+    let cache = Arc::new(LocalCache::new(&fixture.db_path).unwrap());
+    assert_eq!(cache.pending_uploads(), vec![1]);
+    assert_eq!(cache.failed_uploads(), Vec::<u64>::new());
+
+    let retry_config = RetryConfig {
+        max_retries: 3,
+        base_delay_ms: 10,
+        max_delay_ms: 100,
+        ..Default::default()
+    };
+    let uploader = Arc::new(Uploader::new(
+        "test_db".to_string(),
+        cache.clone(),
+        fixture.storage.clone() as Arc<dyn StorageBackend>,
+        "test-prefix".to_string(),
+        Arc::new(RetryPolicy::new(retry_config)),
+        Arc::new(WebhookSender::new(vec![])),
+        4,
+    ));
+    let (tx, handle) = spawn_uploader(uploader.clone());
+
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while uploader.stats().await.uploads_succeeded == 0 && std::time::Instant::now() < deadline {
         sleep(Duration::from_millis(10)).await;
@@ -316,9 +345,10 @@ async fn test_network_disconnect_recovery() {
     // Now succeeds
     let stats = uploader.stats().await;
     assert_eq!(stats.uploads_succeeded, 1);
-    assert_eq!(fixture.cache.pending_uploads().len(), 0);
+    assert_eq!(cache.pending_uploads().len(), 0);
 
     tx.send(UploadMessage::Shutdown).await.unwrap();
+    handle.await.unwrap().unwrap();
 }
 
 #[tokio::test]
