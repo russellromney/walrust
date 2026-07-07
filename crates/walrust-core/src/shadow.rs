@@ -13,6 +13,7 @@ use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::Mutex;
@@ -375,15 +376,45 @@ impl ShadowWal {
             drop(conn);
         }
 
-        // Run PASSIVE checkpoint (non-blocking)
-        {
+        let checkpoint_result = {
             let conn = Connection::open(&self.db_path)?;
-            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
-        }
+            conn.busy_timeout(Duration::from_secs(5))?;
+            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+                conn.query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            if busy != 0 || checkpointed_frames < log_frames {
+                Err(anyhow!(
+                    "{}: shadow checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
+                    self.db_path.display(),
+                    busy,
+                    log_frames,
+                    checkpointed_frames
+                ))
+            } else {
+                Ok(())
+            }
+        };
 
         // Re-establish checkpoint blocker
-        let new_blocker = Self::open_checkpoint_blocker(&self.db_path)?;
-        self.checkpoint_blocker = Some(Arc::new(Mutex::new(new_blocker)));
+        let reopen_result = Self::open_checkpoint_blocker(&self.db_path);
+        match (checkpoint_result, reopen_result) {
+            (Ok(()), Ok(new_blocker)) => {
+                self.checkpoint_blocker = Some(Arc::new(Mutex::new(new_blocker)));
+            }
+            (Err(checkpoint_err), Ok(new_blocker)) => {
+                self.checkpoint_blocker = Some(Arc::new(Mutex::new(new_blocker)));
+                return Err(checkpoint_err);
+            }
+            (Ok(()), Err(reopen_err)) => return Err(reopen_err),
+            (Err(checkpoint_err), Err(reopen_err)) => {
+                return Err(anyhow!(
+                    "{}; additionally failed to re-open shadow checkpoint blocker: {}",
+                    checkpoint_err,
+                    reopen_err
+                ));
+            }
+        }
 
         tracing::debug!(
             "Shadow WAL: checkpoint complete for {}",

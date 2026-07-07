@@ -440,9 +440,6 @@ async fn run_db_task(
     let mut cleanup_timer = tokio::time::interval(Duration::from_secs(300));
     cleanup_timer.tick().await; // Skip first immediate tick
 
-    // Track last synced WAL size to detect changes
-    let mut last_synced_wal_size: u64 = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-
     tracing::debug!(
         "{}: Task started, polling every {}s (WAL: {})",
         db_name,
@@ -455,14 +452,9 @@ async fn run_db_task(
             // Shutdown signal
             _ = shutdown_rx.recv() => {
                 // Final sync before shutdown
-                let current_wal_size = std::fs::metadata(&wal_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                if current_wal_size > last_synced_wal_size {
-                    do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref())
-                        .await
-                        .with_context(|| format!("{}: final sync before shutdown failed", db_name))?;
-                }
+                do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref())
+                    .await
+                    .with_context(|| format!("{}: final sync before shutdown failed", db_name))?;
                 // Signal uploader to shutdown if cache is enabled
                 if let Some(mut cache) = cache_state.take() {
                     cache.upload_tx
@@ -484,27 +476,19 @@ async fn run_db_task(
 
             // Poll timer - check WAL size and sync if changed
             _ = poll_timer.tick() => {
-                let current_wal_size = std::fs::metadata(&wal_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-
-                // Only sync if WAL has grown
-                if current_wal_size > last_synced_wal_size {
-                    match do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await {
-                        Ok(frame_count) => {
-                            if frame_count > 0 {
-                                tracing::debug!("{}: Synced {} frames", db_name, frame_count);
-                            }
-                            last_synced_wal_size = current_wal_size;
+                match do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await {
+                    Ok(frame_count) => {
+                        if frame_count > 0 {
+                            tracing::debug!("{}: Synced {} frames", db_name, frame_count);
                         }
-                        Err(e) => {
-                            let error_msg = e.to_string();
-                            tracing::error!("{}: Sync failed: {}", db_name, error_msg);
-                            webhook_sender
-                                .notify_upload_failed(&db_name, &error_msg, 1)
-                                .await;
-                            return Err(anyhow!("{}: sync failed: {}", db_name, error_msg));
-                        }
+                    }
+                    Err(e) => {
+                        let error_msg = e.to_string();
+                        tracing::error!("{}: Sync failed: {}", db_name, error_msg);
+                        webhook_sender
+                            .notify_upload_failed(&db_name, &error_msg, 1)
+                            .await;
+                        return Err(anyhow!("{}: sync failed: {}", db_name, error_msg));
                     }
                 }
             }

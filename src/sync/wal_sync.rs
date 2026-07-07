@@ -119,10 +119,10 @@ pub(crate) async fn sync_wal_concurrent(
     };
 
     // Track state changes locally
-    let mut wal_offset = input.wal_offset;
-    let mut wal_generation = input.wal_generation;
+    let wal_offset = input.wal_offset;
+    let wal_generation = input.wal_generation;
     let db_checksum = input.db_checksum;
-    let mut checkpoint_detected = false;
+    let checkpoint_detected = false;
     let mut wal_salt = input.wal_salt;
     let mut wal_checksum_chain = input.wal_checksum_chain;
 
@@ -135,16 +135,13 @@ pub(crate) async fn sync_wal_concurrent(
     let size_rollover = current_size < wal_offset;
     let salt_rollover = matches!(wal_salt, Some(prev) if prev != current_salt);
     if size_rollover || salt_rollover {
-        tracing::info!(
-            "{}: WAL rollover detected (size_rollover={}, salt_rollover={}); resetting offset",
+        tracing::warn!(
+            "{}: WAL rollover detected (size_rollover={}, salt_rollover={}); publishing a new snapshot instead of an incremental across the gap",
             input.name,
             size_rollover,
             salt_rollover
         );
-        wal_offset = 0;
-        wal_generation += 1;
-        checkpoint_detected = true;
-        wal_checksum_chain = None;
+        return upload_rollover_snapshot(client, bucket, prefix, input, wal_generation + 1).await;
     }
     wal_salt = Some(current_salt);
 
@@ -278,6 +275,74 @@ pub(crate) async fn sync_wal_concurrent(
     })
 }
 
+async fn upload_rollover_snapshot(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    input: SyncInput,
+    new_wal_generation: u64,
+) -> Result<SyncOutput> {
+    checkpoint_wal_truncate(&input.db_path).await?;
+
+    let page_size = get_page_size(&input.db_path).await?;
+    let db_path_for_encode = input.db_path.clone();
+    let db_size = std::fs::metadata(&input.db_path)?.len() as usize;
+    let estimated_size = db_size.saturating_mul(2);
+    let new_txid = input.current_txid + 1;
+    let db_name_for_error = input.name.clone();
+
+    let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
+        let mut ltx_buffer = Vec::with_capacity(estimated_size);
+        ltx::encode_snapshot(&mut ltx_buffer, &db_path_for_encode, page_size, new_txid).map_err(
+            |e| {
+                anyhow::anyhow!(
+                    "{}: Rollover snapshot encode failed: {}",
+                    db_name_for_error,
+                    e
+                )
+            },
+        )?;
+        let db_checksum = ltx::compute_checksum_from_file(&db_path_for_encode)?;
+        Ok::<_, anyhow::Error>((ltx_buffer, db_checksum))
+    })
+    .await??;
+
+    let ltx_size = ltx_buffer.len() as u64;
+    let (_, current_gen, _) = discover_state_from_s3(client, bucket, prefix, &input.name).await?;
+    let snapshot_gen = (current_gen + 1).max(1);
+    let ltx_key = build_ltx_key(prefix, &input.name, snapshot_gen, 1, new_txid);
+
+    s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
+
+    tracing::info!(
+        "{}: Rollover snapshot uploaded (gen {}, TXID 1-{}, {} bytes, checksum {:#x}) -> {}",
+        input.name,
+        snapshot_gen,
+        new_txid,
+        ltx_size,
+        db_checksum_new.into_inner(),
+        ltx_key
+    );
+
+    let new_wal_salt = wal::read_header(&input.wal_path)
+        .await
+        .ok()
+        .flatten()
+        .map(|h| h.salt());
+
+    Ok(SyncOutput {
+        db_path: input.db_path,
+        frame_count: 1,
+        new_wal_offset: 0,
+        new_current_txid: new_txid,
+        new_db_checksum: Some(db_checksum_new.into_inner()),
+        checkpoint_detected: true,
+        new_wal_generation,
+        new_wal_salt,
+        new_wal_checksum_chain: None,
+    })
+}
+
 /// Sync WAL concurrently with retry and webhook notifications
 pub(crate) async fn sync_wal_concurrent_with_retry(
     client: Arc<aws_sdk_s3::Client>,
@@ -376,6 +441,14 @@ pub(crate) async fn do_sync(
     state.db_state.wal_salt = result.new_wal_salt;
     state.db_state.wal_checksum_chain = result.new_wal_checksum_chain;
     if result.checkpoint_detected {
+        let event = format!(
+            "{}: WAL rollover/checkpoint detected; backup safety path handled it before continuing",
+            state.db_state.name
+        );
+        tracing::warn!("{}", event);
+        webhook_sender
+            .notify_upload_failed(&state.db_state.name, &event, 1)
+            .await;
         state.db_state.wal_generation = result.new_wal_generation;
         state.db_state.wal_offset = result.new_wal_offset;
     }
@@ -791,9 +864,6 @@ pub(crate) async fn take_snapshot(
     Ok(())
 }
 
-/// Checkpoint WAL to ensure all committed data is in the main database file.
-/// Uses PASSIVE mode to avoid blocking active writers - this checkpoints whatever
-/// frames are safe to checkpoint without waiting for readers/writers.
 pub(crate) async fn checkpoint_wal(db_path: &Path) -> Result<()> {
     let db_path = db_path.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -801,9 +871,37 @@ pub(crate) async fn checkpoint_wal(db_path: &Path) -> Result<()> {
             &db_path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
         )?;
-        // PASSIVE: checkpoint frames that can be checkpointed without blocking
-        // This won't block if there are active readers, but ensures we get committed data
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
+}
+
+/// Force a WAL reset before a rollover re-snapshot. This path resets the WAL
+/// cursor afterward, so a partial PASSIVE checkpoint is not sufficient.
+pub(crate) async fn checkpoint_wal_truncate(db_path: &Path) -> Result<()> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 || checkpointed_frames < log_frames {
+            anyhow::bail!(
+                "{}: snapshot checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
+                db_path.display(),
+                busy,
+                log_frames,
+                checkpointed_frames
+            );
+        }
         Ok::<_, anyhow::Error>(())
     })
     .await??;

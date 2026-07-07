@@ -87,6 +87,16 @@ and `crates/walrust-core/`.
   file contains the checkpointed data, so re-snapshot restores consistency).
   Either way, emit a loud event (error log + webhook) on rollover.
 
+Status: Fixed — walrust-owned rollover now re-anchors with a fresh production
+snapshot, external-base and fenced external modes hard-fail until the external
+base is re-anchored, and poll mode no longer waits for WAL growth before
+running the production sync path. Root direct mode mirrors the re-snapshot
+behavior and the watch path emits a rollover webhook event via
+`checkpoint_detected`. Proven by
+`test_walrust_owned_flush_resnapshots_after_checkpoint_rollover`,
+`test_external_mode_refuses_checkpoint_rollover_until_reanchored`, and
+`test_fenced_external_mode_refuses_checkpoint_rollover_until_reanchored`.
+
 ### A4 — walrust's own checkpoint timer destroys unshipped frames
 - `src/sync/watch_shadow.rs:663-681`: comment says "First, ensure all shadow
   data is uploaded" — no such code exists. `ShadowWal::checkpoint()`
@@ -99,6 +109,15 @@ and `crates/walrust-core/`.
 - Fix: `copy_frames` + full shadow encode/upload drain BEFORE checkpoint;
   check the wal_checkpoint result row (busy/log/ckpt counts); retry + webhook
   on blocker re-open failure; set busy_timeout.
+
+Status: Fixed — shadow checkpointing now copies active WAL frames, syncs the
+shadow segments, waits for local-cache upload confirmation before checkpointing,
+returns a hard error/webhook on failure, and `ShadowWal::checkpoint()` in both
+trees checks the `wal_checkpoint(PASSIVE)` result row with a busy timeout while
+re-opening the blocker before returning. Proven by
+`sync::watch_shadow::tests::test_shadow_checkpoint_copies_syncs_and_waits_for_cache_upload`
+and
+`sync::watch_shadow::tests::test_shadow_checkpoint_refuses_pending_cache_upload`.
 
 ### A5 — Shadow generation rollover drops data: sync offset never reset, un-uploaded segments deleted
 - `src/sync/watch_shadow.rs:438` is the only assignment of

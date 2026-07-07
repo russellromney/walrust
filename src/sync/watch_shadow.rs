@@ -32,6 +32,8 @@ use super::wal_sync::take_snapshot_with_retry;
 type ShadowSyncFuture =
     Pin<Box<dyn Future<Output = Result<super::types::ShadowSyncOutput>> + Send>>;
 
+const CHECKPOINT_UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 struct DirectShadowSyncTarget {
     client: Arc<aws_sdk_s3::Client>,
@@ -112,6 +114,19 @@ fn apply_shadow_sync_output(
     }
 }
 
+fn apply_shadow_sync_output_to_state(
+    state: &mut ShadowDbState,
+    output: &super::types::ShadowSyncOutput,
+) {
+    if output.frame_count == 0 {
+        return;
+    }
+
+    state.shadow_sync_offset = output.new_shadow_sync_offset;
+    state.current_txid = output.new_current_txid;
+    state.db_checksum = output.new_db_checksum;
+}
+
 fn apply_shadow_sync_results_strict(
     db_states: &mut HashMap<PathBuf, ShadowDbState>,
     results: Vec<Result<super::types::ShadowSyncOutput>>,
@@ -151,6 +166,120 @@ async fn copy_final_shadow_frames(db_states: &mut HashMap<PathBuf, ShadowDbState
             tracing::debug!("{}: Final shadow copy: {} frames", state.name, frames.len());
             state.wal_copy_offset = new_offset;
         }
+    }
+
+    Ok(())
+}
+
+async fn wait_for_cache_checkpoint_durability(
+    cache: &LocalCache,
+    db_name: &str,
+    required_txid: u64,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let failed = cache.failed_uploads();
+        if !failed.is_empty() {
+            anyhow::bail!(
+                "{}: cannot checkpoint shadow WAL; cache upload failures remain: {:?}",
+                db_name,
+                failed
+            );
+        }
+
+        let pending = cache.pending_uploads();
+        let uploaded_txid = cache.last_uploaded_txid();
+        if pending.is_empty() && uploaded_txid >= required_txid {
+            return Ok(());
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "{}: cannot checkpoint shadow WAL; durable upload confirmation timed out after {:?} (required_txid={}, uploaded_txid={}, pending={:?})",
+                db_name,
+                timeout,
+                required_txid,
+                uploaded_txid,
+                pending
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn checkpoint_shadow_after_durable_sync(
+    state: &mut ShadowDbState,
+    cache_state: Option<&(Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
+    direct_target: Option<DirectShadowSyncTarget>,
+    retry_policy: &RetryPolicy,
+    webhook_sender: Arc<WebhookSender>,
+    drain_timeout: Duration,
+) -> Result<()> {
+    let (frames, new_offset) = state
+        .shadow
+        .copy_frames(state.wal_copy_offset)
+        .await
+        .with_context(|| format!("{}: shadow copy before checkpoint failed", state.name))?;
+    if !frames.is_empty() {
+        tracing::debug!(
+            "{}: checkpoint copied {} frames to shadow (offset {} -> {})",
+            state.name,
+            frames.len(),
+            state.wal_copy_offset,
+            new_offset
+        );
+        state.wal_copy_offset = new_offset;
+    }
+
+    let input = shadow_sync_input(state);
+    let output = if let Some((cache, upload_tx)) = cache_state {
+        sync_shadow_to_cache_with_retry(
+            Arc::clone(cache),
+            upload_tx.clone(),
+            input,
+            retry_policy.clone(),
+            Arc::clone(&webhook_sender),
+        )
+        .await?
+    } else if let Some(target) = direct_target {
+        sync_shadow_concurrent_with_retry(
+            Arc::clone(&target.client),
+            target.bucket_name,
+            target.prefix,
+            input,
+            retry_policy.clone(),
+            Arc::clone(&webhook_sender),
+        )
+        .await?
+    } else {
+        anyhow::bail!(
+            "{}: no cache uploader or direct upload target configured for checkpoint drain",
+            state.name
+        );
+    };
+    apply_shadow_sync_output_to_state(state, &output);
+
+    if let Some((cache, _)) = cache_state {
+        wait_for_cache_checkpoint_durability(cache, &state.name, state.current_txid, drain_timeout)
+            .await?;
+    }
+
+    state
+        .shadow
+        .checkpoint()
+        .await
+        .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
+
+    let current_gen = state.shadow.generation();
+    if current_gen > 0 {
+        state
+            .shadow
+            .cleanup_segments(current_gen)
+            .await
+            .with_context(|| format!("{}: shadow cleanup failed", state.name))?;
     }
 
     Ok(())
@@ -809,9 +938,9 @@ pub async fn watch_with_shadow(
                 }
             }
 
-            // Checkpoint timer - use shadow.checkpoint() for manual control
+            // Checkpoint timer - copy, sync, verify durability, then checkpoint.
             _ = checkpoint_timer.tick(), if global_sync.checkpoint_interval > 0 => {
-                for (_db_path, state) in db_states.iter_mut() {
+                for (db_path, state) in db_states.iter_mut() {
                     // Check if shadow has accumulated enough data
                     let segments = match state.shadow.list_segments(state.shadow.generation()).await {
                         Ok(s) => s,
@@ -832,20 +961,31 @@ pub async fn watch_with_shadow(
                             estimated_frames
                         );
 
-                        // First, ensure all shadow data is uploaded
-                        // Then trigger checkpoint via shadow
-                        if let Err(e) = state.shadow.checkpoint().await {
-                            tracing::error!("{}: Shadow checkpoint failed: {}", state.name, e);
-                        } else {
-                            tracing::debug!("{}: Shadow checkpoint completed", state.name);
-                            // Clean up old generation segments
-                            let current_gen = state.shadow.generation();
-                            if current_gen > 0 {
-                                if let Err(e) = state.shadow.cleanup_segments(current_gen).await {
-                                    tracing::warn!("{}: Shadow cleanup failed: {}", state.name, e);
-                                }
-                            }
+                        if let Err(e) = checkpoint_shadow_after_durable_sync(
+                            state,
+                            cache_states.get(db_path),
+                            Some(DirectShadowSyncTarget {
+                                client: Arc::clone(&client),
+                                bucket_name: bucket_name.clone(),
+                                prefix: prefix.clone(),
+                            }),
+                            &retry_policy,
+                            Arc::clone(&webhook_sender),
+                            CHECKPOINT_UPLOAD_DRAIN_TIMEOUT,
+                        ).await {
+                            let error_msg = e.to_string();
+                            tracing::error!("{}: Shadow checkpoint failed: {}", state.name, error_msg);
+                            webhook_sender
+                                .notify_upload_failed(&state.name, &error_msg, 1)
+                                .await;
+                            return Err(anyhow!(
+                                "{}: shadow checkpoint failed: {}",
+                                state.name,
+                                error_msg
+                            ));
                         }
+
+                        tracing::debug!("{}: Shadow checkpoint completed", state.name);
                     } else {
                         tracing::debug!(
                             "{}: Skipping checkpoint (only ~{} frames, need {})",
@@ -1030,6 +1170,107 @@ mod tests {
         assert!(
             matches!(msg, UploadMessage::Upload(txid) if txid == pending[0]),
             "cache sync must notify uploader for queued LTX"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shadow_checkpoint_copies_syncs_and_waits_for_cache_upload() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let wal_path = db_path.with_extension("db-wal");
+        let mut state = ShadowDbState {
+            name: "checkpoint_shadow".to_string(),
+            db_path: db_path.clone(),
+            wal_path,
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+        let (upload_tx, mut upload_rx) = mpsc::channel(10);
+        let ack_cache = Arc::clone(&cache);
+        let ack_handle = tokio::spawn(async move {
+            match upload_rx.recv().await {
+                Some(UploadMessage::Upload(txid)) => ack_cache.mark_uploaded(txid).unwrap(),
+                other => panic!("expected upload notification, got {other:?}"),
+            }
+        });
+        let cache_state = (Arc::clone(&cache), upload_tx);
+
+        checkpoint_shadow_after_durable_sync(
+            &mut state,
+            Some(&cache_state),
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        ack_handle.await.unwrap();
+
+        assert!(
+            state.wal_copy_offset > 0,
+            "checkpoint path must copy real active WAL frames before checkpointing"
+        );
+        assert!(
+            state.shadow_sync_offset > 0,
+            "checkpoint path must sync copied shadow frames before checkpointing"
+        );
+        assert!(
+            cache.pending_uploads().is_empty(),
+            "checkpoint must wait until cache uploads are confirmed durable"
+        );
+        assert!(
+            cache.last_uploaded_txid() >= state.current_txid,
+            "confirmed uploaded LTX must cover the checkpointed shadow state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shadow_checkpoint_refuses_pending_cache_upload() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let wal_path = db_path.with_extension("db-wal");
+        let mut state = ShadowDbState {
+            name: "checkpoint_shadow_pending".to_string(),
+            db_path: db_path.clone(),
+            wal_path,
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+        let (upload_tx, _upload_rx) = mpsc::channel(10);
+        let cache_state = (Arc::clone(&cache), upload_tx);
+
+        let err = checkpoint_shadow_after_durable_sync(
+            &mut state,
+            Some(&cache_state),
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("checkpoint must fail closed while cache uploads are pending")
+        .to_string();
+
+        assert!(
+            err.contains("durable upload confirmation timed out"),
+            "expected durability timeout, got {err}"
+        );
+        assert!(
+            !cache.pending_uploads().is_empty(),
+            "test must leave an unconfirmed cache upload pending"
         );
     }
 }

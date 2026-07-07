@@ -262,6 +262,40 @@ async fn get_page_size(db_path: &Path) -> Result<u32> {
     Ok(page_size)
 }
 
+async fn checkpoint_wal(db_path: &Path) -> Result<()> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 || checkpointed_frames < log_frames {
+            anyhow::bail!(
+                "{}: snapshot checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
+                db_path.display(),
+                busy,
+                log_frames,
+                checkpointed_frames
+            );
+        }
+        Ok(())
+    })
+    .await?
+}
+
+async fn reset_wal_cursor_after_snapshot(state: &mut SyncState) {
+    state.wal_offset = 0;
+    state.wal_generation += 1;
+    state.wal_salt = wal::read_header(&state.wal_path)
+        .await
+        .ok()
+        .flatten()
+        .map(|h| h.salt());
+    state.wal_checksum_chain = None;
+}
+
 // ============================================================================
 // Manifest operations
 // ============================================================================
@@ -377,6 +411,7 @@ struct WalBatch {
     new_offset: u64,
     final_db_size: u32,
     commit_count: u64,
+    rollover_detected: bool,
 }
 
 /// Detect WAL rollover (by size *or* salt change) and read the next batch of
@@ -398,7 +433,9 @@ async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> 
     let size_rollover = size < state.wal_offset;
     let salt_rollover = matches!(state.wal_salt, Some(prev) if prev != current_salt);
 
-    if size_rollover || salt_rollover {
+    let rollover_detected = size_rollover || salt_rollover;
+
+    if rollover_detected {
         tracing::info!(
             "{}: WAL rollover detected (size_rollover={}, salt_rollover={}); resetting offset",
             state.name,
@@ -406,7 +443,6 @@ async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> 
             salt_rollover
         );
         state.wal_offset = 0;
-        state.wal_generation += 1;
         // New generation: chain must re-seed from the new header.
         state.wal_checksum_chain = None;
     }
@@ -439,6 +475,7 @@ async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> 
         new_offset,
         final_db_size,
         commit_count,
+        rollover_detected,
     })
 }
 
@@ -476,13 +513,43 @@ async fn sync_wal_with_sequence(
         }
     };
 
+    let previous_wal_offset = state.wal_offset;
+    let previous_wal_generation = state.wal_generation;
+    let previous_wal_salt = state.wal_salt;
+    let previous_wal_checksum_chain = state.wal_checksum_chain;
+
     let WalBatch {
         page_map,
         frame_count,
         new_offset,
         final_db_size: _max_db_size,
         commit_count,
+        rollover_detected,
     } = read_next_wal_batch(state, &header).await?;
+
+    if rollover_detected {
+        match sequence {
+            DeltaSequence::WalrustOwned => {
+                tracing::warn!(
+                    "{}: WAL rollover detected; publishing a new snapshot instead of an incremental across the gap",
+                    state.name
+                );
+                take_snapshot(storage, prefix, state).await?;
+                save_state(storage, prefix, state).await?;
+                return Ok(1);
+            }
+            DeltaSequence::ExternalChangeCounter => {
+                state.wal_offset = previous_wal_offset;
+                state.wal_generation = previous_wal_generation;
+                state.wal_salt = previous_wal_salt;
+                state.wal_checksum_chain = previous_wal_checksum_chain;
+                anyhow::bail!(
+                    "{}: WAL rollover detected after external base; refusing to publish deltas until the external base is re-anchored",
+                    state.name
+                );
+            }
+        }
+    }
 
     if page_map.is_empty() {
         return Ok(0);
@@ -896,13 +963,30 @@ pub async fn sync_wal_fenced_delta(
         }
     };
 
+    let previous_wal_offset = state.wal_offset;
+    let previous_wal_generation = state.wal_generation;
+    let previous_wal_salt = state.wal_salt;
+    let previous_wal_checksum_chain = state.wal_checksum_chain;
+
     let WalBatch {
         page_map,
         frame_count,
         new_offset,
         final_db_size,
         commit_count,
+        rollover_detected,
     } = read_next_wal_batch(state, &header).await?;
+
+    if rollover_detected {
+        state.wal_offset = previous_wal_offset;
+        state.wal_generation = previous_wal_generation;
+        state.wal_salt = previous_wal_salt;
+        state.wal_checksum_chain = previous_wal_checksum_chain;
+        anyhow::bail!(
+            "{}: WAL rollover detected in fenced external mode; refusing to publish deltas until the external base is re-anchored",
+            state.name
+        );
+    }
 
     if page_map.is_empty() {
         return Ok(None);
@@ -984,6 +1068,7 @@ pub async fn take_snapshot(
     state: &mut SyncState,
 ) -> Result<()> {
     let timestamp = Utc::now();
+    checkpoint_wal(&state.db_path).await?;
     let page_size = get_page_size(&state.db_path).await?;
 
     // Use the file change counter as a txid source when available.
@@ -1020,6 +1105,7 @@ pub async fn take_snapshot(
     state.current_txid = new_txid;
     state.last_snapshot = Some(timestamp);
     state.db_checksum = Some(db_checksum);
+    reset_wal_cursor_after_snapshot(state).await;
 
     Ok(())
 }
@@ -1246,6 +1332,7 @@ pub async fn take_snapshot_with_retry(
     retry_policy: &RetryPolicy,
 ) -> Result<()> {
     let timestamp = Utc::now();
+    checkpoint_wal(&state.db_path).await?;
     let page_size = get_page_size(&state.db_path).await?;
 
     let cc = change_counter_from_file(&state.db_path).unwrap_or(0);
@@ -1288,6 +1375,7 @@ pub async fn take_snapshot_with_retry(
     state.current_txid = new_txid;
     state.last_snapshot = Some(timestamp);
     state.db_checksum = Some(db_checksum);
+    reset_wal_cursor_after_snapshot(state).await;
 
     Ok(())
 }
@@ -1313,7 +1401,18 @@ pub async fn sync_wal_with_retry(
         new_offset,
         final_db_size: _max_db_size,
         commit_count,
+        rollover_detected,
     } = read_next_wal_batch(state, &header).await?;
+
+    if rollover_detected {
+        tracing::warn!(
+            "{}: WAL rollover detected; publishing a new snapshot instead of an incremental across the gap",
+            state.name
+        );
+        take_snapshot_with_retry(storage, prefix, state, retry_policy).await?;
+        save_state(storage, prefix, state).await?;
+        return Ok(1);
+    }
 
     if page_map.is_empty() {
         return Ok(0);

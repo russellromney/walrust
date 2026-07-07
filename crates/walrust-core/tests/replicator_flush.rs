@@ -465,6 +465,15 @@ fn write_rows(conn: &rusqlite::Connection, start: u32, count: u32) {
     }
 }
 
+fn snapshot_keys(storage: &MemStorage, prefix: &str, db_name: &str) -> Vec<String> {
+    let snapshot_prefix = format!("{prefix}{db_name}/0001/");
+    storage
+        .keys()
+        .into_iter()
+        .filter(|key| key.starts_with(&snapshot_prefix) && key.ends_with(".hadbp"))
+        .collect()
+}
+
 fn make_config() -> ReplicationConfig {
     ReplicationConfig {
         // Very long intervals so the background loop doesn't interfere with tests.
@@ -712,15 +721,17 @@ async fn test_run_wal_replication_returns_final_sync_error_on_shutdown() -> Resu
 
 #[tokio::test]
 async fn test_run_replication_returns_final_sync_error_on_shutdown() -> Result<()> {
-    let storage = FailAfterPutsStorage::new(MemStorage::new(), 1);
+    let storage = FailAfterPutsStorage::new(MemStorage::new(), 2);
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("owned-loop-final-fail.db");
     let conn = create_wal_db(&db_path, 1);
-    write_rows(&conn, 100, 1);
 
     let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let write_path = db_path.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let conn = rusqlite::Connection::open(&write_path).unwrap();
+        write_rows(&conn, 100, 1);
         let _ = cancel_tx.send(true);
     });
 
@@ -740,6 +751,182 @@ async fn test_run_replication_returns_final_sync_error_on_shutdown() -> Result<(
         "error should identify the final sync failure: {err}"
     );
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_walrust_owned_flush_resnapshots_after_checkpoint_rollover() -> Result<()> {
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rollover-resnapshot.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let replicator = Replicator::new(storage.clone(), "wal/", make_config());
+    replicator.add("rollover-resnapshot", &db_path).await?;
+
+    write_rows(&conn, 100, 2);
+    let first_frames = replicator.flush("rollover-resnapshot").await?;
+    assert!(
+        first_frames > 0,
+        "initial flush must publish real WAL frames before the forced checkpoint"
+    );
+    let snapshots_before = snapshot_keys(&storage, "wal/", "rollover-resnapshot");
+    assert!(
+        !snapshots_before.is_empty(),
+        "add() must have published the base snapshot; keys={:?}",
+        storage.keys()
+    );
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let wal_path = db_path.with_extension("db-wal");
+    assert_eq!(
+        std::fs::metadata(&wal_path)?.len(),
+        0,
+        "test setup must force a WAL rollover by truncating the synced WAL"
+    );
+
+    write_rows(&conn, 200, 2);
+    let rollover_frames = replicator.flush("rollover-resnapshot").await?;
+    assert!(
+        rollover_frames > 0,
+        "rollover flush should publish a re-anchor snapshot"
+    );
+
+    let snapshots_after = snapshot_keys(&storage, "wal/", "rollover-resnapshot");
+    assert!(
+        snapshots_after.len() > snapshots_before.len(),
+        "checkpoint rollover must publish a new snapshot instead of a live incremental across the gap; before={snapshots_before:?}, after={snapshots_after:?}, all_keys={:?}",
+        storage.keys()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_external_mode_refuses_checkpoint_rollover_until_reanchored() -> Result<()> {
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-rollover-refusal.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator.add("external-rollover", &db_path).await?;
+
+    write_rows(&conn, 100, 2);
+    let first_frames = replicator.flush("external-rollover").await?;
+    assert!(first_frames > 0, "first flush must publish real WAL frames");
+    let max_seq_before = storage
+        .max_hadbp_seq("wal/external-rollover/")
+        .expect("first external flush should publish a delta");
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_eq!(
+        std::fs::metadata(db_path.with_extension("db-wal"))?.len(),
+        0,
+        "test setup must force a WAL rollover"
+    );
+
+    write_rows(&conn, 200, 2);
+    let err = replicator
+        .flush("external-rollover")
+        .await
+        .expect_err("external-base mode must not publish across a WAL rollover")
+        .to_string();
+    assert!(
+        err.contains("WAL rollover") && err.contains("external base"),
+        "expected rollover re-anchor refusal, got {err}"
+    );
+    assert_eq!(
+        storage.max_hadbp_seq("wal/external-rollover/"),
+        Some(max_seq_before),
+        "rollover refusal must not publish a new external delta"
+    );
+
+    let retry_err = replicator
+        .flush("external-rollover")
+        .await
+        .expect_err("rollover state must stay poisoned until external re-anchor")
+        .to_string();
+    assert!(
+        retry_err.contains("WAL rollover") && retry_err.contains("external base"),
+        "retry must still refuse until re-anchor, got {retry_err}"
+    );
+
+    drop(conn);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fenced_external_mode_refuses_checkpoint_rollover_until_reanchored() -> Result<()> {
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("fenced-rollover-refusal.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator.add("fenced-rollover", &db_path).await?;
+    assert!(
+        replicator
+            .set_external_delta_base("fenced-rollover", 7, "writer-a", base_seq, [0x42; 32],)
+            .await?,
+        "registered database should accept fenced delta base"
+    );
+
+    write_rows(&conn, 100, 2);
+    let first_frames = replicator.flush("fenced-rollover").await?;
+    assert!(
+        first_frames > 0,
+        "first fenced flush must publish real WAL frames"
+    );
+    let tlmd_before = storage
+        .keys()
+        .into_iter()
+        .filter(|key| key.starts_with("wal/fenced-rollover/") && key.ends_with(".tlmd"))
+        .count();
+    assert!(tlmd_before > 0, "first flush should publish a .tlmd delta");
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_eq!(
+        std::fs::metadata(db_path.with_extension("db-wal"))?.len(),
+        0,
+        "test setup must force a WAL rollover"
+    );
+
+    write_rows(&conn, 200, 2);
+    let err = replicator
+        .flush("fenced-rollover")
+        .await
+        .expect_err("fenced external mode must not publish across a WAL rollover")
+        .to_string();
+    assert!(
+        err.contains("WAL rollover") && err.contains("external mode"),
+        "expected fenced rollover re-anchor refusal, got {err}"
+    );
+    let tlmd_after = storage
+        .keys()
+        .into_iter()
+        .filter(|key| key.starts_with("wal/fenced-rollover/") && key.ends_with(".tlmd"))
+        .count();
+    assert_eq!(
+        tlmd_after, tlmd_before,
+        "rollover refusal must not publish a new fenced delta"
+    );
+
+    let retry_err = replicator
+        .flush("fenced-rollover")
+        .await
+        .expect_err("fenced rollover state must stay poisoned until external re-anchor")
+        .to_string();
+    assert!(
+        retry_err.contains("WAL rollover") && retry_err.contains("external mode"),
+        "retry must still refuse until re-anchor, got {retry_err}"
+    );
+
+    drop(conn);
     Ok(())
 }
 
