@@ -758,12 +758,13 @@ and
     because `walrust_core::legacy_restore` did not exist), then fixed by adding
     storage-backed core legacy restore with latest/PIT snapshot selection,
     gap checks, checksum-checked incremental apply, integrity check, and atomic
-    publish. Root `restore` now delegates the normal no-cache/no-webhook path
-    to `walrust-core::legacy_restore`, with the cache/webhook adapter fallback
-    still in root. Remaining work: root `src/sync/*` still owns the CLI
-    watch/restore cache adapter, compact, and replicate apply workflow over
-    the legacy LTX object layout, while core owns the HADBP engine. That
-    workflow/API migration is still required before duplicate sync/restore
-    implementations can be deleted.
+    publish. Root `restore` now delegates all restore engine work to
+    `walrust-core::legacy_restore`; cache support is a root-only
+    cache-over-S3 `StorageBackend` adapter and webhook handling is now error
+    notification around the core call, not a second decode/apply path.
+    Remaining work: root `src/sync/*` still owns the CLI watch, compact, and
+    replicate apply workflow over the legacy LTX object layout, while core owns
+    the HADBP engine. That workflow/API migration is still required before
+    duplicate sync implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.

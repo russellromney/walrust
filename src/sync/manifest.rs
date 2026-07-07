@@ -5,8 +5,7 @@ pub(crate) use walrust_core::legacy_manifest::{
 };
 use walrust_core::legacy_manifest::{
     discover_all_legacy_ltx, discover_legacy_snapshots, discover_legacy_state,
-    find_latest_legacy_snapshot, find_latest_legacy_snapshot_at_or_before,
-    list_legacy_generation_files,
+    find_latest_legacy_snapshot, list_legacy_generation_files,
 };
 
 use super::types::Manifest;
@@ -70,22 +69,6 @@ pub(crate) async fn find_latest_snapshot(
     Ok(find_latest_legacy_snapshot(&storage, prefix, db_name)
         .await?
         .map(|file| (file.generation, file.key, file.min_txid, file.max_txid)))
-}
-
-/// Find the latest snapshot whose max TXID is not after `target_txid`.
-pub(crate) async fn find_latest_snapshot_at_or_before(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    prefix: &str,
-    db_name: &str,
-    target_txid: u64,
-) -> Result<Option<(u64, String, u64, u64)>> {
-    let storage = s3_storage(client, bucket);
-    Ok(
-        find_latest_legacy_snapshot_at_or_before(&storage, prefix, db_name, target_txid)
-            .await?
-            .map(|file| (file.generation, file.key, file.min_txid, file.max_txid)),
-    )
 }
 
 /// List all LTX files in a generation folder
