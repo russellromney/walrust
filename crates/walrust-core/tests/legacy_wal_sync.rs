@@ -2,9 +2,12 @@ use anyhow::Result;
 use async_trait::async_trait;
 use hadb_storage::{CasResult, StorageBackend};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
+use walrust_core::legacy_cache::LocalCache;
 use walrust_core::legacy_manifest::build_ltx_key;
-use walrust_core::legacy_wal_sync::{sync_wal_to_storage, SyncInput};
+use walrust_core::legacy_uploader::UploadMessage;
+use walrust_core::legacy_wal_sync::{sync_wal_to_cache, sync_wal_to_storage, SyncInput};
+use walrust_core::shadow::ShadowWal;
 
 #[derive(Default)]
 struct MemoryStorage {
@@ -106,5 +109,47 @@ async fn legacy_wal_sync_initial_snapshot_is_owned_by_core() -> Result<()> {
     assert!(storage.get(&key).await?.is_some());
     assert_eq!(output.new_current_txid, 1);
     assert_eq!(output.frame_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_wal_sync_cache_initial_snapshot_is_owned_by_core() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("cache-source.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(
+            "CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT);
+             INSERT INTO marker (value) VALUES ('cache-initial-snapshot');",
+        )?;
+    }
+
+    let cache = Arc::new(LocalCache::new(&db_path)?);
+    let shadow = Arc::new(tokio::sync::Mutex::new(ShadowWal::new(&db_path).await?));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<UploadMessage>(4);
+
+    let output = sync_wal_to_cache(
+        &SyncInput {
+            db_path: db_path.clone(),
+            name: "app".to_string(),
+            wal_path: db_path.with_extension("db-wal"),
+            wal_offset: 0,
+            wal_generation: 0,
+            current_txid: 0,
+            db_checksum: None,
+            wal_salt: None,
+            wal_checksum_chain: None,
+        },
+        &cache,
+        &shadow,
+        &tx,
+    )
+    .await?;
+
+    assert_eq!(output.new_current_txid, 1);
+    assert_eq!(output.frame_count, 1);
+    assert_eq!(cache.pending_uploads(), vec![1]);
+    assert!(matches!(rx.try_recv()?, UploadMessage::Upload(1)));
     Ok(())
 }

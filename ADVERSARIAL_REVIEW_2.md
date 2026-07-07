@@ -818,10 +818,15 @@ and
     `sync::wal_sync::tests::test_sync_wal_concurrent_rejects_database_out_of_wal_mode`
     and
     `sync::wal_sync::tests::test_sync_wal_retry_notifies_webhook_when_database_leaves_wal_mode`.
-    Remaining work: root `src/sync/wal_sync.rs::sync_wal_to_cache` and root
-    watch orchestration still own legacy cache-mode WAL upload control flow
-    over the LTX object layout, while core owns the HADBP engine. That
-    workflow/API migration is still required before duplicate sync
-    implementations can be deleted.
+    Legacy cache-mode WAL sync ownership was then reproduced with
+    `legacy_wal_sync_cache_initial_snapshot_is_owned_by_core` (failed because
+    `walrust_core::legacy_wal_sync::sync_wal_to_cache` did not exist), then
+    fixed by moving shadow-backed cache snapshot/incremental encoding, cache
+    writes, and uploader notification into `walrust-core::legacy_wal_sync`;
+    root `src/sync/wal_sync.rs::sync_wal_to_cache` is now a compatibility
+    wrapper. Remaining work: root watch orchestration still owns legacy
+    cache-mode WAL upload control flow over the LTX object layout, while core
+    owns the HADBP engine. That workflow/API migration is still required
+    before duplicate sync implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.
