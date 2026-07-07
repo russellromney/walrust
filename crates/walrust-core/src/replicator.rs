@@ -238,6 +238,7 @@ impl Replicator {
         }
 
         let prefix = self.prefix.clone();
+        sync::ensure_no_saved_state(self.storage.as_ref(), &prefix, name).await?;
 
         // Build state and take initial snapshot OUTSIDE the map lock
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
@@ -258,7 +259,7 @@ impl Replicator {
             &self.config.retry_policy,
         )
         .await?;
-        sync::save_state(self.storage.as_ref(), &prefix, &state).await?;
+        sync::save_initial_state(self.storage.as_ref(), &prefix, &state).await?;
 
         let db_state = Arc::new(AsyncMutex::new(DbState {
             state,

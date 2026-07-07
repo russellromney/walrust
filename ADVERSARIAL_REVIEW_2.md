@@ -256,8 +256,11 @@ sidecar after durable cache/direct shadow sync and snapshot state advances,
 reloads it on restart, and hard-fails if the record cannot be read or
 persisted. Proven by
 `test_shadow_sync_persists_restart_progress_after_durable_cache_write`.
-Walrust-owned fencing and exact external-base head-to-WAL-offset persistence
-remain open for Phase 2.5.
+Fresh walrust-owned lineage creation now refuses an existing active
+`state.json` and publishes initial state with CAS, preventing competing
+`add()` calls from replacing the active lineage. Proven by
+`test_walrust_owned_add_refuses_existing_active_state`. Exact external-base
+head-to-WAL-offset persistence remains open for Phase 2.5.
 
 - `state.json` save/load asymmetry: `save_state` persists `wal_salt` +
   `wal_checksum_chain` (`crates/walrust-core/src/sync.rs:258-267`) but reload
@@ -273,9 +276,9 @@ remain open for Phase 2.5.
   `SyncState::ensure_lineage_id` (`crates/walrust-core/src/sync.rs:230-234`),
   lineaged key builders/discovery (`sync.rs:263-396`), initial replicator
   mint/save (`crates/walrust-core/src/replicator.rs:253-263`), and state reload
-  (`replicator.rs:337`). Remaining: two instances on one prefix can still race
-  within the same active lineage because walrust-owned mode has no lease/fence
-  comparable to external mode's epoch fencing.
+  (`replicator.rs:337`). Fresh lineage creation is now fenced by
+  `ensure_no_saved_state` and `save_initial_state` CAS so a competing `add()`
+  cannot replace the active `state.json`.
 - Sidecar watch path persists nothing: `current_txid` in memory only;
   production never writes `manifest.json`; restart re-mints TXIDs and
   overwrites remote history (`src/sync/watch_shadow.rs:103-111`).

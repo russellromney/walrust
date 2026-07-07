@@ -486,7 +486,17 @@ pub async fn save_state(
     state: &SyncState,
 ) -> Result<()> {
     let state_key = state_key(prefix, &state.name);
-    let state_json = serde_json::json!({
+    let data = state_json_bytes(state)?;
+    storage.put(&state_key, &data).await
+}
+
+fn state_json_bytes(state: &SyncState) -> Result<Vec<u8>> {
+    let state_json = state_json_value(state);
+    Ok(serde_json::to_vec(&state_json)?)
+}
+
+fn state_json_value(state: &SyncState) -> serde_json::Value {
+    serde_json::json!({
         "wal_offset": state.wal_offset,
         "wal_generation": state.wal_generation,
         "current_seq": state.current_seq,
@@ -496,9 +506,51 @@ pub async fn save_state(
         "last_snapshot": state.last_snapshot,
         "wal_salt": state.wal_salt,
         "wal_checksum_chain": state.wal_checksum_chain,
-    });
-    let data = serde_json::to_vec(&state_json)?;
-    storage.put(&state_key, &data).await
+    })
+}
+
+/// Fail if a walrust-owned database already has an active remote state.
+///
+/// Fresh walrust-owned `add()` creates a new lineage. If `state.json` already
+/// exists, another lineage is active and callers must restore/reopen explicitly
+/// instead of silently replacing the active namespace.
+pub async fn ensure_no_saved_state(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+) -> Result<()> {
+    let state_key = state_key(prefix, db_name);
+    if storage.exists(&state_key).await? {
+        anyhow::bail!(
+            "{}: database already has replication state at {}; use add_without_snapshot after restoring/reopening instead of creating a new walrust-owned lineage",
+            db_name,
+            state_key
+        );
+    }
+    Ok(())
+}
+
+/// Save the initial walrust-owned state only if no active state exists.
+///
+/// This is the race-closing half of [`ensure_no_saved_state`]: two creators can
+/// both observe absence, but only one may publish the active `state.json`.
+pub async fn save_initial_state(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &SyncState,
+) -> Result<()> {
+    let state_key = state_key(prefix, &state.name);
+    let data = state_json_bytes(state)?;
+    let cas = storage.put_if_absent(&state_key, &data).await?;
+    if cas.success {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "{}: database already has replication state at {}; refusing to replace active walrust-owned lineage",
+        state.name,
+        state_key
+    );
 }
 
 // ============================================================================

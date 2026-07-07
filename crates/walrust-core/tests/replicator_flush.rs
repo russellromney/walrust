@@ -1590,6 +1590,48 @@ async fn test_walrust_owned_new_stream_writes_lineage_state_and_keys() {
 }
 
 #[tokio::test]
+async fn test_walrust_owned_add_refuses_existing_active_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_db = dir.path().join("walrust-owned-first.db");
+    let second_db = dir.path().join("walrust-owned-second.db");
+    let first_conn = create_wal_db(&first_db, 3);
+    let second_conn = create_wal_db(&second_db, 5);
+    let storage = MemStorage::new();
+
+    let first = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    first.add("owned-fence", &first_db).await.unwrap();
+
+    let first_state = storage.value("wal/owned-fence/state.json").await;
+    let first_lineage = first_state
+        .get("lineage_id")
+        .and_then(|value| value.as_str())
+        .expect("initial walrust-owned add must persist active lineage")
+        .to_string();
+
+    let second = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    let err = second
+        .add("owned-fence", &second_db)
+        .await
+        .expect_err("competing walrust-owned add must not overwrite active state");
+    assert!(
+        err.to_string().contains("already has replication state"),
+        "expected active-state refusal, got {err}"
+    );
+
+    let state_after = storage.value("wal/owned-fence/state.json").await;
+    assert_eq!(
+        state_after
+            .get("lineage_id")
+            .and_then(|value| value.as_str()),
+        Some(first_lineage.as_str()),
+        "competing add must not replace the active lineage"
+    );
+
+    drop(first_conn);
+    drop(second_conn);
+}
+
+#[tokio::test]
 async fn test_walrust_owned_restore_uses_active_lineage_namespace() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("walrust-owned-lineage-restore.db");

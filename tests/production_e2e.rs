@@ -260,7 +260,7 @@ async fn e2e_core_replicator_restore_round_trips_sqlite_rows() -> Result<()> {
 }
 
 #[tokio::test]
-async fn e2e_core_replicator_restart_resnapshots_and_restores_cleanly() -> Result<()> {
+async fn e2e_core_replicator_restart_reopens_state_and_restores_cleanly() -> Result<()> {
     let temp = TempDir::new()?;
     let name = unique_name("core-restart-e2e");
     let prefix = format!("e2e/{name}/");
@@ -283,9 +283,10 @@ async fn e2e_core_replicator_restart_resnapshots_and_restores_cleanly() -> Resul
         first.flush(&name).await? > 0,
         "first replicator flush should upload WAL frames"
     );
+    drop(first);
 
     let second = walrust::walrust_core::Replicator::new(storage, &prefix, config);
-    second.add(&name, &db_path).await?;
+    second.add_without_snapshot(&name, &db_path).await?;
     append_rows(&writer, 9, 12, "core-post-restart")?;
     anyhow::ensure!(
         second.flush(&name).await? > 0,
@@ -294,7 +295,7 @@ async fn e2e_core_replicator_restart_resnapshots_and_restores_cleanly() -> Resul
     let restored_seq = second.restore(&name, &restored_path).await?;
     anyhow::ensure!(
         restored_seq.is_some(),
-        "restart restore should find the re-snapshot base"
+        "restart restore should find the reopened state"
     );
     assert_integrity_ok(&restored_path)?;
     assert_eq!(rows(&db_path)?, rows(&restored_path)?);
