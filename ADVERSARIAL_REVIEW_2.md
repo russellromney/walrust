@@ -628,12 +628,9 @@ and
     Status: Fixed — `tests/production_e2e.rs` adds
     `e2e_cli_watch_restore_round_trips_sqlite_rows`,
     `e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows`,
-    `e2e_core_replicator_restore_round_trips_sqlite_rows`, and
-    `e2e_core_replicator_restart_rejects_divergent_chain`. Note: a stricter
-    CLI restart variant that writes rows while/down after restart reproduced
-    missing restored rows; the core restart variant now hard-errors on the
-    divergent chain after A6. Leave those as A10/A11 evidence rather than
-    masking them in Phase 0.
+    `e2e_core_replicator_restore_round_trips_sqlite_rows`,
+    `e2e_core_replicator_restart_reopens_state_and_restores_cleanly`, and
+    `e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows`.
 
 ### Phase 1 — Stop lying (small diffs, loud errors)
 1.1 A1: flip endianness predicate (both crates), rename constants, golden
@@ -680,6 +677,18 @@ and
 ### Phase 3 — Prove it
 3.1 E2E round-trip + SIGKILL tests from 0.4 running in CI, both stacks,
     with an external autocheckpointing writer (regression for A1-A5).
+    Status: Fixed — `.github/workflows/ci.yml` runs `make test USE_SOUP=0`
+    against MinIO, and `tests/production_e2e.rs` now covers CLI watch
+    round-trip, CLI SIGKILL restart, core Replicator round-trip, core Replicator
+    restart, and core Replicator process-SIGKILL restart through external
+    autocheckpointing writer connections. The core cases pin a live WAL frame
+    during the flush window so SQLite autocheckpointing cannot erase the
+    production frames before the replicator observes them. Proven by
+    `e2e_cli_watch_restore_round_trips_sqlite_rows`,
+    `e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows`,
+    `e2e_core_replicator_restore_round_trips_sqlite_rows`,
+    `e2e_core_replicator_restart_reopens_state_and_restores_cleanly`, and
+    `e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows`.
 3.2 DST drives the production pipeline (not testable.rs) for at least one
     property; restore-from-published-deltas test for phase-4 mode.
 3.3 Compaction-vs-restore race test; two-watchers test; ENOSPC test;

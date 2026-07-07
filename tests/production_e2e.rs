@@ -30,6 +30,7 @@ fn create_source_db(path: &Path, base_rows: i64) -> Result<Connection> {
         PRAGMA journal_mode=WAL;
         PRAGMA wal_autocheckpoint=0;
         CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE walrust_e2e_pin (id INTEGER PRIMARY KEY, label TEXT NOT NULL);
         ",
     )?;
     for id in 1..=base_rows {
@@ -47,14 +48,43 @@ fn open_external_autocheckpoint_connection(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn append_rows(conn: &Connection, start: i64, end: i64, label: &str) -> Result<()> {
-    for id in start..=end {
-        conn.execute(
-            "INSERT INTO items (id, value) VALUES (?1, ?2)",
-            rusqlite::params![id, format!("{label}-{id}")],
-        )?;
-    }
+fn pin_read_transaction(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; BEGIN;")?;
+    let _: i64 = conn.query_row("SELECT COUNT(*) FROM walrust_e2e_pin", [], |row| row.get(0))?;
+    Ok(conn)
+}
+
+fn write_pin_frame(conn: &Connection, label: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO walrust_e2e_pin (label) VALUES (?1)",
+        rusqlite::params![label],
+    )?;
     Ok(())
+}
+
+fn append_rows(conn: &Connection, start: i64, end: i64, label: &str) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        for id in start..=end {
+            conn.execute(
+                "INSERT INTO items (id, value) VALUES (?1, ?2)",
+                rusqlite::params![id, format!("{label}-{id}")],
+            )?;
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(err)
+        }
+    }
 }
 
 fn rows(path: &Path) -> Result<Vec<(i64, String)>> {
@@ -91,6 +121,25 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn wait_for_file_or_child_exit(child: &mut Child, path: &Path, context: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        if path.exists() {
+            return Ok(());
+        }
+
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("{context}: child exited early with status {status}");
+        }
+
+        if Instant::now() >= deadline {
+            anyhow::bail!("{context}: timed out waiting for {}", path.display());
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn wait_for_live_incremental(bucket_arg: &str, endpoint: Option<&str>, name: &str) -> Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
@@ -114,6 +163,32 @@ fn wait_for_live_incremental(bucket_arg: &str, endpoint: Option<&str>, name: &st
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     })
+}
+
+fn core_replicator_config() -> walrust::walrust_core::ReplicationConfig {
+    walrust::walrust_core::ReplicationConfig {
+        sync_interval: Duration::from_millis(100),
+        snapshot_interval: Duration::from_secs(3600),
+        ..Default::default()
+    }
+}
+
+async fn flush_until_frames(
+    replicator: &walrust::walrust_core::Replicator,
+    name: &str,
+    context: &str,
+) -> Result<u64> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let frames = replicator.flush(name).await?;
+        if frames > 0 {
+            return Ok(frames);
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("{context}: timed out waiting for WAL frames");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 fn spawn_cli_watch(
@@ -142,6 +217,18 @@ fn spawn_cli_watch(
         watch.arg("--endpoint").arg(endpoint);
     }
     watch.spawn().context("spawn walrust watch")
+}
+
+struct CoreSigkillHelperArgs<'a> {
+    phase: &'a str,
+    name: &'a str,
+    prefix: &'a str,
+    bucket: &'a str,
+    endpoint: Option<&'a str>,
+    db_path: &'a Path,
+    ready_path: &'a Path,
+    go_path: &'a Path,
+    flushed_path: &'a Path,
 }
 
 fn run_cli_restore(
@@ -174,8 +261,8 @@ fn e2e_cli_watch_restore_round_trips_sqlite_rows() -> Result<()> {
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
 
-    let writer = create_source_db(&db_path, 5)?;
-    let _external_checkpoint = open_external_autocheckpoint_connection(&db_path)?;
+    let _setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_autocheckpoint_connection(&db_path)?;
 
     let mut child = spawn_cli_watch(&db_path, &bucket_arg, endpoint.as_deref(), true)?;
 
@@ -202,8 +289,8 @@ fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
 
-    let writer = create_source_db(&db_path, 5)?;
-    let _external_checkpoint = open_external_autocheckpoint_connection(&db_path)?;
+    let _setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_autocheckpoint_connection(&db_path)?;
 
     let mut first = spawn_cli_watch(&db_path, &bucket_arg, endpoint.as_deref(), true)?;
     std::thread::sleep(Duration::from_secs(2));
@@ -232,20 +319,19 @@ async fn e2e_core_replicator_restore_round_trips_sqlite_rows() -> Result<()> {
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
 
-    let writer = create_source_db(&db_path, 5)?;
-    let _external_checkpoint = open_external_autocheckpoint_connection(&db_path)?;
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_autocheckpoint_connection(&db_path)?;
 
     let storage = walrust::s3_backend_from_env(test_bucket(), test_endpoint().as_deref()).await?;
-    let config = walrust::walrust_core::ReplicationConfig {
-        sync_interval: Duration::from_millis(100),
-        snapshot_interval: Duration::from_secs(3600),
-        ..Default::default()
-    };
+    let config = core_replicator_config();
     let replicator = walrust::walrust_core::Replicator::new(storage, &prefix, config);
     replicator.add(&name, &db_path).await?;
 
+    write_pin_frame(&setup, "core")?;
+    let read_pin = pin_read_transaction(&db_path)?;
     append_rows(&writer, 6, 10, "core")?;
     let frames = replicator.flush(&name).await?;
+    drop(read_pin);
     anyhow::ensure!(frames > 0, "replicator flush should upload WAL frames");
     let restored_seq = replicator.restore(&name, &restored_path).await?;
     anyhow::ensure!(
@@ -267,31 +353,33 @@ async fn e2e_core_replicator_restart_reopens_state_and_restores_cleanly() -> Res
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
 
-    let writer = create_source_db(&db_path, 5)?;
-    let _external_checkpoint = open_external_autocheckpoint_connection(&db_path)?;
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_autocheckpoint_connection(&db_path)?;
 
     let storage = walrust::s3_backend_from_env(test_bucket(), test_endpoint().as_deref()).await?;
-    let config = walrust::walrust_core::ReplicationConfig {
-        sync_interval: Duration::from_millis(100),
-        snapshot_interval: Duration::from_secs(3600),
-        ..Default::default()
-    };
+    let config = core_replicator_config();
     let first = walrust::walrust_core::Replicator::new(storage.clone(), &prefix, config.clone());
     first.add(&name, &db_path).await?;
+    write_pin_frame(&setup, "core-pre-restart")?;
+    let first_read_pin = pin_read_transaction(&db_path)?;
     append_rows(&writer, 6, 8, "core-pre-restart")?;
     anyhow::ensure!(
         first.flush(&name).await? > 0,
         "first replicator flush should upload WAL frames"
     );
+    drop(first_read_pin);
     drop(first);
 
     let second = walrust::walrust_core::Replicator::new(storage, &prefix, config);
     second.add_without_snapshot(&name, &db_path).await?;
+    write_pin_frame(&setup, "core-post-restart")?;
+    let second_read_pin = pin_read_transaction(&db_path)?;
     append_rows(&writer, 9, 12, "core-post-restart")?;
     anyhow::ensure!(
         second.flush(&name).await? > 0,
         "second replicator flush should upload WAL frames"
     );
+    drop(second_read_pin);
     let restored_seq = second.restore(&name, &restored_path).await?;
     anyhow::ensure!(
         restored_seq.is_some(),
@@ -301,4 +389,142 @@ async fn e2e_core_replicator_restart_reopens_state_and_restores_cleanly() -> Res
     assert_eq!(rows(&db_path)?, rows(&restored_path)?);
 
     Ok(())
+}
+
+#[test]
+fn e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
+    let temp = TempDir::new()?;
+    let name = unique_name("core-sigkill-e2e");
+    let prefix = format!("e2e/{name}/");
+    let bucket = test_bucket();
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let ready_path = temp.path().join("core-child-ready");
+    let go_path = temp.path().join("core-child-go");
+    let flushed_path = temp.path().join("core-child-flushed");
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_autocheckpoint_connection(&db_path)?;
+
+    let mut first = spawn_core_sigkill_helper(CoreSigkillHelperArgs {
+        phase: "first",
+        name: &name,
+        prefix: &prefix,
+        bucket: &bucket,
+        endpoint: endpoint.as_deref(),
+        db_path: &db_path,
+        ready_path: &ready_path,
+        go_path: &go_path,
+        flushed_path: &flushed_path,
+    })?;
+    wait_for_file_or_child_exit(&mut first, &ready_path, "first core helper startup")?;
+    write_pin_frame(&setup, "core-pre-sigkill")?;
+    let first_read_pin = pin_read_transaction(&db_path)?;
+    std::fs::write(&go_path, b"go")?;
+    append_rows(&writer, 6, 8, "core-pre-sigkill")?;
+    wait_for_file_or_child_exit(&mut first, &flushed_path, "first core helper flush")?;
+    stop_child(&mut first);
+    drop(first_read_pin);
+
+    write_pin_frame(&setup, "core-post-sigkill")?;
+    let second_read_pin = pin_read_transaction(&db_path)?;
+    append_rows(&writer, 9, 12, "core-post-sigkill")?;
+    let mut second = spawn_core_sigkill_helper(CoreSigkillHelperArgs {
+        phase: "second",
+        name: &name,
+        prefix: &prefix,
+        bucket: &bucket,
+        endpoint: endpoint.as_deref(),
+        db_path: &db_path,
+        ready_path: &ready_path,
+        go_path: &go_path,
+        flushed_path: &flushed_path,
+    })?;
+    let status = second.wait()?;
+    drop(second_read_pin);
+    anyhow::ensure!(status.success(), "second core helper failed with {status}");
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(bucket, endpoint.as_deref()).await?;
+        let replicator =
+            walrust::walrust_core::Replicator::new(storage, &prefix, core_replicator_config());
+        let restored_seq = replicator.restore(&name, &restored_path).await?;
+        anyhow::ensure!(
+            restored_seq.is_some(),
+            "core SIGKILL restore should find the restarted stream"
+        );
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    assert_integrity_ok(&restored_path)?;
+    assert_eq!(rows(&db_path)?, rows(&restored_path)?);
+
+    Ok(())
+}
+
+fn spawn_core_sigkill_helper(args: CoreSigkillHelperArgs<'_>) -> Result<Child> {
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg("--exact")
+        .arg("e2e_core_replicator_sigkill_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("WALRUST_CORE_SIGKILL_PHASE", args.phase)
+        .env("WALRUST_CORE_SIGKILL_NAME", args.name)
+        .env("WALRUST_CORE_SIGKILL_PREFIX", args.prefix)
+        .env("WALRUST_CORE_SIGKILL_BUCKET", args.bucket)
+        .env("WALRUST_CORE_SIGKILL_DB", args.db_path)
+        .env("WALRUST_CORE_SIGKILL_READY", args.ready_path)
+        .env("WALRUST_CORE_SIGKILL_GO", args.go_path)
+        .env("WALRUST_CORE_SIGKILL_FLUSHED", args.flushed_path);
+    if let Some(endpoint) = args.endpoint {
+        cmd.env("WALRUST_CORE_SIGKILL_ENDPOINT", endpoint);
+    }
+    cmd.spawn().context("spawn core replicator SIGKILL helper")
+}
+
+#[test]
+#[ignore = "spawned by e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows"]
+fn e2e_core_replicator_sigkill_child() -> Result<()> {
+    let phase = std::env::var("WALRUST_CORE_SIGKILL_PHASE")?;
+    let name = std::env::var("WALRUST_CORE_SIGKILL_NAME")?;
+    let prefix = std::env::var("WALRUST_CORE_SIGKILL_PREFIX")?;
+    let bucket = std::env::var("WALRUST_CORE_SIGKILL_BUCKET")?;
+    let endpoint = std::env::var("WALRUST_CORE_SIGKILL_ENDPOINT").ok();
+    let db_path = std::path::PathBuf::from(std::env::var("WALRUST_CORE_SIGKILL_DB")?);
+    let ready_path = std::path::PathBuf::from(std::env::var("WALRUST_CORE_SIGKILL_READY")?);
+    let go_path = std::path::PathBuf::from(std::env::var("WALRUST_CORE_SIGKILL_GO")?);
+    let flushed_path = std::path::PathBuf::from(std::env::var("WALRUST_CORE_SIGKILL_FLUSHED")?);
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(bucket, endpoint.as_deref()).await?;
+        let replicator =
+            walrust::walrust_core::Replicator::new(storage, &prefix, core_replicator_config());
+        match phase.as_str() {
+            "first" => {
+                replicator.add(&name, &db_path).await?;
+                std::fs::write(&ready_path, b"ready")?;
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while !go_path.exists() {
+                    if Instant::now() >= deadline {
+                        anyhow::bail!("first helper timed out waiting for go signal");
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                flush_until_frames(&replicator, &name, "first helper").await?;
+                std::fs::write(&flushed_path, b"flushed")?;
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+            "second" => {
+                replicator.add_without_snapshot(&name, &db_path).await?;
+                flush_until_frames(&replicator, &name, "second helper").await?;
+                Ok(())
+            }
+            _ => anyhow::bail!("unknown core SIGKILL helper phase: {phase}"),
+        }
+    })
 }
