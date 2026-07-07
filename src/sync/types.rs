@@ -154,27 +154,10 @@ pub(crate) struct ShadowDbState {
 }
 
 /// Input for concurrent shadow sync
-#[derive(Clone)]
-pub(crate) struct ShadowSyncInput {
-    pub(crate) db_path: PathBuf,
-    pub(crate) name: String,
-    pub(crate) current_txid: u64,
-    pub(crate) db_checksum: Option<u64>,
-    pub(crate) generation: u64,
-    pub(crate) shadow_sync_offset: u64,
-    pub(crate) page_size: u32,
-    pub(crate) shadow_dir: PathBuf,
-}
+pub(crate) use walrust_core::legacy_shadow::ShadowSyncInput;
 
 /// Output from concurrent shadow sync
-#[derive(Debug)]
-pub(crate) struct ShadowSyncOutput {
-    pub(crate) db_path: PathBuf,
-    pub(crate) frame_count: u64,
-    pub(crate) new_shadow_sync_offset: u64,
-    pub(crate) new_current_txid: u64,
-    pub(crate) new_db_checksum: Option<u64>,
-}
+pub(crate) use walrust_core::legacy_shadow::ShadowSyncOutput;
 
 /// State for independent database task
 pub(crate) struct DbTaskState {

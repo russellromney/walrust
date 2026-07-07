@@ -796,9 +796,20 @@ and
     drain behavior into `walrust-core::legacy_uploader`; root
     `src/uploader.rs` is now a compatibility shim. The moved uploader keeps
     its original unit coverage under `walrust-core::legacy_uploader::tests::*`.
-    Remaining work: root `src/sync/*` still owns the CLI watch/upload
-    orchestration over the legacy LTX object layout, while core owns the HADBP
-    engine. That workflow/API migration is still required before duplicate
-    sync implementations can be deleted.
+    Legacy shadow-WAL encoding/cache ownership was then reproduced with
+    `legacy_shadow_sync_to_cache_is_owned_by_core` (failed because
+    `walrust_core::legacy_shadow` did not exist), then fixed by moving shadow
+    segment discovery, committed-frame filtering, LTX encoding, storage upload,
+    cache write, and uploader notification into
+    `walrust-core::legacy_shadow`; root `src/sync/shadow.rs` now keeps retry,
+    webhook, S3 metadata, compaction orchestration, and test wrappers while
+    delegating the sync engine to core. Root wrapper coverage remains
+    `sync::shadow::tests::test_encode*` and
+    `sync::shadow::tests::test_sync_shadow_to_cache*`.
+    Remaining work: root `src/sync/wal_sync.rs` and root watch orchestration
+    still own legacy WAL snapshot/incremental upload control flow over the LTX
+    object layout, while core owns the HADBP engine. That workflow/API
+    migration is still required before duplicate sync implementations can be
+    deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.

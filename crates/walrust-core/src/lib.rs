@@ -17,6 +17,7 @@ pub mod legacy_ltx;
 pub mod legacy_manifest;
 pub mod legacy_replica;
 pub mod legacy_restore;
+pub mod legacy_shadow;
 pub mod legacy_uploader;
 pub mod ltx;
 pub mod replay_sink;
