@@ -235,14 +235,19 @@ by `uploader::tests::test_uploader_basic_upload` and
   timestamp PITR (needs commit-time metadata) or fix the docs/help.
 
 ### A10 — Replication progress state is not durable / not fenced
-Status: Partial — Phase 1.5 reload-half fixed in core. Saved `state.json`
-now round-trips `wal_salt` and `wal_checksum_chain`, and read/parse failures
-propagate instead of becoming a cold start. Proven by
+Status: Partial — Phase 1.5 reload-half fixed in core, and Phase 2.5
+walrust-owned object publication now uses CAS/idempotence checks for snapshots
+and live WAL changesets. Saved `state.json` now round-trips `wal_salt` and
+`wal_checksum_chain`, and read/parse failures propagate instead of becoming a
+cold start. Proven by
 `test_walrust_owned_reload_restores_saved_wal_salt`,
 `test_walrust_owned_reload_restores_saved_wal_checksum_chain`, and
-`test_walrust_owned_reload_state_transport_error_is_hard_error`. The root CLI
+`test_walrust_owned_reload_state_transport_error_is_hard_error`, plus
+`walrust_owned_sync_rejects_divergent_existing_changeset` and
+`walrust_owned_snapshot_rejects_divergent_existing_changeset`. The root CLI
 watch path has no equivalent remote `state.json` reload path; its durable
-progress gap plus walrust-owned CAS/lineage/fencing remain open for Phase 2.5.
+progress gap plus walrust-owned lineage/fencing and the external-base WAL
+offset assumption remain open for Phase 2.5.
 
 - `state.json` save/load asymmetry: `save_state` persists `wal_salt` +
   `wal_checksum_chain` (`crates/walrust-core/src/sync.rs:258-267`) but reload
@@ -251,7 +256,9 @@ progress gap plus walrust-owned CAS/lineage/fencing remain open for Phase 2.5.
 - `if let Ok(Some(data))` (`replicator.rs:300`) swallows transport errors as
   "no saved state" => cursor reset (the repo fixed this exact class for
   load_manifest; same discipline needed here).
-- Walrust-owned mode: blind `storage.put()` (no CAS, `sync.rs:472-474`); seq
+- Walrust-owned mode: blind changeset `storage.put()` is fixed in core via
+  `put_changeset_if_absent` (`crates/walrust-core/src/sync.rs:407-446`,
+  `:638-646`, `:1126-1135`, `:1405-1414`, `:1501-1510`). Remaining: seq
   re-seeded from the SQLite change counter on every `add()`
   (`replicator.rs:222-227`), which barely moves in WAL mode => routine restart
   overwrites the previous run's objects with a divergent lineage; two

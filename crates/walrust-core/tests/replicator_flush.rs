@@ -382,8 +382,8 @@ impl StorageBackend for PutFailsStorage {
         self.inner.exists(key).await
     }
 
-    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
-        self.inner.put_if_absent(key, data).await
+    async fn put_if_absent(&self, key: &str, _data: &[u8]) -> Result<CasResult> {
+        anyhow::bail!("injected put failure: {key}");
     }
 
     async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
@@ -423,7 +423,16 @@ impl StorageBackend for FailAfterPutsStorage {
     }
 
     async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
-        self.inner.put_if_absent(key, data).await
+        if self
+            .remaining_successful_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return self.inner.put_if_absent(key, data).await;
+        }
+        anyhow::bail!("injected put failure after allowed successes: {key}");
     }
 
     async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {

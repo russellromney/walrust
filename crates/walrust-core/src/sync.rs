@@ -404,6 +404,49 @@ async fn get_existing_after_failed_cas(
     Ok(None)
 }
 
+async fn put_changeset_if_absent(
+    storage: &dyn StorageBackend,
+    key: &str,
+    bytes: &[u8],
+    db_name: &str,
+    seq: u64,
+    mode: &str,
+) -> Result<()> {
+    let cas = storage.put_if_absent(key, bytes).await?;
+    if cas.success {
+        return Ok(());
+    }
+
+    let existing = get_existing_after_failed_cas(storage, key)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: {} duplicate changeset seq {} vanished after CAS failure at {}",
+                db_name,
+                mode,
+                seq,
+                key
+            )
+        })?;
+    if existing != bytes {
+        anyhow::bail!(
+            "{}: {} duplicate changeset seq {}; refusing overwrite at {}",
+            db_name,
+            mode,
+            seq,
+            key
+        );
+    }
+
+    tracing::info!(
+        "{}: {} changeset seq {} already exists with identical bytes; treating publish as idempotent",
+        db_name,
+        mode,
+        seq
+    );
+    Ok(())
+}
+
 /// Result of reading the next batch of WAL frames for a sync site.
 struct WalBatch {
     page_map: std::collections::HashMap<u32, Vec<u8>>,
@@ -581,37 +624,26 @@ async fn sync_wal_with_sequence(
 
     match sequence {
         DeltaSequence::ExternalChangeCounter => {
-            let cas = storage
-                .put_if_absent(&changeset_key, &changeset_bytes)
-                .await?;
-            if !cas.success {
-                let existing = get_existing_after_failed_cas(storage, &changeset_key)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "{}: external-base duplicate changeset seq {} vanished after CAS failure at {}",
-                            state.name,
-                            new_seq,
-                            changeset_key
-                        )
-                    })?;
-                if existing != changeset_bytes {
-                    anyhow::bail!(
-                        "{}: external-base duplicate changeset seq {}; refusing overwrite at {}",
-                        state.name,
-                        new_seq,
-                        changeset_key
-                    );
-                }
-                tracing::info!(
-                    "{}: external-base changeset seq {} already exists with identical bytes; treating publish as idempotent",
-                    state.name,
-                    new_seq
-                );
-            }
+            put_changeset_if_absent(
+                storage,
+                &changeset_key,
+                &changeset_bytes,
+                &state.name,
+                new_seq,
+                "external-base",
+            )
+            .await?;
         }
         DeltaSequence::WalrustOwned => {
-            storage.put(&changeset_key, &changeset_bytes).await?;
+            put_changeset_if_absent(
+                storage,
+                &changeset_key,
+                &changeset_bytes,
+                &state.name,
+                new_seq,
+                "walrust-owned",
+            )
+            .await?;
         }
     }
 
@@ -1091,7 +1123,15 @@ pub async fn take_snapshot(
     let changeset_size = changeset_bytes.len() as u64;
     let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_SNAPSHOT, new_seq);
 
-    storage.put(&changeset_key, &changeset_bytes).await?;
+    put_changeset_if_absent(
+        storage,
+        &changeset_key,
+        &changeset_bytes,
+        &state.name,
+        new_seq,
+        "walrust-owned snapshot",
+    )
+    .await?;
 
     tracing::info!(
         "{}: HADBP snapshot uploaded ({} bytes, seq {}) -> {}",
@@ -1355,11 +1395,23 @@ pub async fn take_snapshot_with_retry(
     // Share buffer across retry attempts via Arc to avoid per-attempt clones
     let upload_buffer = std::sync::Arc::new(changeset_bytes);
     let upload_key = changeset_key.clone();
+    let upload_name = state.name.clone();
     retry_policy
         .execute_with_context("upload snapshot", || {
             let data_arc = std::sync::Arc::clone(&upload_buffer);
             let key = upload_key.clone();
-            async move { storage.put(&key, &data_arc).await }
+            let name = upload_name.clone();
+            async move {
+                put_changeset_if_absent(
+                    storage,
+                    &key,
+                    data_arc.as_slice(),
+                    &name,
+                    new_seq,
+                    "walrust-owned snapshot",
+                )
+                .await
+            }
         })
         .await?;
 
@@ -1439,11 +1491,23 @@ pub async fn sync_wal_with_retry(
 
     let upload_buffer = std::sync::Arc::new(changeset_bytes);
     let upload_key = changeset_key.clone();
+    let upload_name = state.name.clone();
     retry_policy
         .execute_with_context("upload WAL changes", || {
             let data_arc = std::sync::Arc::clone(&upload_buffer);
             let key = upload_key.clone();
-            async move { storage.put(&key, &data_arc).await }
+            let name = upload_name.clone();
+            async move {
+                put_changeset_if_absent(
+                    storage,
+                    &key,
+                    data_arc.as_slice(),
+                    &name,
+                    new_seq,
+                    "walrust-owned",
+                )
+                .await
+            }
         })
         .await?;
 
@@ -3438,6 +3502,107 @@ mod tests {
             state.db_checksum,
             Some(decoded.checksum),
             "state checksum must describe the uploaded snapshot bytes, not a later live-file read"
+        );
+    }
+
+    #[tokio::test]
+    async fn walrust_owned_sync_rejects_divergent_existing_changeset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("owned-cas.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            ",
+        )
+        .unwrap();
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path.clone()).unwrap();
+        state.name = "owned_cas".to_string();
+        state.init_checksum().unwrap();
+        take_snapshot_with_retry(
+            &storage,
+            "prefix/",
+            &mut state,
+            &RetryPolicy::default_policy(),
+        )
+        .await
+        .unwrap();
+
+        conn.execute("INSERT INTO items (id, value) VALUES (2, 'delta')", [])
+            .unwrap();
+
+        let next_seq = state.current_seq + 1;
+        let key = build_changeset_key("prefix/", &state.name, GENERATION_LIVE, next_seq);
+        let existing = b"conflicting existing object".to_vec();
+        storage.put(&key, &existing).await.unwrap();
+
+        let err = sync_wal(&storage, "prefix/", &mut state)
+            .await
+            .expect_err("walrust-owned sync must not overwrite a divergent existing object");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate changeset seq") || msg.contains("refusing overwrite"),
+            "expected duplicate overwrite refusal, got: {msg}"
+        );
+        assert_eq!(
+            storage.get(&key).await.unwrap(),
+            Some(existing),
+            "failed CAS publish must leave the existing object intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn walrust_owned_snapshot_rejects_divergent_existing_changeset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("owned-snapshot-cas.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path).unwrap();
+        state.name = "owned_snapshot_cas".to_string();
+        state.init_checksum().unwrap();
+
+        let next_seq = state.current_seq + 1;
+        let key = build_changeset_key("prefix/", &state.name, GENERATION_SNAPSHOT, next_seq);
+        let existing = b"conflicting existing snapshot object".to_vec();
+        storage.put(&key, &existing).await.unwrap();
+
+        let err = take_snapshot_with_retry(
+            &storage,
+            "prefix/",
+            &mut state,
+            &RetryPolicy::default_policy(),
+        )
+        .await
+        .expect_err("walrust-owned snapshot must not overwrite a divergent existing object");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate changeset seq") || msg.contains("refusing overwrite"),
+            "expected duplicate overwrite refusal, got: {msg}"
+        );
+        assert_eq!(
+            storage.get(&key).await.unwrap(),
+            Some(existing),
+            "failed snapshot CAS publish must leave the existing object intact"
+        );
+        assert_eq!(
+            state.current_seq, 0,
+            "failed snapshot publish must not advance state"
         );
     }
 
