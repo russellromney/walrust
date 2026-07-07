@@ -18,7 +18,9 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
@@ -49,6 +51,26 @@ struct DbState {
     /// `Some` when this database ships fenced TLM_DELTA envelopes.
     /// `None` = legacy behavior (walrust-owned or external `.hadbp`).
     fenced_delta_chain: Option<FencedDeltaChainState>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SavedSyncState {
+    #[serde(default)]
+    wal_offset: Option<u64>,
+    #[serde(default)]
+    wal_generation: Option<u64>,
+    #[serde(default)]
+    current_seq: Option<u64>,
+    #[serde(default)]
+    current_txid: Option<u64>,
+    #[serde(default)]
+    db_checksum: Option<u64>,
+    #[serde(default)]
+    last_snapshot: Option<DateTime<Utc>>,
+    #[serde(default)]
+    wal_salt: Option<(u32, u32)>,
+    #[serde(default)]
+    wal_checksum_chain: Option<(u32, u32)>,
 }
 
 /// Dispatch one sync for a database: fenced TLM_DELTA when configured,
@@ -297,34 +319,45 @@ impl Replicator {
         // External-base mode returned above and derives its cursor from the
         // caller's base plus the physical changeset chain.
         let state_key = format!("{}{}/state.json", prefix, name);
-        if let Ok(Some(data)) = self.storage.get(&state_key).await {
-            if let Ok(saved) = serde_json::from_slice::<serde_json::Value>(&data) {
-                let saved_offset = saved.get("wal_offset").and_then(|v| v.as_u64());
-                if let Some(seq) = saved.get("current_seq").and_then(|v| v.as_u64()) {
-                    state.current_seq = seq;
-                }
-                if let Some(offset) = saved_offset {
-                    state.wal_offset = offset;
-                }
-                if let Some(gen) = saved.get("wal_generation").and_then(|v| v.as_u64()) {
-                    state.wal_generation = gen;
-                }
-                if let Some(txid) = saved.get("current_txid").and_then(|v| v.as_u64()) {
-                    state.current_txid = txid;
-                }
-                if let Some(checksum) = saved.get("db_checksum").and_then(|v| v.as_u64()) {
-                    state.db_checksum = Some(checksum);
-                }
-                tracing::info!(
-                    "Replicator: loaded state for '{}': seq={}, gen={}, txid={}, offset={}, checksum={:?}",
-                    name,
-                    state.current_seq,
-                    state.wal_generation,
-                    state.current_txid,
-                    state.wal_offset,
-                    state.db_checksum,
-                );
+        if let Some(data) = self
+            .storage
+            .get(&state_key)
+            .await
+            .with_context(|| format!("failed to load saved replication state {state_key}"))?
+        {
+            let saved = serde_json::from_slice::<SavedSyncState>(&data)
+                .with_context(|| format!("failed to parse saved replication state {state_key}"))?;
+            if let Some(seq) = saved.current_seq {
+                state.current_seq = seq;
             }
+            if let Some(offset) = saved.wal_offset {
+                state.wal_offset = offset;
+            }
+            if let Some(gen) = saved.wal_generation {
+                state.wal_generation = gen;
+            }
+            if let Some(txid) = saved.current_txid {
+                state.current_txid = txid;
+            }
+            if let Some(checksum) = saved.db_checksum {
+                state.db_checksum = Some(checksum);
+            }
+            if let Some(last_snapshot) = saved.last_snapshot {
+                state.last_snapshot = Some(last_snapshot);
+            }
+            state.wal_salt = saved.wal_salt;
+            state.wal_checksum_chain = saved.wal_checksum_chain;
+            tracing::info!(
+                "Replicator: loaded state for '{}': seq={}, gen={}, txid={}, offset={}, checksum={:?}, wal_salt={:?}, wal_checksum_chain={:?}",
+                name,
+                state.current_seq,
+                state.wal_generation,
+                state.current_txid,
+                state.wal_offset,
+                state.db_checksum,
+                state.wal_salt,
+                state.wal_checksum_chain,
+            );
         }
 
         let db_state = Arc::new(AsyncMutex::new(DbState {

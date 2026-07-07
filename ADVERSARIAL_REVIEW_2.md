@@ -186,6 +186,15 @@ fix removes that divergent lineage.
   timestamp PITR (needs commit-time metadata) or fix the docs/help.
 
 ### A10 — Replication progress state is not durable / not fenced
+Status: Partial — Phase 1.5 reload-half fixed in core. Saved `state.json`
+now round-trips `wal_salt` and `wal_checksum_chain`, and read/parse failures
+propagate instead of becoming a cold start. Proven by
+`test_walrust_owned_reload_restores_saved_wal_salt`,
+`test_walrust_owned_reload_restores_saved_wal_checksum_chain`, and
+`test_walrust_owned_reload_state_transport_error_is_hard_error`. The root CLI
+watch path has no equivalent remote `state.json` reload path; its durable
+progress gap plus walrust-owned CAS/lineage/fencing remain open for Phase 2.5.
+
 - `state.json` save/load asymmetry: `save_state` persists `wal_salt` +
   `wal_checksum_chain` (`crates/walrust-core/src/sync.rs:258-267`) but reload
   (`replicator.rs:300-327`) never reads them back => after every restart,

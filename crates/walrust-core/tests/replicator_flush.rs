@@ -242,6 +242,10 @@ struct StateJsonForbiddenStorage {
     inner: Arc<MemStorage>,
 }
 
+struct StateJsonGetFailsStorage {
+    inner: Arc<MemStorage>,
+}
+
 impl StateJsonForbiddenStorage {
     fn new(inner: Arc<MemStorage>) -> Arc<Self> {
         Arc::new(Self { inner })
@@ -252,6 +256,12 @@ impl StateJsonForbiddenStorage {
             anyhow::bail!("state.json access is forbidden in external-base mode: {key}");
         }
         Ok(())
+    }
+}
+
+impl StateJsonGetFailsStorage {
+    fn new(inner: Arc<MemStorage>) -> Arc<Self> {
+        Arc::new(Self { inner })
     }
 }
 
@@ -288,6 +298,40 @@ impl StorageBackend for StateJsonForbiddenStorage {
 
     async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
         Self::reject_state_key(key)?;
+        self.inner.put_if_match(key, data, etag).await
+    }
+}
+
+#[async_trait]
+impl StorageBackend for StateJsonGetFailsStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if key.ends_with("/state.json") {
+            anyhow::bail!("injected state.json read failure: {key}");
+        }
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.inner.put(key, data).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.inner.put_if_absent(key, data).await
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
         self.inner.put_if_match(key, data, etag).await
     }
 }
@@ -379,6 +423,129 @@ async fn seed_physical_delta(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[tokio::test]
+async fn test_walrust_owned_reload_restores_saved_wal_checksum_chain() -> Result<()> {
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reload-chain.db");
+    let wal_path = db_path.with_extension("db-wal");
+    let conn = create_wal_db(&db_path, 3);
+    let header = walrust::wal::read_header(&wal_path).await?.unwrap();
+    let saved_offset = std::fs::metadata(&wal_path)?.len();
+
+    let state_json = serde_json::json!({
+        "wal_offset": saved_offset,
+        "wal_generation": 4,
+        "current_seq": 10,
+        "current_txid": 10,
+        "db_checksum": 0u64,
+        "last_snapshot": null,
+        "wal_salt": [header.salt().0, header.salt().1],
+        "wal_checksum_chain": [0x11111111u32, 0x22222222u32],
+    });
+    storage
+        .put(
+            "wal/reload-chain/state.json",
+            &serde_json::to_vec(&state_json)?,
+        )
+        .await?;
+
+    write_rows(&conn, 100, 1);
+
+    let replicator = Replicator::new(storage.clone(), "wal/", make_config());
+    replicator
+        .add_without_snapshot("reload-chain", &db_path)
+        .await?;
+
+    let frames = replicator.flush("reload-chain").await?;
+    assert_eq!(
+        frames, 0,
+        "the saved checksum chain seed must be restored; the intentionally bogus seed makes the next committed frame unverifiable"
+    );
+    assert_ne!(
+        storage.max_hadbp_seq("wal/reload-chain/"),
+        Some(11),
+        "flush must not publish a changeset when the saved chain seed cannot validate the next WAL frame"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_walrust_owned_reload_restores_saved_wal_salt() -> Result<()> {
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reload-salt.db");
+    let wal_path = db_path.with_extension("db-wal");
+    let conn = create_wal_db(&db_path, 3);
+    let header = walrust::wal::read_header(&wal_path).await?.unwrap();
+    let saved_offset = std::fs::metadata(&wal_path)?.len();
+
+    let state_json = serde_json::json!({
+        "wal_offset": saved_offset,
+        "wal_generation": 4,
+        "current_seq": 10,
+        "current_txid": 10,
+        "db_checksum": 0u64,
+        "last_snapshot": null,
+        "wal_salt": [header.salt().0.wrapping_add(1), header.salt().1],
+        "wal_checksum_chain": null,
+    });
+    storage
+        .put(
+            "wal/reload-salt/state.json",
+            &serde_json::to_vec(&state_json)?,
+        )
+        .await?;
+
+    write_rows(&conn, 100, 1);
+
+    let replicator = Replicator::new(storage.clone(), "wal/", make_config());
+    replicator
+        .add_without_snapshot("reload-salt", &db_path)
+        .await?;
+    let frames = replicator.flush("reload-salt").await?;
+    assert!(
+        frames > 0,
+        "salt rollover should reset to the WAL header and resync committed frames"
+    );
+
+    let saved = storage.value("wal/reload-salt/state.json").await;
+    assert_eq!(
+        saved.get("wal_generation").and_then(|v| v.as_u64()),
+        Some(5),
+        "the saved salt must be reloaded so a salt mismatch increments the WAL generation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_walrust_owned_reload_state_transport_error_is_hard_error() -> Result<()> {
+    let inner = MemStorage::new();
+    let storage = StateJsonGetFailsStorage::new(inner);
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reload-error.db");
+    let _conn = create_wal_db(&db_path, 1);
+
+    let replicator = Replicator::new(storage, "wal/", make_config());
+    let err = replicator
+        .add_without_snapshot("reload-error", &db_path)
+        .await
+        .expect_err("state.json read failures must not be treated as a cold start");
+
+    assert!(
+        err.to_string().contains("state.json"),
+        "error should identify the failed state reload: {err}"
+    );
+    assert!(
+        !replicator.contains("reload-error").await,
+        "database must not be registered after a failed state reload"
+    );
+
+    Ok(())
+}
 
 /// flush() after writing WAL frames should upload an LTX file and return frame count > 0.
 #[tokio::test]
