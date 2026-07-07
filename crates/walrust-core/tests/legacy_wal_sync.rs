@@ -1,0 +1,110 @@
+use anyhow::Result;
+use async_trait::async_trait;
+use hadb_storage::{CasResult, StorageBackend};
+use std::collections::HashMap;
+use std::sync::Mutex;
+use walrust_core::legacy_manifest::build_ltx_key;
+use walrust_core::legacy_wal_sync::{sync_wal_to_storage, SyncInput};
+
+#[derive(Default)]
+struct MemoryStorage {
+    objects: Mutex<HashMap<String, Vec<u8>>>,
+}
+
+#[async_trait]
+impl StorageBackend for MemoryStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.objects.lock().unwrap().get(key).cloned())
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), data.to_vec());
+        Ok(())
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        let mut objects = self.objects.lock().unwrap();
+        if objects.contains_key(key) {
+            Ok(CasResult {
+                success: false,
+                etag: None,
+            })
+        } else {
+            objects.insert(key.to_string(), data.to_vec());
+            Ok(CasResult {
+                success: true,
+                etag: Some("mem".into()),
+            })
+        }
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
+        self.objects
+            .lock()
+            .unwrap()
+            .insert(key.to_string(), data.to_vec());
+        Ok(CasResult {
+            success: true,
+            etag: Some("mem".into()),
+        })
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.objects.lock().unwrap().remove(key);
+        Ok(())
+    }
+
+    async fn list(&self, prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+        let mut keys = self
+            .objects
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|key| key.starts_with(prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        Ok(keys)
+    }
+}
+
+#[tokio::test]
+async fn legacy_wal_sync_initial_snapshot_is_owned_by_core() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("source.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(
+            "CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT);
+             INSERT INTO marker (value) VALUES ('initial-snapshot');",
+        )?;
+    }
+
+    let storage = MemoryStorage::default();
+    let output = sync_wal_to_storage(
+        &storage,
+        "backups",
+        SyncInput {
+            db_path: db_path.clone(),
+            name: "app".to_string(),
+            wal_path: db_path.with_extension("db-wal"),
+            wal_offset: 0,
+            wal_generation: 0,
+            current_txid: 0,
+            db_checksum: None,
+            wal_salt: None,
+            wal_checksum_chain: None,
+        },
+    )
+    .await?;
+
+    let key = build_ltx_key("backups", "app", 1, 1, 1);
+    assert!(storage.get(&key).await?.is_some());
+    assert_eq!(output.new_current_txid, 1);
+    assert_eq!(output.frame_count, 1);
+    Ok(())
+}

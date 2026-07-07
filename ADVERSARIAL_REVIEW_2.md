@@ -806,10 +806,22 @@ and
     delegating the sync engine to core. Root wrapper coverage remains
     `sync::shadow::tests::test_encode*` and
     `sync::shadow::tests::test_sync_shadow_to_cache*`.
-    Remaining work: root `src/sync/wal_sync.rs` and root watch orchestration
-    still own legacy WAL snapshot/incremental upload control flow over the LTX
-    object layout, while core owns the HADBP engine. That workflow/API
-    migration is still required before duplicate sync implementations can be
-    deleted.
+    Legacy direct WAL-to-storage ownership was then reproduced with
+    `legacy_wal_sync_initial_snapshot_is_owned_by_core` (failed because
+    `walrust_core::legacy_wal_sync` did not exist), then fixed by moving
+    storage-backed initial snapshot, incremental WAL-frame encoding,
+    rollover re-snapshot, WAL-mode fail-closed checks, and object-key
+    publishing into `walrust-core::legacy_wal_sync`; root
+    `src/sync/wal_sync.rs::sync_wal_concurrent` now adapts the S3 client to
+    `hadb_storage_s3::S3Storage` and delegates the direct upload engine to
+    core. Root retry/webhook coverage remains
+    `sync::wal_sync::tests::test_sync_wal_concurrent_rejects_database_out_of_wal_mode`
+    and
+    `sync::wal_sync::tests::test_sync_wal_retry_notifies_webhook_when_database_leaves_wal_mode`.
+    Remaining work: root `src/sync/wal_sync.rs::sync_wal_to_cache` and root
+    watch orchestration still own legacy cache-mode WAL upload control flow
+    over the LTX object layout, while core owns the HADBP engine. That
+    workflow/API migration is still required before duplicate sync
+    implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.

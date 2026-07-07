@@ -37,18 +37,7 @@ pub(crate) struct DbState {
 }
 
 /// Input for concurrent WAL sync (immutable snapshot of state)
-#[derive(Clone)]
-pub(crate) struct SyncInput {
-    pub(crate) db_path: PathBuf,
-    pub(crate) name: String,
-    pub(crate) wal_path: PathBuf,
-    pub(crate) wal_offset: u64,
-    pub(crate) wal_generation: u64,
-    pub(crate) current_txid: u64,
-    pub(crate) db_checksum: Option<u64>,
-    pub(crate) wal_salt: Option<(u32, u32)>,
-    pub(crate) wal_checksum_chain: Option<(u32, u32)>,
-}
+pub(crate) use walrust_core::legacy_wal_sync::SyncInput;
 
 impl From<&DbState> for SyncInput {
     fn from(state: &DbState) -> Self {
@@ -67,18 +56,7 @@ impl From<&DbState> for SyncInput {
 }
 
 /// Output from concurrent WAL sync (changes to apply to state)
-pub(crate) struct SyncOutput {
-    pub(crate) db_path: PathBuf,
-    pub(crate) frame_count: u64,
-    pub(crate) new_wal_offset: u64,
-    pub(crate) new_current_txid: u64,
-    pub(crate) new_db_checksum: Option<u64>,
-    /// If checkpoint was detected, new generation
-    pub(crate) checkpoint_detected: bool,
-    pub(crate) new_wal_generation: u64,
-    pub(crate) new_wal_salt: Option<(u32, u32)>,
-    pub(crate) new_wal_checksum_chain: Option<(u32, u32)>,
-}
+pub(crate) use walrust_core::legacy_wal_sync::SyncOutput;
 
 /// Entry in the manifest tracking LTX files
 #[derive(Debug, Clone, Serialize, Deserialize)]
