@@ -1,5 +1,5 @@
+use crate::ltx::Checksum;
 use anyhow::{anyhow, Result};
-use litepages::Checksum;
 use std::sync::Arc;
 
 use crate::ltx;

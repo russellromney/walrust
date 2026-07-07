@@ -724,17 +724,25 @@ and
 4.1 Decide the surviving stack (likely walrust-core as the engine, src/ as
     thin CLI over it); delete the duplicate WAL/LTX/sync/restore
     implementations so invariants live in exactly one place.
-    Status: Partial — `walrust-core` is now the canonical WAL and shadow-WAL
-    implementation. Root `src/wal.rs` and `src/shadow.rs` are compatibility
-    shims over `walrust-core`, preserving the root module paths while deleting
-    the duplicate root implementations. Before shimming shadow, the missing
-    core segment-name regression was reproduced by
+    Status: Partial — `walrust-core` is now the canonical WAL, shadow-WAL, and
+    legacy Litestream-derived LTX implementation. Root `src/wal.rs`,
+    `src/shadow.rs`, and `src/ltx.rs` are compatibility shims over
+    `walrust-core`, preserving the root module paths while deleting the
+    duplicate root implementations. Before shimming shadow, the missing core
+    segment-name regression was reproduced by
     `shadow::tests::test_segment_name_width_keeps_lexical_order_past_u32`
     (failed with 8-hex variable-width names), then fixed by porting the
-    16-hex formatter into core. Remaining work: root `src/ltx.rs` still uses
-    the legacy Litestream-compatible LTX API/format while core uses HADBP, and
+    16-hex formatter into core. Legacy LTX ownership was then reproduced with
+    `legacy_ltx_codec_is_owned_by_core_and_round_trips_real_sqlite` (failed
+    because `walrust_core::legacy_ltx` did not exist), then fixed by moving the
+    existing production codec into `walrust-core::legacy_ltx` and re-exporting
+    it from root. The moved codec keeps its original unit coverage under
+    `walrust-core::legacy_ltx`; targeted proof includes
+    `legacy_ltx::tests::test_encode_sqlite_snapshot_includes_wal_and_returns_encoded_checksum`
+    and `legacy_ltx::tests::test_snapshot_various_page_sizes`. Remaining work:
     root `src/sync/*` still owns the CLI watch/restore/compact/replicate
-    workflow. Those require a larger API/format migration before the duplicate
-    LTX/sync/restore implementations can be deleted.
+    workflow over the legacy LTX object layout, while core owns the HADBP
+    engine. That workflow/API migration is still required before duplicate
+    sync/restore implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.

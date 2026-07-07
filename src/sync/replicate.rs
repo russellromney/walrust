@@ -419,8 +419,8 @@ fn save_replica_state(local: &Path, current_txid: u64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ltx::Checksum;
     use crate::sync::manifest::{build_ltx_key, GENERATION_LIVE};
-    use litepages::Checksum;
     use rusqlite::Connection;
     use std::time::{SystemTime, UNIX_EPOCH};
 

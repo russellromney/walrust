@@ -1,5 +1,5 @@
+use crate::ltx::Decoder;
 use anyhow::Result;
-use litepages::Decoder;
 use std::io::Cursor;
 
 use super::types::Manifest;

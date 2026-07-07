@@ -638,8 +638,8 @@ mod tests {
     }
 
     fn test_ltx(txid: u64) -> Vec<u8> {
+        use crate::ltx::Checksum;
         use crate::ltx::{chain_checksum, encode_wal_changes};
-        use litepages::Checksum;
 
         let fill = (txid % 251) as u8;
         let pages = vec![(1u32, vec![fill; 4096])];
@@ -667,8 +667,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_uploader_basic_upload() {
+        use crate::ltx::Checksum;
         use crate::ltx::{chain_checksum, encode_wal_changes};
-        use litepages::Checksum;
 
         let (uploader, cache, storage, _temp) = setup_uploader();
 

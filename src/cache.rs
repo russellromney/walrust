@@ -16,9 +16,9 @@
 //!     00000003.ltx             # TXID 3 (pending)
 //! ```
 
+use crate::ltx::Decoder;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use litepages::Decoder;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -865,8 +865,8 @@ mod tests {
 
     #[test]
     fn test_contiguous_cursor_advances_over_uploaded_ltx_intervals() {
+        use crate::ltx::Checksum;
         use crate::ltx::{chain_checksum, encode_wal_changes};
-        use litepages::Checksum;
 
         let (cache, _temp) = setup_cache();
         cache.write_snapshot_ltx(1, b"snapshot").unwrap();

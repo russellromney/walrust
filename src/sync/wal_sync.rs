@@ -29,7 +29,7 @@ pub(crate) async fn sync_wal_concurrent(
     prefix: &str,
     input: SyncInput,
 ) -> Result<SyncOutput> {
-    use litepages::Checksum;
+    use crate::ltx::Checksum;
 
     // Special case: Initial sync (current_txid == 0) should ALWAYS create a snapshot from DB file
     // This handles the case where WAL file exists but is empty (0 bytes)
@@ -496,7 +496,7 @@ pub(crate) async fn sync_wal_to_cache(
     shadow: &Arc<tokio::sync::Mutex<ShadowWal>>,
     upload_tx: &mpsc::Sender<UploadMessage>,
 ) -> Result<SyncOutput> {
-    use litepages::Checksum;
+    use crate::ltx::Checksum;
 
     // Special case: Initial sync (current_txid == 0) should create a snapshot
     if input.current_txid == 0 {

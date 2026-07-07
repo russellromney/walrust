@@ -12,6 +12,7 @@
 
 pub mod errors;
 pub mod external_delta;
+pub mod legacy_ltx;
 pub mod ltx;
 pub mod replay_sink;
 pub mod replicator;

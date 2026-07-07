@@ -18,7 +18,7 @@ use super::types::{ShadowSyncInput, ShadowSyncOutput};
 /// Result of encoding shadow WAL segments into LTX
 struct ShadowEncodeResult {
     ltx_buffer: Vec<u8>,
-    post_checksum: litepages::Checksum,
+    post_checksum: crate::ltx::Checksum,
     frame_count: usize,
     unique_pages: usize,
     min_txid: u64,
@@ -28,7 +28,7 @@ struct ShadowEncodeResult {
 /// Read shadow WAL segments and encode into LTX buffer.
 /// Returns None if no new frames to sync.
 fn encode_shadow_to_ltx(input: &ShadowSyncInput) -> Result<Option<(ShadowEncodeResult, u64)>> {
-    use litepages::Checksum;
+    use crate::ltx::Checksum;
 
     let shadow_dir = &input.shadow_dir;
     let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();

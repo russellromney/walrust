@@ -91,9 +91,6 @@ hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0"
 # S3 client type (shared with hadb-io, needed for function signatures).
 aws-sdk-s3 = { version = "1", optional = true }
 
-# LTX format (Litestream-compatible) - see https://github.com/russellromney/litepages
-litepages = "0.1.0"
-
 # SQLite for checkpointing
 rusqlite = { version = "0.35", features = ["bundled"] }
 
