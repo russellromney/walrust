@@ -1,21 +1,16 @@
 use anyhow::Result;
 use chrono::Utc;
 use hadb_storage_s3::S3Storage;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::cache::LocalCache;
 use crate::dashboard::{DbStatus, MetricsState};
-use crate::ltx;
 use crate::retry::{classify_error, ErrorKind, RetryPolicy};
-use crate::s3;
 use crate::shadow::ShadowWal;
 use crate::uploader::UploadMessage;
-use crate::wal;
 use crate::webhook::WebhookSender;
 
-use super::manifest::{build_ltx_key, discover_state_from_s3};
 use super::types::{DbState, DbTaskState, SyncInput, SyncOutput};
 
 // ============================================================================
@@ -273,42 +268,13 @@ pub(crate) async fn take_snapshot(
     state: &mut DbState,
 ) -> Result<()> {
     let timestamp = Utc::now();
-
-    // CRITICAL: Checkpoint WAL to ensure all committed data is in the main database file.
-    // Without this, we could snapshot stale data if another connection holds WAL frames.
-    // Use PASSIVE to avoid blocking writers (we'll get whatever is safely checkpointable).
-    checkpoint_wal(&state.db_path).await?;
-
-    // Get page size from database header
-    let page_size = get_page_size(&state.db_path).await?;
-
-    // Increment TXID for this snapshot
-    let new_txid = state.current_txid + 1;
-
-    // Discover current generation from S3 and create new one
-    let (_, current_gen, _) = discover_state_from_s3(client, bucket, prefix, &state.name).await?;
-    let snapshot_gen = current_gen + 1;
-
-    // Snapshots go to generation 1+ (litestream format)
-    let ltx_key = build_ltx_key(prefix, &state.name, snapshot_gen, 1, new_txid);
-
-    let (ltx_buffer, db_checksum) =
-        ltx::encode_sqlite_snapshot_to_vec(&state.db_path, page_size, new_txid)?;
-
-    let ltx_size = ltx_buffer.len() as u64;
-
-    // Upload LTX file
-    s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
-
-    tracing::info!(
-        "{}: LTX snapshot uploaded (gen {}, TXID 1-{}, {} bytes, checksum {:#x}) -> {}",
-        state.name,
-        snapshot_gen,
-        new_txid,
-        ltx_size,
-        db_checksum.into_inner(),
-        ltx_key
-    );
+    let storage = S3Storage::new(client.clone(), bucket.to_string());
+    let output = walrust_core::legacy_wal_sync::take_snapshot_to_storage(
+        &storage,
+        prefix,
+        SyncInput::from(&*state),
+    )
+    .await?;
 
     // Update state. The snapshot folded all WAL frames into the base, so the
     // WAL cursor must be reset, not left pointing into the pre-checkpoint WAL
@@ -316,51 +282,20 @@ pub(crate) async fn take_snapshot(
     // the header so the next incremental read re-seeds the salt/checksum chain
     // and reads from offset 0 of the new generation. The snapshot's db_checksum
     // becomes the explicit hand-off base for the first incremental.
-    state.current_txid = new_txid;
+    state.current_txid = output.new_current_txid;
     state.last_snapshot = Some(timestamp);
-    state.db_checksum = Some(db_checksum.into_inner());
-    state.wal_offset = 0;
-    state.wal_generation += 1;
-    state.wal_salt = wal::read_header(&state.wal_path)
-        .await
-        .ok()
-        .flatten()
-        .map(|h| h.salt());
-    // Force the next read to re-seed the running checksum from the (new) header.
-    state.wal_checksum_chain = None;
+    state.db_checksum = output.new_db_checksum;
+    state.wal_offset = output.new_wal_offset;
+    state.wal_generation = output.new_wal_generation;
+    state.wal_salt = output.new_wal_salt;
+    state.wal_checksum_chain = output.new_wal_checksum_chain;
 
     Ok(())
 }
 
-pub(crate) async fn checkpoint_wal(db_path: &Path) -> Result<()> {
-    let db_path = db_path.to_path_buf();
-    tokio::task::spawn_blocking(move || {
-        let conn = rusqlite::Connection::open_with_flags(
-            &db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-        )?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
-        Ok::<_, anyhow::Error>(())
-    })
-    .await??;
-    Ok(())
-}
-
-/// Get SQLite database page size from header
-pub(crate) async fn get_page_size(db_path: &Path) -> Result<u32> {
-    use tokio::io::AsyncReadExt;
-    let mut file = tokio::fs::File::open(db_path).await?;
-    let mut header = [0u8; 100];
-    file.read_exact(&mut header).await?;
-
-    // Page size is at offset 16-17, big-endian
-    let page_size = u16::from_be_bytes([header[16], header[17]]) as u32;
-
-    // Page size of 1 means 65536
-    let page_size = if page_size == 1 { 65536 } else { page_size };
-
-    Ok(page_size)
+/// Get SQLite database page size from header.
+pub(crate) async fn get_page_size(db_path: &std::path::Path) -> Result<u32> {
+    walrust_core::legacy_wal_sync::get_page_size(db_path).await
 }
 
 #[cfg(test)]

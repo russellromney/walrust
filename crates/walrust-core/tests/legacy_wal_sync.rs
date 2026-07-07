@@ -6,7 +6,9 @@ use std::sync::{Arc, Mutex};
 use walrust_core::legacy_cache::LocalCache;
 use walrust_core::legacy_manifest::build_ltx_key;
 use walrust_core::legacy_uploader::UploadMessage;
-use walrust_core::legacy_wal_sync::{sync_wal_to_cache, sync_wal_to_storage, SyncInput};
+use walrust_core::legacy_wal_sync::{
+    sync_wal_to_cache, sync_wal_to_storage, take_snapshot_to_storage, SyncInput,
+};
 use walrust_core::shadow::ShadowWal;
 
 #[derive(Default)]
@@ -151,5 +153,50 @@ async fn legacy_wal_sync_cache_initial_snapshot_is_owned_by_core() -> Result<()>
     assert_eq!(output.frame_count, 1);
     assert_eq!(cache.pending_uploads(), vec![1]);
     assert!(matches!(rx.try_recv()?, UploadMessage::Upload(1)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_wal_sync_periodic_snapshot_is_owned_by_core() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("periodic-source.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(
+            "CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT);
+             INSERT INTO marker (value) VALUES ('periodic-snapshot');",
+        )?;
+    }
+
+    let storage = MemoryStorage::default();
+    storage
+        .put(&build_ltx_key("backups", "app", 1, 1, 2), b"existing")
+        .await?;
+
+    let output = take_snapshot_to_storage(
+        &storage,
+        "backups",
+        SyncInput {
+            db_path: db_path.clone(),
+            name: "app".to_string(),
+            wal_path: db_path.with_extension("db-wal"),
+            wal_offset: 8192,
+            wal_generation: 3,
+            current_txid: 2,
+            db_checksum: None,
+            wal_salt: None,
+            wal_checksum_chain: Some((1, 2)),
+        },
+    )
+    .await?;
+
+    let key = build_ltx_key("backups", "app", 2, 1, 3);
+    assert!(storage.get(&key).await?.is_some());
+    assert_eq!(output.new_current_txid, 3);
+    assert_eq!(output.new_wal_offset, 0);
+    assert_eq!(output.new_wal_generation, 4);
+    assert!(output.new_db_checksum.is_some());
+    assert!(output.new_wal_checksum_chain.is_none());
     Ok(())
 }

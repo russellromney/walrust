@@ -824,7 +824,13 @@ and
     fixed by moving shadow-backed cache snapshot/incremental encoding, cache
     writes, and uploader notification into `walrust-core::legacy_wal_sync`;
     root `src/sync/wal_sync.rs::sync_wal_to_cache` is now a compatibility
-    wrapper. Remaining work: root watch orchestration still owns legacy
+    wrapper. Legacy periodic snapshot ownership was then reproduced with
+    `legacy_wal_sync_periodic_snapshot_is_owned_by_core` (failed because
+    `walrust_core::legacy_wal_sync::take_snapshot_to_storage` did not exist),
+    then fixed by moving checkpointed storage-backed snapshot publication into
+    `walrust-core::legacy_wal_sync`; root
+    `src/sync/wal_sync.rs::take_snapshot` now adapts S3 and updates CLI state
+    from the core output. Remaining work: root watch orchestration still owns legacy
     cache-mode WAL upload control flow over the LTX object layout, while core
     owns the HADBP engine. That workflow/API migration is still required
     before duplicate sync implementations can be deleted.

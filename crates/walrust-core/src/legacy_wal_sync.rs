@@ -448,6 +448,64 @@ pub async fn sync_wal_to_cache(
     })
 }
 
+pub async fn take_snapshot_to_storage(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    input: SyncInput,
+) -> Result<SyncOutput> {
+    checkpoint_wal_passive(&input.db_path).await?;
+
+    let page_size = get_page_size(&input.db_path).await?;
+    let new_txid = input.current_txid + 1;
+    let (_, current_gen) = discover_legacy_state(storage, prefix, &input.name).await?;
+    let snapshot_gen = current_gen + 1;
+    let ltx_key = build_ltx_key(prefix, &input.name, snapshot_gen, 1, new_txid);
+
+    let db_path_for_encode = input.db_path.clone();
+    let db_name_for_error = input.name.clone();
+    let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
+        ltx::encode_sqlite_snapshot_to_vec(&db_path_for_encode, page_size, new_txid).map_err(|e| {
+            anyhow::anyhow!(
+                "{}: Periodic snapshot encode failed: {}",
+                db_name_for_error,
+                e
+            )
+        })
+    })
+    .await??;
+
+    let ltx_size = ltx_buffer.len() as u64;
+    storage.put(&ltx_key, &ltx_buffer).await?;
+
+    tracing::info!(
+        "{}: LTX snapshot uploaded (gen {}, TXID 1-{}, {} bytes, checksum {:#x}) -> {}",
+        input.name,
+        snapshot_gen,
+        new_txid,
+        ltx_size,
+        db_checksum_new.into_inner(),
+        ltx_key
+    );
+
+    let wal_salt = wal::read_header(&input.wal_path)
+        .await
+        .ok()
+        .flatten()
+        .map(|h| h.salt());
+
+    Ok(SyncOutput {
+        db_path: input.db_path,
+        frame_count: 1,
+        new_wal_offset: 0,
+        new_current_txid: new_txid,
+        new_db_checksum: Some(db_checksum_new.into_inner()),
+        checkpoint_detected: true,
+        new_wal_generation: input.wal_generation + 1,
+        new_wal_salt: wal_salt,
+        new_wal_checksum_chain: None,
+    })
+}
+
 async fn upload_rollover_snapshot(
     storage: &dyn StorageBackend,
     prefix: &str,
@@ -506,6 +564,21 @@ async fn upload_rollover_snapshot(
         new_wal_salt,
         new_wal_checksum_chain: None,
     })
+}
+
+async fn checkpoint_wal_passive(db_path: &Path) -> Result<()> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let conn = rusqlite::Connection::open_with_flags(
+            &db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
+        )?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE)")?;
+        Ok::<_, anyhow::Error>(())
+    })
+    .await??;
+    Ok(())
 }
 
 pub async fn checkpoint_wal_truncate(db_path: &Path) -> Result<()> {
