@@ -1,5 +1,6 @@
 //! Legacy shadow-watch lifecycle helpers shared by the root CLI wrapper.
 
+use crate::legacy_cache::LocalCache;
 use crate::shadow::ShadowWal;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -7,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 const SHADOW_PROGRESS_FILE: &str = "progress.json";
 
@@ -134,4 +136,43 @@ pub fn load_shadow_progress(shadow: &ShadowWal, db_name: &str) -> Result<Option<
     }
 
     Ok(Some(progress))
+}
+
+pub async fn wait_for_cache_checkpoint_durability(
+    cache: &LocalCache,
+    db_name: &str,
+    required_txid: u64,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    loop {
+        let failed = cache.failed_uploads();
+        if !failed.is_empty() {
+            anyhow::bail!(
+                "{}: cannot checkpoint shadow WAL; cache upload failures remain: {:?}",
+                db_name,
+                failed
+            );
+        }
+
+        let pending = cache.pending_uploads();
+        let uploaded_txid = cache.last_uploaded_txid();
+        if pending.is_empty() && uploaded_txid >= required_txid {
+            return Ok(());
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "{}: cannot checkpoint shadow WAL; durable upload confirmation timed out after {:?} (required_txid={}, uploaded_txid={}, pending={:?})",
+                db_name,
+                timeout,
+                required_txid,
+                uploaded_txid,
+                pending
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

@@ -1,6 +1,9 @@
 use anyhow::Result;
+use std::time::Duration;
+use walrust_core::legacy_cache::LocalCache;
 use walrust_core::legacy_shadow_watch::{
-    load_shadow_progress, save_shadow_progress, ShadowProgress,
+    load_shadow_progress, save_shadow_progress, wait_for_cache_checkpoint_durability,
+    ShadowProgress,
 };
 use walrust_core::shadow::ShadowWal;
 
@@ -37,5 +40,30 @@ async fn legacy_shadow_progress_persistence_is_owned_by_core() -> Result<()> {
         progress.shadow_sync_generation
     );
     assert_eq!(loaded.shadow_sync_offset, progress.shadow_sync_offset);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_shadow_checkpoint_drain_wait_is_owned_by_core() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("checkpoint-drain.db");
+    let cache = LocalCache::new(&db_path)?;
+
+    cache.write_ltx(2, b"pending")?;
+    let err = wait_for_cache_checkpoint_durability(
+        &cache,
+        "checkpoint-drain",
+        2,
+        Duration::from_millis(1),
+    )
+    .await
+    .expect_err("pending upload must block checkpoint drain");
+    assert!(err
+        .to_string()
+        .contains("durable upload confirmation timed out"));
+
+    cache.mark_uploaded(2)?;
+    wait_for_cache_checkpoint_durability(&cache, "checkpoint-drain", 2, Duration::from_millis(1))
+        .await?;
     Ok(())
 }

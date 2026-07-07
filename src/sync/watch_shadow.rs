@@ -22,7 +22,8 @@ use crate::webhook::WebhookSender;
 use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
 use walrust_core::legacy_shadow_watch::{
-    load_shadow_progress, save_shadow_progress as save_shadow_progress_file, ShadowProgress,
+    load_shadow_progress, save_shadow_progress as save_shadow_progress_file,
+    wait_for_cache_checkpoint_durability, ShadowProgress,
 };
 
 use super::shadow::{
@@ -241,45 +242,6 @@ async fn copy_final_shadow_frames(db_states: &mut HashMap<PathBuf, ShadowDbState
     }
 
     Ok(())
-}
-
-async fn wait_for_cache_checkpoint_durability(
-    cache: &LocalCache,
-    db_name: &str,
-    required_txid: u64,
-    timeout: Duration,
-) -> Result<()> {
-    let deadline = tokio::time::Instant::now() + timeout;
-
-    loop {
-        let failed = cache.failed_uploads();
-        if !failed.is_empty() {
-            anyhow::bail!(
-                "{}: cannot checkpoint shadow WAL; cache upload failures remain: {:?}",
-                db_name,
-                failed
-            );
-        }
-
-        let pending = cache.pending_uploads();
-        let uploaded_txid = cache.last_uploaded_txid();
-        if pending.is_empty() && uploaded_txid >= required_txid {
-            return Ok(());
-        }
-
-        if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!(
-                "{}: cannot checkpoint shadow WAL; durable upload confirmation timed out after {:?} (required_txid={}, uploaded_txid={}, pending={:?})",
-                db_name,
-                timeout,
-                required_txid,
-                uploaded_txid,
-                pending
-            );
-        }
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
 }
 
 async fn checkpoint_shadow_after_durable_sync(
