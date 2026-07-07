@@ -870,11 +870,19 @@ pub async fn initialize_external_base_state(
     state.current_txid = head.seq;
     state.db_checksum = Some(head.checksum);
 
-    // The object chain is authoritative for seq/checksum. WAL offset is only
-    // a local process cursor. On restart after already-published deltas, skip
-    // the bytes currently present; new writes will extend the WAL beyond this
-    // point and be captured normally.
-    state.wal_offset = crate::wal::get_wal_size(&state.wal_path).await.unwrap_or(0);
+    // The object chain is authoritative for seq/checksum. If no external
+    // delta object exists after the base, locally present WAL bytes are not
+    // proven durable remotely and must be read from the beginning. If a chain
+    // does exist, this reopen path preserves the legacy cursor heuristic until
+    // Phase 2.5's durable local progress record can map an object-chain head
+    // to an exact WAL offset.
+    state.wal_offset = if head.count == 0 {
+        0
+    } else {
+        crate::wal::get_wal_size(&state.wal_path)
+            .await
+            .map_err(|e| anyhow!("{}: failed to read WAL size: {}", state.name, e))?
+    };
 
     Ok(())
 }

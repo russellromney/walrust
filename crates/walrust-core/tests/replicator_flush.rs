@@ -1286,6 +1286,48 @@ async fn test_external_mode_ignores_stale_same_seq_delta() {
 }
 
 #[tokio::test]
+async fn test_external_mode_registration_does_not_skip_unpublished_wal_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-unpublished-wal.db");
+    let wal_path = db_path.with_extension("db-wal");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+    let base_checksum = walrust::ltx::compute_checksum_from_file(&db_path).unwrap();
+
+    write_rows(&conn, 100, 1);
+
+    let storage = MemStorage::new();
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator
+        .add_external_base_with_wal_path(
+            "external",
+            &db_path,
+            &wal_path,
+            walrust::ExternalBaseCursor {
+                seq: base_seq,
+                checksum: base_checksum,
+            },
+        )
+        .await
+        .unwrap();
+
+    let frames = replicator.flush("external").await.unwrap();
+    assert!(
+        frames > 0,
+        "registration from an older external base must not skip WAL bytes already present locally"
+    );
+    assert_eq!(
+        storage.max_hadbp_seq("wal/external/"),
+        Some(base_seq + 1),
+        "unpublished WAL bytes must become the next external changeset"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
 async fn test_external_mode_does_not_read_or_write_remote_state_json() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("external-no-state-access.db");

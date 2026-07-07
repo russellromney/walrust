@@ -248,10 +248,12 @@ of becoming a cold start. Proven by
 `walrust_owned_sync_rejects_divergent_existing_changeset` and
 `walrust_owned_snapshot_rejects_divergent_existing_changeset`,
 `test_walrust_owned_new_stream_writes_lineage_state_and_keys`, and
-`test_walrust_owned_restore_uses_active_lineage_namespace`. The root CLI watch
-path has no equivalent remote `state.json` reload path; its durable progress
-gap plus walrust-owned fencing and the external-base WAL offset assumption
-remain open for Phase 2.5.
+`test_walrust_owned_restore_uses_active_lineage_namespace`, and the external
+base no-chain offset regression
+`test_external_mode_registration_does_not_skip_unpublished_wal_bytes`. The
+root CLI watch path has no equivalent remote `state.json` reload path; its
+durable progress gap plus walrust-owned fencing and exact external-base
+head-to-WAL-offset persistence remain open for Phase 2.5.
 
 - `state.json` save/load asymmetry: `save_state` persists `wal_salt` +
   `wal_checksum_chain` (`crates/walrust-core/src/sync.rs:258-267`) but reload
@@ -273,10 +275,11 @@ remain open for Phase 2.5.
 - Sidecar watch path persists nothing: `current_txid` in memory only;
   production never writes `manifest.json`; restart re-mints TXIDs and
   overwrites remote history (`src/sync/watch_shadow.rs:103-111`).
-- `initialize_external_base_state` (`sync.rs:557`) sets
-  `wal_offset = current WAL size` — assumes every WAL byte was published;
-  after a crash between commit and publish those transactions are skipped
-  forever. `unwrap_or(0)` swallows I/O errors.
+- `initialize_external_base_state` no longer skips local WAL bytes when the
+  external base has no published delta chain (`crates/walrust-core/src/sync.rs:879-884`);
+  WAL-size I/O errors now propagate. Remaining: when a remote delta chain
+  already exists, exact head-to-local-WAL-offset proof still depends on the
+  durable fsynced local progress record below.
 - Fix: symmetrical state round-trip; transport errors propagate; CAS
   (`put_if_absent`/`put_if_match`) in walrust-owned mode; a lineage ID minted
   at bootstrap and embedded in keys + state; one durable fsynced local
