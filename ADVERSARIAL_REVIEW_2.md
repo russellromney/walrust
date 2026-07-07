@@ -321,18 +321,22 @@ Replica in-place apply/bootstrap remains open for the Phase 2 replica-half.
   (`watch_independent.rs:449-455`): TRUNCATE/RESTART resets never fire a
   sync; unbounded RPO on low-write DBs.
 - B7 — `remove()` and shutdown final syncs swallow upload failures
-  Status: Partial — core `Replicator::remove`, `run_replication`, and
+  Status: Fixed — core `Replicator::remove`, `run_replication`, and
   `run_wal_replication` now return hard errors on final sync failure and
-  `remove` keeps the database registered. Proven by
+  `remove` keeps the database registered; root uploaders return drain errors,
+  independent shutdown awaits final sync/uploader drain, and shadow shutdown
+  copies final real WAL frames through the normal shadow cache/direct sync path
+  before awaiting uploader drain. Proven by
   `test_remove_keeps_database_registered_when_final_sync_fails`,
   `test_run_replication_returns_final_sync_error_on_shutdown`, and
-  `test_run_wal_replication_returns_final_sync_error_on_shutdown`. Root
-  sidecar shutdown drain/final-upload paths remain open in the next B7
-  subcluster.
-  (`replicator.rs:393-416`; `sync.rs:1733-1737, 1810-1813`; shadow-mode final
-  sync only copies frames, never encodes/uploads, `watch_shadow.rs:760-769`;
-  independent mode drops the uploader JoinHandle, `watch_independent.rs:287`).
-  Caller then checkpoints => permanent loss. Return Result; drain fully.
+  `test_run_wal_replication_returns_final_sync_error_on_shutdown`,
+  `test_uploader_shutdown_returns_error_after_failed_upload`, and
+  `test_shadow_shutdown_syncs_final_real_wal_frames_to_cache`.
+  (`crates/walrust-core/src/replicator.rs:426-452`;
+  `crates/walrust-core/src/sync.rs:1798-1806, 1875-1883`;
+  `src/uploader.rs:280-338, 346-379, 392-400`;
+  `src/sync/watch_independent.rs:286-292, 369-397, 456-480`;
+  `src/sync/watch_shadow.rs:138-194, 919-934`).
 - B8 — `apply_changeset_to_db` / `pull_incremental` accept `page_id = 0` =>
   u64 underflow offset (`crates/walrust-core/src/ltx.rs:170`,
   `sync.rs:1121, 1381`) — F4 guard landed only in decode_to_db. Also no file

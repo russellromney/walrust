@@ -192,6 +192,9 @@ pub(crate) struct CacheState {
     pub(crate) shadow: Arc<tokio::sync::Mutex<ShadowWal>>,
     /// Channel to send upload notifications to uploader task
     pub(crate) upload_tx: mpsc::Sender<crate::uploader::UploadMessage>,
+    /// Uploader task handle so shutdown can verify the drain completed.
+    pub(crate) upload_handle:
+        Option<tokio::task::JoinHandle<anyhow::Result<crate::uploader::UploaderStats>>>,
     /// Cache config for cleanup parameters
     pub(crate) retention_duration: chrono::Duration,
     pub(crate) max_cache_size: u64,

@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -283,16 +283,13 @@ pub async fn watch_with_independent_tasks(
                 cache_config.uploader_concurrency,
             ));
 
-            // Spawn uploader task and get channel
-            // Note: JoinHandle is intentionally dropped here. Independent tasks
-            // outlive the uploader via the runtime's 10s shutdown timeout, giving
-            // uploaders time to drain after receiving Shutdown.
-            let (upload_tx, _uploader_handle) = spawn_uploader(uploader);
+            let (upload_tx, uploader_handle) = spawn_uploader(uploader);
 
             Some(CacheState {
                 cache,
                 shadow,
                 upload_tx,
+                upload_handle: Some(uploader_handle),
                 retention_duration: *retention,
                 max_cache_size: cache_config.max_size,
             })
@@ -310,7 +307,7 @@ pub async fn watch_with_independent_tasks(
         let shutdown_rx = shutdown_tx.subscribe();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_db_task(
+            let result = run_db_task(
                 task_state,
                 client,
                 bucket,
@@ -321,10 +318,13 @@ pub async fn watch_with_independent_tasks(
                 shutdown_rx,
                 cache_state,
             )
-            .await
-            {
+            .await;
+
+            if let Err(e) = &result {
                 tracing::error!("{}: Task failed: {}", name, e);
             }
+
+            result
         });
 
         task_handles.push(handle);
@@ -368,14 +368,38 @@ pub async fn watch_with_independent_tasks(
     // Wait for all tasks to complete (with timeout)
     let shutdown_timeout = Duration::from_secs(10);
     match tokio::time::timeout(shutdown_timeout, async {
+        let mut first_error = None;
         for handle in task_handles {
-            let _ = handle.await;
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!("Database task shutdown failed: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Database task panicked during shutdown: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(anyhow!("database task panicked during shutdown: {e}"));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     })
     .await
     {
-        Ok(_) => tracing::info!("All tasks shut down gracefully"),
-        Err(_) => tracing::warn!("Shutdown timeout - some tasks may not have completed"),
+        Ok(Ok(())) => tracing::info!("All tasks shut down gracefully"),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(anyhow!(
+                "shutdown timeout - some tasks may not have completed"
+            ))
+        }
     }
 
     tracing::info!("walrust shutdown complete");
@@ -391,7 +415,7 @@ async fn run_db_task(
     webhook_sender: Arc<WebhookSender>,
     metrics_state: Arc<MetricsState>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
-    cache_state: Option<CacheState>,
+    mut cache_state: Option<CacheState>,
 ) -> Result<()> {
     let db_name = state.db_state.name.clone();
     let wal_path = state.db_state.wal_path.clone();
@@ -435,11 +459,25 @@ async fn run_db_task(
                     .map(|m| m.len())
                     .unwrap_or(0);
                 if current_wal_size > last_synced_wal_size {
-                    let _ = do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await;
+                    do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref())
+                        .await
+                        .with_context(|| format!("{}: final sync before shutdown failed", db_name))?;
                 }
                 // Signal uploader to shutdown if cache is enabled
-                if let Some(ref cache) = cache_state {
-                    let _ = cache.upload_tx.send(UploadMessage::Shutdown).await;
+                if let Some(mut cache) = cache_state.take() {
+                    cache.upload_tx
+                        .send(UploadMessage::Shutdown)
+                        .await
+                        .map_err(|e| anyhow!("{}: failed to send uploader shutdown: {}", db_name, e))?;
+
+                    if let Some(handle) = cache.upload_handle.take() {
+                        let stats = tokio::time::timeout(Duration::from_secs(10), handle)
+                            .await
+                            .map_err(|_| anyhow!("{}: uploader drain timed out", db_name))?
+                            .map_err(|e| anyhow!("{}: uploader task panicked: {}", db_name, e))?
+                            .with_context(|| format!("{}: uploader drain failed", db_name))?;
+                        tracing::debug!("{}: Uploader drained successfully: {:?}", db_name, stats);
+                    }
                 }
                 break;
             }

@@ -28,7 +28,7 @@
 use crate::cache::LocalCache;
 use crate::retry::RetryPolicy;
 use crate::webhook::WebhookSender;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use hadb_storage::StorageBackend;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -257,7 +257,7 @@ impl Uploader {
                 // Wait for a slot if at capacity
                 while in_flight.len() >= self.max_concurrent {
                     if let Some(result) = in_flight.join_next().await {
-                        Self::handle_join_result(&self.ctx.db_name, result);
+                        Self::handle_join_result_nonfatal(&self.ctx.db_name, result)?;
                     }
                 }
                 let ctx = self.ctx.clone();
@@ -279,25 +279,26 @@ impl Uploader {
                         }
                         Some(UploadMessage::Shutdown) => {
                             info!("[{}] Uploader received shutdown signal, draining {} in-flight", self.ctx.db_name, in_flight.len());
-                            while let Some(result) = in_flight.join_next().await {
-                                Self::handle_join_result(&self.ctx.db_name, result);
-                            }
+                            Self::drain_in_flight(&self.ctx.db_name, &mut in_flight).await?;
                             break;
                         }
                         None => {
                             info!("[{}] Upload channel closed, draining {} in-flight", self.ctx.db_name, in_flight.len());
-                            while let Some(result) = in_flight.join_next().await {
-                                Self::handle_join_result(&self.ctx.db_name, result);
-                            }
+                            Self::drain_in_flight(&self.ctx.db_name, &mut in_flight).await?;
                             break;
                         }
                     }
                 }
                 // Reap completed uploads when at capacity (or any time one finishes)
                 Some(result) = in_flight.join_next() => {
-                    Self::handle_join_result(&self.ctx.db_name, result);
+                    Self::handle_join_result_nonfatal(&self.ctx.db_name, result)?;
                 }
             }
+        }
+
+        let failed = self.ctx.cache.failed_uploads();
+        if !failed.is_empty() {
+            return Err(Self::failed_uploads_error(&failed));
         }
 
         let stats = self.ctx.stats.lock().await.clone();
@@ -309,19 +310,71 @@ impl Uploader {
         Ok(stats)
     }
 
+    async fn drain_in_flight(
+        db_name: &str,
+        in_flight: &mut JoinSet<Result<UploadResult>>,
+    ) -> Result<()> {
+        let mut first_error = None;
+        while let Some(result) = in_flight.join_next().await {
+            if let Err(e) = Self::handle_join_result(db_name, result) {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+
+    fn failed_uploads_error(failed: &[u64]) -> anyhow::Error {
+        let txids = failed
+            .iter()
+            .map(|txid| format!("TXID {txid}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        anyhow!("Failed to upload {txids}; uploader shutdown cannot confirm durable backup")
+    }
+
+    /// Handle a JoinSet result during steady-state operation.
+    ///
+    /// Upload failures are recorded in the cache and stats by `upload_txid`;
+    /// keep the uploader alive so operators/recovery paths can retry them.
+    /// Task panics still tear down the uploader because task state is unknown.
+    fn handle_join_result_nonfatal(
+        db_name: &str,
+        result: Result<Result<UploadResult>, tokio::task::JoinError>,
+    ) -> Result<()> {
+        match result {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => {
+                error!("[{}] Upload task failed: {}", db_name, e);
+                Ok(())
+            }
+            Err(e) => {
+                error!("[{}] Upload task panicked: {}", db_name, e);
+                Err(anyhow!("upload task panicked: {e}"))
+            }
+        }
+    }
+
     /// Handle a JoinSet result
     fn handle_join_result(
         db_name: &str,
         result: Result<Result<UploadResult>, tokio::task::JoinError>,
-    ) {
+    ) -> Result<()> {
         match result {
-            Ok(Ok(_)) => {}
+            Ok(Ok(_)) => Ok(()),
             Ok(Err(e)) => {
                 // Stats already updated inside upload_txid
                 error!("[{}] Upload task failed: {}", db_name, e);
+                Err(e)
             }
             Err(e) => {
                 error!("[{}] Upload task panicked: {}", db_name, e);
+                Err(anyhow!("upload task panicked: {e}"))
             }
         }
     }
@@ -338,14 +391,13 @@ impl Uploader {
 /// ensuring in-flight uploads finish before the runtime exits.
 pub fn spawn_uploader(
     uploader: Arc<Uploader>,
-) -> (mpsc::Sender<UploadMessage>, tokio::task::JoinHandle<()>) {
+) -> (
+    mpsc::Sender<UploadMessage>,
+    tokio::task::JoinHandle<Result<UploaderStats>>,
+) {
     let (tx, rx) = mpsc::channel(1000); // Buffer 1000 upload notifications
 
-    let handle = tokio::spawn(async move {
-        if let Err(e) = uploader.run(rx).await {
-            error!("Uploader task failed: {}", e);
-        }
-    });
+    let handle = tokio::spawn(async move { uploader.run(rx).await });
 
     (tx, handle)
 }
@@ -727,6 +779,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_uploader_shutdown_returns_error_after_failed_upload() {
+        let storage = Arc::new(MockStorage::with_failures(100));
+        let (uploader, cache, _temp) = setup_uploader_with_storage(storage, 1);
+
+        let (tx, rx) = mpsc::channel(10);
+        let uploader_clone = uploader.clone();
+        let task = tokio::spawn(async move { uploader_clone.run(rx).await });
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        cache.write_ltx(1, b"data").unwrap();
+        tx.send(UploadMessage::Upload(1)).await.unwrap();
+        tx.send(UploadMessage::Shutdown).await.unwrap();
+
+        let err = timeout(Duration::from_secs(5), task)
+            .await
+            .expect("uploader should finish shutdown drain")
+            .unwrap()
+            .expect_err("failed uploads during shutdown drain must be returned");
+
+        assert!(
+            err.to_string().contains("Failed to upload TXID 1"),
+            "error should identify the failed upload: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_uploader_stats_tracking() {
         let (uploader, cache, _storage, _temp) = setup_uploader();
 
@@ -771,7 +850,8 @@ mod tests {
         assert_eq!(storage.object_count(), 1);
 
         tx.send(UploadMessage::Shutdown).await.unwrap();
-        handle.await.unwrap(); // Verify handle completes
+        let stats = handle.await.unwrap().unwrap();
+        assert_eq!(stats.uploads_succeeded, 2);
     }
 
     // ============================================
