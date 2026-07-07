@@ -186,6 +186,17 @@ fix removes that divergent lineage.
   read transaction (or backup API / VACUUM INTO); compute db_checksum from
   the bytes actually encoded, in one pass.
 
+Status: Fixed — core snapshot paths now checkpoint/reset the WAL cursor and
+encode from a stable SQLite `VACUUM INTO` copy; root snapshot paths use the
+same stable-copy helper. Both trees return the checksum from the bytes encoded
+into the snapshot instead of re-reading the live DB after upload. The raw
+`encode_snapshot` helpers remain for already-stable byte fixtures, while
+production callers use `encode_sqlite_snapshot*`. Proven by
+`sync::tests::take_snapshot_state_checksum_matches_uploaded_snapshot_bytes` in
+`walrust-core`, and
+`ltx::tests::test_encode_sqlite_snapshot_includes_wal_and_returns_encoded_checksum`
+in both trees.
+
 ### A8 — Cache-mode uploads are unrestorable (key layout mismatch)
 - Uploader PUTs flat keys: `src/uploader.rs:100`
   `format!("{}/{:08}.ltx", prefix, txid)`. Discovery/restore parse only

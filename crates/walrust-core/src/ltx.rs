@@ -13,7 +13,8 @@ use hadb_changeset::physical::{
     self, PageEntry, PageId, PageIdSize, PhysicalChangeset, PhysicalHeader,
 };
 use std::io::Read;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// SQLite page ID size (u32).
 pub const SQLITE_PAGE_ID_SIZE: PageIdSize = PageIdSize::U32;
@@ -35,6 +36,36 @@ pub fn encode_snapshot(
     seq: u64,
     prev_checksum: u64,
 ) -> Result<Vec<u8>> {
+    encode_snapshot_with_checksum(db_path, page_size, seq, prev_checksum)
+        .map(|encoded| encoded.bytes)
+}
+
+#[derive(Debug)]
+pub struct EncodedSnapshot {
+    pub bytes: Vec<u8>,
+    pub checksum: u64,
+}
+
+/// Create an HADBP snapshot from a stable SQLite backup copy.
+pub fn encode_sqlite_snapshot(
+    db_path: &Path,
+    page_size: u32,
+    seq: u64,
+    prev_checksum: u64,
+) -> Result<EncodedSnapshot> {
+    let snapshot = StableSqliteSnapshot::create(db_path)?;
+    encode_snapshot_with_checksum(snapshot.path(), page_size, seq, prev_checksum)
+}
+
+/// Create an HADBP changeset from an already-stable database image and return
+/// the checksum of the database bytes that were encoded.
+pub fn encode_snapshot_with_checksum(
+    db_path: &Path,
+    page_size: u32,
+    seq: u64,
+    prev_checksum: u64,
+) -> Result<EncodedSnapshot> {
+    use sha2::{Digest, Sha256};
     use std::io::BufReader;
 
     let file = std::fs::File::open(db_path)
@@ -44,10 +75,12 @@ pub fn encode_snapshot(
 
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
     let mut pages = Vec::with_capacity(num_pages);
+    let mut hasher = Sha256::new();
 
     for i in 0..num_pages {
         let mut page_buf = vec![0u8; page_size as usize];
         reader.read_exact(&mut page_buf)?;
+        hasher.update(&page_buf);
         // SQLite uses 1-based page numbers
         pages.push(PageEntry {
             page_id: PageId::U32((i + 1) as u32),
@@ -57,7 +90,60 @@ pub fn encode_snapshot(
 
     let changeset =
         PhysicalChangeset::new(seq, prev_checksum, SQLITE_PAGE_ID_SIZE, page_size, pages);
-    Ok(physical::encode(&changeset))
+    let checksum = {
+        let result = hasher.finalize();
+        u64::from_be_bytes(result[0..8].try_into().expect("sha256 is 32 bytes"))
+    };
+    Ok(EncodedSnapshot {
+        bytes: physical::encode(&changeset),
+        checksum,
+    })
+}
+
+struct StableSqliteSnapshot {
+    path: PathBuf,
+}
+
+impl StableSqliteSnapshot {
+    fn create(source: &Path) -> Result<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let parent = source.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("database");
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{file_name}.walrust-snapshot-{}-{id}.db",
+            std::process::id()
+        ));
+
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+
+        let dest = path
+            .to_str()
+            .ok_or_else(|| anyhow!("snapshot path is not valid UTF-8: {}", path.display()))?;
+        let conn = rusqlite::Connection::open(source)
+            .map_err(|e| anyhow!("Failed to open database for stable snapshot: {}", e))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        conn.execute("VACUUM INTO ?1", [dest])
+            .map_err(|e| anyhow!("Failed to create stable SQLite snapshot: {}", e))?;
+
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StableSqliteSnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Result of decoding an HADBP snapshot, including the post-apply checksum for chain verification.
@@ -292,6 +378,40 @@ mod tests {
         assert_eq!(db_data, restored_data);
         assert_eq!(result.header.page_size, page_size);
         assert_eq!(result.header.seq, 1);
+    }
+
+    #[test]
+    fn test_encode_sqlite_snapshot_includes_wal_and_returns_encoded_checksum() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("wal-resident.db");
+        let restored_path = dir.path().join("restored.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA page_size=4096;
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            INSERT INTO items (id, value) VALUES (2, 'wal-resident');
+            ",
+        )
+        .unwrap();
+
+        let encoded = encode_sqlite_snapshot(&db_path, 4096, 1, 0).unwrap();
+        let decoded = decode_to_db(&encoded.bytes, &restored_path).unwrap();
+
+        let restored = rusqlite::Connection::open(&restored_path).unwrap();
+        let count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(encoded.checksum, decoded.checksum);
+        assert_eq!(
+            encoded.checksum,
+            compute_checksum_from_file(&restored_path).unwrap()
+        );
     }
 
     #[test]

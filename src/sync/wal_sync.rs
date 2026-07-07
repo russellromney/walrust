@@ -49,23 +49,19 @@ pub(crate) async fn sync_wal_concurrent(
         };
 
         let db_path_for_encode = input.db_path.clone();
-        let db_size = std::fs::metadata(&input.db_path)?.len() as usize;
-        let estimated_size = db_size.saturating_mul(2);
         let db_name_for_error = input.name.clone();
         let new_txid = 1u64; // Initial snapshot is TXID 1
 
         let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
-            let mut ltx_buffer = Vec::with_capacity(estimated_size);
-            ltx::encode_snapshot(&mut ltx_buffer, &db_path_for_encode, page_size, new_txid)
-                .map_err(|e| {
+            ltx::encode_sqlite_snapshot_to_vec(&db_path_for_encode, page_size, new_txid).map_err(
+                |e| {
                     anyhow::anyhow!(
                         "{}: Initial snapshot encode failed: {}",
                         db_name_for_error,
                         e
                     )
-                })?;
-            let db_checksum = ltx::compute_checksum_from_file(&db_path_for_encode)?;
-            Ok::<_, anyhow::Error>((ltx_buffer, db_checksum))
+                },
+            )
         })
         .await??;
 
@@ -286,24 +282,17 @@ async fn upload_rollover_snapshot(
 
     let page_size = get_page_size(&input.db_path).await?;
     let db_path_for_encode = input.db_path.clone();
-    let db_size = std::fs::metadata(&input.db_path)?.len() as usize;
-    let estimated_size = db_size.saturating_mul(2);
     let new_txid = input.current_txid + 1;
     let db_name_for_error = input.name.clone();
 
     let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
-        let mut ltx_buffer = Vec::with_capacity(estimated_size);
-        ltx::encode_snapshot(&mut ltx_buffer, &db_path_for_encode, page_size, new_txid).map_err(
-            |e| {
-                anyhow::anyhow!(
-                    "{}: Rollover snapshot encode failed: {}",
-                    db_name_for_error,
-                    e
-                )
-            },
-        )?;
-        let db_checksum = ltx::compute_checksum_from_file(&db_path_for_encode)?;
-        Ok::<_, anyhow::Error>((ltx_buffer, db_checksum))
+        ltx::encode_sqlite_snapshot_to_vec(&db_path_for_encode, page_size, new_txid).map_err(|e| {
+            anyhow::anyhow!(
+                "{}: Rollover snapshot encode failed: {}",
+                db_name_for_error,
+                e
+            )
+        })
     })
     .await??;
 
@@ -522,23 +511,19 @@ pub(crate) async fn sync_wal_to_cache(
         };
 
         let db_path_for_encode = input.db_path.clone();
-        let db_size = std::fs::metadata(&input.db_path)?.len() as usize;
-        let estimated_size = db_size.saturating_mul(2);
         let db_name_for_error = input.name.clone();
         let new_txid = 1u64;
 
         let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
-            let mut ltx_buffer = Vec::with_capacity(estimated_size);
-            ltx::encode_snapshot(&mut ltx_buffer, &db_path_for_encode, page_size, new_txid)
-                .map_err(|e| {
+            ltx::encode_sqlite_snapshot_to_vec(&db_path_for_encode, page_size, new_txid).map_err(
+                |e| {
                     anyhow::anyhow!(
                         "{}: Initial snapshot encode failed: {}",
                         db_name_for_error,
                         e
                     )
-                })?;
-            let db_checksum = ltx::compute_checksum_from_file(&db_path_for_encode)?;
-            Ok::<_, anyhow::Error>((ltx_buffer, db_checksum))
+                },
+            )
         })
         .await??;
 
@@ -817,20 +802,13 @@ pub(crate) async fn take_snapshot(
     // Snapshots go to generation 1+ (litestream format)
     let ltx_key = build_ltx_key(prefix, &state.name, snapshot_gen, 1, new_txid);
 
-    // Encode database as LTX
-    // Pre-allocate buffer: estimate 2x db size for compression headroom
-    let db_size = std::fs::metadata(&state.db_path)?.len() as usize;
-    let estimated_size = db_size.saturating_mul(2);
-    let mut ltx_buffer = Vec::with_capacity(estimated_size);
-    ltx::encode_snapshot(&mut ltx_buffer, &state.db_path, page_size, new_txid)?;
+    let (ltx_buffer, db_checksum) =
+        ltx::encode_sqlite_snapshot_to_vec(&state.db_path, page_size, new_txid)?;
 
     let ltx_size = ltx_buffer.len() as u64;
 
     // Upload LTX file
     s3::upload_bytes(client, bucket, &ltx_key, ltx_buffer).await?;
-
-    // Compute checksum from database for future incremental LTX
-    let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
 
     tracing::info!(
         "{}: LTX snapshot uploaded (gen {}, TXID 1-{}, {} bytes, checksum {:#x}) -> {}",

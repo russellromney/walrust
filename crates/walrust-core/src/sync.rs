@@ -1084,14 +1084,14 @@ pub async fn take_snapshot(
     let new_seq = state.current_seq + 1;
 
     let prev_checksum = state.db_checksum.unwrap_or(0);
-    let changeset_bytes = ltx::encode_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let snapshot = ltx::encode_sqlite_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let db_checksum = snapshot.checksum;
+    let changeset_bytes = snapshot.bytes;
 
     let changeset_size = changeset_bytes.len() as u64;
     let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_SNAPSHOT, new_seq);
 
     storage.put(&changeset_key, &changeset_bytes).await?;
-
-    let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
 
     tracing::info!(
         "{}: HADBP snapshot uploaded ({} bytes, seq {}) -> {}",
@@ -1345,7 +1345,9 @@ pub async fn take_snapshot_with_retry(
 
     let new_seq = state.current_seq + 1;
     let prev_checksum = state.db_checksum.unwrap_or(0);
-    let changeset_bytes = ltx::encode_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let snapshot = ltx::encode_sqlite_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let db_checksum = snapshot.checksum;
+    let changeset_bytes = snapshot.bytes;
 
     let changeset_size = changeset_bytes.len() as u64;
     let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_SNAPSHOT, new_seq);
@@ -1360,8 +1362,6 @@ pub async fn take_snapshot_with_retry(
             async move { storage.put(&key, &data_arc).await }
         })
         .await?;
-
-    let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
 
     tracing::info!(
         "{}: HADBP snapshot uploaded ({} bytes, seq {}) -> {}",
@@ -3308,6 +3308,136 @@ mod tests {
         assert!(
             err.to_string().contains("equivocation"),
             "error must name equivocation, got: {err}"
+        );
+    }
+
+    struct MutateSourceOnPutStorage {
+        objects: Arc<Mutex<StdHashMap<String, Vec<u8>>>>,
+        db_path: PathBuf,
+        mutated: Arc<Mutex<bool>>,
+    }
+
+    impl MutateSourceOnPutStorage {
+        fn new(db_path: PathBuf) -> Self {
+            Self {
+                objects: Arc::new(Mutex::new(StdHashMap::new())),
+                db_path,
+                mutated: Arc::new(Mutex::new(false)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for MutateSourceOnPutStorage {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.objects.lock().unwrap().get(key).cloned())
+        }
+
+        async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), data.to_vec());
+
+            let mut mutated = self.mutated.lock().unwrap();
+            if !*mutated {
+                let conn = rusqlite::Connection::open(&self.db_path)?;
+                conn.execute_batch(
+                    "
+                    PRAGMA journal_mode=WAL;
+                    INSERT INTO items (id, value) VALUES (2, 'after-upload');
+                    ",
+                )?;
+                *mutated = true;
+            }
+
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+            let mut keys: Vec<String> = self
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .filter(|k| after.map(|a| k.as_str() > a).unwrap_or(true))
+                .cloned()
+                .collect();
+            keys.sort();
+            Ok(keys)
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+            self.put(key, data).await?;
+            Ok(CasResult {
+                success: true,
+                etag: Some("test".into()),
+            })
+        }
+
+        async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
+            self.put(key, data).await?;
+            Ok(CasResult {
+                success: true,
+                etag: Some("test".into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn take_snapshot_state_checksum_matches_uploaded_snapshot_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("checksum-race.db");
+        let restored_path = dir.path().join("restored.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'uploaded');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = MutateSourceOnPutStorage::new(db_path.clone());
+        let mut state = SyncState::new(db_path.clone()).unwrap();
+        state.name = "checksum_race".to_string();
+        state.init_checksum().unwrap();
+
+        take_snapshot_with_retry(
+            &storage,
+            "prefix/",
+            &mut state,
+            &RetryPolicy::default_policy(),
+        )
+        .await
+        .unwrap();
+
+        let key = build_changeset_key(
+            "prefix/",
+            &state.name,
+            GENERATION_SNAPSHOT,
+            state.current_seq,
+        );
+        let uploaded = storage.get(&key).await.unwrap().expect("snapshot uploaded");
+        let decoded = ltx::decode_to_db(&uploaded, &restored_path).unwrap();
+
+        assert_eq!(
+            state.db_checksum,
+            Some(decoded.checksum),
+            "state checksum must describe the uploaded snapshot bytes, not a later live-file read"
         );
     }
 

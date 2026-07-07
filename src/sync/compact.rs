@@ -215,12 +215,7 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
     // Snapshots go to generation 1+ (litestream format)
     let ltx_key = build_ltx_key(&prefix, name, snapshot_gen, 1, new_txid);
 
-    // Encode database as LTX
-    // Pre-allocate buffer: estimate 2x db size for compression headroom
-    let db_size = std::fs::metadata(database)?.len() as usize;
-    let estimated_size = db_size.saturating_mul(2);
-    let mut ltx_buffer = Vec::with_capacity(estimated_size);
-    ltx::encode_snapshot(&mut ltx_buffer, database, page_size, new_txid)?;
+    let (ltx_buffer, _) = ltx::encode_sqlite_snapshot_to_vec(database, page_size, new_txid)?;
 
     let ltx_size = ltx_buffer.len() as u64;
 

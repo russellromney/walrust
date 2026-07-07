@@ -6,7 +6,8 @@
 use anyhow::{anyhow, Result};
 use litepages::{Checksum, Decoder, Encoder, Header, HeaderFlags, PageNum, PageSize, TXID};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 
 /// Create an LTX file from a SQLite database snapshot.
@@ -19,6 +20,42 @@ pub fn encode_snapshot<W: Write>(
     page_size: u32,
     txid: u64,
 ) -> Result<()> {
+    encode_snapshot_with_checksum(writer, db_path, page_size, txid).map(|_| ())
+}
+
+/// Create an LTX snapshot from a stable SQLite backup copy and return the
+/// checksum of the database bytes that were actually encoded.
+pub fn encode_sqlite_snapshot_to_vec(
+    db_path: &Path,
+    page_size: u32,
+    txid: u64,
+) -> Result<(Vec<u8>, Checksum)> {
+    let db_size = std::fs::metadata(db_path)?.len() as usize;
+    let mut buffer = Vec::with_capacity(db_size.saturating_mul(2));
+    let checksum = encode_sqlite_snapshot(&mut buffer, db_path, page_size, txid)?;
+    Ok((buffer, checksum))
+}
+
+/// Create an LTX snapshot from a stable SQLite backup copy and return the
+/// checksum of the database bytes that were actually encoded.
+pub fn encode_sqlite_snapshot<W: Write>(
+    writer: W,
+    db_path: &Path,
+    page_size: u32,
+    txid: u64,
+) -> Result<Checksum> {
+    let snapshot = StableSqliteSnapshot::create(db_path)?;
+    encode_snapshot_with_checksum(writer, snapshot.path(), page_size, txid)
+}
+
+/// Create an LTX file from an already-stable database image and return the
+/// checksum of the bytes encoded into the snapshot.
+pub fn encode_snapshot_with_checksum<W: Write>(
+    writer: W,
+    db_path: &Path,
+    page_size: u32,
+    txid: u64,
+) -> Result<Checksum> {
     use sha2::{Digest, Sha256};
     use std::io::BufReader;
 
@@ -58,7 +95,53 @@ pub fn encode_snapshot<W: Write>(
     let checksum = Checksum::new(u64::from_be_bytes(result[0..8].try_into().unwrap()));
     encoder.finish(checksum)?;
 
-    Ok(())
+    Ok(checksum)
+}
+
+struct StableSqliteSnapshot {
+    path: PathBuf,
+}
+
+impl StableSqliteSnapshot {
+    fn create(source: &Path) -> Result<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let parent = source.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("database");
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{file_name}.walrust-snapshot-{}-{id}.db",
+            std::process::id()
+        ));
+
+        if path.exists() {
+            std::fs::remove_file(&path)?;
+        }
+
+        let dest = path
+            .to_str()
+            .ok_or_else(|| anyhow!("snapshot path is not valid UTF-8: {}", path.display()))?;
+        let conn = rusqlite::Connection::open(source)
+            .map_err(|e| anyhow!("Failed to open database for stable snapshot: {}", e))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        conn.execute("VACUUM INTO ?1", [dest])
+            .map_err(|e| anyhow!("Failed to create stable SQLite snapshot: {}", e))?;
+
+        Ok(Self { path })
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+impl Drop for StableSqliteSnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
 }
 
 /// Result of decoding an LTX snapshot, including the post-apply checksum for chain verification
@@ -513,6 +596,40 @@ mod tests {
         assert_eq!(result.header.page_size.into_inner(), page_size);
         assert_eq!(result.header.min_txid.into_inner(), 1);
         assert_eq!(result.header.max_txid.into_inner(), 1);
+    }
+
+    #[test]
+    fn test_encode_sqlite_snapshot_includes_wal_and_returns_encoded_checksum() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("wal-resident.db");
+        let restored_path = dir.path().join("restored.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA page_size=4096;
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            INSERT INTO items (id, value) VALUES (2, 'wal-resident');
+            ",
+        )
+        .unwrap();
+
+        let (encoded, encoded_checksum) = encode_sqlite_snapshot_to_vec(&db_path, 4096, 1).unwrap();
+        let decoded = decode_to_db(std::io::Cursor::new(encoded), &restored_path).unwrap();
+
+        let restored = rusqlite::Connection::open(&restored_path).unwrap();
+        let count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(count, 2);
+        assert_eq!(encoded_checksum, decoded.post_apply_checksum);
+        assert_eq!(
+            encoded_checksum,
+            compute_checksum_from_file(&restored_path).unwrap()
+        );
     }
 
     #[test]
