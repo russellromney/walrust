@@ -1,6 +1,6 @@
 // Module declarations
 mod compact;
-mod manifest;
+pub(crate) mod manifest;
 mod shadow;
 mod types;
 mod wal_sync;

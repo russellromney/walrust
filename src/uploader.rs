@@ -27,6 +27,7 @@
 
 use crate::cache::LocalCache;
 use crate::retry::RetryPolicy;
+use crate::sync::manifest::build_ltx_key;
 use crate::webhook::WebhookSender;
 use anyhow::{anyhow, Context, Result};
 use hadb_storage::StorageBackend;
@@ -96,8 +97,8 @@ impl UploadTaskContext {
 
         let data_len = data.len() as u64;
 
-        // Upload with retry loop
-        let key = format!("{}/{:08}.ltx", self.prefix, txid);
+        let (generation, min_txid, max_txid) = self.cache.remote_key_parts(txid);
+        let key = build_ltx_key(&self.prefix, &self.db_name, generation, min_txid, max_txid);
         let mut attempts = 0u32;
         let max_retries = self.retry_policy.config().max_retries;
 
@@ -219,6 +220,11 @@ impl Uploader {
         webhook_sender: Arc<WebhookSender>,
         max_concurrent: usize,
     ) -> Self {
+        let prefix = if prefix.is_empty() || prefix.ends_with('/') {
+            prefix
+        } else {
+            format!("{prefix}/")
+        };
         Self {
             ctx: UploadTaskContext {
                 db_name,
@@ -620,6 +626,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_uploader_basic_upload() {
+        use crate::ltx::{chain_checksum, encode_wal_changes};
+        use litepages::Checksum;
+
         let (uploader, cache, storage, _temp) = setup_uploader();
 
         let (tx, rx) = mpsc::channel(10);
@@ -628,8 +637,24 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(10)).await;
 
-        cache.write_ltx(1, b"test data").unwrap();
-        tx.send(UploadMessage::Upload(1)).await.unwrap();
+        let pages = vec![(1u32, vec![0x42; 4096])];
+        let pre_checksum = Checksum::new(1);
+        let post_checksum = chain_checksum(pre_checksum, &pages);
+        let mut ltx = Vec::new();
+        encode_wal_changes(
+            &mut ltx,
+            &pages,
+            4096,
+            2,
+            3,
+            1,
+            Some(pre_checksum),
+            post_checksum,
+        )
+        .unwrap();
+
+        cache.write_ltx(3, &ltx).unwrap();
+        tx.send(UploadMessage::Upload(3)).await.unwrap();
         tx.send(UploadMessage::Shutdown).await.unwrap();
 
         let stats = task.await.unwrap().unwrap();
@@ -637,14 +662,16 @@ mod tests {
         assert_eq!(stats.uploads_attempted, 1);
         assert_eq!(stats.uploads_succeeded, 1);
         assert_eq!(stats.uploads_failed, 0);
-        assert_eq!(stats.last_uploaded_txid, 1);
+        assert_eq!(stats.last_uploaded_txid, 3);
 
         assert_eq!(storage.object_count(), 1);
-        let data = storage.get_object("test-prefix/00000001.ltx").unwrap();
-        assert_eq!(data, b"test data");
+        let data = storage
+            .get_object("test-prefix/test_db/0000/0000000000000002-0000000000000003.ltx")
+            .unwrap();
+        assert_eq!(data, ltx);
 
         assert_eq!(cache.pending_uploads().len(), 0);
-        assert_eq!(cache.last_uploaded_txid(), 1);
+        assert_eq!(cache.last_uploaded_txid(), 3);
     }
 
     #[tokio::test]

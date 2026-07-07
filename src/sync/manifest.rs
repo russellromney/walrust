@@ -1,4 +1,6 @@
 use anyhow::Result;
+use litepages::Decoder;
+use std::io::Cursor;
 
 use super::types::Manifest;
 use crate::s3;
@@ -44,6 +46,41 @@ pub(crate) fn parse_ltx_filename(filename: &str) -> Option<(u64, u64)> {
     Some((min_txid, max_txid))
 }
 
+fn parse_legacy_flat_ltx_filename(filename: &str) -> Option<u64> {
+    let name = filename.strip_suffix(".ltx")?;
+    if name.contains('-') || name.len() != 8 {
+        return None;
+    }
+    name.parse::<u64>().ok()
+}
+
+fn prefix_with_separator(prefix: &str) -> String {
+    if prefix.is_empty() || prefix.ends_with('/') {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/")
+    }
+}
+
+fn database_prefix(prefix: &str, db_name: &str) -> String {
+    format!("{}{}/", prefix_with_separator(prefix), db_name)
+}
+
+async fn legacy_flat_ltx_range(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    key: &str,
+    txid: u64,
+) -> (u64, u64) {
+    let Ok(bytes) = s3::download_bytes(client, bucket, key).await else {
+        return (txid, txid);
+    };
+    let Ok((_, header)) = Decoder::new(Cursor::new(bytes)) else {
+        return (txid, txid);
+    };
+    (header.min_txid.into_inner(), header.max_txid.into_inner())
+}
+
 /// Format generation folder name (4-char hex)
 pub(crate) fn format_generation(gen: u64) -> String {
     format!("{:04x}", gen)
@@ -66,7 +103,7 @@ pub(crate) fn build_ltx_key(
 ) -> String {
     format!(
         "{}{}/{}/{}",
-        prefix,
+        prefix_with_separator(prefix),
         db_name,
         format_generation(generation),
         format_ltx_filename(min_txid, max_txid)
@@ -132,7 +169,7 @@ pub(crate) async fn discover_state_from_s3(
     db_name: &str,
 ) -> Result<(u64, u64, Option<u64>)> {
     // List all objects under db_name/
-    let db_prefix = format!("{}{}/", prefix, db_name);
+    let db_prefix = database_prefix(prefix, db_name);
     let objects = s3::list_objects(client, bucket, &db_prefix).await?;
 
     if objects.is_empty() {
@@ -159,6 +196,12 @@ pub(crate) async fn discover_state_from_s3(
                     }
                 }
             }
+        } else if parts.len() == 1 {
+            if let Some(file_max_txid) = parse_legacy_flat_ltx_filename(parts[0]) {
+                if file_max_txid > max_txid {
+                    max_txid = file_max_txid;
+                }
+            }
         }
     }
 
@@ -175,7 +218,7 @@ pub(crate) async fn find_latest_snapshot(
     db_name: &str,
 ) -> Result<Option<(u64, String, u64, u64)>> {
     // Returns: (generation, key, min_txid, max_txid)
-    let db_prefix = format!("{}{}/", prefix, db_name);
+    let db_prefix = database_prefix(prefix, db_name);
     let objects = s3::list_objects(client, bucket, &db_prefix).await?;
 
     let mut best_snapshot: Option<(u64, String, u64, u64)> = None;
@@ -204,6 +247,24 @@ pub(crate) async fn find_latest_snapshot(
                     }
                 }
             }
+        } else if parts.len() == 1 {
+            if let Some(txid) = parse_legacy_flat_ltx_filename(parts[0]) {
+                let (min_txid, max_txid) = legacy_flat_ltx_range(client, bucket, key, txid).await;
+                if min_txid == 1 {
+                    match &best_snapshot {
+                        None => {
+                            best_snapshot =
+                                Some((GENERATION_LIVE, key.clone(), min_txid, max_txid));
+                        }
+                        Some((best_gen, _, _, best_max)) => {
+                            if *best_gen == GENERATION_LIVE && max_txid > *best_max {
+                                best_snapshot =
+                                    Some((GENERATION_LIVE, key.clone(), min_txid, max_txid));
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -219,13 +280,34 @@ pub(crate) async fn list_generation_files(
     generation: u64,
 ) -> Result<Vec<(String, u64, u64)>> {
     // Returns: Vec<(key, min_txid, max_txid)>
-    let gen_prefix = format!("{}{}/{}/", prefix, db_name, format_generation(generation));
+    let gen_prefix = format!(
+        "{}{}/",
+        database_prefix(prefix, db_name),
+        format_generation(generation)
+    );
     let objects = s3::list_objects(client, bucket, &gen_prefix).await?;
 
     let mut files = Vec::new();
     for key in objects {
         let filename = key.rsplit('/').next().unwrap_or(&key);
         if let Some((min_txid, max_txid)) = parse_ltx_filename(filename) {
+            files.push((key, min_txid, max_txid));
+        }
+    }
+
+    if generation == GENERATION_LIVE {
+        let db_prefix = database_prefix(prefix, db_name);
+        let legacy_objects = s3::list_objects(client, bucket, &db_prefix).await?;
+        for key in legacy_objects {
+            let relative = key.strip_prefix(&db_prefix).unwrap_or(&key);
+            let parts: Vec<&str> = relative.split('/').collect();
+            if parts.len() != 1 {
+                continue;
+            }
+            let Some(txid) = parse_legacy_flat_ltx_filename(parts[0]) else {
+                continue;
+            };
+            let (min_txid, max_txid) = legacy_flat_ltx_range(client, bucket, &key, txid).await;
             files.push((key, min_txid, max_txid));
         }
     }
@@ -295,7 +377,7 @@ pub(crate) async fn load_manifest(
     prefix: &str,
     db_name: &str,
 ) -> Result<Manifest> {
-    let manifest_key = format!("{}{}/manifest.json", prefix, db_name);
+    let manifest_key = format!("{}manifest.json", database_prefix(prefix, db_name));
     match s3::download_bytes(client, bucket, &manifest_key).await {
         Ok(data) => Ok(serde_json::from_slice(&data)?),
         Err(_) => Ok(Manifest {
@@ -312,7 +394,7 @@ pub(crate) async fn save_manifest(
     prefix: &str,
     manifest: &Manifest,
 ) -> Result<()> {
-    let manifest_key = format!("{}{}/manifest.json", prefix, manifest.name);
+    let manifest_key = format!("{}manifest.json", database_prefix(prefix, &manifest.name));
     s3::upload_bytes(
         client,
         bucket,
@@ -321,4 +403,35 @@ pub(crate) async fn save_manifest(
     )
     .await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_ltx_key_normalizes_prefix_separator() {
+        assert_eq!(
+            build_ltx_key("base", "db", 0, 2, 3),
+            "base/db/0000/0000000000000002-0000000000000003.ltx"
+        );
+        assert_eq!(
+            build_ltx_key("base/", "db", 0, 2, 3),
+            "base/db/0000/0000000000000002-0000000000000003.ltx"
+        );
+        assert_eq!(
+            build_ltx_key("", "db", 1, 1, 1),
+            "db/0001/0000000000000001-0000000000000001.ltx"
+        );
+    }
+
+    #[test]
+    fn parse_legacy_flat_ltx_filename_accepts_only_old_cache_shape() {
+        assert_eq!(parse_legacy_flat_ltx_filename("00000003.ltx"), Some(3));
+        assert_eq!(parse_legacy_flat_ltx_filename("0000000000000003.ltx"), None);
+        assert_eq!(
+            parse_legacy_flat_ltx_filename("0000000000000002-0000000000000003.ltx"),
+            None
+        );
+    }
 }

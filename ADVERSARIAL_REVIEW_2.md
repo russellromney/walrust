@@ -212,6 +212,17 @@ in both trees.
 - Fix: one canonical key layout + one cache-dir convention shared by
   uploader, snapshot, discovery, restore; migration/detection for old keys.
 
+Status: Fixed — root cache uploads now publish through the canonical
+Litestream-style key builder (`db/GEN/min-max.ltx`) using LTX header range
+metadata stored in the cache manifest; both watch modes pass the same base
+prefix to the uploader, and independent-mode cache creation now uses an
+explicit cache directory instead of nesting `-walrust` twice. Discovery,
+snapshot selection, and live-generation listing also detect legacy flat
+`00000003.ltx` cache objects for migration. `walrust-core` is unaffected
+because it does not use the root `LocalCache`/uploader/LTX S3 key path. Proven
+by `uploader::tests::test_uploader_basic_upload` and
+`sync::manifest::tests::build_ltx_key_normalizes_prefix_separator`.
+
 ### A9 — PIT restore can only use the newest snapshot; GFS retention is dead weight
 - `src/sync/restore.rs:84` hard-codes `find_latest_snapshot` (no target
   param). If `target_txid < snapshot_max_txid`, restore always fails

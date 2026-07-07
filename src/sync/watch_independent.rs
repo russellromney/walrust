@@ -238,8 +238,7 @@ pub async fn watch_with_independent_tasks(
                 })?;
             }
 
-            // Create LocalCache
-            let cache = Arc::new(LocalCache::new(&cache_dir)?);
+            let cache = Arc::new(LocalCache::new_at(&cache_dir)?);
             tracing::debug!(
                 "{}: LocalCache initialized at {}",
                 name,
@@ -272,12 +271,11 @@ pub async fn watch_with_independent_tasks(
                 Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
 
             // Create Uploader
-            let s3_prefix = format!("{}/{}", prefix, name);
             let uploader = Arc::new(Uploader::new(
                 name.clone(),
                 Arc::clone(&cache),
                 storage,
-                s3_prefix,
+                prefix.clone(),
                 Arc::new(retry_policy.clone()),
                 Arc::clone(&webhook_sender),
                 cache_config.uploader_concurrency,

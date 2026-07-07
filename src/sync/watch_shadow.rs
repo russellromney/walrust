@@ -517,12 +517,11 @@ pub async fn watch_with_shadow(
             let cache = Arc::new(LocalCache::new(db_path)?);
             let storage: Arc<dyn StorageBackend> =
                 Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
-            let s3_prefix = format!("{}{}", prefix, name);
             let uploader = Arc::new(Uploader::new(
                 name.clone(),
                 Arc::clone(&cache),
                 storage,
-                s3_prefix,
+                prefix.clone(),
                 Arc::new(retry_policy.clone()),
                 Arc::clone(&webhook_sender),
                 cache_config.uploader_concurrency,

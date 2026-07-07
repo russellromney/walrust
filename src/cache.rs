@@ -18,9 +18,11 @@
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use litepages::Decoder;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -71,6 +73,12 @@ pub struct CacheEntry {
     /// incremental chain built on it (F8).
     #[serde(default)]
     pub is_snapshot: bool,
+    /// Minimum TXID encoded in this LTX file.
+    #[serde(default)]
+    pub min_txid: u64,
+    /// Maximum TXID encoded in this LTX file.
+    #[serde(default)]
+    pub max_txid: u64,
 }
 
 impl Default for CacheManifest {
@@ -85,6 +93,11 @@ impl Default for CacheManifest {
             entries: HashMap::new(),
         }
     }
+}
+
+fn ltx_txid_range(data: &[u8]) -> Option<(u64, u64)> {
+    let (_, header) = Decoder::new(Cursor::new(data)).ok()?;
+    Some((header.min_txid.into_inner(), header.max_txid.into_inner()))
 }
 
 /// Local LTX cache with atomic operations and crash recovery
@@ -105,6 +118,11 @@ impl LocalCache {
     /// - `{db_path}-walrust/ltx/`
     pub fn new(db_path: &Path) -> Result<Self> {
         let cache_dir = Self::cache_dir_for_db(db_path);
+        Self::new_at(&cache_dir)
+    }
+
+    /// Create or open a cache at an explicit cache directory.
+    pub fn new_at(cache_dir: &Path) -> Result<Self> {
         let manifest_path = cache_dir.join("manifest.json");
 
         // Create cache directory structure
@@ -123,7 +141,7 @@ impl LocalCache {
         };
 
         Ok(Self {
-            cache_dir,
+            cache_dir: cache_dir.to_path_buf(),
             manifest_path,
             manifest: Arc::new(Mutex::new(manifest)),
         })
@@ -236,6 +254,7 @@ impl LocalCache {
     fn write_ltx_inner(&self, txid: u64, data: &[u8], is_snapshot: bool) -> Result<()> {
         let ltx_path = self.ltx_path(txid);
         let tmp_path = ltx_path.with_extension("tmp");
+        let (min_txid, max_txid) = ltx_txid_range(data).unwrap_or((txid, txid));
 
         // Write to temp file
         fs::write(&tmp_path, data)
@@ -258,6 +277,8 @@ impl LocalCache {
                 uploaded: false,
                 uploaded_at: None,
                 is_snapshot,
+                min_txid,
+                max_txid,
             },
         );
 
@@ -270,6 +291,26 @@ impl LocalCache {
     pub fn read_ltx(&self, txid: u64) -> Result<Vec<u8>> {
         let ltx_path = self.ltx_path(txid);
         fs::read(&ltx_path).with_context(|| format!("Failed to read LTX file for TXID {}", txid))
+    }
+
+    /// Return the canonical remote key parts for a cached LTX file.
+    pub fn remote_key_parts(&self, txid: u64) -> (u64, u64, u64) {
+        let manifest = self.manifest.lock().unwrap();
+        let Some(entry) = manifest.entries.get(&txid) else {
+            return (0, txid, txid);
+        };
+        let generation = if entry.is_snapshot { 1 } else { 0 };
+        let min_txid = if entry.min_txid > 0 {
+            entry.min_txid
+        } else {
+            txid
+        };
+        let max_txid = if entry.max_txid > 0 {
+            entry.max_txid
+        } else {
+            txid
+        };
+        (generation, min_txid, max_txid)
     }
 
     /// Mark TXID as uploaded (PUT confirmed durable).
