@@ -321,6 +321,14 @@ Replica in-place apply/bootstrap remains open for the Phase 2 replica-half.
   (`watch_independent.rs:449-455`): TRUNCATE/RESTART resets never fire a
   sync; unbounded RPO on low-write DBs.
 - B7 — `remove()` and shutdown final syncs swallow upload failures
+  Status: Partial — core `Replicator::remove`, `run_replication`, and
+  `run_wal_replication` now return hard errors on final sync failure and
+  `remove` keeps the database registered. Proven by
+  `test_remove_keeps_database_registered_when_final_sync_fails`,
+  `test_run_replication_returns_final_sync_error_on_shutdown`, and
+  `test_run_wal_replication_returns_final_sync_error_on_shutdown`. Root
+  sidecar shutdown drain/final-upload paths remain open in the next B7
+  subcluster.
   (`replicator.rs:393-416`; `sync.rs:1733-1737, 1810-1813`; shadow-mode final
   sync only copies frames, never encodes/uploads, `watch_shadow.rs:760-769`;
   independent mode drops the uploader JoinHandle, `watch_independent.rs:287`).

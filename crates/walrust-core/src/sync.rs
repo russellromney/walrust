@@ -1802,7 +1802,7 @@ pub async fn run_replication(
                             tracing::info!("{}: Final sync captured {} frames before shutdown", state.name, frames);
                         }
                         Err(e) => {
-                            tracing::warn!("{}: Final sync failed: {}", state.name, e);
+                            return Err(anyhow!("{}: Final sync failed: {}", state.name, e));
                         }
                         _ => {}
                     }
@@ -1879,7 +1879,7 @@ pub async fn run_wal_replication(
                             tracing::info!("{}: Final sync captured {} frames before shutdown", state.name, frames);
                         }
                         Err(e) => {
-                            tracing::warn!("{}: Final sync failed: {}", state.name, e);
+                            return Err(anyhow!("{}: Final sync failed: {}", state.name, e));
                         }
                         _ => {}
                     }

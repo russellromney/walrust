@@ -11,7 +11,7 @@
 //! replicator.add("tenant-1", Path::new("/data/tenant-1.db")).await?;
 //! replicator.add("tenant-2", Path::new("/data/tenant-2.db")).await?;
 //! // ... background loop syncs both every tick ...
-//! replicator.remove("tenant-1").await;  // final sync, then drop
+//! replicator.remove("tenant-1").await?;  // final sync, then drop
 //! ```
 
 use std::collections::HashMap;
@@ -421,31 +421,35 @@ impl Replicator {
 
     /// Remove a database from replication.
     ///
-    /// Does a final sync before removing — blocks until the sync completes
-    /// (or fails). The caller should checkpoint/close the database AFTER this returns.
-    pub async fn remove(&self, name: &str) {
-        let entry = self.databases.write().await.remove(name);
+    /// Does a final sync before removing — blocks until the sync completes.
+    /// The caller should checkpoint/close the database only after this returns `Ok(())`.
+    pub async fn remove(&self, name: &str) -> Result<()> {
+        let entry = {
+            let databases = self.databases.read().await;
+            databases.get(name).cloned()
+        };
 
         if let Some(db_state) = entry {
             let mut s = db_state.lock().await;
             let prefix = s.prefix.clone();
             let external = self.config.snapshot_ownership.is_external();
-            let sync_result = sync_one_db(self.storage.as_ref(), &prefix, &mut s, external).await;
-            match sync_result {
-                Ok(frames) if frames > 0 => {
-                    tracing::info!(
-                        "Replicator: final sync for '{}' captured {} frames",
-                        name,
-                        frames
-                    );
-                }
-                Err(e) => {
-                    tracing::error!("Replicator: final sync for '{}' failed: {}", name, e);
-                }
-                _ => {}
+            let frames = sync_one_db(self.storage.as_ref(), &prefix, &mut s, external)
+                .await
+                .with_context(|| format!("Replicator: final sync for '{name}' failed"))?;
+            if frames > 0 {
+                tracing::info!(
+                    "Replicator: final sync for '{}' captured {} frames",
+                    name,
+                    frames
+                );
             }
+            drop(s);
+
+            self.databases.write().await.remove(name);
             tracing::info!("Replicator: removed '{}'", name);
         }
+
+        Ok(())
     }
 
     /// Restore a database from S3.

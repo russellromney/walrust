@@ -246,6 +246,15 @@ struct StateJsonGetFailsStorage {
     inner: Arc<MemStorage>,
 }
 
+struct PutFailsStorage {
+    inner: Arc<MemStorage>,
+}
+
+struct FailAfterPutsStorage {
+    inner: Arc<MemStorage>,
+    remaining_successful_puts: AtomicUsize,
+}
+
 impl StateJsonForbiddenStorage {
     fn new(inner: Arc<MemStorage>) -> Arc<Self> {
         Arc::new(Self { inner })
@@ -262,6 +271,21 @@ impl StateJsonForbiddenStorage {
 impl StateJsonGetFailsStorage {
     fn new(inner: Arc<MemStorage>) -> Arc<Self> {
         Arc::new(Self { inner })
+    }
+}
+
+impl PutFailsStorage {
+    fn new(inner: Arc<MemStorage>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+}
+
+impl FailAfterPutsStorage {
+    fn new(inner: Arc<MemStorage>, successful_puts: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            remaining_successful_puts: AtomicUsize::new(successful_puts),
+        })
     }
 }
 
@@ -313,6 +337,77 @@ impl StorageBackend for StateJsonGetFailsStorage {
 
     async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
         self.inner.put(key, data).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.inner.put_if_absent(key, data).await
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.inner.put_if_match(key, data, etag).await
+    }
+}
+
+#[async_trait]
+impl StorageBackend for PutFailsStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("injected put failure: {key}");
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.inner.put_if_absent(key, data).await
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.inner.put_if_match(key, data, etag).await
+    }
+}
+
+#[async_trait]
+impl StorageBackend for FailAfterPutsStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        if self
+            .remaining_successful_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return self.inner.put(key, data).await;
+        }
+        anyhow::bail!("injected put failure after allowed successes: {key}");
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
@@ -542,6 +637,107 @@ async fn test_walrust_owned_reload_state_transport_error_is_hard_error() -> Resu
     assert!(
         !replicator.contains("reload-error").await,
         "database must not be registered after a failed state reload"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remove_keeps_database_registered_when_final_sync_fails() -> Result<()> {
+    let inner = MemStorage::new();
+    let storage = PutFailsStorage::new(inner);
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("remove-fail.db");
+    let conn = create_wal_db(&db_path, 1);
+
+    let replicator = Replicator::new(storage, "wal/", make_config());
+    replicator
+        .add_without_snapshot("remove-fail", &db_path)
+        .await?;
+    write_rows(&conn, 100, 1);
+
+    let err = replicator
+        .remove("remove-fail")
+        .await
+        .expect_err("failed final sync must be returned to the caller");
+
+    assert!(
+        err.to_string().contains("final sync"),
+        "remove error should identify the failed final sync: {err}"
+    );
+
+    assert!(
+        replicator.contains("remove-fail").await,
+        "a failed final sync must not unregister the database"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_wal_replication_returns_final_sync_error_on_shutdown() -> Result<()> {
+    let storage = PutFailsStorage::new(MemStorage::new());
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("wal-loop-final-fail.db");
+    let conn = create_wal_db(&db_path, 1);
+    write_rows(&conn, 100, 1);
+
+    let mut state = walrust::SyncState::new(db_path.clone())?;
+    state.name = "wal-loop-final-fail".to_string();
+    state.init_checksum()?;
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = cancel_tx.send(true);
+    });
+
+    let err = walrust::run_wal_replication(
+        storage.as_ref(),
+        "wal/",
+        &mut state,
+        0,
+        make_config(),
+        cancel_rx,
+    )
+    .await
+    .expect_err("shutdown final sync upload failure must be returned");
+
+    assert!(
+        err.to_string().contains("Final sync"),
+        "error should identify the final sync failure: {err}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_replication_returns_final_sync_error_on_shutdown() -> Result<()> {
+    let storage = FailAfterPutsStorage::new(MemStorage::new(), 1);
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("owned-loop-final-fail.db");
+    let conn = create_wal_db(&db_path, 1);
+    write_rows(&conn, 100, 1);
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = cancel_tx.send(true);
+    });
+
+    let err = walrust::sync::run_replication(
+        storage.as_ref(),
+        "wal/",
+        &db_path,
+        make_config(),
+        cancel_rx,
+    )
+    .await
+    .expect_err("shutdown final sync upload failure must be returned");
+    drop(conn);
+
+    assert!(
+        err.to_string().contains("Final sync"),
+        "error should identify the final sync failure: {err}"
     );
 
     Ok(())
@@ -1196,7 +1392,7 @@ async fn test_flush_after_remove_errors() {
     replicator.add("test", &db_path).await.unwrap();
 
     // Remove the database
-    replicator.remove("test").await;
+    replicator.remove("test").await.unwrap();
 
     // flush() should fail
     let result = replicator.flush("test").await;
