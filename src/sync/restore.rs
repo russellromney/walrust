@@ -2,8 +2,10 @@ use crate::cache::LocalCache;
 use crate::ltx;
 use crate::s3::{self, create_client, parse_bucket};
 use anyhow::{anyhow, Result};
+use hadb_storage_s3::S3Storage;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use walrust_core::legacy_restore;
 
 use super::manifest::{
     discover_state_from_s3, find_latest_snapshot, find_latest_snapshot_at_or_before,
@@ -138,6 +140,35 @@ pub async fn restore(
         None
     };
 
+    // Parse point in time if provided (TXID only for litestream format).
+    let parsed_point_in_time = if let Some(pit) = point_in_time {
+        Some(
+            pit.parse::<u64>()
+                .map_err(|_| anyhow!("Invalid point_in_time format. Use TXID (number)"))?,
+        )
+    } else {
+        None
+    };
+
+    if cache.is_none() && webhook.is_none() {
+        let storage = S3Storage::new(client.clone(), bucket_name.clone());
+        let final_txid = legacy_restore::restore_legacy_ltx(
+            &storage,
+            &prefix,
+            name,
+            output,
+            parsed_point_in_time,
+        )
+        .await?;
+        println!(
+            "Restored {} to {} (TXID: {})",
+            name,
+            output.display(),
+            final_txid
+        );
+        return Ok(());
+    }
+
     // Discover state from S3 file listings (litestream format - no manifest)
     let (current_txid, _max_gen, _) =
         discover_state_from_s3(&client, &bucket_name, &prefix, name).await?;
@@ -146,13 +177,7 @@ pub async fn restore(
         return Err(anyhow!("No LTX files found for database: {}", name));
     }
 
-    // Parse point in time if provided (TXID only for litestream format)
-    let target_txid = if let Some(pit) = point_in_time {
-        pit.parse::<u64>()
-            .map_err(|_| anyhow!("Invalid point_in_time format. Use TXID (number)"))?
-    } else {
-        current_txid
-    };
+    let target_txid = parsed_point_in_time.unwrap_or(current_txid);
 
     let snapshot = if point_in_time.is_some() {
         find_latest_snapshot_at_or_before(&client, &bucket_name, &prefix, name, target_txid).await?

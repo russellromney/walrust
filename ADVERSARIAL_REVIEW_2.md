@@ -752,10 +752,18 @@ and
     fixed by moving snapshot selection, generation listing, state discovery,
     and all-file discovery into `walrust-core::legacy_manifest` over
     `hadb_storage::StorageBackend`; root `src/sync/manifest.rs` now delegates
-    its S3 discovery wrappers through `hadb_storage_s3::S3Storage`. Remaining
-    work: root `src/sync/*` still owns the CLI watch/restore/compact/replicate
-    apply workflow over the legacy LTX object layout, while core owns the HADBP
-    engine. That workflow/API migration is still required before duplicate
-    sync/restore implementations can be deleted.
+    its S3 discovery wrappers through `hadb_storage_s3::S3Storage`. Legacy
+    restore ownership was then reproduced with
+    `legacy_restore_is_owned_by_core_and_replays_real_wal_incremental` (failed
+    because `walrust_core::legacy_restore` did not exist), then fixed by adding
+    storage-backed core legacy restore with latest/PIT snapshot selection,
+    gap checks, checksum-checked incremental apply, integrity check, and atomic
+    publish. Root `restore` now delegates the normal no-cache/no-webhook path
+    to `walrust-core::legacy_restore`, with the cache/webhook adapter fallback
+    still in root. Remaining work: root `src/sync/*` still owns the CLI
+    watch/restore cache adapter, compact, and replicate apply workflow over
+    the legacy LTX object layout, while core owns the HADBP engine. That
+    workflow/API migration is still required before duplicate sync/restore
+    implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.
