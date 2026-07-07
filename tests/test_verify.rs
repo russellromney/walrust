@@ -1,7 +1,8 @@
 // Comprehensive tests for `walrust verify` command
 //
 // Tests cover: positive cases, negative cases, edge cases, and integration tests
-// Requires S3/Tigris credentials (run with: soup run -p walrust -e development -- cargo test)
+// Requires S3/Tigris credentials. The workspace `make test` target injects
+// them via Soup.
 use anyhow::Result;
 use std::process::Command;
 use tempfile::TempDir;

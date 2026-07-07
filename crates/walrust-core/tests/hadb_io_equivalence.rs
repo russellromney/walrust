@@ -5,6 +5,7 @@
 //! walrust-core's re-exported types without importing hadb-io directly.
 
 use anyhow::anyhow;
+use walrust_core as walrust;
 
 // ============================================================================
 // Re-export: Retry types accessible via walrust::

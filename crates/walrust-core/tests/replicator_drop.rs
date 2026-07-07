@@ -24,6 +24,7 @@ use std::time::Duration;
 use hadb_storage::{CasResult, StorageBackend};
 use walrust::Replicator;
 use walrust::{ReplicationConfig, SnapshotOwnership};
+use walrust_core as walrust;
 
 // ============================================================================
 // Minimal in-memory storage backend (mirrors tests/replicator_flush.rs but

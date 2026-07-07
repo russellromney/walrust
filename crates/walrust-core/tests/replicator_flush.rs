@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use hadb_storage::{CasResult, StorageBackend};
 use walrust::Replicator;
 use walrust::{ReplicationConfig, SnapshotOwnership};
+use walrust_core as walrust;
 
 // ============================================================================
 // In-memory storage backend for tests

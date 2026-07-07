@@ -719,6 +719,37 @@ pub async fn read_frames_with_metadata(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    struct RealWalFixture {
+        _dir: TempDir,
+        _conn: rusqlite::Connection,
+        db_path: PathBuf,
+        wal_path: PathBuf,
+    }
+
+    fn build_real_sqlite_wal() -> RealWalFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("real-wal.db");
+        let wal_path = db_path.with_extension("db-wal");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT);
+            INSERT INTO items (value) VALUES ('alpha'), ('beta'), ('gamma');
+            ",
+        )
+        .unwrap();
+        assert!(wal_path.exists(), "SQLite should leave a live WAL file");
+        RealWalFixture {
+            _dir: dir,
+            _conn: conn,
+            db_path,
+            wal_path,
+        }
+    }
 
     fn wal_header(page_size: u32) -> Vec<u8> {
         let mut header = vec![0u8; WAL_HEADER_SIZE as usize];
@@ -777,6 +808,26 @@ mod tests {
         // [1,2,3,4] => (7, 14).
         let data2 = [0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4];
         assert_eq!(wal_checksum((0, 0), &data2, true), (7, 14));
+    }
+
+    #[tokio::test]
+    async fn test_real_sqlite_wal_helper_produces_live_wal() {
+        let fixture = build_real_sqlite_wal();
+        assert!(fixture.db_path.exists());
+
+        let header = read_header(&fixture.wal_path).await.unwrap().unwrap();
+        assert!(matches!(header.magic, WAL_MAGIC_BE | WAL_MAGIC_LE));
+        #[cfg(target_endian = "little")]
+        assert_eq!(header.magic, 0x377F_0682);
+        assert!(header.page_size > 0);
+        assert_ne!(
+            (header.checksum1, header.checksum2),
+            (0, 0),
+            "real SQLite WAL headers carry checksums"
+        );
+
+        let size = get_wal_size(&fixture.wal_path).await.unwrap();
+        assert!(size > WAL_HEADER_SIZE);
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@
 //!
 //! ```bash
 //! set -a && source ../../.env && set +a
-//! WALRUST_S3_TEST_BUCKET=sqlces-test cargo test --test snapshot_source_s3 -- --ignored
+//! WALRUST_S3_TEST_BUCKET=sqlces-test cargo test --test snapshot_source_s3
 //! ```
 
 use anyhow::Result;
@@ -17,6 +17,7 @@ use std::path::Path;
 use walrust::snapshot_source::SnapshotSource;
 use walrust::sync::restore_with_snapshot_source;
 use walrust::SyncState;
+use walrust_core as walrust;
 
 fn test_bucket() -> String {
     std::env::var("WALRUST_S3_TEST_BUCKET").unwrap_or_else(|_| "sqlces-test".to_string())
@@ -91,7 +92,6 @@ impl SnapshotSource for FileSnapshotSource {
 /// Happy path: materialize via snapshot source, no incrementals in S3.
 /// All S3 operations hit real Tigris.
 #[tokio::test]
-#[ignore = "real S3 proof; run with soup credentials and --ignored"]
 async fn test_s3_restore_snapshot_source_no_incrementals() {
     let bucket = test_bucket();
     let endpoint = test_endpoint();
@@ -124,7 +124,6 @@ async fn test_s3_restore_snapshot_source_no_incrementals() {
 
 /// E2E: create base DB, sync WAL to real Tigris, then restore via snapshot source.
 #[tokio::test]
-#[ignore = "real S3 proof; run with soup credentials and --ignored"]
 async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
     let bucket = test_bucket();
     let endpoint = test_endpoint();
@@ -160,7 +159,7 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
     walrust::sync::take_snapshot(&storage, &prefix, &mut state)
         .await
         .unwrap();
-    let snapshot_txid = state.current_txid;
+    let snapshot_seq = state.current_seq;
 
     // Step 3: write more rows and keep the writer connection open while
     // walrust reads the live WAL. If the last SQLite connection closes first,
@@ -182,8 +181,8 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
         .unwrap();
     assert!(synced > 0, "real WAL sync proof must capture frames");
     eprintln!(
-        "[test] synced {} WAL frames, snapshot_txid={}, current_txid={}",
-        synced, snapshot_txid, state.current_txid
+        "[test] synced {} WAL frames, snapshot_seq={}, current_txid={}",
+        synced, snapshot_seq, state.current_txid
     );
     drop(conn);
 
@@ -209,7 +208,7 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
     let output = dir.path().join("restored.db");
     let source = FileSnapshotSource {
         source: clean_base,
-        version: snapshot_txid,
+        version: snapshot_seq,
     };
 
     let restored_txid = restore_with_snapshot_source(&storage, &prefix, "base", &output, &source)
@@ -237,7 +236,6 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
 
 /// Negative: snapshot source fails, error propagates through real S3 path.
 #[tokio::test]
-#[ignore = "real S3 proof; run with soup credentials and --ignored"]
 async fn test_s3_restore_snapshot_source_materialize_fails() {
     let bucket = test_bucket();
     let endpoint = test_endpoint();

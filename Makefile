@@ -1,5 +1,17 @@
 .PHONY: build release test clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-realworld help
 
+SOUP_PROJECT ?= turbolite
+SOUP_ENV ?= development
+USE_SOUP ?= 1
+
+TEST_ENV = export AWS_ENDPOINT_URL_S3="$${AWS_ENDPOINT_URL_S3:-$${AWS_ENDPOINT_URL:-}}"; export WALRUST_TEST_BUCKET="$${WALRUST_TEST_BUCKET:-$${TIERED_TEST_BUCKET:-walrust-test-rr-2026}/verify-test}"; export WALRUST_S3_TEST_BUCKET="$${WALRUST_S3_TEST_BUCKET:-$${TIERED_TEST_BUCKET:-sqlces-test}}"
+
+ifeq ($(USE_SOUP),1)
+TEST_RUNNER = soup run -p $(SOUP_PROJECT) -e $(SOUP_ENV) --
+else
+TEST_RUNNER =
+endif
+
 # Default target
 all: build
 
@@ -15,13 +27,13 @@ release:
 build-python:
 	maturin build --release
 
-# Run all tests (injects S3/Tigris credentials via soup)
+# Run all workspace tests with live storage credentials from Soup.
 test:
-	~/.soup/bin/soup run -p walrust -e development -- cargo test
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo test --workspace'
 
 # Run tests with output
 test-verbose:
-	~/.soup/bin/soup run -p walrust -e development -- cargo test -- --nocapture
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo test --workspace -- --nocapture'
 
 # Run micro-benchmarks (cargo bench)
 bench:
@@ -54,19 +66,19 @@ dev:
 
 # Check for errors without building
 check:
-	cargo check
+	cargo check --workspace --all-targets
 
 # Format code
 fmt:
-	cargo fmt
+	cargo fmt --all
 
 # Check formatting
 fmt-check:
-	cargo fmt -- --check
+	cargo fmt --all -- --check
 
 # Run clippy linter
 lint:
-	cargo clippy -- -D warnings
+	cargo clippy --workspace --all-targets
 
 # Publish to crates.io
 publish:
