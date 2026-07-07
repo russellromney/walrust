@@ -1,11 +1,13 @@
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use litepages::Checksum;
 use std::sync::Arc;
 
 use crate::ltx;
 use crate::s3::{self, create_client, parse_bucket};
 
 use super::manifest::{
-    discover_state_from_s3, is_snapshot, list_generation_files, load_manifest, GENERATION_LIVE,
+    discover_all_ltx_from_s3, discover_state_from_s3, is_snapshot, list_generation_files,
+    GENERATION_LIVE,
 };
 
 /// Verification issue found during verify
@@ -26,6 +28,76 @@ pub struct ValidationResult {
     pub is_valid: bool,
 }
 
+#[derive(Debug, Clone)]
+struct VerifiedLtxFile {
+    key: String,
+    generation: u64,
+    min_txid: u64,
+    max_txid: u64,
+    pre_apply_checksum: Option<Checksum>,
+    post_apply_checksum: Checksum,
+}
+
+fn verify_ltx_chain(files: &[VerifiedLtxFile]) -> Vec<VerifyIssue> {
+    let mut issues = Vec::new();
+
+    let Some(snapshot) = files
+        .iter()
+        .filter(|file| is_snapshot(file.generation, file.min_txid, file.max_txid))
+        .max_by_key(|file| (file.generation, file.max_txid))
+    else {
+        issues.push(VerifyIssue {
+            filename: "<chain>".to_string(),
+            issue: "No snapshot found - backup is incomplete".to_string(),
+            is_orphan: false,
+        });
+        return issues;
+    };
+
+    let mut expected_next_txid = snapshot.max_txid + 1;
+    let mut expected_pre_apply = snapshot.post_apply_checksum;
+    let mut incrementals: Vec<_> = files
+        .iter()
+        .filter(|file| file.generation == GENERATION_LIVE && file.max_txid >= expected_next_txid)
+        .collect();
+    incrementals.sort_by_key(|file| file.min_txid);
+
+    for file in incrementals {
+        if file.min_txid != expected_next_txid {
+            issues.push(VerifyIssue {
+                filename: file.key.clone(),
+                issue: format!(
+                    "TXID gap after snapshot chain: expected min_txid={}, got {}",
+                    expected_next_txid, file.min_txid
+                ),
+                is_orphan: false,
+            });
+            expected_next_txid = file.max_txid + 1;
+            expected_pre_apply = file.post_apply_checksum;
+            continue;
+        }
+
+        if file.pre_apply_checksum != Some(expected_pre_apply) {
+            issues.push(VerifyIssue {
+                filename: file.key.clone(),
+                issue: format!(
+                    "checksum chain break: expected pre_apply {:#x}, got {}",
+                    expected_pre_apply.into_inner(),
+                    file.pre_apply_checksum
+                        .map(|checksum| format!("{:#x}", checksum.into_inner()))
+                        .unwrap_or_else(|| "none".to_string())
+                ),
+                is_orphan: false,
+            });
+        }
+
+        expected_next_txid = file.max_txid + 1;
+        expected_pre_apply = file.post_apply_checksum;
+    }
+
+    issues
+}
+
 /// Validate backup integrity for a database (non-blocking, for periodic validation)
 pub(crate) async fn validate_backup_integrity(
     client: &aws_sdk_s3::Client,
@@ -33,119 +105,132 @@ pub(crate) async fn validate_backup_integrity(
     prefix: &str,
     db_name: &str,
 ) -> Result<ValidationResult> {
-    // Load manifest
-    let manifest = load_manifest(client, bucket, prefix, db_name).await?;
+    let discovered = discover_all_ltx_from_s3(client, bucket, prefix, db_name).await?;
 
-    if manifest.files.is_empty() {
-        return Ok(ValidationResult {
-            verified_count: 0,
-            total_files: 0,
-            issues: Vec::new(),
-            verified_size_bytes: 0,
-            is_valid: true,
-        });
+    if discovered.is_empty() {
+        return Err(anyhow!(
+            "{}: no LTX files found during backup validation",
+            db_name
+        ));
     }
 
     let mut issues: Vec<VerifyIssue> = Vec::new();
+    let mut verified_files: Vec<VerifiedLtxFile> = Vec::new();
     let mut verified_count = 0;
     let mut total_size: u64 = 0;
 
     // Check each LTX file
-    for entry in &manifest.files {
-        let ltx_key = format!("{}{}/{}", prefix, db_name, entry.filename);
+    for entry in &discovered {
+        match s3::download_bytes(client, bucket, &entry.key).await {
+            Ok(data) => {
+                let cursor = std::io::Cursor::new(&data);
+                match ltx::verify_ltx_with_result(cursor) {
+                    Ok(result) => {
+                        let header_min = result.header.min_txid.into_inner();
+                        let header_max = result.header.max_txid.into_inner();
 
-        match s3::exists(client, bucket, &ltx_key).await {
-            Ok(true) => {
-                // File exists, download and verify
-                match s3::download_bytes(client, bucket, &ltx_key).await {
-                    Ok(data) => {
-                        let cursor = std::io::Cursor::new(&data);
-                        match ltx::verify_ltx(cursor) {
-                            Ok(header) => {
-                                let header_min = header.min_txid.into_inner();
-                                let header_max = header.max_txid.into_inner();
-
-                                if header_min != entry.min_txid || header_max != entry.max_txid {
-                                    issues.push(VerifyIssue {
-                                        filename: entry.filename.clone(),
-                                        issue: format!(
-                                            "TXID mismatch: manifest {}-{}, header {}-{}",
-                                            entry.min_txid, entry.max_txid, header_min, header_max
-                                        ),
-                                        is_orphan: false,
-                                    });
-                                } else {
-                                    verified_count += 1;
-                                    total_size += data.len() as u64;
-                                }
-                            }
-                            Err(e) => {
-                                issues.push(VerifyIssue {
-                                    filename: entry.filename.clone(),
-                                    issue: format!("Checksum failed: {}", e),
-                                    is_orphan: false,
-                                });
-                            }
+                        if header_min != entry.min_txid || header_max != entry.max_txid {
+                            issues.push(VerifyIssue {
+                                filename: entry.key.clone(),
+                                issue: format!(
+                                    "TXID mismatch: filename {}-{}, header {}-{}",
+                                    entry.min_txid, entry.max_txid, header_min, header_max
+                                ),
+                                is_orphan: false,
+                            });
+                        } else {
+                            verified_count += 1;
+                            total_size += data.len() as u64;
+                            verified_files.push(VerifiedLtxFile {
+                                key: entry.key.clone(),
+                                generation: entry.generation,
+                                min_txid: entry.min_txid,
+                                max_txid: entry.max_txid,
+                                pre_apply_checksum: result.header.pre_apply_checksum,
+                                post_apply_checksum: result.post_apply_checksum,
+                            });
                         }
                     }
                     Err(e) => {
                         issues.push(VerifyIssue {
-                            filename: entry.filename.clone(),
-                            issue: format!("Download failed: {}", e),
+                            filename: entry.key.clone(),
+                            issue: format!("Checksum failed: {}", e),
                             is_orphan: false,
                         });
                     }
                 }
             }
-            Ok(false) => {
-                issues.push(VerifyIssue {
-                    filename: entry.filename.clone(),
-                    issue: "File missing from S3".to_string(),
-                    is_orphan: true,
-                });
-            }
             Err(e) => {
                 issues.push(VerifyIssue {
-                    filename: entry.filename.clone(),
-                    issue: format!("S3 check failed: {}", e),
+                    filename: entry.key.clone(),
+                    issue: format!("Download failed: {}", e),
                     is_orphan: false,
                 });
             }
         }
     }
-
-    // Check TXID continuity
-    let mut sorted_files: Vec<_> = manifest.files.iter().collect();
-    sorted_files.sort_by_key(|f| f.min_txid);
-
-    let mut expected_next_txid: Option<u64> = None;
-    for entry in &sorted_files {
-        if let Some(expected) = expected_next_txid {
-            // For incrementals, check for gaps
-            if !entry.is_snapshot && entry.min_txid != expected && entry.min_txid > expected {
-                issues.push(VerifyIssue {
-                    filename: entry.filename.clone(),
-                    issue: format!(
-                        "TXID gap: expected {}, got {} (missing {}-{})",
-                        expected,
-                        entry.min_txid,
-                        expected,
-                        entry.min_txid - 1
-                    ),
-                    is_orphan: false,
-                });
-            }
-        }
-        expected_next_txid = Some(entry.max_txid + 1);
-    }
+    issues.extend(verify_ltx_chain(&verified_files));
 
     Ok(ValidationResult {
         verified_count,
-        total_files: manifest.files.len(),
+        total_files: discovered.len(),
         issues: issues.clone(),
         verified_size_bytes: total_size,
         is_valid: issues.is_empty(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn verified_file(
+        key: &str,
+        generation: u64,
+        min_txid: u64,
+        max_txid: u64,
+        pre_apply_checksum: Option<u64>,
+        post_apply_checksum: u64,
+    ) -> VerifiedLtxFile {
+        VerifiedLtxFile {
+            key: key.to_string(),
+            generation,
+            min_txid,
+            max_txid,
+            pre_apply_checksum: pre_apply_checksum.map(Checksum::new),
+            post_apply_checksum: Checksum::new(post_apply_checksum),
+        }
+    }
+
+    #[test]
+    fn test_verify_chain_rejects_snapshot_to_incremental_checksum_mismatch() {
+        let files = vec![
+            verified_file(
+                "db/0001/0000000000000001-0000000000000001.ltx",
+                1,
+                1,
+                1,
+                None,
+                0x1111,
+            ),
+            verified_file(
+                "db/0000/0000000000000002-0000000000000002.ltx",
+                0,
+                2,
+                2,
+                Some(0x2222),
+                0x3333,
+            ),
+        ];
+
+        let issues = verify_ltx_chain(&files);
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.issue.contains("checksum chain break")),
+            "verify must reject an incremental whose pre_apply does not match the snapshot post_apply"
+        );
+    }
 }
 
 /// Verify integrity of all LTX files in S3 for a database
@@ -176,7 +261,11 @@ pub async fn verify(
 
     if current_txid == 0 {
         println!("No LTX files found for database: {}", name);
-        return Ok(());
+        println!("Exit code: 5 (integrity issues found)");
+        return Err(anyhow!(
+            "Integrity verification failed: No LTX files found for database: {}",
+            name
+        ));
     }
 
     // Collect all files from all generations
@@ -224,6 +313,7 @@ pub async fn verify(
     println!();
 
     let mut issues: Vec<VerifyIssue> = Vec::new();
+    let mut verified_files: Vec<VerifiedLtxFile> = Vec::new();
     let mut verified_count = 0;
     let mut total_size: u64 = 0;
 
@@ -236,10 +326,10 @@ pub async fn verify(
             Ok(data) => {
                 let size_kb = data.len() / 1024;
                 let cursor = std::io::Cursor::new(&data);
-                match ltx::verify_ltx(cursor) {
-                    Ok(header) => {
-                        let header_min = header.min_txid.into_inner();
-                        let header_max = header.max_txid.into_inner();
+                match ltx::verify_ltx_with_result(cursor) {
+                    Ok(result) => {
+                        let header_min = result.header.min_txid.into_inner();
+                        let header_max = result.header.max_txid.into_inner();
 
                         // Verify header matches filename
                         if header_min != *expected_min || header_max != *expected_max {
@@ -261,6 +351,14 @@ pub async fn verify(
                             println!("  OK {} ({} TXIDs, {}KB)", filename, txid_count, size_kb);
                             verified_count += 1;
                             total_size += data.len() as u64;
+                            verified_files.push(VerifiedLtxFile {
+                                key: key.clone(),
+                                generation: *_gen,
+                                min_txid: *expected_min,
+                                max_txid: *expected_max,
+                                pre_apply_checksum: result.header.pre_apply_checksum,
+                                post_apply_checksum: result.post_apply_checksum,
+                            });
                         }
                     }
                     Err(e) => {
@@ -293,6 +391,7 @@ pub async fn verify(
             }
         }
     }
+    issues.extend(verify_ltx_chain(&verified_files));
 
     // Check TXID continuity in generation 0 (live)
     let mut live_files: Vec<_> = all_files
@@ -377,12 +476,12 @@ pub async fn verify(
     } else if has_critical_gap {
         println!("Recommendation: Re-snapshot database to repair backup chain");
         println!();
-        println!("Exit code: 2 (critical errors - data may be unrecoverable)");
+        println!("Exit code: 5 (integrity errors - data may be unrecoverable)");
         anyhow::bail!("Critical integrity issues detected")
     } else {
         println!("Recommendation: Investigate checksum failures or re-upload affected files");
         println!();
-        println!("Exit code: 1 (issues found)");
+        println!("Exit code: 5 (integrity issues found)");
         anyhow::bail!("Integrity issues detected")
     }
 }

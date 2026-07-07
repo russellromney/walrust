@@ -10,8 +10,10 @@ use crate::s3;
 use crate::uploader::UploadMessage;
 use crate::webhook::WebhookSender;
 
-use super::manifest::{build_ltx_key, load_manifest, save_manifest, GENERATION_LIVE};
-use super::types::{LtxEntry, Manifest, ShadowSyncInput, ShadowSyncOutput};
+use super::manifest::{
+    build_ltx_key, discover_snapshots_from_s3, list_generation_files, GENERATION_LIVE,
+};
+use super::types::{ShadowSyncInput, ShadowSyncOutput};
 
 /// Result of encoding shadow WAL segments into LTX
 struct ShadowEncodeResult {
@@ -386,36 +388,71 @@ pub(crate) async fn run_compaction(
     name: &str,
     policy: &RetentionPolicy,
 ) -> Result<()> {
-    // Load manifest to get snapshot info
-    let manifest = load_manifest(client, bucket, prefix, name).await?;
+    let discovered = discover_snapshots_from_s3(client, bucket, prefix, name).await?;
 
-    if manifest.files.is_empty() {
+    if discovered.is_empty() {
         return Ok(());
     }
 
-    // Filter to only snapshots (not incremental files)
-    let snapshot_entries: Vec<SnapshotEntry> = manifest
-        .files
-        .iter()
-        .filter(|f| f.is_snapshot)
-        .filter_map(|f| {
-            chrono::DateTime::parse_from_rfc3339(&f.created_at)
-                .ok()
-                .map(|dt| SnapshotEntry {
-                    key: f.filename.clone(),
-                    created_at: dt.with_timezone(&Utc),
-                    sequence: f.max_txid,
-                    size: f.size,
-                })
-        })
-        .collect();
-
-    if snapshot_entries.is_empty() {
-        return Ok(());
+    let mut snapshot_entries: Vec<SnapshotEntry> = Vec::with_capacity(discovered.len());
+    for (key, _gen, _min, max) in &discovered {
+        let meta = s3::head_object_meta(client, bucket, key).await?;
+        snapshot_entries.push(SnapshotEntry {
+            key: key.clone(),
+            created_at: meta.last_modified,
+            sequence: *max,
+            size: meta.size,
+        });
     }
 
     let now = Utc::now();
-    let plan = analyze_retention(&snapshot_entries, policy, now);
+    let mut plan = analyze_retention(&snapshot_entries, policy, now);
+
+    let live_incrementals =
+        list_generation_files(client, bucket, prefix, name, GENERATION_LIVE).await?;
+    let earliest_live_min = live_incrementals
+        .iter()
+        .filter(|(_, min, max)| !(*min == 1 && *max == 1))
+        .map(|(_, min, _)| *min)
+        .min();
+
+    let max_snapshot_txid = snapshot_entries.iter().map(|entry| entry.sequence).max();
+    let base_for_live_chain = earliest_live_min.and_then(|min| {
+        snapshot_entries
+            .iter()
+            .filter(|entry| entry.sequence < min)
+            .map(|entry| entry.sequence)
+            .max()
+            .or_else(|| snapshot_entries.iter().map(|entry| entry.sequence).min())
+    });
+
+    let protected: std::collections::HashSet<u64> = max_snapshot_txid
+        .into_iter()
+        .chain(base_for_live_chain)
+        .collect();
+
+    let before = plan.delete.len();
+    let rescued: Vec<_> = plan
+        .delete
+        .iter()
+        .filter(|entry| protected.contains(&entry.sequence))
+        .cloned()
+        .collect();
+    if !rescued.is_empty() {
+        plan.delete
+            .retain(|entry| !protected.contains(&entry.sequence));
+        for entry in &rescued {
+            if !plan.keep.iter().any(|kept| kept.sequence == entry.sequence) {
+                plan.keep.push(entry.clone());
+            }
+            plan.bytes_freed = plan.bytes_freed.saturating_sub(entry.size);
+        }
+        tracing::info!(
+            "{}: compaction retained {} snapshot(s) as reachability base for the incremental chain",
+            name,
+            before - plan.delete.len()
+        );
+    }
 
     if !plan.has_deletions() {
         tracing::debug!("Compaction for {}: nothing to delete", name);
@@ -429,31 +466,9 @@ pub(crate) async fn run_compaction(
         plan.keep.len()
     );
 
-    // Delete files
-    let keys_to_delete: Vec<String> = plan
-        .delete
-        .iter()
-        .map(|e| format!("{}{}/{}", prefix, name, e.key))
-        .collect();
+    let keys_to_delete: Vec<String> = plan.delete.iter().map(|entry| entry.key.clone()).collect();
 
     let deleted_count = s3::delete_objects(client, bucket, &keys_to_delete).await?;
-
-    // Update manifest to remove deleted entries
-    let kept_keys: std::collections::HashSet<_> =
-        plan.keep.iter().map(|e| e.key.as_str()).collect();
-
-    let updated_files: Vec<LtxEntry> = manifest
-        .files
-        .into_iter()
-        .filter(|f| !f.is_snapshot || kept_keys.contains(f.filename.as_str()))
-        .collect();
-
-    let updated_manifest = Manifest {
-        files: updated_files,
-        ..manifest
-    };
-
-    save_manifest(client, bucket, prefix, &updated_manifest).await?;
 
     tracing::info!(
         "Compaction complete for {}: deleted {} snapshots, freed {:.2} MB",
@@ -471,10 +486,61 @@ mod tests {
     use crate::cache::LocalCache;
     use crate::uploader::UploadMessage;
     use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
     const PAGE_SIZE: u32 = 4096;
+
+    fn unique_s3_name(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{prefix}-{nanos}")
+    }
+
+    fn test_bucket_config() -> (String, Option<String>) {
+        let bucket = std::env::var("WALRUST_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026/verify-test".to_string());
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        (bucket, endpoint)
+    }
+
+    #[tokio::test]
+    async fn test_watch_auto_compaction_uses_listing_without_manifest() {
+        let (bucket_arg, endpoint) = test_bucket_config();
+        let (bucket, prefix) = s3::parse_bucket(&bucket_arg);
+        let client = s3::create_client(endpoint.as_deref()).await.unwrap();
+        let name = unique_s3_name("watch-compact-no-manifest");
+
+        let keep_old = build_ltx_key(&prefix, &name, 1, 1, 1);
+        let delete_middle = build_ltx_key(&prefix, &name, 2, 1, 2);
+        let keep_latest = build_ltx_key(&prefix, &name, 3, 1, 3);
+        let keys = vec![keep_old.clone(), delete_middle.clone(), keep_latest.clone()];
+
+        for key in &keys {
+            s3::upload_bytes(&client, &bucket, key, b"snapshot".to_vec())
+                .await
+                .unwrap();
+        }
+
+        let policy = RetentionPolicy::new(0, 0, 0, 0);
+        run_compaction(&client, &bucket, &prefix, &name, &policy)
+            .await
+            .unwrap();
+
+        assert!(
+            !s3::exists(&client, &bucket, &delete_middle).await.unwrap(),
+            "watch auto-compaction must delete eligible listing-discovered snapshots even without manifest.json"
+        );
+        assert!(s3::exists(&client, &bucket, &keep_old).await.unwrap());
+        assert!(s3::exists(&client, &bucket, &keep_latest).await.unwrap());
+
+        let _ = s3::delete_objects(&client, &bucket, &keys).await;
+    }
 
     /// Create a shadow WAL segment file with the given frames.
     /// Each frame is (page_number, db_size, page_data).

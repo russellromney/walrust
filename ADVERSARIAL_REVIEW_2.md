@@ -253,6 +253,26 @@ progress gap plus walrust-owned CAS/lineage/fencing remain open for Phase 2.5.
   (decode header/trailer) before PUT.
 
 ### A13 — Verification is theater at both levels
+Status: Fixed — `walrust verify` now decodes each production LTX through
+`verify_ltx_with_result`, validates snapshot-to-incremental TXID and
+`post_apply_checksum -> pre_apply_checksum` linkage, fails closed on empty
+backups, and prints integrity exit code 5 for verification failures. Periodic
+daemon validation now uses listing-based discovery instead of the phantom
+manifest and hard-errors on empty backups. Watch-mode auto-compaction now uses
+S3 listing discovery with the same reachability guard as manual compaction, and
+disabled watch timers no longer materialize `u64::MAX` intervals that panic
+before the guarded branches run. Proven by
+`sync::verify::tests::test_verify_chain_rejects_snapshot_to_incremental_checksum_mismatch`
+`test_verify_no_backup_found`, and
+`sync::shadow::tests::test_watch_auto_compaction_uses_listing_without_manifest`;
+the disabled-timer regression is covered by
+`e2e_cli_watch_restore_round_trips_sqlite_rows`. Current refs:
+`src/ltx.rs:440-472`, `src/sync/verify.rs:31-181`,
+`src/sync/verify.rs:262-269`, `src/sync/verify.rs:322-394`,
+`src/sync/verify.rs:470-486`, `src/sync/shadow.rs:383-480`, and
+`src/sync/watch_shadow.rs:475-502`. `walrust-core` has no verify command,
+daemon validation path, or watch-mode auto-compaction path for this finding.
+
 - `walrust verify` (`src/sync/verify.rs:233-322`): per-file internal
   checksums + TXID continuity among gen-0 files only, starting from whichever
   file is first. Never checks snapshot->first-incremental linkage, never

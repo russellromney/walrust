@@ -438,8 +438,14 @@ impl ChainHasher {
 }
 
 /// Verify an LTX file by decoding all pages and checking the checksum
-/// Returns the header on success, or an error describing the verification failure
-pub fn verify_ltx<R: Read>(reader: R) -> Result<Header> {
+/// Returns the header and trailer checksum on success, or an error describing the verification failure.
+#[derive(Debug)]
+pub struct VerifyLtxResult {
+    pub header: Header,
+    pub post_apply_checksum: Checksum,
+}
+
+pub fn verify_ltx_with_result<R: Read>(reader: R) -> Result<VerifyLtxResult> {
     let (mut decoder, header) = Decoder::new(reader)?;
 
     let page_size = header.page_size.into_inner() as usize;
@@ -451,9 +457,18 @@ pub fn verify_ltx<R: Read>(reader: R) -> Result<Header> {
     }
 
     // Verify checksum - this will fail if corrupted
-    decoder.finish()?;
+    let trailer = decoder.finish()?;
 
-    Ok(header)
+    Ok(VerifyLtxResult {
+        header,
+        post_apply_checksum: trailer.post_apply_checksum,
+    })
+}
+
+/// Verify an LTX file by decoding all pages and checking the checksum.
+/// Returns the header on success, or an error describing the verification failure.
+pub fn verify_ltx<R: Read>(reader: R) -> Result<Header> {
+    Ok(verify_ltx_with_result(reader)?.header)
 }
 
 /// Compute database checksum (single u64 from SHA256)

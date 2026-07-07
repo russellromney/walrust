@@ -472,10 +472,11 @@ pub async fn watch_with_shadow(
     let mut wal_sync_timer = tokio::time::interval(wal_sync_interval);
     wal_sync_timer.tick().await;
 
+    let disabled_timer_duration = Duration::from_secs(86400 * 365);
     let compact_interval_duration = if global_sync.compact_interval > 0 {
         Duration::from_secs(global_sync.compact_interval)
     } else {
-        Duration::from_secs(u64::MAX)
+        disabled_timer_duration
     };
     let mut compact_timer = tokio::time::interval(compact_interval_duration);
     compact_timer.tick().await;
@@ -484,7 +485,7 @@ pub async fn watch_with_shadow(
     let checkpoint_interval_duration = if global_sync.checkpoint_interval > 0 {
         Duration::from_secs(global_sync.checkpoint_interval)
     } else {
-        Duration::from_secs(u64::MAX)
+        disabled_timer_duration
     };
     let mut checkpoint_timer = tokio::time::interval(checkpoint_interval_duration);
     checkpoint_timer.tick().await;
@@ -495,7 +496,7 @@ pub async fn watch_with_shadow(
     let validation_interval_duration = if global_sync.validation_interval > 0 {
         Duration::from_secs(global_sync.validation_interval)
     } else {
-        Duration::from_secs(u64::MAX)
+        disabled_timer_duration
     };
     let mut validation_timer = tokio::time::interval(validation_interval_duration);
     validation_timer.tick().await;
