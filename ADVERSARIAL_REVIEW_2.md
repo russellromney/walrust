@@ -830,7 +830,13 @@ and
     then fixed by moving checkpointed storage-backed snapshot publication into
     `walrust-core::legacy_wal_sync`; root
     `src/sync/wal_sync.rs::take_snapshot` now adapts S3 and updates CLI state
-    from the core output. Remaining work: root watch orchestration still owns legacy
+    from the core output. Legacy manual snapshot command ownership was then
+    reproduced with `legacy_manual_snapshot_is_owned_by_core` (failed because
+    `walrust_core::legacy_wal_sync::snapshot_database_to_storage` did not
+    exist), then fixed by moving the `walrust snapshot` storage-backed
+    publication path into `walrust-core::legacy_wal_sync`; root
+    `src/sync/compact.rs::snapshot` now keeps only CLI validation and output
+    formatting. Remaining work: root watch orchestration still owns legacy
     cache-mode WAL upload control flow over the LTX object layout, while core
     owns the HADBP engine. That workflow/API migration is still required
     before duplicate sync implementations can be deleted.

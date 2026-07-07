@@ -293,11 +293,6 @@ pub(crate) async fn take_snapshot(
     Ok(())
 }
 
-/// Get SQLite database page size from header.
-pub(crate) async fn get_page_size(db_path: &std::path::Path) -> Result<u32> {
-    walrust_core::legacy_wal_sync::get_page_size(db_path).await
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

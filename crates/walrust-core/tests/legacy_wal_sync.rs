@@ -7,7 +7,8 @@ use walrust_core::legacy_cache::LocalCache;
 use walrust_core::legacy_manifest::build_ltx_key;
 use walrust_core::legacy_uploader::UploadMessage;
 use walrust_core::legacy_wal_sync::{
-    sync_wal_to_cache, sync_wal_to_storage, take_snapshot_to_storage, SyncInput,
+    snapshot_database_to_storage, sync_wal_to_cache, sync_wal_to_storage, take_snapshot_to_storage,
+    SyncInput,
 };
 use walrust_core::shadow::ShadowWal;
 
@@ -198,5 +199,39 @@ async fn legacy_wal_sync_periodic_snapshot_is_owned_by_core() -> Result<()> {
     assert_eq!(output.new_wal_generation, 4);
     assert!(output.new_db_checksum.is_some());
     assert!(output.new_wal_checksum_chain.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_manual_snapshot_is_owned_by_core() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("manual-source.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(
+            "CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT);
+             INSERT INTO marker (value) VALUES ('manual-snapshot');",
+        )?;
+    }
+
+    let storage = MemoryStorage::default();
+    storage
+        .put(
+            &build_ltx_key("backups", "manual-source", 1, 1, 4),
+            b"existing",
+        )
+        .await?;
+
+    let output =
+        snapshot_database_to_storage(&storage, "backups", "manual-source", &db_path).await?;
+
+    let key = build_ltx_key("backups", "manual-source", 2, 1, 5);
+    assert!(storage.get(&key).await?.is_some());
+    assert_eq!(output.key, key);
+    assert_eq!(output.generation, 2);
+    assert_eq!(output.min_txid, 1);
+    assert_eq!(output.max_txid, 5);
+    assert!(output.size_bytes > 0);
     Ok(())
 }

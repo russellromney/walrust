@@ -3,13 +3,12 @@ use chrono::Utc;
 use hadb_storage_s3::S3Storage;
 use std::path::Path;
 use walrust_core::legacy_manifest::plan_legacy_compaction;
+use walrust_core::legacy_wal_sync::snapshot_database_to_storage;
 
-use crate::ltx;
 use crate::retention::{RetentionPolicy, SnapshotEntry};
 use crate::s3::{self, create_client, parse_bucket};
 
-use super::manifest::{build_ltx_key, discover_snapshots_from_s3, discover_state_from_s3};
-use super::wal_sync::get_page_size;
+use super::manifest::discover_snapshots_from_s3;
 
 pub async fn compact(
     name: &str,
@@ -154,35 +153,12 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
         .and_then(|s| s.to_str())
         .ok_or_else(|| anyhow!("Invalid database path"))?;
 
-    // Get page size from database header
-    let page_size = get_page_size(database).await?;
+    let storage = S3Storage::new(client, bucket_name.clone());
+    let output = snapshot_database_to_storage(&storage, &prefix, name, database).await?;
 
-    // Discover current state from S3 to get current TXID and generation
-    let (current_txid, current_gen, _) =
-        discover_state_from_s3(&client, &bucket_name, &prefix, name).await?;
-    let new_txid = current_txid + 1;
-    let snapshot_gen = current_gen + 1;
-
-    // Snapshots go to generation 1+ (litestream format)
-    let ltx_key = build_ltx_key(&prefix, name, snapshot_gen, 1, new_txid);
-
-    let (ltx_buffer, _) = ltx::encode_sqlite_snapshot_to_vec(database, page_size, new_txid)?;
-
-    let ltx_size = ltx_buffer.len() as u64;
-
-    // Upload LTX file
-    s3::upload_bytes(&client, &bucket_name, &ltx_key, ltx_buffer).await?;
-
-    tracing::info!(
-        "LTX snapshot uploaded (gen {}, TXID 1-{}, {} bytes) -> {}",
-        snapshot_gen,
-        new_txid,
-        ltx_size,
-        ltx_key
-    );
     println!(
         "Snapshot uploaded: s3://{}/{} (gen {}, TXID 1-{})",
-        bucket_name, ltx_key, snapshot_gen, new_txid
+        bucket_name, output.key, output.generation, output.max_txid
     );
     Ok(())
 }
