@@ -1,10 +1,12 @@
 //! Legacy shadow-watch lifecycle helpers shared by the root CLI wrapper.
 
 use crate::legacy_cache::LocalCache;
+use crate::legacy_shadow::{ShadowSyncInput, ShadowSyncOutput};
 use crate::shadow::ShadowWal;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,19 @@ pub struct ShadowProgress {
     pub db_checksum: Option<u64>,
     pub shadow_sync_generation: u64,
     pub shadow_sync_offset: u64,
+}
+
+pub struct ShadowWatchState {
+    pub name: String,
+    pub db_path: PathBuf,
+    pub wal_path: PathBuf,
+    pub current_txid: u64,
+    pub last_snapshot: Option<chrono::DateTime<Utc>>,
+    pub db_checksum: Option<u64>,
+    pub shadow: ShadowWal,
+    pub shadow_sync_generation: u64,
+    pub shadow_sync_offset: u64,
+    pub wal_copy_offset: u64,
 }
 
 pub fn shadow_progress_path(shadow_dir: &Path) -> PathBuf {
@@ -174,5 +189,118 @@ pub async fn wait_for_cache_checkpoint_durability(
         }
 
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+pub fn shadow_sync_input(state: &ShadowWatchState) -> ShadowSyncInput {
+    ShadowSyncInput {
+        db_path: state.db_path.clone(),
+        name: state.name.clone(),
+        current_txid: state.current_txid,
+        db_checksum: state.db_checksum,
+        generation: state.shadow_sync_generation,
+        shadow_sync_offset: state.shadow_sync_offset,
+        page_size: state.shadow.page_size(),
+        shadow_dir: state.shadow.shadow_dir().to_path_buf(),
+    }
+}
+
+fn progress_from_state(state: &ShadowWatchState) -> ShadowProgress {
+    ShadowProgress {
+        version: 1,
+        current_txid: state.current_txid,
+        last_snapshot: state.last_snapshot,
+        db_checksum: state.db_checksum,
+        shadow_sync_generation: state.shadow_sync_generation,
+        shadow_sync_offset: state.shadow_sync_offset,
+    }
+}
+
+pub fn save_shadow_watch_progress(state: &ShadowWatchState) -> Result<()> {
+    save_shadow_progress(
+        state.shadow.shadow_dir(),
+        &state.name,
+        &progress_from_state(state),
+    )
+}
+
+pub async fn advance_shadow_sync_cursor_if_drained(state: &mut ShadowWatchState) -> Result<()> {
+    loop {
+        let live_generation = state.shadow.generation();
+        if state.shadow_sync_generation >= live_generation {
+            return Ok(());
+        }
+
+        let segments = state
+            .shadow
+            .list_segments(state.shadow_sync_generation)
+            .await
+            .with_context(|| {
+                format!(
+                    "{}: failed to list shadow generation {}",
+                    state.name, state.shadow_sync_generation
+                )
+            })?;
+        let generation_size: u64 = segments.iter().map(|segment| segment.size).sum();
+        if state.shadow_sync_offset < generation_size {
+            return Ok(());
+        }
+
+        tracing::debug!(
+            "{}: shadow generation {} fully synced ({} bytes); advancing upload cursor to generation {}",
+            state.name,
+            state.shadow_sync_generation,
+            generation_size,
+            state.shadow_sync_generation + 1
+        );
+        state.shadow_sync_generation += 1;
+        state.shadow_sync_offset = 0;
+    }
+}
+
+pub fn apply_shadow_sync_output_to_state(state: &mut ShadowWatchState, output: &ShadowSyncOutput) {
+    if output.frame_count == 0 {
+        return;
+    }
+
+    state.shadow_sync_offset = output.new_shadow_sync_offset;
+    state.current_txid = output.new_current_txid;
+    state.db_checksum = output.new_db_checksum;
+}
+
+pub async fn apply_shadow_sync_result_to_state(
+    state: &mut ShadowWatchState,
+    output: &ShadowSyncOutput,
+) -> Result<()> {
+    apply_shadow_sync_output_to_state(state, output);
+    advance_shadow_sync_cursor_if_drained(state).await?;
+    save_shadow_watch_progress(state)?;
+    Ok(())
+}
+
+pub async fn apply_shadow_sync_results_strict(
+    db_states: &mut HashMap<PathBuf, ShadowWatchState>,
+    results: Vec<Result<ShadowSyncOutput>>,
+) -> Result<()> {
+    let mut first_error = None;
+
+    for result in results {
+        match result {
+            Ok(output) => {
+                if let Some(state) = db_states.get_mut(&output.db_path) {
+                    apply_shadow_sync_result_to_state(state, &output).await?;
+                }
+            }
+            Err(e) => {
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+
+    match first_error {
+        Some(e) => Err(e).context("final shadow sync failed"),
+        None => Ok(()),
     }
 }

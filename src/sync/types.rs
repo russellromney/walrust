@@ -143,23 +143,7 @@ impl Default for TriggerState {
 }
 
 /// State for shadow WAL mode databases
-pub(crate) struct ShadowDbState {
-    /// Base database state
-    pub(crate) name: String,
-    pub(crate) db_path: PathBuf,
-    pub(crate) wal_path: PathBuf,
-    pub(crate) current_txid: u64,
-    pub(crate) last_snapshot: Option<chrono::DateTime<Utc>>,
-    pub(crate) db_checksum: Option<u64>,
-    /// Shadow WAL manager (owns the checkpoint blocker)
-    pub(crate) shadow: ShadowWal,
-    /// Shadow WAL generation currently being uploaded.
-    pub(crate) shadow_sync_generation: u64,
-    /// Offset within shadow segments for upload tracking
-    pub(crate) shadow_sync_offset: u64,
-    /// WAL offset for copy_frames tracking
-    pub(crate) wal_copy_offset: u64,
-}
+pub(crate) use walrust_core::legacy_shadow_watch::ShadowWatchState as ShadowDbState;
 
 /// Input for concurrent shadow sync
 pub(crate) use walrust_core::legacy_shadow::ShadowSyncInput;

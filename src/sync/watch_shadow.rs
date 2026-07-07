@@ -22,8 +22,9 @@ use crate::webhook::WebhookSender;
 use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
 use walrust_core::legacy_shadow_watch::{
-    load_shadow_progress, save_shadow_progress as save_shadow_progress_file,
-    wait_for_cache_checkpoint_durability, ShadowProgress,
+    apply_shadow_sync_result_to_state, apply_shadow_sync_results_strict, load_shadow_progress,
+    save_shadow_watch_progress as save_shadow_progress, shadow_sync_input,
+    wait_for_cache_checkpoint_durability,
 };
 
 use super::shadow::{
@@ -43,38 +44,6 @@ struct DirectShadowSyncTarget {
     client: Arc<aws_sdk_s3::Client>,
     bucket_name: String,
     prefix: String,
-}
-
-fn shadow_progress_from_state(state: &ShadowDbState) -> ShadowProgress {
-    ShadowProgress {
-        version: 1,
-        current_txid: state.current_txid,
-        last_snapshot: state.last_snapshot,
-        db_checksum: state.db_checksum,
-        shadow_sync_generation: state.shadow_sync_generation,
-        shadow_sync_offset: state.shadow_sync_offset,
-    }
-}
-
-fn save_shadow_progress(state: &ShadowDbState) -> Result<()> {
-    save_shadow_progress_file(
-        state.shadow.shadow_dir(),
-        &state.name,
-        &shadow_progress_from_state(state),
-    )
-}
-
-fn shadow_sync_input(state: &ShadowDbState) -> ShadowSyncInput {
-    ShadowSyncInput {
-        db_path: state.db_path.clone(),
-        name: state.name.clone(),
-        current_txid: state.current_txid,
-        db_checksum: state.db_checksum,
-        generation: state.shadow_sync_generation,
-        shadow_sync_offset: state.shadow_sync_offset,
-        page_size: state.shadow.page_size(),
-        shadow_dir: state.shadow.shadow_dir().to_path_buf(),
-    }
 }
 
 async fn run_shadow_syncs(
@@ -120,107 +89,6 @@ async fn run_shadow_syncs(
         .collect();
 
     join_all(sync_futures).await
-}
-
-fn apply_shadow_sync_output(
-    db_states: &mut HashMap<PathBuf, ShadowDbState>,
-    output: &super::types::ShadowSyncOutput,
-) {
-    if output.frame_count == 0 {
-        return;
-    }
-
-    if let Some(state) = db_states.get_mut(&output.db_path) {
-        state.shadow_sync_offset = output.new_shadow_sync_offset;
-        state.current_txid = output.new_current_txid;
-        state.db_checksum = output.new_db_checksum;
-    }
-}
-
-async fn advance_shadow_sync_cursor_if_drained(state: &mut ShadowDbState) -> Result<()> {
-    loop {
-        let live_generation = state.shadow.generation();
-        if state.shadow_sync_generation >= live_generation {
-            return Ok(());
-        }
-
-        let segments = state
-            .shadow
-            .list_segments(state.shadow_sync_generation)
-            .await
-            .with_context(|| {
-                format!(
-                    "{}: failed to list shadow generation {}",
-                    state.name, state.shadow_sync_generation
-                )
-            })?;
-        let generation_size: u64 = segments.iter().map(|segment| segment.size).sum();
-        if state.shadow_sync_offset < generation_size {
-            return Ok(());
-        }
-
-        tracing::debug!(
-            "{}: shadow generation {} fully synced ({} bytes); advancing upload cursor to generation {}",
-            state.name,
-            state.shadow_sync_generation,
-            generation_size,
-            state.shadow_sync_generation + 1
-        );
-        state.shadow_sync_generation += 1;
-        state.shadow_sync_offset = 0;
-    }
-}
-
-fn apply_shadow_sync_output_to_state(
-    state: &mut ShadowDbState,
-    output: &super::types::ShadowSyncOutput,
-) {
-    if output.frame_count == 0 {
-        return;
-    }
-
-    state.shadow_sync_offset = output.new_shadow_sync_offset;
-    state.current_txid = output.new_current_txid;
-    state.db_checksum = output.new_db_checksum;
-}
-
-async fn apply_shadow_sync_result_to_state(
-    state: &mut ShadowDbState,
-    output: &super::types::ShadowSyncOutput,
-) -> Result<()> {
-    apply_shadow_sync_output_to_state(state, output);
-    advance_shadow_sync_cursor_if_drained(state).await?;
-    save_shadow_progress(state)?;
-    Ok(())
-}
-
-async fn apply_shadow_sync_results_strict(
-    db_states: &mut HashMap<PathBuf, ShadowDbState>,
-    results: Vec<Result<super::types::ShadowSyncOutput>>,
-) -> Result<()> {
-    let mut first_error = None;
-
-    for result in results {
-        match result {
-            Ok(output) => {
-                apply_shadow_sync_output(db_states, &output);
-                if let Some(state) = db_states.get_mut(&output.db_path) {
-                    advance_shadow_sync_cursor_if_drained(state).await?;
-                    save_shadow_progress(state)?;
-                }
-            }
-            Err(e) => {
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-            }
-        }
-    }
-
-    match first_error {
-        Some(e) => Err(e).context("final shadow sync failed"),
-        None => Ok(()),
-    }
 }
 
 async fn copy_final_shadow_frames(db_states: &mut HashMap<PathBuf, ShadowDbState>) -> Result<()> {

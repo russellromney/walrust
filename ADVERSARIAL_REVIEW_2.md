@@ -724,7 +724,7 @@ and
 4.1 Decide the surviving stack (likely walrust-core as the engine, src/ as
     thin CLI over it); delete the duplicate WAL/LTX/sync/restore
     implementations so invariants live in exactly one place.
-    Status: Partial — `walrust-core` is now the canonical WAL, shadow-WAL, and
+    Status: Fixed — `walrust-core` is now the canonical WAL, shadow-WAL, and
     legacy Litestream-derived LTX implementation. Root `src/wal.rs`,
     `src/shadow.rs`, and `src/ltx.rs` are compatibility shims over
     `walrust-core`, preserving the root module paths while deleting the
@@ -857,8 +857,15 @@ and
     did not exist), then fixed by moving the failed-upload/pending-upload
     hard-error gate into `walrust-core::legacy_shadow_watch`; root
     `checkpoint_shadow_after_durable_sync` now calls the core wait helper.
-    Remaining work: root shadow watch orchestration still owns multi-DB shadow
-    sync lifecycle control. That workflow/API migration is still required
-    before duplicate sync implementations can be deleted.
+    Legacy multi-DB shadow sync state application was then reproduced with
+    `legacy_shadow_multi_db_sync_apply_is_owned_by_core` (failed because
+    `walrust_core::legacy_shadow_watch::{ShadowWatchState,
+    apply_shadow_sync_results_strict}` did not exist), then fixed by moving
+    shadow watch state, shadow-sync input construction, strict result
+    application, cursor advancement across drained generations, and progress
+    persistence into `walrust-core::legacy_shadow_watch`; root
+    `src/sync/watch_shadow.rs` now keeps CLI scheduling, retry/webhook/S3
+    adaptation, metrics, and shutdown orchestration while delegating shadow
+    engine/state transitions to core.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.
