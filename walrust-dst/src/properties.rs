@@ -564,7 +564,7 @@ pub fn prop_wal_page_sizes() -> Result<()> {
     let mut runner = proptest::test_runner::TestRunner::new(get_config());
 
     let result = runner.run(
-        &prop::sample::select(vec![1024u32, 2048, 4096, 8192, 16384, 32768]),
+        &prop::sample::select(vec![1024u32, 2048, 4096, 8192, 16384, 32768, 65536]),
         |page_size| {
             let tmpdir = TempDir::new().unwrap();
             let db_path = tmpdir.path().join("test.db");

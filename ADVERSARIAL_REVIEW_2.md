@@ -702,6 +702,23 @@ and
     `walrust-dst invariants --invariant production_published_deltas`.
 3.3 Compaction-vs-restore race test; two-watchers test; ENOSPC test;
     64KB pages; >100MB DB smoke test.
+    Status: Fixed — production and dual-tree coverage now exercises these
+    previously untested edges. Root CLI/S3 coverage proves restore remains
+    valid while forced compaction runs and proves watch/restore round-trips a
+    real SQLite database with 64KB pages. Core Replicator coverage proves
+    concurrent walrust-owned watchers race through the active-lineage CAS and
+    only one wins, and that an ENOSPC-style storage failure is a hard add
+    error that leaves the DB unregistered. Both `src/ltx.rs` and
+    `crates/walrust-core/src/ltx.rs` now include 64KB snapshot round-trips and
+    real SQLite >100MiB snapshot smoke tests verified by integrity/row/byte
+    aggregate checks; `walrust-dst` page-size property now includes 64KB.
+    Proven by `e2e_compaction_during_restore_keeps_backup_restorable`,
+    `e2e_cli_watch_restore_round_trips_64kb_pages`,
+    `test_walrust_owned_concurrent_two_watchers_only_one_wins`,
+    `test_walrust_owned_enospc_during_add_is_hard_error`,
+    `ltx::tests::test_snapshot_various_page_sizes`,
+    `ltx::tests::test_sqlite_snapshot_over_100mb_smoke`, and
+    `properties::tests::test_prop_wal_page_sizes`.
 
 ### Phase 4 — Converge (larger, optional but recommended)
 4.1 Decide the surviving stack (likely walrust-core as the engine, src/ as

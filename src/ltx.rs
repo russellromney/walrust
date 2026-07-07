@@ -671,7 +671,7 @@ mod tests {
     fn test_snapshot_various_page_sizes() {
         let dir = tempdir().unwrap();
 
-        for page_size in [512u32, 1024, 2048, 4096, 8192, 16384, 32768] {
+        for page_size in [512u32, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
             let db_path = dir.path().join(format!("test_{}.db", page_size));
             let restored_path = dir.path().join(format!("restored_{}.db", page_size));
 
@@ -915,6 +915,59 @@ mod tests {
 
         let restored_data = std::fs::read(&restored_path).unwrap();
         assert_eq!(db_data, restored_data);
+    }
+
+    #[test]
+    fn test_sqlite_snapshot_over_100mb_smoke() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("large-sqlite.db");
+        let restored_path = dir.path().join("restored-large-sqlite.db");
+
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA page_size=4096;
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE blobs (id INTEGER PRIMARY KEY, data BLOB NOT NULL);
+            BEGIN IMMEDIATE;
+            ",
+        )
+        .unwrap();
+        for id in 1..=101i64 {
+            conn.execute(
+                "INSERT INTO blobs (id, data) VALUES (?1, zeroblob(1048576))",
+                rusqlite::params![id],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT; PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        drop(conn);
+
+        assert!(
+            std::fs::metadata(&db_path).unwrap().len() > 100 * 1024 * 1024,
+            "fixture must exercise a database larger than 100 MiB"
+        );
+
+        let (encoded, encoded_checksum) = encode_sqlite_snapshot_to_vec(&db_path, 4096, 1).unwrap();
+        let decoded = decode_to_db(std::io::Cursor::new(encoded), &restored_path).unwrap();
+
+        let restored = rusqlite::Connection::open(&restored_path).unwrap();
+        let integrity: String = restored
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        let count: i64 = restored
+            .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+        let bytes: i64 = restored
+            .query_row("SELECT SUM(length(data)) FROM blobs", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(integrity, "ok");
+        assert_eq!(count, 101);
+        assert_eq!(bytes, 101 * 1024 * 1024);
+        assert_eq!(encoded_checksum, decoded.post_apply_checksum);
     }
 
     #[test]

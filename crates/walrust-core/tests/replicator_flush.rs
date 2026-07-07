@@ -250,6 +250,10 @@ struct PutFailsStorage {
     inner: Arc<MemStorage>,
 }
 
+struct EnospcStorage {
+    inner: Arc<MemStorage>,
+}
+
 struct FailAfterPutsStorage {
     inner: Arc<MemStorage>,
     remaining_successful_puts: AtomicUsize,
@@ -277,6 +281,16 @@ impl StateJsonGetFailsStorage {
 impl PutFailsStorage {
     fn new(inner: Arc<MemStorage>) -> Arc<Self> {
         Arc::new(Self { inner })
+    }
+}
+
+impl EnospcStorage {
+    fn new(inner: Arc<MemStorage>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+
+    fn enospc(key: &str) -> anyhow::Error {
+        anyhow::anyhow!("No space left on device while writing {key}")
     }
 }
 
@@ -388,6 +402,44 @@ impl StorageBackend for PutFailsStorage {
 
     async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
         self.inner.put_if_match(key, data, etag).await
+    }
+}
+
+#[async_trait]
+impl StorageBackend for EnospcStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, _data: &[u8]) -> Result<()> {
+        Err(Self::enospc(key))
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, _data: &[u8]) -> Result<CasResult> {
+        Err(Self::enospc(key))
+    }
+
+    async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
+        Ok(CasResult {
+            success: false,
+            etag: None,
+        })
+    }
+
+    async fn range_get(&self, key: &str, start: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        self.inner.range_get(key, start, len).await
     }
 }
 
@@ -1663,6 +1715,74 @@ async fn test_walrust_owned_add_refuses_existing_active_state() {
 
     drop(first_conn);
     drop(second_conn);
+}
+
+#[tokio::test]
+async fn test_walrust_owned_concurrent_two_watchers_only_one_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("walrust-owned-two-watchers.db");
+    let conn = create_wal_db(&db_path, 3);
+    let storage = MemStorage::new();
+
+    let first = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    let second = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+
+    let (first_result, second_result) = tokio::join!(
+        first.add("owned-two-watchers", &db_path),
+        second.add("owned-two-watchers", &db_path)
+    );
+
+    let successes = usize::from(first_result.is_ok()) + usize::from(second_result.is_ok());
+    let errors = [first_result.as_ref().err(), second_result.as_ref().err()];
+
+    assert_eq!(
+        successes, 1,
+        "exactly one competing walrust-owned watcher may claim active state"
+    );
+    assert!(
+        errors
+            .iter()
+            .flatten()
+            .any(|err| err.to_string().contains("active walrust-owned lineage")),
+        "losing watcher must fail closed with active-lineage refusal"
+    );
+
+    let state = storage.value("wal/owned-two-watchers/state.json").await;
+    assert!(
+        state
+            .get("lineage_id")
+            .and_then(|value| value.as_str())
+            .is_some(),
+        "winning watcher must persist the active lineage"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_walrust_owned_enospc_during_add_is_hard_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("walrust-owned-enospc.db");
+    let conn = create_wal_db(&db_path, 3);
+    let inner = MemStorage::new();
+    let storage = EnospcStorage::new(inner);
+    let replicator = Replicator::try_new(storage, "wal/", make_config()).unwrap();
+
+    let err = replicator
+        .add("owned-enospc", &db_path)
+        .await
+        .expect_err("ENOSPC during initial snapshot/state write must fail add");
+    assert!(
+        err.to_string().contains("No space left on device"),
+        "expected ENOSPC to be surfaced, got {err}"
+    );
+    assert_eq!(
+        replicator.current_seq("owned-enospc").await,
+        None,
+        "failed add must not leave the database registered"
+    );
+
+    drop(conn);
 }
 
 #[tokio::test]

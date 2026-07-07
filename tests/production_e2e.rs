@@ -24,15 +24,24 @@ fn unique_name(prefix: &str) -> String {
 }
 
 fn create_source_db(path: &Path, base_rows: i64) -> Result<Connection> {
+    create_source_db_with_page_size(path, base_rows, 4096)
+}
+
+fn create_source_db_with_page_size(
+    path: &Path,
+    base_rows: i64,
+    page_size: u32,
+) -> Result<Connection> {
     let conn = Connection::open(path)?;
-    conn.execute_batch(
+    conn.execute_batch(&format!(
         "
+        PRAGMA page_size={page_size};
         PRAGMA journal_mode=WAL;
         PRAGMA wal_autocheckpoint=0;
         CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE walrust_e2e_pin (id INTEGER PRIMARY KEY, label TEXT NOT NULL);
         ",
-    )?;
+    ))?;
     for id in 1..=base_rows {
         conn.execute(
             "INSERT INTO items (id, value) VALUES (?1, ?2)",
@@ -103,6 +112,11 @@ fn assert_integrity_ok(path: &Path) -> Result<()> {
     let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     anyhow::ensure!(integrity == "ok", "integrity_check failed: {integrity}");
     Ok(())
+}
+
+fn sqlite_page_size(path: &Path) -> Result<u32> {
+    let conn = Connection::open(path)?;
+    Ok(conn.query_row("PRAGMA page_size", [], |row| row.get(0))?)
 }
 
 fn run_cmd(mut cmd: Command, context: &str) -> Result<()> {
@@ -251,6 +265,19 @@ fn run_cli_restore(
     run_cmd(restore, "walrust restore")
 }
 
+fn run_cli_snapshot(db_path: &Path, bucket_arg: &str, endpoint: Option<&str>) -> Result<()> {
+    let mut snapshot = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    snapshot
+        .arg("snapshot")
+        .arg(db_path)
+        .arg("--bucket")
+        .arg(bucket_arg);
+    if let Some(endpoint) = endpoint {
+        snapshot.arg("--endpoint").arg(endpoint);
+    }
+    run_cmd(snapshot, "walrust snapshot")
+}
+
 #[test]
 fn e2e_cli_watch_restore_round_trips_sqlite_rows() -> Result<()> {
     let temp = TempDir::new()?;
@@ -274,6 +301,35 @@ fn e2e_cli_watch_restore_round_trips_sqlite_rows() -> Result<()> {
     run_cli_restore(&name, &bucket_arg, endpoint.as_deref(), &restored_path)?;
 
     assert_integrity_ok(&restored_path)?;
+    assert_eq!(rows(&db_path)?, rows(&restored_path)?);
+
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_watch_restore_round_trips_64kb_pages() -> Result<()> {
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-64kb-e2e");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+
+    let _setup = create_source_db_with_page_size(&db_path, 4, 65_536)?;
+    let writer = open_external_autocheckpoint_connection(&db_path)?;
+
+    let mut child = spawn_cli_watch(&db_path, &bucket_arg, endpoint.as_deref(), true)?;
+
+    std::thread::sleep(Duration::from_secs(2));
+    append_rows(&writer, 5, 9, "watch-64kb")?;
+    wait_for_live_incremental(&bucket_arg, endpoint.as_deref(), &name)?;
+    stop_child(&mut child);
+
+    run_cli_restore(&name, &bucket_arg, endpoint.as_deref(), &restored_path)?;
+
+    assert_integrity_ok(&restored_path)?;
+    assert_eq!(sqlite_page_size(&restored_path)?, 65_536);
     assert_eq!(rows(&db_path)?, rows(&restored_path)?);
 
     Ok(())
@@ -304,6 +360,75 @@ fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     stop_child(&mut second);
 
     run_cli_restore(&name, &bucket_arg, endpoint.as_deref(), &restored_path)?;
+
+    assert_integrity_ok(&restored_path)?;
+    assert_eq!(rows(&db_path)?, rows(&restored_path)?);
+
+    Ok(())
+}
+
+#[test]
+fn e2e_compaction_during_restore_keeps_backup_restorable() -> Result<()> {
+    let temp = TempDir::new()?;
+    let name = unique_name("compact-race-e2e");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+
+    let writer = create_source_db(&db_path, 4)?;
+    run_cli_snapshot(&db_path, &bucket_arg, endpoint.as_deref())?;
+    append_rows(&writer, 5, 7, "snapshot-two")?;
+    run_cli_snapshot(&db_path, &bucket_arg, endpoint.as_deref())?;
+    append_rows(&writer, 8, 12, "snapshot-three")?;
+    run_cli_snapshot(&db_path, &bucket_arg, endpoint.as_deref())?;
+
+    let mut restore = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    restore
+        .arg("restore")
+        .arg(&name)
+        .arg("--output")
+        .arg(&restored_path)
+        .arg("--bucket")
+        .arg(&bucket_arg);
+    if let Some(endpoint) = endpoint.as_deref() {
+        restore.arg("--endpoint").arg(endpoint);
+    }
+
+    let mut compact = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    compact
+        .arg("compact")
+        .arg(&name)
+        .arg("--bucket")
+        .arg(&bucket_arg)
+        .arg("--hourly")
+        .arg("0")
+        .arg("--daily")
+        .arg("0")
+        .arg("--weekly")
+        .arg("0")
+        .arg("--monthly")
+        .arg("0")
+        .arg("--force");
+    if let Some(endpoint) = endpoint.as_deref() {
+        compact.arg("--endpoint").arg(endpoint);
+    }
+
+    let mut restore_child = restore.spawn().context("spawn walrust restore")?;
+    let compact_output = compact.output().context("run walrust compact")?;
+    let restore_status = restore_child.wait().context("wait walrust restore")?;
+
+    anyhow::ensure!(
+        compact_output.status.success(),
+        "walrust compact failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&compact_output.stdout),
+        String::from_utf8_lossy(&compact_output.stderr)
+    );
+    anyhow::ensure!(
+        restore_status.success(),
+        "walrust restore failed during compaction"
+    );
 
     assert_integrity_ok(&restored_path)?;
     assert_eq!(rows(&db_path)?, rows(&restored_path)?);
