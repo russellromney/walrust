@@ -780,9 +780,17 @@ and
     `sync::replicate::tests::replica_failed_incremental_apply_preserves_existing_database`
     and
     `sync::replicate::tests::replica_gap_without_future_snapshot_errors_and_preserves_existing_database`.
-    Remaining work: root `src/sync/*` still owns the CLI watch/upload
-    orchestration over the legacy LTX object layout, while core owns the HADBP
-    engine. That workflow/API migration is still required before duplicate sync
-    implementations can be deleted.
+    Legacy local-cache ownership was then reproduced with
+    `legacy_cache_is_owned_by_core_and_persists_pending_ltx` (failed because
+    `walrust_core::legacy_cache` did not exist), then fixed by moving
+    `LocalCache`, cache manifest persistence, interval-aware durable cursors,
+    fsynced cache writes, cleanup, and verification into
+    `walrust-core::legacy_cache`; root `src/cache.rs` is now a compatibility
+    shim. The moved cache keeps its original unit coverage under
+    `walrust-core::legacy_cache::tests::*`.
+    Remaining work: root `src/uploader.rs` and root `src/sync/*` still own the
+    CLI watch/upload orchestration over the legacy LTX object layout, while
+    core owns the HADBP engine. That workflow/API migration is still required
+    before duplicate sync implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.

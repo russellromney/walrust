@@ -12,6 +12,7 @@
 
 pub mod errors;
 pub mod external_delta;
+pub mod legacy_cache;
 pub mod legacy_ltx;
 pub mod legacy_manifest;
 pub mod legacy_replica;
