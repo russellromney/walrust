@@ -40,6 +40,11 @@ in both `src/` and `crates/walrust-core/`.
   frame chain validation passes.
 
 ### A2 — No frame-salt check; zeroed header checksum silently disables validation
+Status: Fixed — proven by
+`wal::tests::test_checked_reader_rejects_frame_salt_mismatch` and
+`wal::tests::test_checked_reader_rejects_zero_header_checksum` in both `src/`
+and `crates/walrust-core/`.
+
 - `crates/walrust-core/src/wal.rs:424-453` (frame salt bytes 8..16 never
   compared to header salt), `wal.rs:106-130, 398-418` (`None` from
   `validate_header_checksum` => validate=false, silently)

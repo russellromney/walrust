@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::fmt;
 use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
@@ -38,6 +39,36 @@ pub const FRAME_HEADER_SIZE: u64 = 24;
 pub const WAL_MAGIC_LE: u32 = 0x377F_0682;
 /// WAL magic for the big-endian checksum variant.
 pub const WAL_MAGIC_BE: u32 = 0x377F_0683;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalValidationError {
+    InvalidHeaderChecksum,
+    FrameSaltMismatch {
+        frame: u64,
+        expected: (u32, u32),
+        actual: (u32, u32),
+    },
+}
+
+impl fmt::Display for WalValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WalValidationError::InvalidHeaderChecksum => {
+                write!(f, "WAL header checksum is invalid")
+            }
+            WalValidationError::FrameSaltMismatch {
+                frame,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "WAL frame salt mismatch at frame {frame}: expected {expected:?}, got {actual:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WalValidationError {}
 
 /// SQLite WAL cumulative checksum (the s0/s1 Fibonacci-weighted sum).
 ///
@@ -79,9 +110,11 @@ fn magic_is_big_endian(magic: u32) -> bool {
 
 /// Validate the 32-byte WAL header's own checksum (computed over the first 24
 /// bytes, seeded `(0, 0)`, stored big-endian in bytes 24..32). Returns the
-/// header checksum to seed the frame chain when valid; `None` for a synthetic
-/// header with a zero stored checksum (never a real SQLite WAL).
-pub fn validate_header_checksum(header_bytes: &[u8; 32], big_endian: bool) -> Option<(u32, u32)> {
+/// header checksum to seed the frame chain when valid.
+pub fn validate_header_checksum(
+    header_bytes: &[u8; 32],
+    big_endian: bool,
+) -> std::result::Result<(u32, u32), WalValidationError> {
     let stored = (
         u32::from_be_bytes([
             header_bytes[24],
@@ -97,13 +130,13 @@ pub fn validate_header_checksum(header_bytes: &[u8; 32], big_endian: bool) -> Op
         ]),
     );
     if stored == (0, 0) {
-        return None;
+        return Err(WalValidationError::InvalidHeaderChecksum);
     }
     let computed = wal_checksum((0, 0), &header_bytes[0..24], big_endian);
     if computed == stored {
-        Some(stored)
+        Ok(stored)
     } else {
-        None
+        Err(WalValidationError::InvalidHeaderChecksum)
     }
 }
 
@@ -281,10 +314,11 @@ pub async fn read_frames_as_page_map(
 ///
 /// `chain_seed` is the running WAL checksum at `start_offset` (the last frame
 /// already consumed). Pass `None` when starting from the header. A frame whose
-/// stored checksum does not match the chain is treated as a torn / partial tail:
-/// reading stops at the last good committed frame, so a torn tail frame carrying
-/// a bogus non-zero db_size is never mistaken for a commit boundary. Validation
-/// is skipped only for synthetic WALs with a zero header checksum.
+/// stored checksum does not match the chain or whose salt does not match the
+/// header is treated as a torn / stale tail: reading stops at the last good
+/// committed frame, so a torn tail frame carrying a bogus non-zero db_size is
+/// never mistaken for a commit boundary. Invalid header checksums are hard
+/// errors.
 #[allow(clippy::type_complexity)]
 pub async fn read_frames_as_page_map_checked(
     path: &Path,
@@ -323,7 +357,22 @@ pub async fn read_frames_as_page_map_checked(
         ]);
         if magic == WAL_MAGIC_BE || magic == WAL_MAGIC_LE {
             let be = magic_is_big_endian(magic);
-            validate_header_checksum(&header_bytes, be).map(|seed| (seed, be))
+            let seed = validate_header_checksum(&header_bytes, be)?;
+            let salt = (
+                u32::from_be_bytes([
+                    header_bytes[16],
+                    header_bytes[17],
+                    header_bytes[18],
+                    header_bytes[19],
+                ]),
+                u32::from_be_bytes([
+                    header_bytes[20],
+                    header_bytes[21],
+                    header_bytes[22],
+                    header_bytes[23],
+                ]),
+            );
+            Some((seed, be, salt))
         } else {
             None
         }
@@ -358,17 +407,17 @@ pub async fn read_frames_as_page_map_checked(
         ));
     }
 
-    let (mut running, big_endian, validate) = match header_seed {
-        Some((hdr_seed, be)) => {
+    let (mut running, big_endian, validate, header_salt) = match header_seed {
+        Some((hdr_seed, be, salt)) => {
             let seed = if start_pos == WAL_HEADER_SIZE {
                 hdr_seed
             } else {
-                chain_seed.unwrap_or((0, 0))
+                chain_seed.unwrap_or_default()
             };
             let validate = start_pos == WAL_HEADER_SIZE || chain_seed.is_some();
-            (seed, be, validate)
+            (seed, be, validate, salt)
         }
-        None => ((0, 0), true, false),
+        None => ((0, 0), true, false, (0, 0)),
     };
 
     let mut frame_headers = Vec::with_capacity(full_frames as usize);
@@ -381,6 +430,27 @@ pub async fn read_frames_as_page_map_checked(
         file.read_exact(&mut page_data).await?;
 
         if validate {
+            let frame_salt = (
+                u32::from_be_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]),
+                u32::from_be_bytes([
+                    header_buf[12],
+                    header_buf[13],
+                    header_buf[14],
+                    header_buf[15],
+                ]),
+            );
+            if frame_salt != header_salt {
+                tracing::warn!(
+                    "{}; treating as stale tail",
+                    WalValidationError::FrameSaltMismatch {
+                        frame: frame_index + 1,
+                        expected: header_salt,
+                        actual: frame_salt,
+                    }
+                );
+                break;
+            }
+
             match verify_frame_checksum(running, &header_buf, &page_data, big_endian) {
                 Some(next) => running = next,
                 None => {
@@ -430,7 +500,7 @@ pub async fn read_frames_as_page_map_checked(
 
     let mut page_map = std::collections::HashMap::new();
     let mut out_chain = match header_seed {
-        Some((hdr_seed, _)) if start_pos == WAL_HEADER_SIZE => Some(hdr_seed),
+        Some((hdr_seed, _, _)) if start_pos == WAL_HEADER_SIZE => Some(hdr_seed),
         _ => chain_seed,
     };
 
@@ -904,6 +974,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_checked_reader_rejects_frame_salt_mismatch() {
+        let page_size = 1024u32;
+        let frame_size = FRAME_HEADER_SIZE as usize + page_size as usize;
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-bin-salt-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let mut wal = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(1, 1, 0xAA), (2, 2, 0xBB)],
+        );
+        let second_frame_header = WAL_HEADER_SIZE as usize + frame_size;
+        wal[second_frame_header + 8..second_frame_header + 12]
+            .copy_from_slice(&0x3333_3333u32.to_be_bytes());
+        tokio::fs::write(&path, &wal).await.unwrap();
+
+        let (pages, frame_count, _offset, db_size, commit_count, _chain) =
+            read_frames_as_page_map_checked(&path, page_size, 0, None)
+                .await
+                .unwrap();
+
+        assert_eq!(frame_count, 1, "stale frame salt must stop the reader");
+        assert_eq!(db_size, 1);
+        assert_eq!(commit_count, 1);
+        assert!(pages.contains_key(&1));
+        assert!(!pages.contains_key(&2));
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_checked_reader_rejects_zero_header_checksum() {
+        let page_size = 1024u32;
+        let frame_size = FRAME_HEADER_SIZE as usize + page_size as usize;
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-bin-zero-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let mut data = vec![0u8; WAL_HEADER_SIZE as usize + frame_size];
+        data[0..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
+        data[8..12].copy_from_slice(&page_size.to_be_bytes());
+        data[32..36].copy_from_slice(&1u32.to_be_bytes());
+        data[36..40].copy_from_slice(&1u32.to_be_bytes());
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        let err = read_frames_as_page_map_checked(&path, page_size, 0, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err.downcast_ref::<WalValidationError>(),
+            Some(WalValidationError::InvalidHeaderChecksum)
+        ));
+        assert!(err.to_string().contains("WAL header checksum"));
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
     async fn test_read_header_nonexistent_file() {
         let path = PathBuf::from("/tmp/nonexistent-wal-file.db-wal");
         let result = read_header(&path).await.unwrap();
@@ -1125,9 +1253,11 @@ mod tests {
     async fn test_read_frames_as_page_map_waits_for_commit_frame() {
         let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
         let page_size = 1024u32;
-        let mut data = wal_header(page_size);
-        append_frame(&mut data, 1, 0, 0xAA, page_size);
-        append_frame(&mut data, 2, 0, 0xBB, page_size);
+        let data = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(1, 0, 0xAA), (2, 0, 0xBB)],
+        );
         tokio::fs::write(&path, &data).await.unwrap();
 
         let (pages, frame_count, offset, max_db_size, commit_count) =
@@ -1150,10 +1280,11 @@ mod tests {
         let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
         let page_size = 1024u32;
         let frame_size = FRAME_HEADER_SIZE + page_size as u64;
-        let mut data = wal_header(page_size);
-        append_frame(&mut data, 1, 0, 0xAA, page_size);
-        append_frame(&mut data, 2, 2, 0xBB, page_size);
-        append_frame(&mut data, 3, 0, 0xCC, page_size);
+        let data = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(1, 0, 0xAA), (2, 2, 0xBB), (3, 0, 0xCC)],
+        );
         tokio::fs::write(&path, &data).await.unwrap();
 
         let (pages, frame_count, offset, max_db_size, commit_count) =
@@ -1201,9 +1332,11 @@ mod tests {
     async fn test_read_frames_reports_last_commit_db_size_not_max() {
         let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
         let page_size = 1024u32;
-        let mut data = wal_header(page_size);
-        append_frame(&mut data, 5, 5, 0xAA, page_size);
-        append_frame(&mut data, 3, 3, 0xBB, page_size);
+        let data = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(5, 5, 0xAA), (3, 3, 0xBB)],
+        );
         tokio::fs::write(&path, &data).await.unwrap();
 
         let (_, _, _, final_db_size, commit_count) =
