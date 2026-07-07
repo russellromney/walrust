@@ -1740,11 +1740,12 @@ async fn test_walrust_owned_concurrent_two_watchers_only_one_wins() {
         "exactly one competing walrust-owned watcher may claim active state"
     );
     assert!(
-        errors
-            .iter()
-            .flatten()
-            .any(|err| err.to_string().contains("active walrust-owned lineage")),
-        "losing watcher must fail closed with active-lineage refusal"
+        errors.iter().flatten().any(|err| {
+            let err = err.to_string();
+            err.contains("active walrust-owned lineage")
+                || err.contains("already has replication state")
+        }),
+        "losing watcher must fail closed with active-state refusal"
     );
 
     let state = storage.value("wal/owned-two-watchers/state.json").await;

@@ -739,8 +739,14 @@ and
     it from root. The moved codec keeps its original unit coverage under
     `walrust-core::legacy_ltx`; targeted proof includes
     `legacy_ltx::tests::test_encode_sqlite_snapshot_includes_wal_and_returns_encoded_checksum`
-    and `legacy_ltx::tests::test_snapshot_various_page_sizes`. Remaining work:
-    root `src/sync/*` still owns the CLI watch/restore/compact/replicate
+    and `legacy_ltx::tests::test_snapshot_various_page_sizes`. Legacy object
+    layout ownership was then reproduced with
+    `legacy_ltx_object_layout_is_owned_by_core` (failed because
+    `walrust_core::legacy_manifest` did not exist), then fixed by moving the
+    pure key-formatting, generation, snapshot-classification, and discovered
+    file types into `walrust-core::legacy_manifest`; root `src/sync/manifest.rs`
+    now reuses those definitions. Remaining work: root `src/sync/*` still owns
+    the S3-specific CLI watch/restore/compact/replicate discovery and apply
     workflow over the legacy LTX object layout, while core owns the HADBP
     engine. That workflow/API migration is still required before duplicate
     sync/restore implementations can be deleted.

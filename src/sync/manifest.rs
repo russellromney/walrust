@@ -1,6 +1,10 @@
 use crate::ltx::Decoder;
 use anyhow::Result;
 use std::io::Cursor;
+pub(crate) use walrust_core::legacy_manifest::{
+    build_ltx_key, database_prefix, format_generation, is_snapshot, parse_generation,
+    parse_legacy_flat_ltx_filename, parse_ltx_filename, DiscoveredLtx, GENERATION_LIVE,
+};
 
 use super::types::Manifest;
 use crate::s3;
@@ -13,58 +17,6 @@ use crate::s3;
 //   db_name/0001/{min_txid}-{max_txid}.ltx  <- generation 1 (snapshot + compacted)
 //   db_name/0002/...                         <- generation 2, etc.
 // TXIDs are 16-char lowercase hex (e.g., 0000000000000001)
-
-/// Format a TXID as 16-char lowercase hex (litestream format)
-pub(crate) fn format_txid_hex(txid: u64) -> String {
-    format!("{:016x}", txid)
-}
-
-/// Parse a TXID from 16-char hex string
-pub(crate) fn parse_txid_hex(s: &str) -> Option<u64> {
-    u64::from_str_radix(s, 16).ok()
-}
-
-/// Format an LTX filename in litestream format
-pub(crate) fn format_ltx_filename(min_txid: u64, max_txid: u64) -> String {
-    format!(
-        "{}-{}.ltx",
-        format_txid_hex(min_txid),
-        format_txid_hex(max_txid)
-    )
-}
-
-/// Parse min/max TXID from litestream-format filename
-/// e.g., "0000000000000001-0000000000000010.ltx" -> Some((1, 16))
-pub(crate) fn parse_ltx_filename(filename: &str) -> Option<(u64, u64)> {
-    let name = filename.strip_suffix(".ltx")?;
-    let parts: Vec<&str> = name.split('-').collect();
-    if parts.len() != 2 {
-        return None;
-    }
-    let min_txid = parse_txid_hex(parts[0])?;
-    let max_txid = parse_txid_hex(parts[1])?;
-    Some((min_txid, max_txid))
-}
-
-fn parse_legacy_flat_ltx_filename(filename: &str) -> Option<u64> {
-    let name = filename.strip_suffix(".ltx")?;
-    if name.contains('-') || name.len() != 8 {
-        return None;
-    }
-    name.parse::<u64>().ok()
-}
-
-fn prefix_with_separator(prefix: &str) -> String {
-    if prefix.is_empty() || prefix.ends_with('/') {
-        prefix.to_string()
-    } else {
-        format!("{prefix}/")
-    }
-}
-
-fn database_prefix(prefix: &str, db_name: &str) -> String {
-    format!("{}{}/", prefix_with_separator(prefix), db_name)
-}
 
 async fn legacy_flat_ltx_range(
     client: &aws_sdk_s3::Client,
@@ -79,50 +31,6 @@ async fn legacy_flat_ltx_range(
         return (txid, txid);
     };
     (header.min_txid.into_inner(), header.max_txid.into_inner())
-}
-
-/// Format generation folder name (4-char hex)
-pub(crate) fn format_generation(gen: u64) -> String {
-    format!("{:04x}", gen)
-}
-
-/// Parse generation from folder name
-pub(crate) fn parse_generation(s: &str) -> Option<u64> {
-    u64::from_str_radix(s, 16).ok()
-}
-
-/// Build S3 key for an LTX file in litestream format
-/// - generation 0 = live incrementals (0000/)
-/// - generation 1+ = snapshots and compacted files
-pub(crate) fn build_ltx_key(
-    prefix: &str,
-    db_name: &str,
-    generation: u64,
-    min_txid: u64,
-    max_txid: u64,
-) -> String {
-    format!(
-        "{}{}/{}/{}",
-        prefix_with_separator(prefix),
-        db_name,
-        format_generation(generation),
-        format_ltx_filename(min_txid, max_txid)
-    )
-}
-
-/// Live incrementals go to generation 0 (0000/)
-pub(crate) const GENERATION_LIVE: u64 = 0;
-
-/// Single definition of "is this LTX file a snapshot (full DB base)".
-///
-/// A snapshot is either any file in a snapshot generation (>= 1), or the
-/// initial base in the live generation, which litestream writes as the
-/// single-TXID file `min_txid == 1 && max_txid == 1`. Incrementals in the live
-/// generation always have `max_txid > 1` (or `min_txid > 1`). Centralizing this
-/// keeps `verify`, `compact`, `replicate`, and manifest construction from
-/// drifting apart (F15).
-pub(crate) fn is_snapshot(generation: u64, min_txid: u64, max_txid: u64) -> bool {
-    generation > 0 || (min_txid == 1 && max_txid == 1)
 }
 
 /// Discover all snapshot LTX files from S3 by listing (no manifest needed).
@@ -339,17 +247,6 @@ pub(crate) async fn list_generation_files(
     // Sort by min_txid
     files.sort_by_key(|(_, min, _)| *min);
     Ok(files)
-}
-
-/// A discovered LTX file from S3 listing.
-#[derive(Debug, Clone)]
-pub(crate) struct DiscoveredLtx {
-    /// Full S3 key.
-    pub key: String,
-    pub generation: u64,
-    pub min_txid: u64,
-    pub max_txid: u64,
-    pub is_snapshot: bool,
 }
 
 /// Discover every LTX file (snapshots + incrementals) for a database from the
