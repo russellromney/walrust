@@ -55,6 +55,36 @@ impl From<&DbState> for SyncInput {
     }
 }
 
+impl From<&DbState> for walrust_core::legacy_wal_sync::WatchedDbState {
+    fn from(state: &DbState) -> Self {
+        Self {
+            db_path: state.db_path.clone(),
+            name: state.name.clone(),
+            wal_path: state.wal_path.clone(),
+            wal_offset: state.wal_offset,
+            wal_generation: state.wal_generation,
+            current_txid: state.current_txid,
+            db_checksum: state.db_checksum,
+            wal_salt: state.wal_salt,
+            wal_checksum_chain: state.wal_checksum_chain,
+        }
+    }
+}
+
+impl DbState {
+    pub(crate) fn apply_watched_state(
+        &mut self,
+        state: &walrust_core::legacy_wal_sync::WatchedDbState,
+    ) {
+        self.wal_offset = state.wal_offset;
+        self.wal_generation = state.wal_generation;
+        self.current_txid = state.current_txid;
+        self.db_checksum = state.db_checksum;
+        self.wal_salt = state.wal_salt;
+        self.wal_checksum_chain = state.wal_checksum_chain;
+    }
+}
+
 /// Output from concurrent WAL sync (changes to apply to state)
 pub(crate) use walrust_core::legacy_wal_sync::SyncOutput;
 

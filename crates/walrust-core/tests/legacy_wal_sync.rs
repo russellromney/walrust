@@ -7,8 +7,8 @@ use walrust_core::legacy_cache::LocalCache;
 use walrust_core::legacy_manifest::build_ltx_key;
 use walrust_core::legacy_uploader::UploadMessage;
 use walrust_core::legacy_wal_sync::{
-    snapshot_database_to_storage, sync_wal_to_cache, sync_wal_to_storage, take_snapshot_to_storage,
-    SyncInput,
+    snapshot_database_to_storage, sync_wal_to_cache, sync_wal_to_storage,
+    sync_watched_db_once_to_cache, take_snapshot_to_storage, SyncInput, WatchedDbState,
 };
 use walrust_core::shadow::ShadowWal;
 
@@ -152,6 +152,47 @@ async fn legacy_wal_sync_cache_initial_snapshot_is_owned_by_core() -> Result<()>
 
     assert_eq!(output.new_current_txid, 1);
     assert_eq!(output.frame_count, 1);
+    assert_eq!(cache.pending_uploads(), vec![1]);
+    assert!(matches!(rx.try_recv()?, UploadMessage::Upload(1)));
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_watch_sync_once_state_machine_is_owned_by_core() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("watch-source.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(
+            "CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT);
+             INSERT INTO marker (value) VALUES ('watch-sync-once');",
+        )?;
+    }
+
+    let cache = Arc::new(LocalCache::new(&db_path)?);
+    let shadow = Arc::new(tokio::sync::Mutex::new(ShadowWal::new(&db_path).await?));
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<UploadMessage>(4);
+    let mut state = WatchedDbState {
+        db_path: db_path.clone(),
+        name: "app".to_string(),
+        wal_path: db_path.with_extension("db-wal"),
+        wal_offset: 0,
+        wal_generation: 0,
+        current_txid: 0,
+        db_checksum: None,
+        wal_salt: None,
+        wal_checksum_chain: None,
+    };
+
+    let output = sync_watched_db_once_to_cache(&mut state, &cache, &shadow, &tx).await?;
+
+    assert_eq!(output.frame_count, 1);
+    assert_eq!(state.wal_offset, output.new_wal_offset);
+    assert_eq!(state.current_txid, output.new_current_txid);
+    assert_eq!(state.db_checksum, output.new_db_checksum);
+    assert_eq!(state.wal_salt, output.new_wal_salt);
+    assert_eq!(state.wal_checksum_chain, output.new_wal_checksum_chain);
     assert_eq!(cache.pending_uploads(), vec![1]);
     assert!(matches!(rx.try_recv()?, UploadMessage::Upload(1)));
     Ok(())

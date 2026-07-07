@@ -38,6 +38,75 @@ pub struct SyncOutput {
     pub new_wal_checksum_chain: Option<(u32, u32)>,
 }
 
+#[derive(Clone)]
+pub struct WatchedDbState {
+    pub db_path: PathBuf,
+    pub name: String,
+    pub wal_path: PathBuf,
+    pub wal_offset: u64,
+    pub wal_generation: u64,
+    pub current_txid: u64,
+    pub db_checksum: Option<u64>,
+    pub wal_salt: Option<(u32, u32)>,
+    pub wal_checksum_chain: Option<(u32, u32)>,
+}
+
+impl From<&WatchedDbState> for SyncInput {
+    fn from(state: &WatchedDbState) -> Self {
+        Self {
+            db_path: state.db_path.clone(),
+            name: state.name.clone(),
+            wal_path: state.wal_path.clone(),
+            wal_offset: state.wal_offset,
+            wal_generation: state.wal_generation,
+            current_txid: state.current_txid,
+            db_checksum: state.db_checksum,
+            wal_salt: state.wal_salt,
+            wal_checksum_chain: state.wal_checksum_chain,
+        }
+    }
+}
+
+pub fn apply_sync_output_to_watched_state(state: &mut WatchedDbState, output: &SyncOutput) {
+    state.wal_salt = output.new_wal_salt;
+    state.wal_checksum_chain = output.new_wal_checksum_chain;
+
+    if output.checkpoint_detected {
+        state.wal_generation = output.new_wal_generation;
+        state.wal_offset = output.new_wal_offset;
+    }
+
+    if output.frame_count > 0 {
+        state.wal_offset = output.new_wal_offset;
+        state.current_txid = output.new_current_txid;
+        state.db_checksum = output.new_db_checksum;
+        if output.checkpoint_detected {
+            state.wal_generation = output.new_wal_generation;
+        }
+    }
+}
+
+pub async fn sync_watched_db_once_to_storage(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut WatchedDbState,
+) -> Result<SyncOutput> {
+    let output = sync_wal_to_storage(storage, prefix, SyncInput::from(&*state)).await?;
+    apply_sync_output_to_watched_state(state, &output);
+    Ok(output)
+}
+
+pub async fn sync_watched_db_once_to_cache(
+    state: &mut WatchedDbState,
+    cache: &Arc<LocalCache>,
+    shadow: &Arc<tokio::sync::Mutex<ShadowWal>>,
+    upload_tx: &mpsc::Sender<UploadMessage>,
+) -> Result<SyncOutput> {
+    let output = sync_wal_to_cache(&SyncInput::from(&*state), cache, shadow, upload_tx).await?;
+    apply_sync_output_to_watched_state(state, &output);
+    Ok(output)
+}
+
 pub struct SnapshotUploadOutput {
     pub key: String,
     pub generation: u64,

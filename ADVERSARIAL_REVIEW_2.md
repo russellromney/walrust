@@ -823,8 +823,9 @@ and
     `walrust_core::legacy_wal_sync::sync_wal_to_cache` did not exist), then
     fixed by moving shadow-backed cache snapshot/incremental encoding, cache
     writes, and uploader notification into `walrust-core::legacy_wal_sync`;
-    root `src/sync/wal_sync.rs::sync_wal_to_cache` is now a compatibility
-    wrapper. Legacy periodic snapshot ownership was then reproduced with
+    root `src/sync/wal_sync.rs::sync_wal_to_cache` was left as a compatibility
+    wrapper and later deleted after the watched sync-once path moved into
+    core. Legacy periodic snapshot ownership was then reproduced with
     `legacy_wal_sync_periodic_snapshot_is_owned_by_core` (failed because
     `walrust_core::legacy_wal_sync::take_snapshot_to_storage` did not exist),
     then fixed by moving checkpointed storage-backed snapshot publication into
@@ -836,9 +837,16 @@ and
     exist), then fixed by moving the `walrust snapshot` storage-backed
     publication path into `walrust-core::legacy_wal_sync`; root
     `src/sync/compact.rs::snapshot` now keeps only CLI validation and output
-    formatting. Remaining work: root watch orchestration still owns legacy
-    cache-mode WAL upload control flow over the LTX object layout, while core
-    owns the HADBP engine. That workflow/API migration is still required
-    before duplicate sync implementations can be deleted.
+    formatting. Legacy watch sync-once ownership was then reproduced with
+    `legacy_watch_sync_once_state_machine_is_owned_by_core` (failed because
+    `walrust_core::legacy_wal_sync::{WatchedDbState,
+    sync_watched_db_once_to_cache}` did not exist), then fixed by moving the
+    watched database cursor mutation for cache-mode WAL sync into
+    `walrust-core::legacy_wal_sync`; root `src/sync/wal_sync.rs::do_sync`
+    now delegates cache-mode state advancement to core and uses the same core
+    transition after direct-upload retry success. Remaining work: root shadow
+    watch orchestration still owns durable shadow progress, checkpoint drain,
+    and multi-DB shadow sync lifecycle control. That workflow/API migration is
+    still required before duplicate sync implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.

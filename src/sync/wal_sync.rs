@@ -2,14 +2,13 @@ use anyhow::Result;
 use chrono::Utc;
 use hadb_storage_s3::S3Storage;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 
-use crate::cache::LocalCache;
 use crate::dashboard::{DbStatus, MetricsState};
 use crate::retry::{classify_error, ErrorKind, RetryPolicy};
-use crate::shadow::ShadowWal;
-use crate::uploader::UploadMessage;
 use crate::webhook::WebhookSender;
+use walrust_core::legacy_wal_sync::{
+    apply_sync_output_to_watched_state, sync_watched_db_once_to_cache, WatchedDbState,
+};
 
 use super::types::{DbState, DbTaskState, SyncInput, SyncOutput};
 
@@ -103,14 +102,19 @@ pub(crate) async fn do_sync(
     metrics_state: &Arc<MetricsState>,
     cache_state: Option<&super::types::CacheState>,
 ) -> Result<u64> {
-    let input = SyncInput::from(&state.db_state);
+    let mut watched_state = WatchedDbState::from(&state.db_state);
 
     let result = if let Some(cache) = cache_state {
-        // Cache-enabled path: shadow WAL → encode → cache → notify uploader
-        sync_wal_to_cache(&input, &cache.cache, &cache.shadow, &cache.upload_tx).await?
+        sync_watched_db_once_to_cache(
+            &mut watched_state,
+            &cache.cache,
+            &cache.shadow,
+            &cache.upload_tx,
+        )
+        .await?
     } else {
-        // Direct S3 upload path (current behavior)
-        sync_wal_concurrent_with_retry(
+        let input = SyncInput::from(&watched_state);
+        let result = sync_wal_concurrent_with_retry(
             Arc::new(client.clone()),
             bucket.to_string(),
             prefix.to_string(),
@@ -118,14 +122,12 @@ pub(crate) async fn do_sync(
             retry_policy.clone(),
             Arc::clone(webhook_sender),
         )
-        .await?
+        .await?;
+        apply_sync_output_to_watched_state(&mut watched_state, &result);
+        result
     };
 
-    // Track the WAL salt and running checksum chain even on a no-op sync so a
-    // later in-place WAL reset (new salt) is detected and the chain seed stays
-    // current for the next incremental read.
-    state.db_state.wal_salt = result.new_wal_salt;
-    state.db_state.wal_checksum_chain = result.new_wal_checksum_chain;
+    state.db_state.apply_watched_state(&watched_state);
     if result.checkpoint_detected {
         let event = format!(
             "{}: WAL rollover/checkpoint detected; backup safety path handled it before continuing",
@@ -135,19 +137,9 @@ pub(crate) async fn do_sync(
         webhook_sender
             .notify_upload_failed(&state.db_state.name, &event, 1)
             .await;
-        state.db_state.wal_generation = result.new_wal_generation;
-        state.db_state.wal_offset = result.new_wal_offset;
     }
 
     if result.frame_count > 0 {
-        // Update state
-        state.db_state.wal_offset = result.new_wal_offset;
-        state.db_state.current_txid = result.new_current_txid;
-        state.db_state.db_checksum = result.new_db_checksum;
-        if result.checkpoint_detected {
-            state.db_state.wal_generation = result.new_wal_generation;
-        }
-
         // Update trigger state
         state.trigger_state.frames_since_snapshot += result.frame_count;
         state.trigger_state.last_wal_activity = Some(std::time::Instant::now());
@@ -173,27 +165,6 @@ pub(crate) async fn do_sync(
     }
 
     Ok(result.frame_count)
-}
-
-/// Sync WAL to local cache via shadow WAL (checkpoint-safe)
-///
-/// This function uses the Litestream-style shadow WAL architecture:
-/// 1. Shadow WAL holds checkpoint blocker (prevents SQLite from truncating WAL)
-/// 2. Frames are copied from live WAL to shadow (now safe from checkpoint)
-/// 3. Frames are encoded to LTX format
-/// 4. LTX is written to local disk cache (atomic write)
-/// 5. TXID notification sent to uploader task
-///
-/// The shadow WAL ensures no frames are lost to checkpoints. The uploader task
-/// runs independently and handles S3 uploads with retry. This provides both
-/// checkpoint safety and crash recovery.
-pub(crate) async fn sync_wal_to_cache(
-    input: &SyncInput,
-    cache: &Arc<LocalCache>,
-    shadow: &Arc<tokio::sync::Mutex<ShadowWal>>,
-    upload_tx: &mpsc::Sender<UploadMessage>,
-) -> Result<SyncOutput> {
-    walrust_core::legacy_wal_sync::sync_wal_to_cache(input, cache, shadow, upload_tx).await
 }
 
 // ============================================================================
