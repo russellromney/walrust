@@ -4,7 +4,10 @@
 //! the implementation into `walrust-core`.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
+use hadb_io::{analyze_retention, RetentionPlan, RetentionPolicy, SnapshotEntry};
 use hadb_storage::StorageBackend;
+use std::collections::HashSet;
 use std::io::Cursor;
 
 use crate::legacy_ltx::Decoder;
@@ -329,6 +332,65 @@ pub async fn discover_all_legacy_ltx(
     Ok(files)
 }
 
+/// Build the retention/deletion plan for legacy LTX snapshots.
+///
+/// The retention policy is time/size-oriented, but a legacy restore needs a
+/// snapshot base for retained live incrementals. This planner keeps the latest
+/// snapshot overall and also rescues the latest snapshot before the earliest
+/// live incremental from deletion.
+pub async fn plan_legacy_compaction(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    snapshot_entries: &[SnapshotEntry],
+    policy: &RetentionPolicy,
+    now: DateTime<Utc>,
+) -> Result<RetentionPlan> {
+    let mut plan = analyze_retention(snapshot_entries, policy, now);
+
+    let live_incrementals =
+        list_legacy_generation_files(storage, prefix, db_name, GENERATION_LIVE).await?;
+    let earliest_live_min = live_incrementals
+        .iter()
+        .filter(|(_, min, max)| !(*min == 1 && *max == 1))
+        .map(|(_, min, _)| *min)
+        .min();
+
+    let max_snapshot_txid = snapshot_entries.iter().map(|entry| entry.sequence).max();
+    let base_for_live_chain = earliest_live_min.and_then(|min| {
+        snapshot_entries
+            .iter()
+            .filter(|entry| entry.sequence < min)
+            .map(|entry| entry.sequence)
+            .max()
+            .or_else(|| snapshot_entries.iter().map(|entry| entry.sequence).min())
+    });
+
+    let protected: HashSet<u64> = max_snapshot_txid
+        .into_iter()
+        .chain(base_for_live_chain)
+        .collect();
+
+    let rescued: Vec<_> = plan
+        .delete
+        .iter()
+        .filter(|entry| protected.contains(&entry.sequence))
+        .cloned()
+        .collect();
+    if !rescued.is_empty() {
+        plan.delete
+            .retain(|entry| !protected.contains(&entry.sequence));
+        for entry in &rescued {
+            if !plan.keep.iter().any(|kept| kept.sequence == entry.sequence) {
+                plan.keep.push(entry.clone());
+            }
+            plan.bytes_freed = plan.bytes_freed.saturating_sub(entry.size);
+        }
+    }
+
+    Ok(plan)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,5 +512,55 @@ mod tests {
             .unwrap();
         assert_eq!(all.len(), 4);
         assert_eq!(all.last().unwrap().max_txid, 4);
+    }
+
+    #[tokio::test]
+    async fn legacy_ltx_compaction_plan_is_owned_by_core_and_rescues_chain_base() {
+        let storage = TestStorage {
+            objects: HashMap::from([(
+                "backups/app/0000/0000000000000004-0000000000000005.ltx".to_string(),
+                Vec::new(),
+            )]),
+        };
+        let now = Utc::now();
+        let snapshots = vec![
+            SnapshotEntry {
+                key: "backups/app/0001/0000000000000001-0000000000000003.ltx".to_string(),
+                created_at: now - chrono::Duration::days(40),
+                sequence: 3,
+                size: 10,
+            },
+            SnapshotEntry {
+                key: "backups/app/0002/0000000000000001-0000000000000008.ltx".to_string(),
+                created_at: now - chrono::Duration::days(1),
+                sequence: 8,
+                size: 10,
+            },
+        ];
+        let policy = RetentionPolicy {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: 0,
+            minimum: 1,
+        };
+
+        let plan = plan_legacy_compaction(&storage, "backups", "app", &snapshots, &policy, now)
+            .await
+            .unwrap();
+
+        let kept: Vec<_> = plan.keep.iter().map(|entry| entry.sequence).collect();
+        assert!(
+            kept.contains(&3),
+            "core compaction must protect the snapshot base for live incrementals"
+        );
+        assert!(
+            kept.contains(&8),
+            "core compaction must keep the latest snapshot"
+        );
+        assert!(
+            plan.delete.is_empty(),
+            "the policy wanted to delete the old snapshot, but reachability must rescue it"
+        );
     }
 }

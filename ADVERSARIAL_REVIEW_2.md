@@ -761,10 +761,17 @@ and
     publish. Root `restore` now delegates all restore engine work to
     `walrust-core::legacy_restore`; cache support is a root-only
     cache-over-S3 `StorageBackend` adapter and webhook handling is now error
-    notification around the core call, not a second decode/apply path.
-    Remaining work: root `src/sync/*` still owns the CLI watch, compact, and
-    replicate apply workflow over the legacy LTX object layout, while core owns
-    the HADBP engine. That workflow/API migration is still required before
-    duplicate sync implementations can be deleted.
+    notification around the core call, not a second decode/apply path. Legacy
+    compaction planning was then reproduced with
+    `legacy_manifest::tests::legacy_ltx_compaction_plan_is_owned_by_core_and_rescues_chain_base`
+    (failed because core had no reachability-aware legacy compaction planner),
+    then fixed by moving retention-plus-live-chain reachability planning into
+    `walrust-core::legacy_manifest::plan_legacy_compaction`; root manual
+    compact and watch-mode auto-compaction now use that core planner and keep
+    only S3 metadata lookup, output/logging, and deletion orchestration.
+    Remaining work: root `src/sync/*` still owns the CLI watch and replicate
+    apply workflow over the legacy LTX object layout, while core owns the HADBP
+    engine. That workflow/API migration is still required before duplicate sync
+    implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
     end-to-end.

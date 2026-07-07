@@ -1,18 +1,18 @@
 use anyhow::Result;
 use chrono::Utc;
+use hadb_storage_s3::S3Storage;
 use std::sync::Arc;
+use walrust_core::legacy_manifest::plan_legacy_compaction;
 
 use crate::cache::LocalCache;
 use crate::ltx;
-use crate::retention::{analyze_retention, RetentionPolicy, SnapshotEntry};
+use crate::retention::{RetentionPolicy, SnapshotEntry};
 use crate::retry::{classify_error, ErrorKind, RetryPolicy};
 use crate::s3;
 use crate::uploader::UploadMessage;
 use crate::webhook::WebhookSender;
 
-use super::manifest::{
-    build_ltx_key, discover_snapshots_from_s3, list_generation_files, GENERATION_LIVE,
-};
+use super::manifest::{build_ltx_key, discover_snapshots_from_s3, GENERATION_LIVE};
 use super::types::{ShadowSyncInput, ShadowSyncOutput};
 
 /// Result of encoding shadow WAL segments into LTX
@@ -406,51 +406,18 @@ pub(crate) async fn run_compaction(
     }
 
     let now = Utc::now();
-    let mut plan = analyze_retention(&snapshot_entries, policy, now);
-
-    let live_incrementals =
-        list_generation_files(client, bucket, prefix, name, GENERATION_LIVE).await?;
-    let earliest_live_min = live_incrementals
-        .iter()
-        .filter(|(_, min, max)| !(*min == 1 && *max == 1))
-        .map(|(_, min, _)| *min)
-        .min();
-
-    let max_snapshot_txid = snapshot_entries.iter().map(|entry| entry.sequence).max();
-    let base_for_live_chain = earliest_live_min.and_then(|min| {
-        snapshot_entries
-            .iter()
-            .filter(|entry| entry.sequence < min)
-            .map(|entry| entry.sequence)
-            .max()
-            .or_else(|| snapshot_entries.iter().map(|entry| entry.sequence).min())
-    });
-
-    let protected: std::collections::HashSet<u64> = max_snapshot_txid
-        .into_iter()
-        .chain(base_for_live_chain)
-        .collect();
-
+    let storage = S3Storage::new(client.clone(), bucket.to_string());
+    let plan_before_reachability =
+        crate::retention::analyze_retention(&snapshot_entries, policy, now);
+    let plan =
+        plan_legacy_compaction(&storage, prefix, name, &snapshot_entries, policy, now).await?;
     let before = plan.delete.len();
-    let rescued: Vec<_> = plan
-        .delete
-        .iter()
-        .filter(|entry| protected.contains(&entry.sequence))
-        .cloned()
-        .collect();
-    if !rescued.is_empty() {
-        plan.delete
-            .retain(|entry| !protected.contains(&entry.sequence));
-        for entry in &rescued {
-            if !plan.keep.iter().any(|kept| kept.sequence == entry.sequence) {
-                plan.keep.push(entry.clone());
-            }
-            plan.bytes_freed = plan.bytes_freed.saturating_sub(entry.size);
-        }
+    let rescued = plan_before_reachability.delete.len().saturating_sub(before);
+    if rescued > 0 {
         tracing::info!(
             "{}: compaction retained {} snapshot(s) as reachability base for the incremental chain",
             name,
-            before - plan.delete.len()
+            rescued
         );
     }
 
