@@ -250,10 +250,14 @@ of becoming a cold start. Proven by
 `test_walrust_owned_new_stream_writes_lineage_state_and_keys`, and
 `test_walrust_owned_restore_uses_active_lineage_namespace`, and the external
 base no-chain offset regression
-`test_external_mode_registration_does_not_skip_unpublished_wal_bytes`. The
-root CLI watch path has no equivalent remote `state.json` reload path; its
-durable progress gap plus walrust-owned fencing and exact external-base
-head-to-WAL-offset persistence remain open for Phase 2.5.
+`test_external_mode_registration_does_not_skip_unpublished_wal_bytes`.
+The root CLI shadow watch path now writes a local fsynced `progress.json`
+sidecar after durable cache/direct shadow sync and snapshot state advances,
+reloads it on restart, and hard-fails if the record cannot be read or
+persisted. Proven by
+`test_shadow_sync_persists_restart_progress_after_durable_cache_write`.
+Walrust-owned fencing and exact external-base head-to-WAL-offset persistence
+remain open for Phase 2.5.
 
 - `state.json` save/load asymmetry: `save_state` persists `wal_salt` +
   `wal_checksum_chain` (`crates/walrust-core/src/sync.rs:258-267`) but reload

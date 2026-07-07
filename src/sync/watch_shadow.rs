@@ -1,8 +1,11 @@
 use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs::{self, File};
 use std::future::Future;
-use std::path::PathBuf;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
@@ -33,12 +36,150 @@ type ShadowSyncFuture =
     Pin<Box<dyn Future<Output = Result<super::types::ShadowSyncOutput>> + Send>>;
 
 const CHECKPOINT_UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const SHADOW_PROGRESS_FILE: &str = "progress.json";
 
 #[derive(Clone)]
 struct DirectShadowSyncTarget {
     client: Arc<aws_sdk_s3::Client>,
     bucket_name: String,
     prefix: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct ShadowProgress {
+    version: u32,
+    current_txid: u64,
+    last_snapshot: Option<chrono::DateTime<chrono::Utc>>,
+    db_checksum: Option<u64>,
+    shadow_sync_generation: u64,
+    shadow_sync_offset: u64,
+}
+
+impl ShadowProgress {
+    fn from_state(state: &ShadowDbState) -> Self {
+        Self {
+            version: 1,
+            current_txid: state.current_txid,
+            last_snapshot: state.last_snapshot,
+            db_checksum: state.db_checksum,
+            shadow_sync_generation: state.shadow_sync_generation,
+            shadow_sync_offset: state.shadow_sync_offset,
+        }
+    }
+}
+
+fn shadow_progress_path(shadow_dir: &Path) -> PathBuf {
+    shadow_dir.join(SHADOW_PROGRESS_FILE)
+}
+
+fn fsync_dir(path: &Path) -> Result<()> {
+    File::open(path)
+        .with_context(|| format!("failed to open directory {} for fsync", path.display()))?
+        .sync_all()
+        .with_context(|| format!("failed to fsync directory {}", path.display()))
+}
+
+fn save_shadow_progress(state: &ShadowDbState) -> Result<()> {
+    let shadow_dir = state.shadow.shadow_dir();
+    fs::create_dir_all(shadow_dir).with_context(|| {
+        format!(
+            "{}: failed to create shadow progress directory {}",
+            state.name,
+            shadow_dir.display()
+        )
+    })?;
+
+    let progress_path = shadow_progress_path(shadow_dir);
+    let tmp_path = progress_path.with_extension("json.tmp");
+    let progress = ShadowProgress::from_state(state);
+    let json = serde_json::to_vec_pretty(&progress)
+        .with_context(|| format!("{}: failed to serialize shadow progress", state.name))?;
+
+    {
+        let mut file = File::create(&tmp_path).with_context(|| {
+            format!(
+                "{}: failed to create temporary shadow progress file {}",
+                state.name,
+                tmp_path.display()
+            )
+        })?;
+        file.write_all(&json).with_context(|| {
+            format!(
+                "{}: failed to write temporary shadow progress file {}",
+                state.name,
+                tmp_path.display()
+            )
+        })?;
+        file.sync_all().with_context(|| {
+            format!(
+                "{}: failed to fsync temporary shadow progress file {}",
+                state.name,
+                tmp_path.display()
+            )
+        })?;
+    }
+
+    fs::rename(&tmp_path, &progress_path).with_context(|| {
+        format!(
+            "{}: failed to install shadow progress file {}",
+            state.name,
+            progress_path.display()
+        )
+    })?;
+    fsync_dir(shadow_dir).with_context(|| {
+        format!(
+            "{}: failed to durably commit shadow progress file {}",
+            state.name,
+            progress_path.display()
+        )
+    })?;
+
+    Ok(())
+}
+
+fn load_shadow_progress(shadow: &ShadowWal, db_name: &str) -> Result<Option<ShadowProgress>> {
+    let progress_path = shadow_progress_path(shadow.shadow_dir());
+    let data = match fs::read(&progress_path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(e).with_context(|| {
+                format!(
+                    "{}: failed to read shadow progress file {}",
+                    db_name,
+                    progress_path.display()
+                )
+            });
+        }
+    };
+
+    let progress: ShadowProgress = serde_json::from_slice(&data).with_context(|| {
+        format!(
+            "{}: failed to parse shadow progress file {}",
+            db_name,
+            progress_path.display()
+        )
+    })?;
+
+    if progress.version != 1 {
+        anyhow::bail!(
+            "{}: unsupported shadow progress version {} in {}",
+            db_name,
+            progress.version,
+            progress_path.display()
+        );
+    }
+    if progress.shadow_sync_generation > shadow.generation() {
+        anyhow::bail!(
+            "{}: shadow progress generation {} is ahead of live generation {} in {}",
+            db_name,
+            progress.shadow_sync_generation,
+            shadow.generation(),
+            progress_path.display()
+        );
+    }
+
+    Ok(Some(progress))
 }
 
 fn shadow_sync_input(state: &ShadowDbState) -> ShadowSyncInput {
@@ -161,6 +302,16 @@ fn apply_shadow_sync_output_to_state(
     state.db_checksum = output.new_db_checksum;
 }
 
+async fn apply_shadow_sync_result_to_state(
+    state: &mut ShadowDbState,
+    output: &super::types::ShadowSyncOutput,
+) -> Result<()> {
+    apply_shadow_sync_output_to_state(state, output);
+    advance_shadow_sync_cursor_if_drained(state).await?;
+    save_shadow_progress(state)?;
+    Ok(())
+}
+
 async fn apply_shadow_sync_results_strict(
     db_states: &mut HashMap<PathBuf, ShadowDbState>,
     results: Vec<Result<super::types::ShadowSyncOutput>>,
@@ -173,6 +324,7 @@ async fn apply_shadow_sync_results_strict(
                 apply_shadow_sync_output(db_states, &output);
                 if let Some(state) = db_states.get_mut(&output.db_path) {
                     advance_shadow_sync_cursor_if_drained(state).await?;
+                    save_shadow_progress(state)?;
                 }
             }
             Err(e) => {
@@ -299,13 +451,17 @@ async fn checkpoint_shadow_after_durable_sync(
             state.name
         );
     };
-    apply_shadow_sync_output_to_state(state, &output);
-    advance_shadow_sync_cursor_if_drained(state).await?;
-
     if let Some((cache, _)) = cache_state {
-        wait_for_cache_checkpoint_durability(cache, &state.name, state.current_txid, drain_timeout)
-            .await?;
+        wait_for_cache_checkpoint_durability(
+            cache,
+            &state.name,
+            output.new_current_txid,
+            drain_timeout,
+        )
+        .await?;
     }
+
+    apply_shadow_sync_result_to_state(state, &output).await?;
 
     state
         .shadow
@@ -463,7 +619,7 @@ pub async fn watch_with_shadow(
 
         // Check for existing state in S3 (manifest.json)
         let manifest_key = format!("{}{}/manifest.json", prefix, name);
-        let (current_txid, manifest_checksum) =
+        let (mut current_txid, manifest_checksum) =
             match s3::download_bytes(&client, &bucket_name, &manifest_key).await {
                 Ok(data) => {
                     let manifest: Manifest = serde_json::from_slice(&data).unwrap_or_default();
@@ -473,7 +629,7 @@ pub async fn watch_with_shadow(
             };
 
         // Get initial checksum: from manifest if available, otherwise compute from db
-        let db_checksum = match manifest_checksum {
+        let mut db_checksum = match manifest_checksum {
             Some(cs) => {
                 tracing::debug!("{}: Using checksum from manifest: {:#x}", name, cs);
                 Some(cs)
@@ -493,6 +649,9 @@ pub async fn watch_with_shadow(
                 }
             },
         };
+        let mut last_snapshot = None;
+        let mut shadow_sync_generation = 0;
+        let mut shadow_sync_offset = 0;
 
         // Create shadow WAL manager (this holds the checkpoint blocker)
         let shadow = match ShadowWal::new(db_path).await {
@@ -502,6 +661,21 @@ pub async fn watch_with_shadow(
                 return Err(e);
             }
         };
+
+        if let Some(progress) = load_shadow_progress(&shadow, &name)? {
+            tracing::info!(
+                "{}: restored durable shadow progress (TXID: {}, generation: {}, offset: {})",
+                name,
+                progress.current_txid,
+                progress.shadow_sync_generation,
+                progress.shadow_sync_offset
+            );
+            current_txid = progress.current_txid;
+            last_snapshot = progress.last_snapshot;
+            db_checksum = progress.db_checksum;
+            shadow_sync_generation = progress.shadow_sync_generation;
+            shadow_sync_offset = progress.shadow_sync_offset;
+        }
 
         tracing::info!(
             "Shadow WAL: Watching {} as '{}' (TXID: {}, generation: {}, shadow dir: {})",
@@ -538,11 +712,11 @@ pub async fn watch_with_shadow(
                 db_path: db_path.clone(),
                 wal_path,
                 current_txid,
-                last_snapshot: None,
+                last_snapshot,
                 db_checksum,
                 shadow,
-                shadow_sync_generation: 0,
-                shadow_sync_offset: 0,
+                shadow_sync_generation,
+                shadow_sync_offset,
                 wal_copy_offset: 0,
             },
         );
@@ -587,6 +761,8 @@ pub async fn watch_with_shadow(
                 }
                 Err(e) => {
                     tracing::error!("{}: Initial shadow copy failed: {}", state.name, e);
+                    return Err(e)
+                        .with_context(|| format!("{}: initial shadow copy failed", state.name));
                 }
             }
         }
@@ -624,6 +800,7 @@ pub async fn watch_with_shadow(
                 state.current_txid = db_state.current_txid;
                 state.last_snapshot = db_state.last_snapshot;
                 state.db_checksum = db_state.db_checksum;
+                save_shadow_progress(state)?;
 
                 if let Some(trigger) = trigger_states.get_mut(db_path) {
                     trigger.frames_since_snapshot = 0;
@@ -770,10 +947,9 @@ pub async fn watch_with_shadow(
                     match result {
                         Ok(output) => {
                             let frame_count = output.frame_count;
-                            apply_shadow_sync_output(&mut db_states, &output);
 
                             if let Some(state) = db_states.get_mut(&output.db_path) {
-                                advance_shadow_sync_cursor_if_drained(state).await?;
+                                apply_shadow_sync_result_to_state(state, &output).await?;
 
                                 if frame_count == 0 {
                                     continue;
@@ -838,6 +1014,7 @@ pub async fn watch_with_shadow(
                                             state.current_txid = db_state.current_txid;
                                             state.last_snapshot = db_state.last_snapshot;
                                             state.db_checksum = db_state.db_checksum;
+                                            save_shadow_progress(state)?;
                                             metrics_state.record_snapshot(&state.name);
                                             trigger.frames_since_snapshot = 0;
                                             trigger.first_change_time = None;
@@ -848,6 +1025,7 @@ pub async fn watch_with_shadow(
                         }
                         Err(e) => {
                             tracing::error!("Shadow sync failed: {}", e);
+                            return Err(e).context("shadow sync failed");
                         }
                     }
                 }
@@ -920,6 +1098,7 @@ pub async fn watch_with_shadow(
                             state.current_txid = db_state.current_txid;
                             state.last_snapshot = db_state.last_snapshot;
                             state.db_checksum = db_state.db_checksum;
+                            save_shadow_progress(state)?;
                             metrics_state.record_snapshot(&state.name);
                             trigger.frames_since_snapshot = 0;
                             trigger.first_change_time = None;
@@ -951,6 +1130,7 @@ pub async fn watch_with_shadow(
                         state.current_txid = db_state.current_txid;
                         state.last_snapshot = db_state.last_snapshot;
                         state.db_checksum = db_state.db_checksum;
+                        save_shadow_progress(state)?;
                         metrics_state.record_snapshot(&state.name);
 
                         if let Some(trigger) = trigger_states.get_mut(db_path) {
@@ -1237,6 +1417,65 @@ mod tests {
             matches!(msg, UploadMessage::Upload(txid) if txid == pending[0]),
             "cache sync must notify uploader for queued LTX"
         );
+    }
+
+    #[tokio::test]
+    async fn test_shadow_sync_persists_restart_progress_after_durable_cache_write() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let progress_path = shadow.shadow_dir().join("progress.json");
+        let wal_path = db_path.with_extension("db-wal");
+
+        let mut db_states = HashMap::new();
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name: "restart_progress".to_string(),
+                db_path: db_path.clone(),
+                wal_path,
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                shadow,
+                shadow_sync_generation: 0,
+                shadow_sync_offset: 0,
+                wal_copy_offset: 0,
+            },
+        );
+
+        copy_final_shadow_frames(&mut db_states).await.unwrap();
+
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+        let (upload_tx, _upload_rx) = mpsc::channel(10);
+        let mut cache_states = HashMap::new();
+        cache_states.insert(db_path.clone(), (Arc::clone(&cache), upload_tx));
+
+        let results = run_shadow_syncs(
+            &db_states,
+            &cache_states,
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+        )
+        .await;
+        apply_shadow_sync_results_strict(&mut db_states, results)
+            .await
+            .unwrap();
+
+        assert!(
+            progress_path.exists(),
+            "shadow sync must persist a restart progress record after durable cache write"
+        );
+        let state = db_states.get(&db_path).unwrap();
+        let reloaded = load_shadow_progress(&state.shadow, &state.name)
+            .unwrap()
+            .expect("progress record must reload");
+        assert_eq!(reloaded.current_txid, state.current_txid);
+        assert_eq!(
+            reloaded.shadow_sync_generation,
+            state.shadow_sync_generation
+        );
+        assert_eq!(reloaded.shadow_sync_offset, state.shadow_sync_offset);
     }
 
     #[tokio::test]
