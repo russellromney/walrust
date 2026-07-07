@@ -18,6 +18,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// SQLite page ID size (u32).
 pub const SQLITE_PAGE_ID_SIZE: PageIdSize = PageIdSize::U32;
+pub const FLAG_END_PAGE_COUNT_MARKER: u8 = 0x01;
+const HADBP_HEADER_SIZE: usize = 40;
+const HADBP_TRAILER_SIZE: usize = 8;
+const MIN_SQLITE_PAGE_SIZE: u32 = 512;
+const MAX_SQLITE_PAGE_SIZE: u32 = 65_536;
+const MAX_DECODED_DB_BYTES: u64 = 1 << 40; // 1 TiB sanity cap for untrusted objects.
 
 // Re-export hadb-changeset types used by sync.rs and consumers.
 pub use hadb_changeset::physical::{
@@ -68,17 +74,31 @@ pub fn encode_snapshot_with_checksum(
     use sha2::{Digest, Sha256};
     use std::io::BufReader;
 
+    let page_size_usize = validate_sqlite_page_size(page_size)?;
     let file = std::fs::File::open(db_path)
         .map_err(|e| anyhow!("Failed to open database for snapshot: {}", e))?;
     let file_size = file.metadata()?.len() as usize;
-    let num_pages = file_size / page_size as usize;
+    if !file_size.is_multiple_of(page_size_usize) {
+        return Err(anyhow!(
+            "database size {} is not a multiple of SQLite page_size {}",
+            file_size,
+            page_size
+        ));
+    }
+    let num_pages = file_size / page_size_usize;
+    if num_pages > u32::MAX as usize {
+        return Err(anyhow!(
+            "database has {} pages, exceeds SQLite U32 page-id limit",
+            num_pages
+        ));
+    }
 
     let mut reader = BufReader::with_capacity(1024 * 1024, file);
     let mut pages = Vec::with_capacity(num_pages);
     let mut hasher = Sha256::new();
 
     for i in 0..num_pages {
-        let mut page_buf = vec![0u8; page_size as usize];
+        let mut page_buf = vec![0u8; page_size_usize];
         reader.read_exact(&mut page_buf)?;
         hasher.update(&page_buf);
         // SQLite uses 1-based page numbers
@@ -157,10 +177,13 @@ pub struct DecodeResult {
 ///
 /// Returns the header and checksum for chain tracking.
 pub fn decode_to_db(data: &[u8], output_path: &Path) -> Result<DecodeResult> {
-    let changeset =
-        physical::decode(data).map_err(|e| anyhow!("Failed to decode HADBP changeset: {}", e))?;
-
-    let page_size = changeset.header.page_size as usize;
+    let changeset = decode_sqlite_changeset(data)?;
+    if changeset_end_page_count(&changeset)?.is_some() {
+        return Err(anyhow!(
+            "HADBP snapshot decode does not accept incremental end-page-count markers"
+        ));
+    }
+    let page_size = validate_sqlite_page_size(changeset.header.page_size)? as u64;
 
     // Find the maximum page number to determine DB size
     let max_page = changeset
@@ -169,40 +192,22 @@ pub fn decode_to_db(data: &[u8], output_path: &Path) -> Result<DecodeResult> {
         .map(|p| p.page_id.to_u64())
         .max()
         .unwrap_or(0);
-    // Bound the allocation against an untrusted/corrupt max page id.
-    let db_size = (max_page as usize).checked_mul(page_size).ok_or_else(|| {
-        anyhow!("changeset max_page * page_size overflows usize (corrupt changeset)")
+    let db_size = max_page.checked_mul(page_size).ok_or_else(|| {
+        anyhow!("changeset max_page * page_size overflows u64 (corrupt changeset)")
     })?;
-
-    let mut db_data = vec![0u8; db_size];
-
-    for page in &changeset.pages {
-        let page_num = page.page_id.to_u64();
-        // SQLite uses 1-based page numbers: page 1 is at offset 0. A
-        // page id of 0 is invalid; reject rather than underflow. A page
-        // beyond the image is corruption — reject rather than silently
-        // drop it (which would produce a wrong byte image).
-        if page_num < 1 {
-            return Err(anyhow!("changeset contains invalid page number 0"));
-        }
-        let idx = (page_num - 1) as usize;
-        let start = idx * page_size;
-        let end = start + page.data.len();
-        if end > db_data.len() {
-            return Err(anyhow!(
-                "changeset page {page_num} (len {}) exceeds db image size {}; \
-                 refusing to decode (corrupt changeset)",
-                page.data.len(),
-                db_data.len()
-            ));
-        }
-        db_data[start..end].copy_from_slice(&page.data);
+    if db_size > MAX_DECODED_DB_BYTES {
+        return Err(anyhow!(
+            "decoded database size {} exceeds safety cap {} bytes",
+            db_size,
+            MAX_DECODED_DB_BYTES
+        ));
     }
 
-    write_db_atomically(output_path, &db_data)?;
+    write_snapshot_changeset_atomically(output_path, &changeset, db_size)?;
 
-    // Verify actual checksum matches what was computed
-    let actual_checksum = compute_db_checksum_raw(&db_data);
+    // Verify actual checksum from the bytes written, without materializing the
+    // decoded database in memory.
+    let actual_checksum = compute_checksum_from_file(output_path)?;
     tracing::debug!(
         "Decoded snapshot (seq {}, checksum: {:016x})",
         changeset.header.seq,
@@ -215,17 +220,201 @@ pub fn decode_to_db(data: &[u8], output_path: &Path) -> Result<DecodeResult> {
     })
 }
 
-fn write_db_atomically(output_path: &Path, data: &[u8]) -> Result<()> {
-    use std::io::Write;
+fn write_snapshot_changeset_atomically(
+    output_path: &Path,
+    changeset: &PhysicalChangeset,
+    db_size: u64,
+) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
 
     let tmp_path = output_path.with_extension("tmp");
-    {
+    let write_result = (|| -> Result<()> {
         let mut file = std::fs::File::create(&tmp_path)?;
-        file.write_all(data)?;
+        file.set_len(db_size)?;
+        for page in &changeset.pages {
+            let offset = sqlite_page_offset(page.page_id.to_u64(), changeset.header.page_size)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&page.data)?;
+        }
         file.sync_all()?;
+        Ok(())
+    })();
+    if let Err(err) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(err);
     }
     std::fs::rename(&tmp_path, output_path)?;
     fsync_parent_dir(output_path)?;
+    Ok(())
+}
+
+fn validate_sqlite_page_size(page_size: u32) -> Result<usize> {
+    if !(MIN_SQLITE_PAGE_SIZE..=MAX_SQLITE_PAGE_SIZE).contains(&page_size)
+        || !page_size.is_power_of_two()
+    {
+        return Err(anyhow!(
+            "Invalid SQLite page_size {page_size}; expected power of two between \
+             {MIN_SQLITE_PAGE_SIZE} and {MAX_SQLITE_PAGE_SIZE}"
+        ));
+    }
+    Ok(page_size as usize)
+}
+
+fn preflight_hadbp_header(data: &[u8]) -> Result<()> {
+    if data.len() < HADBP_HEADER_SIZE {
+        return Ok(());
+    }
+
+    let page_id_size = data[7];
+    let pid_len = match page_id_size {
+        4 | 8 => page_id_size as usize,
+        _ => return Ok(()),
+    };
+    let page_size = u32::from_be_bytes(data[8..12].try_into().expect("4 bytes"));
+    validate_sqlite_page_size(page_size)?;
+    let page_count = u32::from_be_bytes(data[28..32].try_into().expect("4 bytes")) as usize;
+    let max_possible_pages = data
+        .len()
+        .saturating_sub(HADBP_HEADER_SIZE + HADBP_TRAILER_SIZE)
+        / (pid_len + 4);
+    if page_count > max_possible_pages {
+        return Err(anyhow!(
+            "HADBP page_count {} exceeds encoded body capacity {}",
+            page_count,
+            max_possible_pages
+        ));
+    }
+    Ok(())
+}
+
+pub fn decode_sqlite_changeset(data: &[u8]) -> Result<PhysicalChangeset> {
+    preflight_hadbp_header(data)?;
+    let changeset =
+        physical::decode(data).map_err(|e| anyhow!("Failed to decode HADBP changeset: {}", e))?;
+    validate_sqlite_changeset(&changeset)?;
+    Ok(changeset)
+}
+
+pub fn validate_sqlite_changeset(changeset: &PhysicalChangeset) -> Result<()> {
+    let page_size = validate_sqlite_page_size(changeset.header.page_size)?;
+    if changeset.header.flags & !FLAG_END_PAGE_COUNT_MARKER != 0 {
+        return Err(anyhow!(
+            "Unsupported HADBP flags for SQLite changeset: 0x{:02x}",
+            changeset.header.flags
+        ));
+    }
+    if changeset.header.page_id_size != SQLITE_PAGE_ID_SIZE {
+        return Err(anyhow!(
+            "Invalid SQLite page_id_size {:?}; expected {:?}",
+            changeset.header.page_id_size,
+            SQLITE_PAGE_ID_SIZE
+        ));
+    }
+    if changeset.header.page_count as usize != changeset.pages.len() {
+        return Err(anyhow!(
+            "HADBP page_count {} does not match decoded page count {}",
+            changeset.header.page_count,
+            changeset.pages.len()
+        ));
+    }
+    let end_page_count = changeset_end_page_count(changeset)?;
+    for page in &changeset.pages {
+        let page_num = page.page_id.to_u64();
+        if page_num == 0 {
+            return Err(anyhow!("changeset contains invalid page number 0"));
+        }
+        if page.data.is_empty() {
+            continue;
+        }
+        if let Some(end_page_count) = end_page_count {
+            if page_num > end_page_count {
+                return Err(anyhow!(
+                    "changeset page {} is past encoded end_page_count {}",
+                    page_num,
+                    end_page_count
+                ));
+            }
+        }
+        if page.data.len() != page_size {
+            return Err(anyhow!(
+                "changeset page {} has {} bytes, expected SQLite page_size {}",
+                page_num,
+                page.data.len(),
+                page_size
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn changeset_end_page_count(changeset: &PhysicalChangeset) -> Result<Option<u64>> {
+    let mut marker = None;
+    for page in &changeset.pages {
+        if !page.data.is_empty() {
+            continue;
+        }
+        if changeset.header.flags & FLAG_END_PAGE_COUNT_MARKER == 0 {
+            return Err(anyhow!(
+                "changeset page {} is empty but end-page-count marker flag is not set",
+                page.page_id.to_u64()
+            ));
+        }
+        let page_num = page.page_id.to_u64();
+        if page_num == 0 {
+            return Err(anyhow!("changeset contains invalid page number 0"));
+        }
+        if marker.replace(page_num - 1).is_some() {
+            return Err(anyhow!(
+                "changeset contains multiple end-page-count markers"
+            ));
+        }
+    }
+    if changeset.header.flags & FLAG_END_PAGE_COUNT_MARKER != 0 && marker.is_none() {
+        return Err(anyhow!(
+            "HADBP end-page-count marker flag set without marker page"
+        ));
+    }
+    Ok(marker)
+}
+
+fn sqlite_page_offset(page_num: u64, page_size: u32) -> Result<u64> {
+    if page_num == 0 {
+        return Err(anyhow!("changeset contains invalid page number 0"));
+    }
+    let page_size = validate_sqlite_page_size(page_size)? as u64;
+    page_num
+        .checked_sub(1)
+        .and_then(|idx| idx.checked_mul(page_size))
+        .ok_or_else(|| anyhow!("SQLite page offset overflow for page {page_num}"))
+}
+
+pub fn apply_decoded_changeset_to_db(changeset: &PhysicalChangeset, db_path: &Path) -> Result<()> {
+    validate_sqlite_changeset(changeset)?;
+    use std::fs::OpenOptions;
+    use std::io::{Seek, SeekFrom, Write as IoWrite};
+
+    let mut file = OpenOptions::new()
+        .write(true)
+        .open(db_path)
+        .map_err(|e| anyhow!("Failed to open database for in-place apply: {}", e))?;
+
+    for page in &changeset.pages {
+        if page.data.is_empty() {
+            continue;
+        }
+        let offset = sqlite_page_offset(page.page_id.to_u64(), changeset.header.page_size)?;
+        file.seek(SeekFrom::Start(offset))?;
+        file.write_all(&page.data)?;
+    }
+    if let Some(end_page_count) = changeset_end_page_count(changeset)? {
+        let page_size = validate_sqlite_page_size(changeset.header.page_size)? as u64;
+        let len = end_page_count
+            .checked_mul(page_size)
+            .ok_or_else(|| anyhow!("end_page_count * page_size overflows u64"))?;
+        file.set_len(len)?;
+    }
+
+    file.sync_all()?;
     Ok(())
 }
 
@@ -255,33 +444,13 @@ pub fn apply_changeset_to_db(
     db_path: &Path,
     expected_prev_checksum: u64,
 ) -> Result<ApplyResult> {
-    let changeset =
-        physical::decode(data).map_err(|e| anyhow!("Failed to decode HADBP changeset: {}", e))?;
+    let changeset = decode_sqlite_changeset(data)?;
 
     // Verify checksum chain before writing
     physical::verify_chain(expected_prev_checksum, &changeset)
         .map_err(|e| anyhow!("Checksum chain broken: {}", e))?;
 
-    // Apply pages using hadb-changeset's apply_physical
-    // But we need SQLite 1-based page offset: page N is at offset (N-1) * page_size
-    use std::fs::OpenOptions;
-    use std::io::{Seek, SeekFrom, Write as IoWrite};
-
-    let page_size = changeset.header.page_size as u64;
-
-    let mut file = OpenOptions::new()
-        .write(true)
-        .open(db_path)
-        .map_err(|e| anyhow!("Failed to open database for in-place apply: {}", e))?;
-
-    for page in &changeset.pages {
-        // SQLite 1-based: page_id 1 is at offset 0
-        let offset = (page.page_id.to_u64() - 1) * page_size;
-        file.seek(SeekFrom::Start(offset))?;
-        file.write_all(&page.data)?;
-    }
-
-    file.sync_all()?;
+    apply_decoded_changeset_to_db(&changeset, db_path)?;
 
     tracing::debug!(
         "Applied {} pages in-place (seq {})",
@@ -307,6 +476,27 @@ pub fn encode_wal_changes(
     seq: u64,
     prev_checksum: u64,
 ) -> Result<(Vec<u8>, u64)> {
+    encode_wal_changes_inner(pages, page_size, seq, prev_checksum, None)
+}
+
+pub fn encode_wal_changes_with_end_page_count(
+    pages: &[(u32, Vec<u8>)],
+    page_size: u32,
+    seq: u64,
+    prev_checksum: u64,
+    end_page_count: u64,
+) -> Result<(Vec<u8>, u64)> {
+    encode_wal_changes_inner(pages, page_size, seq, prev_checksum, Some(end_page_count))
+}
+
+fn encode_wal_changes_inner(
+    pages: &[(u32, Vec<u8>)],
+    page_size: u32,
+    seq: u64,
+    prev_checksum: u64,
+    end_page_count: Option<u64>,
+) -> Result<(Vec<u8>, u64)> {
+    validate_sqlite_page_size(page_size)?;
     let entries: Vec<PageEntry> = pages
         .iter()
         .map(|(page_num, data)| PageEntry {
@@ -315,8 +505,50 @@ pub fn encode_wal_changes(
         })
         .collect();
 
-    let changeset =
+    let mut entries = entries;
+    if let Some(end_page_count) = end_page_count {
+        if end_page_count == 0 {
+            return Err(anyhow!(
+                "end_page_count=0 is invalid for a SQLite changeset"
+            ));
+        }
+        if end_page_count >= u32::MAX as u64 {
+            return Err(anyhow!(
+                "end_page_count {} exceeds SQLite U32 page-id marker capacity",
+                end_page_count
+            ));
+        }
+        for (page_num, data) in pages {
+            if *page_num == 0 {
+                return Err(anyhow!("changeset contains invalid page number 0"));
+            }
+            if *page_num as u64 > end_page_count {
+                return Err(anyhow!(
+                    "changeset page {} is past encoded end_page_count {}",
+                    page_num,
+                    end_page_count
+                ));
+            }
+            if data.len() != page_size as usize {
+                return Err(anyhow!(
+                    "changeset page {} has {} bytes, expected SQLite page_size {}",
+                    page_num,
+                    data.len(),
+                    page_size
+                ));
+            }
+        }
+        entries.push(PageEntry {
+            page_id: PageId::U32((end_page_count + 1) as u32),
+            data: Vec::new(),
+        });
+    }
+
+    let mut changeset =
         PhysicalChangeset::new(seq, prev_checksum, SQLITE_PAGE_ID_SIZE, page_size, entries);
+    if end_page_count.is_some() {
+        changeset.header.flags |= FLAG_END_PAGE_COUNT_MARKER;
+    }
     let checksum = changeset.checksum;
     let encoded = physical::encode(&changeset);
     Ok((encoded, checksum))
@@ -678,6 +910,95 @@ mod tests {
 
         assert_eq!(result.header.seq, 1);
         assert_eq!(result.checksum, expected_post);
+    }
+
+    #[test]
+    fn test_apply_rejects_page_id_zero_without_mutating_database() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let page_size = 4096u32;
+        let original = vec![0x11u8; page_size as usize * 2];
+        std::fs::write(&db_path, &original).unwrap();
+
+        let pre_checksum = compute_checksum_from_file(&db_path).unwrap();
+        let (encoded, _) = encode_wal_changes(
+            &[(0, vec![0xAA; page_size as usize])],
+            page_size,
+            2,
+            pre_checksum,
+        )
+        .unwrap();
+
+        let result = apply_changeset_to_db(&encoded, &db_path, pre_checksum);
+
+        assert!(result.is_err(), "page_id 0 must be rejected");
+        assert!(
+            result.unwrap_err().to_string().contains("page number 0"),
+            "error should identify invalid page 0"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_apply_rejects_invalid_sqlite_page_size_without_mutating_database() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let original = vec![0x11u8; 4096 * 2];
+        std::fs::write(&db_path, &original).unwrap();
+
+        let pre_checksum = compute_checksum_from_file(&db_path).unwrap();
+        let changeset = PhysicalChangeset::new(
+            2,
+            pre_checksum,
+            SQLITE_PAGE_ID_SIZE,
+            1000,
+            vec![PageEntry {
+                page_id: PageId::U32(1),
+                data: vec![0xAA; 1000],
+            }],
+        );
+        let encoded = physical::encode(&changeset);
+
+        let result = apply_changeset_to_db(&encoded, &db_path, pre_checksum);
+
+        assert!(result.is_err(), "non-SQLite page size must be rejected");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid SQLite page_size"),
+            "error should identify invalid page size"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), original);
+    }
+
+    #[test]
+    fn test_decode_rejects_invalid_sqlite_page_size() {
+        let dir = tempdir().unwrap();
+        let restored_path = dir.path().join("restored.db");
+        let changeset = PhysicalChangeset::new(
+            1,
+            0,
+            SQLITE_PAGE_ID_SIZE,
+            0,
+            vec![PageEntry {
+                page_id: PageId::U32(1),
+                data: Vec::new(),
+            }],
+        );
+        let encoded = physical::encode(&changeset);
+
+        let result = decode_to_db(&encoded, &restored_path);
+
+        assert!(result.is_err(), "zero page_size must be rejected");
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid SQLite page_size"),
+            "error should identify invalid page size"
+        );
+        assert!(!restored_path.exists());
     }
 
     #[test]

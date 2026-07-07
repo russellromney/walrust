@@ -478,10 +478,29 @@ and
   `sync.rs:1121, 1381`) — F4 guard landed only in decode_to_db. Also no file
   truncation on shrink (VACUUM leaves stale tail pages; snapshot then derives
   num_pages from the inflated size).
+  Status: Fixed — core HADBP decode/apply now preflights page size/page count,
+  rejects SQLite page ID 0 before offset math, routes restore/pull direct
+  apply loops through the shared checked writer, and new core WAL changesets
+  carry an end-page-count marker so followers truncate after shrink/VACUUM.
+  Proven by
+  `ltx::tests::test_apply_rejects_page_id_zero_without_mutating_database`,
+  `sync::tests::pull_incremental_rejects_page_id_zero_without_mutating_database`,
+  and
+  `sync::tests::pull_incremental_truncates_database_to_encoded_end_page_count`.
+  Root uses the separate `litepages` LTX path; page IDs/page sizes are
+  constructed through `PageNum::new`/`PageSize::new` and this HADBP
+  `apply_changeset_to_db`/`pull_incremental` bug does not exist there.
 - B9 — Untrusted-size allocations: `page_size`/`max_page` magnitude unchecked
   (`crates/walrust-core/src/ltx.rs:87-91`; page_size never checked for
   0/pow2/<=65536); `hadb-changeset` `Vec::with_capacity(page_count)` with
   untrusted count. DoS on crafted objects.
+  Status: Fixed — core now preflights HADBP headers before
+  `hadb-changeset::decode` can allocate a page vector, enforces SQLite page
+  sizes as powers of two in 512..=65536, streams snapshot decode to a synced
+  temp file instead of materializing the whole output DB in memory, and rejects
+  decoded DB sizes beyond a 1 TiB safety cap. Proven by
+  `ltx::tests::test_apply_rejects_invalid_sqlite_page_size_without_mutating_database`
+  and `ltx::tests::test_decode_rejects_invalid_sqlite_page_size`.
 - B10 — Snapshot TXID cursor claims WAL-resident commits the raw file copy
   doesn't contain (`sync.rs:913-919` counts WAL commits; binary path PASSIVE
   may not backfill) => transactions in neither snapshot nor any post-snapshot

@@ -957,7 +957,7 @@ async fn sync_wal_with_sequence(
         page_map,
         frame_count,
         new_offset,
-        final_db_size: _max_db_size,
+        final_db_size,
         commit_count,
         rollover_detected,
     } = read_next_wal_batch(state, &header).await?;
@@ -1008,8 +1008,20 @@ async fn sync_wal_with_sequence(
         DeltaSequence::WalrustOwned | DeltaSequence::ExternalChangeCounter => state.current_seq + 1,
     };
 
-    let (changeset_bytes, post_checksum) =
-        ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;
+    if final_db_size == 0 {
+        anyhow::bail!(
+            "{}: WAL commit produced end_page_count=0 with {} dirty pages; refusing to publish a truncating changeset",
+            state.name,
+            pages.len()
+        );
+    }
+    let (changeset_bytes, post_checksum) = ltx::encode_wal_changes_with_end_page_count(
+        &pages,
+        header.page_size,
+        new_seq,
+        pre_checksum,
+        final_db_size as u64,
+    )?;
 
     let changeset_size = changeset_bytes.len() as u64;
     let changeset_key = build_state_changeset_key(prefix, state, GENERATION_LIVE, new_seq);
@@ -1184,7 +1196,7 @@ async fn external_same_seq_changeset_checksum(
     let Some(data) = storage.get(&base_key).await? else {
         return Ok(None);
     };
-    let changeset = hadb_changeset::physical::decode(&data).map_err(|e| {
+    let changeset = ltx::decode_sqlite_changeset(&data).map_err(|e| {
         anyhow!(
             "failed to decode external base changeset at {}: {}",
             base_key,
@@ -1476,9 +1488,6 @@ pub async fn sync_wal_fenced_delta(
 
     let new_seq = state.current_seq + 1;
 
-    let (ltx_bytes, post_checksum) =
-        ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;
-
     // `final_db_size` is the database size in pages after the last
     // commit frame in this batch — the authoritative end_page_count.
     // Guard against a zero: page_map is non-empty here (we returned
@@ -1494,6 +1503,13 @@ pub async fn sync_wal_fenced_delta(
         );
     }
     let end_page_count = final_db_size as u64;
+    let (ltx_bytes, post_checksum) = ltx::encode_wal_changes_with_end_page_count(
+        &pages,
+        header.page_size,
+        new_seq,
+        pre_checksum,
+        end_page_count,
+    )?;
 
     let payload = DeltaPayloadV1 {
         seq: new_seq,
@@ -1774,7 +1790,7 @@ pub async fn restore_with_snapshot_source(
             .get(&inc.key)
             .await?
             .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
-        let changeset = hadb_changeset::physical::decode(&data)
+        let changeset = ltx::decode_sqlite_changeset(&data)
             .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", inc.key, e))?;
 
         // Verify the chain for every incremental after the first one.
@@ -1783,23 +1799,7 @@ pub async fn restore_with_snapshot_source(
                 .map_err(|e| anyhow!("Checksum chain broken at seq {}: {}", inc.seq, e))?;
         }
 
-        // Apply pages directly (SQLite 1-based page offsets)
-        use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write as IoWrite};
-
-        let page_size = changeset.header.page_size as u64;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(staged_output)
-            .map_err(|e| anyhow!("Failed to open database for apply: {}", e))?;
-
-        for page in &changeset.pages {
-            let offset = (page.page_id.to_u64() - 1) * page_size;
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&page.data)?;
-        }
-        file.sync_all()?;
-        drop(file);
+        ltx::apply_decoded_changeset_to_db(&changeset, staged_output)?;
 
         tracing::info!(
             "Applied incremental (seq {}, checksum: {:016x})",
@@ -1920,7 +1920,7 @@ pub async fn sync_wal_with_retry(
         page_map,
         frame_count,
         new_offset,
-        final_db_size: _max_db_size,
+        final_db_size,
         commit_count,
         rollover_detected,
     } = read_next_wal_batch(state, &header).await?;
@@ -1952,8 +1952,20 @@ pub async fn sync_wal_with_retry(
 
     let new_seq = state.current_seq + 1;
 
-    let (changeset_bytes, post_checksum) =
-        ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;
+    if final_db_size == 0 {
+        anyhow::bail!(
+            "{}: WAL commit produced end_page_count=0 with {} dirty pages; refusing to publish a truncating changeset",
+            state.name,
+            pages.len()
+        );
+    }
+    let (changeset_bytes, post_checksum) = ltx::encode_wal_changes_with_end_page_count(
+        &pages,
+        header.page_size,
+        new_seq,
+        pre_checksum,
+        final_db_size as u64,
+    )?;
 
     let changeset_size = changeset_bytes.len() as u64;
     let changeset_key = build_state_changeset_key(prefix, state, GENERATION_LIVE, new_seq);
@@ -2081,7 +2093,7 @@ pub async fn pull_incremental(
     let mut current_checksum: Option<u64> = None;
     for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
         let data = data?;
-        let changeset = match hadb_changeset::physical::decode(&data) {
+        let changeset = match ltx::decode_sqlite_changeset(&data) {
             Ok(cs) => cs,
             Err(e) => {
                 tracing::error!("Failed to decode changeset at {}: {}", file.key, e);
@@ -2102,22 +2114,7 @@ pub async fn pull_incremental(
             }
         }
 
-        // Apply pages (SQLite 1-based page offsets)
-        use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write as IoWrite};
-
-        let page_size = changeset.header.page_size as u64;
-        let mut db_file = OpenOptions::new()
-            .write(true)
-            .open(db_path)
-            .map_err(|e| anyhow!("Failed to open database for apply: {}", e))?;
-
-        for page in &changeset.pages {
-            let offset = (page.page_id.to_u64() - 1) * page_size;
-            db_file.seek(SeekFrom::Start(offset))?;
-            db_file.write_all(&page.data)?;
-        }
-        db_file.sync_all()?;
+        ltx::apply_decoded_changeset_to_db(&changeset, db_path)?;
 
         applied_seq = file.seq;
         applied_count += 1;
@@ -2248,7 +2245,7 @@ async fn pull_incremental_into_sink_inner(
     let mut current_checksum: Option<u64> = None;
     for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
         let data = data?;
-        let changeset = hadb_changeset::physical::decode(&data)
+        let changeset = ltx::decode_sqlite_changeset(&data)
             .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", file.key, e))?;
 
         if let Some(prev) = current_checksum {
@@ -3475,6 +3472,80 @@ mod tests {
         assert_eq!(applied[1].0, 2);
         assert_eq!(applied[0].1, p1);
         assert_eq!(applied[1].1, p2);
+    }
+
+    #[tokio::test]
+    async fn pull_incremental_rejects_page_id_zero_without_mutating_database() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("follower.db");
+        let page_size = 4096u32;
+        let original = vec![0x11u8; page_size as usize * 2];
+        std::fs::write(&db_path, &original).unwrap();
+
+        let pre_checksum = ltx::compute_checksum_from_file(&db_path).unwrap();
+        let (bytes, _) = ltx::encode_wal_changes(
+            &[(0, page_payload(page_size as usize, 0xAA))],
+            page_size,
+            1,
+            pre_checksum,
+        )
+        .unwrap();
+        let key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 1);
+        storage.insert(&key, bytes);
+
+        let err = pull_incremental(&storage, "test/", "mydb", &db_path, 0)
+            .await
+            .expect_err("pull_incremental must reject page_id 0");
+
+        assert!(
+            err.to_string().contains("page number 0"),
+            "expected invalid page id error, got: {err}"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn pull_incremental_truncates_database_to_encoded_end_page_count() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("follower.db");
+        let page_size = 4096u32;
+        let mut original = Vec::new();
+        original.extend(vec![0x11; page_size as usize]);
+        original.extend(vec![0x22; page_size as usize]);
+        original.extend(vec![0x33; page_size as usize]);
+        std::fs::write(&db_path, &original).unwrap();
+
+        let pre_checksum = ltx::compute_checksum_from_file(&db_path).unwrap();
+        let mut changeset = ltx::HadbChangeset::new(
+            1,
+            pre_checksum,
+            ltx::SQLITE_PAGE_ID_SIZE,
+            page_size,
+            vec![
+                ltx::HadbPageEntry {
+                    page_id: ltx::HadbPageId::U32(1),
+                    data: vec![0xAA; page_size as usize],
+                },
+                ltx::HadbPageEntry {
+                    page_id: ltx::HadbPageId::U32(2),
+                    data: Vec::new(),
+                },
+            ],
+        );
+        changeset.header.flags = 0x01;
+        let key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 1);
+        storage.insert(&key, hadb_changeset::physical::encode(&changeset));
+
+        let seq = pull_incremental(&storage, "test/", "mydb", &db_path, 0)
+            .await
+            .expect("pull should apply shrink marker");
+
+        assert_eq!(seq, 1);
+        let data = std::fs::read(&db_path).unwrap();
+        assert_eq!(data.len(), page_size as usize);
+        assert_eq!(data, vec![0xAA; page_size as usize]);
     }
 
     #[tokio::test]
