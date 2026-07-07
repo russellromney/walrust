@@ -14,6 +14,7 @@ pub mod errors;
 pub mod external_delta;
 pub mod legacy_ltx;
 pub mod legacy_manifest;
+pub mod legacy_replica;
 pub mod legacy_restore;
 pub mod ltx;
 pub mod replay_sink;

@@ -1,10 +1,11 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::path::Path;
 use std::time::Duration;
+use walrust_core::legacy_replica;
 
+#[cfg(test)]
 use crate::ltx;
 use crate::s3::{self, create_client};
 
@@ -22,91 +23,6 @@ fn fsync_parent_dir(path: &Path) -> Result<()> {
         })?
         .sync_all()
         .map_err(|e| anyhow!("failed to fsync directory {}: {e}", parent.display()))
-}
-
-fn sync_file(path: &Path) -> Result<()> {
-    File::open(path)
-        .map_err(|e| anyhow!("failed to open {} for fsync: {e}", path.display()))?
-        .sync_all()
-        .map_err(|e| anyhow!("failed to fsync {}: {e}", path.display()))
-}
-
-fn verify_sqlite_integrity(path: &Path) -> Result<()> {
-    let conn = rusqlite::Connection::open(path)
-        .map_err(|e| anyhow!("failed to open replica database for integrity_check: {e}"))?;
-    let result: String = conn
-        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
-        .map_err(|e| anyhow!("failed to run integrity_check on replica database: {e}"))?;
-    if result != "ok" {
-        return Err(anyhow!("replica database failed integrity_check: {result}"));
-    }
-    Ok(())
-}
-
-struct AtomicReplicaFile {
-    path: PathBuf,
-    published: bool,
-}
-
-impl AtomicReplicaFile {
-    fn new(target: &Path) -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-
-        let parent = target.parent().unwrap_or_else(|| Path::new("."));
-        let file_name = target
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("replica.db");
-        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        let path = parent.join(format!(
-            ".{file_name}.replica-{}-{id}.tmp",
-            std::process::id()
-        ));
-        Self {
-            path,
-            published: false,
-        }
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-
-    fn copy_from(target: &Path) -> Result<Self> {
-        let staged = Self::new(target);
-        fs::copy(target, &staged.path).map_err(|e| {
-            anyhow!(
-                "failed to stage replica copy from {} to {}: {e}",
-                target.display(),
-                staged.path.display()
-            )
-        })?;
-        sync_file(&staged.path)?;
-        fsync_parent_dir(&staged.path)?;
-        Ok(staged)
-    }
-
-    fn publish(mut self, target: &Path) -> Result<()> {
-        sync_file(&self.path)?;
-        fs::rename(&self.path, target).map_err(|e| {
-            anyhow!(
-                "failed to atomically publish replica database {} over {}: {e}",
-                self.path.display(),
-                target.display()
-            )
-        })?;
-        fsync_parent_dir(target)?;
-        self.published = true;
-        Ok(())
-    }
-}
-
-impl Drop for AtomicReplicaFile {
-    fn drop(&mut self) {
-        if !self.published {
-            let _ = fs::remove_file(&self.path);
-        }
-    }
 }
 
 pub async fn replicate(
@@ -346,14 +262,7 @@ async fn bootstrap_replica_from_snapshot(
 
     let ltx_data = s3::download_bytes(client, bucket, &snapshot.key).await?;
 
-    let staged = AtomicReplicaFile::new(local);
-
-    // Decode snapshot to a staged database (verifies checksum)
-    let cursor = std::io::Cursor::new(ltx_data);
-    let decode_result = ltx::decode_to_db(cursor, staged.path())?;
-    sync_file(staged.path())?;
-    verify_sqlite_integrity(staged.path())?;
-    staged.publish(local)?;
+    let decode_result = legacy_replica::bootstrap_from_snapshot_bytes(&ltx_data, local)?;
 
     println!(
         "Bootstrapped from snapshot: {} pages, TXID {}, checksum: {:016x}",
@@ -365,14 +274,11 @@ async fn bootstrap_replica_from_snapshot(
     Ok(())
 }
 
-fn apply_incremental_atomically(ltx_data: &[u8], local: &Path) -> Result<ltx::ApplyResult> {
-    let staged = AtomicReplicaFile::copy_from(local)?;
-    let cursor = std::io::Cursor::new(ltx_data);
-    let apply_result = ltx::apply_ltx_to_db(cursor, staged.path())?;
-    sync_file(staged.path())?;
-    verify_sqlite_integrity(staged.path())?;
-    staged.publish(local)?;
-    Ok(apply_result)
+fn apply_incremental_atomically(
+    ltx_data: &[u8],
+    local: &Path,
+) -> Result<walrust_core::legacy_ltx::ApplyResult> {
+    legacy_replica::apply_incremental_atomically(ltx_data, local)
 }
 
 /// Save replica state to local file

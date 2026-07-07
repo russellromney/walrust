@@ -768,9 +768,20 @@ and
     then fixed by moving retention-plus-live-chain reachability planning into
     `walrust-core::legacy_manifest::plan_legacy_compaction`; root manual
     compact and watch-mode auto-compaction now use that core planner and keep
-    only S3 metadata lookup, output/logging, and deletion orchestration.
-    Remaining work: root `src/sync/*` still owns the CLI watch and replicate
-    apply workflow over the legacy LTX object layout, while core owns the HADBP
+    only S3 metadata lookup, output/logging, and deletion orchestration. Legacy
+    read-replica apply ownership was then reproduced with
+    `legacy_replica_engine_is_owned_by_core_and_preserves_live_db_on_bad_incremental`
+    and `legacy_replica_engine_bootstraps_snapshot_through_core` (failed
+    because `walrust_core::legacy_replica` did not exist), then fixed by moving
+    atomic snapshot bootstrap and incremental staged-apply into
+    `walrust-core::legacy_replica`; root `src/sync/replicate.rs` now keeps S3
+    polling, gap decisions, and local replica state while delegating live-file
+    mutation to core. Root production path coverage remains
+    `sync::replicate::tests::replica_failed_incremental_apply_preserves_existing_database`
+    and
+    `sync::replicate::tests::replica_gap_without_future_snapshot_errors_and_preserves_existing_database`.
+    Remaining work: root `src/sync/*` still owns the CLI watch/upload
+    orchestration over the legacy LTX object layout, while core owns the HADBP
     engine. That workflow/API migration is still required before duplicate sync
     implementations can be deleted.
 4.2 Error taxonomy: replace substring classification with typed errors
