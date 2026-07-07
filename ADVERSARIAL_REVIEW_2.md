@@ -691,6 +691,15 @@ and
     `e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows`.
 3.2 DST drives the production pipeline (not testable.rs) for at least one
     property; restore-from-published-deltas test for phase-4 mode.
+    Status: Fixed — `walrust-dst` now has
+    `prop_production_published_delta_restore`, which drives
+    `walrust-core` production `take_snapshot`, `sync_wal`, object discovery,
+    and `restore` against the deterministic `MockStorageBackend`. It verifies
+    that published HADBP snapshots and incrementals exist, restore reaches the
+    stream head, `PRAGMA integrity_check` passes, and restored rows match the
+    source. Proven by
+    `invariants::tests::test_prop_production_published_delta_restore` and
+    `walrust-dst invariants --invariant production_published_deltas`.
 3.3 Compaction-vs-restore race test; two-watchers test; ENOSPC test;
     64KB pages; >100MB DB smoke test.
 
