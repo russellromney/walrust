@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::manifest::{
-    discover_state_from_s3, find_latest_snapshot, list_generation_files, GENERATION_LIVE,
+    discover_state_from_s3, find_latest_snapshot, find_latest_snapshot_at_or_before,
+    list_generation_files, GENERATION_LIVE,
 };
 
 /// Decide whether a completed restore actually reached its requested target.
@@ -145,13 +146,6 @@ pub async fn restore(
         return Err(anyhow!("No LTX files found for database: {}", name));
     }
 
-    // Find the latest snapshot (min_txid=1 in generation 1+)
-    let snapshot = find_latest_snapshot(&client, &bucket_name, &prefix, name)
-        .await?
-        .ok_or_else(|| anyhow!("No snapshot found for database: {}", name))?;
-
-    let (snapshot_gen, snapshot_key, snapshot_min_txid, snapshot_max_txid) = snapshot;
-
     // Parse point in time if provided (TXID only for litestream format)
     let target_txid = if let Some(pit) = point_in_time {
         pit.parse::<u64>()
@@ -159,6 +153,21 @@ pub async fn restore(
     } else {
         current_txid
     };
+
+    let snapshot = if point_in_time.is_some() {
+        find_latest_snapshot_at_or_before(&client, &bucket_name, &prefix, name, target_txid).await?
+    } else {
+        find_latest_snapshot(&client, &bucket_name, &prefix, name).await?
+    }
+    .ok_or_else(|| {
+        if point_in_time.is_some() {
+            anyhow!("No snapshot found for database {name} at or before TXID {target_txid}")
+        } else {
+            anyhow!("No snapshot found for database: {}", name)
+        }
+    })?;
+
+    let (snapshot_gen, snapshot_key, snapshot_min_txid, snapshot_max_txid) = snapshot;
 
     tracing::info!(
         "Restoring from LTX snapshot: {} (TXID: {}-{}, generation: {})",

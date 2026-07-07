@@ -224,6 +224,14 @@ by `uploader::tests::test_uploader_basic_upload` and
 `sync::manifest::tests::build_ltx_key_normalizes_prefix_separator`.
 
 ### A9 — PIT restore can only use the newest snapshot; GFS retention is dead weight
+Status: Fixed — root restore now selects the latest snapshot whose `max_txid`
+is `<= --point-in-time`, and core restore now does the same for HADBP
+sequence numbers while filtering incrementals at the target. Timestamp PITR is
+not implementable from current object metadata, so CLI/help/docs now document
+TXID/sequence-based PITR instead of ISO 8601 timestamps. Proven by
+`point_in_time_restore_uses_latest_snapshot_not_after_target` and
+`sync::tests::restore_point_in_time_uses_latest_snapshot_not_after_target`.
+
 - `src/sync/restore.rs:84` hard-codes `find_latest_snapshot` (no target
   param). If `target_txid < snapshot_max_txid`, restore always fails
   ("overshot") even when an older retained snapshot + incrementals cover the
@@ -391,12 +399,22 @@ daemon validation path, or watch-mode auto-compaction path for this finding.
   listing-based path; align exit codes.
 
 ### A14 — Restore/replica destroy existing local data before success is known
-Status: Partial — restore-half fixed in root and core. Root production restore
+Status: Fixed — restore-half fixed in root and core. Root production restore
 is proven by `failed_restore_preserves_existing_output_database`; core restore
 is proven by `sync::tests::restore_failure_preserves_existing_output_database`
 and
 `sync::tests::restore_with_snapshot_source_failure_preserves_existing_output_database`.
-Replica in-place apply/bootstrap remains open for the Phase 2 replica-half.
+Root read-replica bootstrap now decodes snapshots to a staged file and
+atomically publishes only after decode, fsync, and integrity check; incremental
+replica apply now operates on a staged copy and atomically swaps it into place
+only after the LTX apply and integrity check succeed. Replica gap handling now
+re-seeds only from a snapshot at or past the gap and otherwise returns a hard
+error without mutating local data/state. Proven by
+`sync::replicate::tests::replica_failed_incremental_apply_preserves_existing_database`
+and
+`sync::replicate::tests::replica_gap_without_future_snapshot_errors_and_preserves_existing_database`.
+`walrust-core` has no read-replica loop corresponding to root
+`src/sync/replicate.rs`; its restore-half coverage is the relevant tree.
 
 - `src/ltx.rs:127` writes the full DB image THEN checks the trailer; every
   incremental applies in place to the output. A failed restore leaves the

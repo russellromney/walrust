@@ -63,7 +63,7 @@ More commands:
 
 ```bash
 walrust restore mydb -o restored.db -b s3://my-bucket                        # restore from S3
-walrust restore mydb -o restored.db -b s3://my-bucket --point-in-time 2026-03-01T12:00:00Z  # PITR
+walrust restore mydb -o restored.db -b s3://my-bucket --point-in-time 42     # restore through TXID/sequence 42
 walrust snapshot app.db -b s3://my-bucket                  # immediate snapshot
 walrust verify mydb -b s3://my-bucket                      # check backup integrity
 walrust list -b s3://my-bucket                             # list backups

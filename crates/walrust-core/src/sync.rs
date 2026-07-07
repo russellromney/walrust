@@ -402,6 +402,38 @@ async fn discover_latest_snapshot_in_namespace(
     Ok(snapshots.pop())
 }
 
+async fn discover_latest_snapshot_at_or_before_in_namespace(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    lineage_id: Option<&str>,
+    target_seq: u64,
+    kind: ChangesetKind,
+) -> Result<Option<DiscoveredChangeset>> {
+    let mut snapshots = discover_after_in_namespace(
+        storage,
+        prefix,
+        db_name,
+        lineage_id,
+        GENERATION_SNAPSHOT,
+        0,
+        kind,
+    )
+    .await?;
+    snapshots.retain(|changeset| changeset.seq <= target_seq);
+    snapshots.sort_by_key(|c| c.seq);
+    Ok(snapshots.pop())
+}
+
+fn parse_point_in_time_seq(point_in_time: Option<&str>) -> Result<Option<u64>> {
+    point_in_time
+        .map(|pit| {
+            pit.parse::<u64>()
+                .map_err(|_| anyhow!("Invalid point_in_time format. Use sequence/TXID number"))
+        })
+        .transpose()
+}
+
 /// Get SQLite database page size from header.
 async fn get_page_size(db_path: &Path) -> Result<u32> {
     use tokio::io::AsyncReadExt;
@@ -1566,22 +1598,41 @@ pub async fn restore(
     prefix: &str,
     db_name: &str,
     output: &Path,
-    _point_in_time: Option<&str>,
+    point_in_time: Option<&str>,
 ) -> Result<u64> {
-    // Find latest snapshot
+    let target_seq = parse_point_in_time_seq(point_in_time)?;
+
     let lineage_id = active_lineage_id(storage, prefix, db_name).await?;
-    let snapshot = discover_latest_snapshot_in_namespace(
-        storage,
-        prefix,
-        db_name,
-        lineage_id.as_deref(),
-        ChangesetKind::Physical,
-    )
-    .await?
-    .ok_or_else(|| anyhow!("No snapshot found for database '{}'", db_name))?;
+    let snapshot = match target_seq {
+        Some(target) => discover_latest_snapshot_at_or_before_in_namespace(
+            storage,
+            prefix,
+            db_name,
+            lineage_id.as_deref(),
+            target,
+            ChangesetKind::Physical,
+        )
+        .await?
+        .ok_or_else(|| {
+            anyhow!(
+                "No snapshot found for database '{}' at or before seq {}",
+                db_name,
+                target
+            )
+        })?,
+        None => discover_latest_snapshot_in_namespace(
+            storage,
+            prefix,
+            db_name,
+            lineage_id.as_deref(),
+            ChangesetKind::Physical,
+        )
+        .await?
+        .ok_or_else(|| anyhow!("No snapshot found for database '{}'", db_name))?,
+    };
 
     // Find incrementals after the snapshot
-    let incrementals = discover_after_in_namespace(
+    let mut incrementals = discover_after_in_namespace(
         storage,
         prefix,
         db_name,
@@ -1591,6 +1642,9 @@ pub async fn restore(
         ChangesetKind::Physical,
     )
     .await?;
+    if let Some(target) = target_seq {
+        incrementals.retain(|changeset| changeset.seq <= target);
+    }
 
     tracing::info!(
         "Restoring from snapshot (seq {}) + {} incrementals",
@@ -3058,6 +3112,38 @@ mod tests {
             msg.contains("gap") || msg.contains("contiguous") || msg.contains("seq"),
             "expected gap/contiguity error, got: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn restore_point_in_time_uses_latest_snapshot_not_after_target() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let old_db = dir.path().join("old.db");
+        let new_db = dir.path().join("new.db");
+        let output = dir.path().join("restored.db");
+        let page_size = 4096u32;
+
+        create_marker_db(&old_db, "old-snapshot").unwrap();
+        create_marker_db(&new_db, "newer-snapshot").unwrap();
+
+        let old_snapshot = ltx::encode_snapshot(&old_db, page_size, 1, 0).unwrap();
+        let old_key = build_changeset_key("test/", "mydb", GENERATION_SNAPSHOT, 1);
+        storage.insert(&old_key, old_snapshot);
+
+        let new_snapshot = ltx::encode_snapshot(&new_db, page_size, 5, 0).unwrap();
+        let new_key = build_changeset_key("test/", "mydb", GENERATION_SNAPSHOT, 5);
+        storage.insert(&new_key, new_snapshot);
+
+        let restored_seq = restore(&storage, "test/", "mydb", &output, Some("3"))
+            .await
+            .expect("core restore should choose the latest snapshot <= target");
+
+        assert_eq!(restored_seq, 1);
+        let conn = rusqlite::Connection::open(&output).unwrap();
+        let marker: String = conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(marker, "old-snapshot");
     }
 
     #[tokio::test]

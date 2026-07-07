@@ -218,7 +218,7 @@ enum Commands {
         #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
         endpoint: Option<String>,
 
-        /// Restore to specific point in time (ISO 8601)
+        /// Restore to specific TXID/sequence number
         #[arg(long)]
         point_in_time: Option<String>,
 

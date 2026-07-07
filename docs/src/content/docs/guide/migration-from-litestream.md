@@ -230,7 +230,7 @@ walrust list --bucket my-backups --endpoint https://fly.storage.tigris.dev
 | `litestream replicate` | `walrust watch` |
 | `litestream snapshots <db>` | `walrust list --bucket <bucket>` |
 | `litestream restore <db> <path>` | `walrust restore <db> -o <path> --bucket <bucket>` |
-| `litestream restore -timestamp <time>` | `walrust restore --point-in-time <time>` |
+| `litestream restore -timestamp <time>` | No timestamp equivalent; use `walrust restore --point-in-time <txid>` for TXID/sequence-based restore |
 | `litestream databases` | `walrust list --bucket <bucket>` |
 | `litestream version` | `walrust --version` |
 | `litestream generations` | (Not implemented) |

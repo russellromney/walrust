@@ -213,7 +213,7 @@ walrust restore [OPTIONS] --output <OUTPUT> --bucket <BUCKET> <NAME>
 | `-o, --output <OUTPUT>` | Output path for restored database (required) |
 | `-b, --bucket <BUCKET>` | S3 bucket (required) |
 | `--endpoint <ENDPOINT>` | S3 endpoint URL for Tigris/MinIO/etc. Also reads from `AWS_ENDPOINT_URL_S3` |
-| `--point-in-time <TIMESTAMP>` | Restore to specific point in time (ISO 8601 format) |
+| `--point-in-time <TXID>` | Restore through a specific TXID/sequence number |
 | `-h, --help` | Print help |
 
 ### Examples
@@ -224,11 +224,11 @@ walrust restore myapp.db \
   --bucket my-backups \
   --output restored.db
 
-# Restore to specific point in time
+# Restore through a specific TXID/sequence number
 walrust restore myapp.db \
   --bucket my-backups \
   --output restored.db \
-  --point-in-time "2024-01-15T10:30:00Z"
+  --point-in-time 42
 
 # Restore from Tigris
 walrust restore myapp.db \

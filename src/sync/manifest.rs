@@ -217,6 +217,30 @@ pub(crate) async fn find_latest_snapshot(
     prefix: &str,
     db_name: &str,
 ) -> Result<Option<(u64, String, u64, u64)>> {
+    find_latest_snapshot_matching(client, bucket, prefix, db_name, |_| true).await
+}
+
+/// Find the latest snapshot whose max TXID is not after `target_txid`.
+pub(crate) async fn find_latest_snapshot_at_or_before(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    db_name: &str,
+    target_txid: u64,
+) -> Result<Option<(u64, String, u64, u64)>> {
+    find_latest_snapshot_matching(client, bucket, prefix, db_name, |max_txid| {
+        max_txid <= target_txid
+    })
+    .await
+}
+
+async fn find_latest_snapshot_matching(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    db_name: &str,
+    include_max_txid: impl Fn(u64) -> bool,
+) -> Result<Option<(u64, String, u64, u64)>> {
     // Returns: (generation, key, min_txid, max_txid)
     let db_prefix = database_prefix(prefix, db_name);
     let objects = s3::list_objects(client, bucket, &db_prefix).await?;
@@ -232,7 +256,7 @@ pub(crate) async fn find_latest_snapshot(
                 if let Some((min_txid, max_txid)) = parse_ltx_filename(parts[1]) {
                     // A snapshot has min_txid = 1
                     // Look in all generations (litestream puts initial snapshot in gen 0)
-                    if min_txid == 1 {
+                    if min_txid == 1 && include_max_txid(max_txid) {
                         match &best_snapshot {
                             None => {
                                 best_snapshot = Some((gen, key.clone(), min_txid, max_txid));
@@ -250,7 +274,7 @@ pub(crate) async fn find_latest_snapshot(
         } else if parts.len() == 1 {
             if let Some(txid) = parse_legacy_flat_ltx_filename(parts[0]) {
                 let (min_txid, max_txid) = legacy_flat_ltx_range(client, bucket, key, txid).await;
-                if min_txid == 1 {
+                if min_txid == 1 && include_max_txid(max_txid) {
                     match &best_snapshot {
                         None => {
                             best_snapshot =

@@ -44,6 +44,55 @@ fn create_marker_db(path: &Path, marker: &str) -> Result<()> {
     Ok(())
 }
 
+fn sqlite_page_size(path: &Path) -> Result<u32> {
+    let conn = Connection::open(path)?;
+    Ok(conn.query_row("PRAGMA page_size", [], |row| row.get(0))?)
+}
+
+#[tokio::test]
+async fn point_in_time_restore_uses_latest_snapshot_not_after_target() -> Result<()> {
+    let (bucket_arg, endpoint) = test_bucket_config();
+    let (bucket, prefix) = walrust::s3::parse_bucket(&bucket_arg);
+    let client = walrust::s3::create_client(endpoint.as_deref()).await?;
+    let name = unique_name("restore-pit-snapshot");
+    let tmp = tempfile::tempdir()?;
+    let old_db = tmp.path().join("old.db");
+    let new_db = tmp.path().join("new.db");
+    let restored = tmp.path().join("restored.db");
+
+    create_marker_db(&old_db, "old-snapshot")?;
+    create_marker_db(&new_db, "newer-snapshot")?;
+
+    let mut old_snapshot = Vec::new();
+    walrust::ltx::encode_snapshot(&mut old_snapshot, &old_db, sqlite_page_size(&old_db)?, 1)?;
+    let old_key = format!("{prefix}{name}/0001/0000000000000001-0000000000000001.ltx");
+    walrust::s3::upload_bytes(&client, &bucket, &old_key, old_snapshot).await?;
+
+    let mut new_snapshot = Vec::new();
+    walrust::ltx::encode_snapshot(&mut new_snapshot, &new_db, sqlite_page_size(&new_db)?, 5)?;
+    let new_key = format!("{prefix}{name}/0002/0000000000000001-0000000000000005.ltx");
+    walrust::s3::upload_bytes(&client, &bucket, &new_key, new_snapshot).await?;
+
+    walrust::sync::restore(
+        &name,
+        &restored,
+        &bucket_arg,
+        endpoint.as_deref(),
+        Some("3"),
+        None,
+        None,
+    )
+    .await?;
+
+    let conn = Connection::open(&restored)?;
+    let marker: String = conn.query_row("SELECT value FROM marker", [], |row| row.get(0))?;
+    assert_eq!(
+        marker, "old-snapshot",
+        "PIT restore at TXID 3 must choose the latest snapshot <= target, not the newer TXID 5 snapshot"
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn restore_rejects_incremental_without_prior_chain_link() -> Result<()> {
     let (bucket_arg, endpoint) = test_bucket_config();

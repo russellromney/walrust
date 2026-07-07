@@ -83,7 +83,7 @@ Restoring is the reverse:
 3. Verify checksums along the way
 4. Output a complete, consistent database
 
-Point-in-time restore works by stopping at a specific transaction ID or timestamp.
+Point-in-time restore works by stopping at a specific transaction ID/sequence number. Timestamp-based PITR is not currently implemented.
 
 ---
 
