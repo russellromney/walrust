@@ -18,6 +18,16 @@ use anyhow::Result;
 use async_trait::async_trait;
 use std::path::Path;
 
+/// Replay cursor and checksum for a materialized snapshot/base state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotCheckpoint {
+    /// Durable replay sequence represented by the materialized base.
+    pub seq: u64,
+    /// HADBP chain checksum that represents the materialized base. The first WAL
+    /// delta applied on top must chain from this value.
+    pub checksum: u64,
+}
+
 /// A source that can materialize a base database file for WAL replay.
 ///
 /// The `restore()` function uses this trait to produce the base DB instead
@@ -32,15 +42,17 @@ pub trait SnapshotSource: Send + Sync {
     /// Materialize the database at the latest checkpoint to a local file.
     ///
     /// Writes a complete SQLite database to `output`. Returns the durable replay
-    /// cursor for that checkpoint/base state so walrust knows which WAL
-    /// increments are newer and need to be applied. For external base-state
-    /// integrations this is not necessarily the provider's manifest version.
+    /// cursor and chain checksum for that checkpoint/base state so walrust knows
+    /// which WAL increments are newer and can verify the first incremental chains
+    /// from the materialized base. For external base-state integrations this
+    /// sequence is not necessarily the provider's manifest version.
     ///
     /// This replaces the LTX snapshot download step in `restore()`.
-    async fn materialize(&self, output: &Path) -> Result<u64>;
+    async fn materialize(&self, output: &Path) -> Result<SnapshotCheckpoint>;
 
-    /// Return the current checkpoint/base replay cursor without materializing.
+    /// Return the current checkpoint/base replay cursor and chain checksum without
+    /// materializing.
     ///
     /// Used to check if WAL increments exist before doing a full materialization.
-    async fn checkpoint_version(&self) -> Result<u64>;
+    async fn checkpoint(&self) -> Result<SnapshotCheckpoint>;
 }

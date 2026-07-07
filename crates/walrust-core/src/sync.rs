@@ -163,6 +163,15 @@ pub struct ExternalBaseCursor {
     pub checksum: u64,
 }
 
+/// Follower cursor for incremental pull APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullCursor {
+    /// Highest HADBP sequence already applied by the follower.
+    pub seq: u64,
+    /// Running HADBP checksum at `seq`. The next changeset must chain from it.
+    pub checksum: u64,
+}
+
 /// State for a single database being synced.
 #[derive(Debug, Clone)]
 pub struct SyncState {
@@ -1735,10 +1744,11 @@ pub async fn restore_with_snapshot_source(
     let staged_output = staged_restore.path();
 
     // Step 1: materialize the base DB from the external snapshot source
-    let checkpoint_version = snapshot_source.materialize(staged_output).await?;
+    let checkpoint = snapshot_source.materialize(staged_output).await?;
     tracing::info!(
-        "Materialized base DB from snapshot source (checkpoint version {})",
-        checkpoint_version,
+        "Materialized base DB from snapshot source (checkpoint version {}, checksum {:016x})",
+        checkpoint.seq,
+        checkpoint.checksum,
     );
 
     // Step 2: discover incremental changesets newer than the checkpoint version.
@@ -1746,7 +1756,7 @@ pub async fn restore_with_snapshot_source(
         storage,
         prefix,
         db_name,
-        checkpoint_version,
+        checkpoint.seq,
         ChangesetKind::Physical,
     )
     .await?;
@@ -1754,30 +1764,28 @@ pub async fn restore_with_snapshot_source(
     if incrementals.is_empty() {
         tracing::info!(
             "No incremental changesets to apply (up to date at version {})",
-            checkpoint_version
+            checkpoint.seq
         );
         verify_sqlite_integrity(staged_output)?;
         staged_restore.publish(output)?;
-        return Ok(checkpoint_version);
+        return Ok(checkpoint.seq);
     }
 
     tracing::info!(
         "Applying {} incremental changesets after checkpoint version {}",
         incrementals.len(),
-        checkpoint_version,
+        checkpoint.seq,
     );
 
-    // Step 3: apply incrementals in order, verifying the HADBP checksum chain.
-    //
-    // When restoring from an external snapshot source we do not have the HADBP
-    // checksum of the materialized base, so the *first* incremental cannot be
-    // chain-verified against the snapshot — it establishes the chain. Every
-    // subsequent incremental must chain from the prior one. A gap or chain
-    // break means the restore cannot prove success, so it is a hard error.
-    let mut restored_seq = checkpoint_version;
-    let mut current_checksum: Option<u64> = None;
+    // Step 3: apply incrementals in order, verifying every file against the
+    // materialized base checksum. A gap or chain break means the restore cannot
+    // prove success, so it is a hard error.
+    let mut cursor = PullCursor {
+        seq: checkpoint.seq,
+        checksum: checkpoint.checksum,
+    };
     for inc in incrementals.iter() {
-        let expected_seq = restored_seq + 1;
+        let expected_seq = cursor.seq + 1;
         if inc.seq != expected_seq {
             return Err(anyhow!(
                 "restore incremental gap: expected seq {expected_seq}, got seq {} at {}",
@@ -1793,11 +1801,8 @@ pub async fn restore_with_snapshot_source(
         let changeset = ltx::decode_sqlite_changeset(&data)
             .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", inc.key, e))?;
 
-        // Verify the chain for every incremental after the first one.
-        if let Some(prev) = current_checksum {
-            hadb_changeset::physical::verify_chain(prev, &changeset)
-                .map_err(|e| anyhow!("Checksum chain broken at seq {}: {}", inc.seq, e))?;
-        }
+        hadb_changeset::physical::verify_chain(cursor.checksum, &changeset)
+            .map_err(|e| anyhow!("Checksum chain broken at seq {}: {}", inc.seq, e))?;
 
         ltx::apply_decoded_changeset_to_db(&changeset, staged_output)?;
 
@@ -1806,13 +1811,15 @@ pub async fn restore_with_snapshot_source(
             inc.seq,
             changeset.checksum
         );
-        restored_seq = inc.seq;
-        current_checksum = Some(changeset.checksum);
+        cursor = PullCursor {
+            seq: inc.seq,
+            checksum: changeset.checksum,
+        };
     }
 
     verify_sqlite_integrity(staged_output)?;
     staged_restore.publish(output)?;
-    Ok(restored_seq)
+    Ok(cursor.seq)
 }
 
 fn verify_sqlite_integrity(path: &Path) -> Result<()> {
@@ -2047,10 +2054,69 @@ pub async fn sync_wal_and_manifest(
 /// Maximum concurrent S3 downloads for incremental pulling.
 const PULL_CONCURRENCY: usize = 8;
 
+struct DecodedPullChangeset {
+    seq: u64,
+    key: String,
+    changeset: hadb_changeset::physical::PhysicalChangeset,
+}
+
+async fn download_decode_pull_changesets(
+    storage: &dyn StorageBackend,
+    files: &[DiscoveredChangeset],
+) -> Result<Vec<DecodedPullChangeset>> {
+    let downloaded = download_parallel(storage, files, PULL_CONCURRENCY).await;
+    let mut decoded = Vec::with_capacity(files.len());
+
+    for (file, data) in files.iter().zip(downloaded.into_iter()) {
+        let data = data?;
+        let changeset = ltx::decode_sqlite_changeset(&data)
+            .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", file.key, e))?;
+        decoded.push(DecodedPullChangeset {
+            seq: file.seq,
+            key: file.key.clone(),
+            changeset,
+        });
+    }
+
+    Ok(decoded)
+}
+
+fn verify_decoded_pull_chain(
+    decoded: &[DecodedPullChangeset],
+    current: PullCursor,
+    context: &str,
+) -> Result<PullCursor> {
+    let mut cursor = current;
+    for entry in decoded {
+        let expected_seq = cursor.seq + 1;
+        if entry.seq != expected_seq {
+            return Err(anyhow!(
+                "{context} incremental gap: expected seq {expected_seq}, got seq {} at {}",
+                entry.seq,
+                entry.key
+            ));
+        }
+
+        hadb_changeset::physical::verify_chain(cursor.checksum, &entry.changeset).map_err(|e| {
+            anyhow!(
+                "{context} checksum chain broken at seq {} ({}): {}",
+                entry.seq,
+                entry.key,
+                e
+            )
+        })?;
+        cursor = PullCursor {
+            seq: entry.seq,
+            checksum: entry.changeset.checksum,
+        };
+    }
+    Ok(cursor)
+}
+
 /// Pull and apply new HADBP changesets from S3 that are ahead of `current_seq`.
 ///
 /// This is the follower's replication primitive. Call it in a loop (e.g., every 1s)
-/// to stay in sync with the leader. Returns the new highest applied seq.
+/// to stay in sync with the leader. Returns the new highest applied cursor.
 ///
 /// Optimizations:
 /// - Uses `start_after` on S3 LIST to skip past already-applied changesets
@@ -2060,8 +2126,8 @@ pub async fn pull_incremental(
     prefix: &str,
     db_name: &str,
     db_path: &Path,
-    current_seq: u64,
-) -> Result<u64> {
+    current: PullCursor,
+) -> Result<PullCursor> {
     let lineage_id = active_lineage_id(storage, prefix, db_name).await?;
     let new_files = discover_after_in_namespace(
         storage,
@@ -2069,69 +2135,32 @@ pub async fn pull_incremental(
         db_name,
         lineage_id.as_deref(),
         GENERATION_LIVE,
-        current_seq,
+        current.seq,
         ChangesetKind::Physical,
     )
     .await?;
 
     if new_files.is_empty() {
-        return Ok(current_seq);
+        return Ok(current);
     }
 
-    // Download concurrently, apply sequentially (checksum chain is serial)
-    let downloaded = download_parallel(storage, &new_files, PULL_CONCURRENCY).await;
+    let decoded = download_decode_pull_changesets(storage, &new_files).await?;
+    let verified_cursor = verify_decoded_pull_chain(&decoded, current, "pull_incremental")?;
 
-    let mut applied_seq = current_seq;
-    let mut applied_count = 0u64;
-    let mut stale_count = 0u64;
-
-    // For followers pulling incrementals we don't have the prev_checksum of the
-    // base, so the first changeset establishes the chain. Every changeset after
-    // it must chain from the prior one; a break means a stale object from a
-    // different lineage is sitting at an in-range seq and must NOT be applied —
-    // we stop rather than corrupting the follower's database.
-    let mut current_checksum: Option<u64> = None;
-    for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
-        let data = data?;
-        let changeset = match ltx::decode_sqlite_changeset(&data) {
-            Ok(cs) => cs,
-            Err(e) => {
-                tracing::error!("Failed to decode changeset at {}: {}", file.key, e);
-                return Err(anyhow!("Failed to decode changeset: {}", e));
-            }
-        };
-
-        if let Some(prev) = current_checksum {
-            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
-                tracing::warn!(
-                    "Stopping pull at seq {}: checksum chain broken ({}); \
-                     remaining changesets are from a different lineage",
-                    file.seq,
-                    e
-                );
-                stale_count = new_files.len() as u64 - applied_count;
-                break;
-            }
-        }
-
-        ltx::apply_decoded_changeset_to_db(&changeset, db_path)?;
-
-        applied_seq = file.seq;
-        applied_count += 1;
-        current_checksum = Some(changeset.checksum);
+    for entry in &decoded {
+        ltx::apply_decoded_changeset_to_db(&entry.changeset, db_path)?;
     }
 
-    if applied_count > 0 {
+    if !decoded.is_empty() {
         tracing::info!(
-            "Pulled {} HADBP changesets (skipped {} stale), seq {} -> {}",
-            applied_count,
-            stale_count,
-            current_seq,
-            applied_seq
+            "Pulled {} HADBP changesets, seq {} -> {}",
+            decoded.len(),
+            current.seq,
+            verified_cursor.seq
         );
     }
 
-    Ok(applied_seq)
+    Ok(verified_cursor)
 }
 
 /// Pull and apply new HADBP changesets from S3 through a `PageReplaySink`,
@@ -2163,8 +2192,8 @@ pub async fn pull_incremental_into_sink(
     prefix: &str,
     db_name: &str,
     sink: &mut dyn crate::replay_sink::PageReplaySink,
-    current_seq: u64,
-) -> Result<u64> {
+    current: PullCursor,
+) -> Result<PullCursor> {
     // begin() may fail; if it does, abort() is still called as a
     // best-effort cleanup so the contract "exactly one of finalize or
     // abort per invocation" holds even on early failure. Sinks must
@@ -2174,11 +2203,10 @@ pub async fn pull_incremental_into_sink(
         return Err(begin_err);
     }
 
-    let result =
-        pull_incremental_into_sink_inner(storage, prefix, db_name, sink, current_seq).await;
+    let result = pull_incremental_into_sink_inner(storage, prefix, db_name, sink, current).await;
 
     match result {
-        Ok(applied_seq) => {
+        Ok(applied_cursor) => {
             // finalize() may fail mid-install (the Turbolite sink
             // writes pages, marks bitmap, bumps generation, etc. — any
             // step can fail). On failure we still need to give the
@@ -2187,7 +2215,7 @@ pub async fn pull_incremental_into_sink(
                 try_abort(sink, &finalize_err);
                 return Err(finalize_err);
             }
-            Ok(applied_seq)
+            Ok(applied_cursor)
         }
         Err(e) => {
             try_abort(sink, &e);
@@ -2214,8 +2242,8 @@ async fn pull_incremental_into_sink_inner(
     prefix: &str,
     db_name: &str,
     sink: &mut dyn crate::replay_sink::PageReplaySink,
-    current_seq: u64,
-) -> Result<u64> {
+    current: PullCursor,
+) -> Result<PullCursor> {
     let lineage_id = active_lineage_id(storage, prefix, db_name).await?;
     let new_files = discover_after_in_namespace(
         storage,
@@ -2223,44 +2251,24 @@ async fn pull_incremental_into_sink_inner(
         db_name,
         lineage_id.as_deref(),
         GENERATION_LIVE,
-        current_seq,
+        current.seq,
         ChangesetKind::Physical,
     )
     .await?;
 
     if new_files.is_empty() {
-        return Ok(current_seq);
+        return Ok(current);
     }
 
-    let downloaded = download_parallel(storage, &new_files, PULL_CONCURRENCY).await;
+    let decoded = download_decode_pull_changesets(storage, &new_files).await?;
+    let verified_cursor =
+        verify_decoded_pull_chain(&decoded, current, "pull_incremental_into_sink")?;
 
-    let mut applied_seq = current_seq;
-    let mut applied_count = 0u64;
-
-    // The first changeset establishes the chain; each subsequent one must chain
-    // from the prior. A break means a stale object from a different lineage at
-    // an in-range seq — stop before routing its pages into the sink (the sink
-    // commits per changeset, so a mis-chained changeset must be rejected whole,
-    // not partially applied).
-    let mut current_checksum: Option<u64> = None;
-    for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
-        let data = data?;
-        let changeset = ltx::decode_sqlite_changeset(&data)
-            .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", file.key, e))?;
-
-        if let Some(prev) = current_checksum {
-            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
-                tracing::warn!(
-                    "pull_incremental_into_sink: stopping at seq {}: checksum chain broken \
-                     ({}); remaining changesets are from a different lineage",
-                    file.seq,
-                    e
-                );
-                break;
+    for entry in &decoded {
+        for page in &entry.changeset.pages {
+            if page.data.is_empty() {
+                continue;
             }
-        }
-
-        for page in &changeset.pages {
             // SQLite 1-based page id straight from the HADBP changeset.
             let sqlite_page_id: u32 = page
                 .page_id
@@ -2270,23 +2278,19 @@ async fn pull_incremental_into_sink_inner(
             sink.apply_page(sqlite_page_id, &page.data)?;
         }
 
-        sink.commit_changeset(file.seq)?;
-
-        applied_seq = file.seq;
-        applied_count += 1;
-        current_checksum = Some(changeset.checksum);
+        sink.commit_changeset(entry.seq)?;
     }
 
-    if applied_count > 0 {
+    if !decoded.is_empty() {
         tracing::info!(
             "pull_incremental_into_sink: applied {} HADBP changesets, seq {} -> {}",
-            applied_count,
-            current_seq,
-            applied_seq
+            decoded.len(),
+            current.seq,
+            verified_cursor.seq
         );
     }
 
-    Ok(applied_seq)
+    Ok(verified_cursor)
 }
 
 /// Download one S3 object, returning its index for ordered reassembly.
@@ -2887,7 +2891,10 @@ mod tests {
 
     #[async_trait]
     impl crate::snapshot_source::SnapshotSource for MockSnapshotSource {
-        async fn materialize(&self, output: &Path) -> Result<u64> {
+        async fn materialize(
+            &self,
+            output: &Path,
+        ) -> Result<crate::snapshot_source::SnapshotCheckpoint> {
             if let Some(ref msg) = self.fail {
                 return Err(anyhow!("{}", msg));
             }
@@ -2901,11 +2908,43 @@ mod tests {
                 )
                 .map_err(|e| anyhow!("insert: {}", e))?;
             }
-            Ok(self.version)
+            drop(conn);
+            Ok(crate::snapshot_source::SnapshotCheckpoint {
+                seq: self.version,
+                checksum: ltx::compute_checksum_from_file(output)?,
+            })
         }
 
-        async fn checkpoint_version(&self) -> Result<u64> {
-            Ok(self.version)
+        async fn checkpoint(&self) -> Result<crate::snapshot_source::SnapshotCheckpoint> {
+            Err(anyhow!(
+                "MockSnapshotSource cannot report a checksum without materializing"
+            ))
+        }
+    }
+
+    struct CopySnapshotSource {
+        version: u64,
+        path: PathBuf,
+    }
+
+    #[async_trait]
+    impl crate::snapshot_source::SnapshotSource for CopySnapshotSource {
+        async fn materialize(
+            &self,
+            output: &Path,
+        ) -> Result<crate::snapshot_source::SnapshotCheckpoint> {
+            std::fs::copy(&self.path, output)?;
+            Ok(crate::snapshot_source::SnapshotCheckpoint {
+                seq: self.version,
+                checksum: ltx::compute_checksum_from_file(output)?,
+            })
+        }
+
+        async fn checkpoint(&self) -> Result<crate::snapshot_source::SnapshotCheckpoint> {
+            Ok(crate::snapshot_source::SnapshotCheckpoint {
+                seq: self.version,
+                checksum: ltx::compute_checksum_from_file(&self.path)?,
+            })
         }
     }
 
@@ -3046,13 +3085,19 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_version_reports_correct_value() {
         use crate::snapshot_source::SnapshotSource;
-        let source = MockSnapshotSource {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.db");
+        create_marker_db(&base, "checkpoint").unwrap();
+        let source = CopySnapshotSource {
             version: 42,
-            row_count: 5,
-            fail: None,
+            path: base.clone(),
         };
-        let version: u64 = source.checkpoint_version().await.unwrap();
-        assert_eq!(version, 42);
+        let checkpoint = source.checkpoint().await.unwrap();
+        assert_eq!(checkpoint.seq, 42);
+        assert_eq!(
+            checkpoint.checksum,
+            ltx::compute_checksum_from_file(&base).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -3199,6 +3244,46 @@ mod tests {
             std::fs::read(&output).unwrap(),
             original_output,
             "failed snapshot-source restore must leave the existing output database untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_with_snapshot_source_rejects_first_incremental_with_wrong_anchor_checksum() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.db");
+        let output = dir.path().join("restored.db");
+        let existing = dir.path().join("existing.db");
+        create_marker_db(&base, "base").unwrap();
+        create_marker_db(&existing, "must-survive").unwrap();
+        std::fs::copy(&existing, &output).unwrap();
+        let original_output = std::fs::read(&output).unwrap();
+
+        let source = CopySnapshotSource {
+            version: 5,
+            path: base.clone(),
+        };
+        let page_size = 4096u32;
+        let base_data = std::fs::read(&base).unwrap();
+        let base_page_1 = base_data[0..page_size as usize].to_vec();
+        let actual_anchor = ltx::compute_checksum_from_file(&base).unwrap();
+        let wrong_anchor = actual_anchor ^ 0xfeed_face_dead_beef;
+        let (incremental, _) =
+            ltx::encode_wal_changes(&[(1, base_page_1)], page_size, 6, wrong_anchor).unwrap();
+        let incremental_key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 6);
+        storage.insert(&incremental_key, incremental);
+
+        restore_with_snapshot_source(&storage, "test/", "mydb", &output, &source)
+            .await
+            .expect_err(
+                "snapshot-source restore must reject a first incremental that does not chain \
+                 from the materialized base checksum",
+            );
+
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            original_output,
+            "failed snapshot-source restore must leave existing output untouched"
         );
     }
 
@@ -3423,11 +3508,24 @@ mod tests {
         let storage = TestStorage::new();
         let mut sink = RecordingSink::new();
 
-        let seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 5)
-            .await
-            .expect("pull");
+        let cursor = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 5,
+                checksum: 0x55,
+            },
+        )
+        .await
+        .expect("pull");
 
-        assert_eq!(seq, 5, "no new changesets, returns current_seq");
+        assert_eq!(cursor.seq, 5, "no new changesets, returns current seq");
+        assert_eq!(
+            cursor.checksum, 0x55,
+            "no new changesets, returns current checksum"
+        );
 
         let ev = sink.snapshot();
         assert_eq!(ev.begin_calls, 1, "begin must be called exactly once");
@@ -3453,10 +3551,19 @@ mod tests {
         );
 
         let mut sink = RecordingSink::new();
-        let seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0)
-            .await
-            .expect("pull");
-        assert_eq!(seq, 1);
+        let cursor = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await
+        .expect("pull");
+        assert_eq!(cursor.seq, 1);
 
         let ev = sink.snapshot();
         assert_eq!(ev.begin_calls, 1);
@@ -3494,9 +3601,18 @@ mod tests {
         let key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 1);
         storage.insert(&key, bytes);
 
-        let err = pull_incremental(&storage, "test/", "mydb", &db_path, 0)
-            .await
-            .expect_err("pull_incremental must reject page_id 0");
+        let err = pull_incremental(
+            &storage,
+            "test/",
+            "mydb",
+            &db_path,
+            PullCursor {
+                seq: 0,
+                checksum: pre_checksum,
+            },
+        )
+        .await
+        .expect_err("pull_incremental must reject page_id 0");
 
         assert!(
             err.to_string().contains("page number 0"),
@@ -3538,14 +3654,64 @@ mod tests {
         let key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 1);
         storage.insert(&key, hadb_changeset::physical::encode(&changeset));
 
-        let seq = pull_incremental(&storage, "test/", "mydb", &db_path, 0)
-            .await
-            .expect("pull should apply shrink marker");
+        let cursor = pull_incremental(
+            &storage,
+            "test/",
+            "mydb",
+            &db_path,
+            PullCursor {
+                seq: 0,
+                checksum: pre_checksum,
+            },
+        )
+        .await
+        .expect("pull should apply shrink marker");
 
-        assert_eq!(seq, 1);
+        assert_eq!(cursor.seq, 1);
         let data = std::fs::read(&db_path).unwrap();
         assert_eq!(data.len(), page_size as usize);
         assert_eq!(data, vec![0xAA; page_size as usize]);
+    }
+
+    #[tokio::test]
+    async fn pull_incremental_rejects_first_changeset_with_wrong_anchor_checksum() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("follower.db");
+        let page_size = 4096u32;
+        let original = vec![0x11u8; page_size as usize];
+        std::fs::write(&db_path, &original).unwrap();
+
+        let actual_anchor = ltx::compute_checksum_from_file(&db_path).unwrap();
+        let wrong_anchor = actual_anchor ^ 0xfeed_face_dead_beef;
+        let (bytes, _) = ltx::encode_wal_changes(
+            &[(1, page_payload(page_size as usize, 0xAA))],
+            page_size,
+            1,
+            wrong_anchor,
+        )
+        .unwrap();
+        let key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 1);
+        storage.insert(&key, bytes);
+
+        pull_incremental(
+            &storage,
+            "test/",
+            "mydb",
+            &db_path,
+            PullCursor {
+                seq: 0,
+                checksum: actual_anchor,
+            },
+        )
+            .await
+            .expect_err("pull_incremental must reject a first changeset that does not chain from the follower checksum");
+
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            original,
+            "failed pull must not mutate the follower database"
+        );
     }
 
     #[tokio::test]
@@ -3582,10 +3748,19 @@ mod tests {
         );
 
         let mut sink = RecordingSink::new();
-        let final_seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0)
-            .await
-            .expect("pull");
-        assert_eq!(final_seq, 3);
+        let final_cursor = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await
+        .expect("pull");
+        assert_eq!(final_cursor.seq, 3);
 
         let ev = sink.snapshot();
         assert_eq!(ev.begin_calls, 1);
@@ -3601,11 +3776,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_into_sink_stops_on_broken_chain() {
-        // F13: a stale changeset from a different lineage sitting at an in-range
-        // seq must NOT be applied. Seq 1 and 2 chain; seq 3 carries a bogus
-        // prev_checksum (a prior leader's lineage). Pull must apply 1 and 2,
-        // then stop at 3.
+    async fn pull_into_sink_errors_on_broken_chain_without_applying_pages() {
+        // A stale changeset from a different lineage sitting at an in-range seq
+        // must NOT be applied. The pull prevalidates the whole discovered chain
+        // before routing any pages into the sink, so a later chain break fails
+        // closed without partially advancing local state.
         let mut storage = TestStorage::new();
         let page_size = 4096u32;
         let ck1 = seed_chained_changeset(
@@ -3638,24 +3813,76 @@ mod tests {
         );
 
         let mut sink = RecordingSink::new();
-        let final_seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0)
-            .await
-            .expect("pull");
-        assert_eq!(final_seq, 2, "must stop before the mis-chained seq 3");
+        let err = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await
+        .expect_err("pull must hard-error on the mis-chained seq 3");
+        assert!(
+            err.to_string().contains("checksum chain broken"),
+            "expected checksum-chain error, got: {err}"
+        );
 
         let ev = sink.snapshot();
-        assert_eq!(ev.committed_seqs, vec![1, 2], "seq 3 rejected");
-        assert_eq!(ev.applied.len(), 2);
-        // The valid prefix still finalizes cleanly (no abort).
-        assert_eq!(ev.finalize_calls, 1);
-        assert_eq!(ev.abort_calls, 0);
+        assert!(ev.committed_seqs.is_empty());
+        assert!(ev.applied.is_empty());
+        assert_eq!(ev.finalize_calls, 0);
+        assert_eq!(ev.abort_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_rejects_first_changeset_with_wrong_anchor_checksum() {
+        let mut storage = TestStorage::new();
+        let page_size = 4096u32;
+        seed_chained_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            1,
+            0xfeed_face_dead_beef,
+            page_size,
+            &[(1, page_payload(page_size as usize, 0x11))],
+        );
+
+        let mut sink = RecordingSink::new();
+        pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await
+        .expect_err(
+            "sink pull must reject a first changeset that does not chain from the caller checksum",
+        );
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.begin_calls, 1);
+        assert_eq!(ev.finalize_calls, 0);
+        assert_eq!(ev.abort_calls, 1);
+        assert!(
+            ev.applied.is_empty(),
+            "invalid first changeset must be rejected before pages reach the sink"
+        );
+        assert!(ev.committed_seqs.is_empty());
     }
 
     #[tokio::test]
     async fn pull_into_sink_skips_changesets_at_or_below_current_seq() {
         let mut storage = TestStorage::new();
         let page_size = 4096u32;
-        seed_changeset(
+        let ck1 = seed_changeset(
             &mut storage,
             "test/",
             "mydb",
@@ -3663,20 +3890,30 @@ mod tests {
             page_size,
             &[(1, page_payload(page_size as usize, 0x11))],
         );
-        seed_changeset(
+        seed_chained_changeset(
             &mut storage,
             "test/",
             "mydb",
             2,
+            ck1,
             page_size,
             &[(2, page_payload(page_size as usize, 0x22))],
         );
 
         let mut sink = RecordingSink::new();
-        let seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 1)
-            .await
-            .expect("pull");
-        assert_eq!(seq, 2, "should advance past current_seq=1 to seq=2");
+        let cursor = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 1,
+                checksum: ck1,
+            },
+        )
+        .await
+        .expect("pull");
+        assert_eq!(cursor.seq, 2, "should advance past current_seq=1 to seq=2");
 
         let ev = sink.snapshot();
         assert_eq!(ev.committed_seqs, vec![2], "only seq>1 applied");
@@ -3705,7 +3942,17 @@ mod tests {
 
         // Inject a failure on the second apply_page call.
         let mut sink = RecordingSink::new().fail_at(1);
-        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+        let result = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await;
 
         assert!(result.is_err(), "primary error must propagate");
         let err = result.unwrap_err().to_string();
@@ -3738,7 +3985,17 @@ mod tests {
         storage.insert(&key, b"not a valid HADBP changeset".to_vec());
 
         let mut sink = RecordingSink::new();
-        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+        let result = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await;
 
         assert!(result.is_err(), "decode failure must propagate");
         let err = result.unwrap_err().to_string();
@@ -3764,7 +4021,17 @@ mod tests {
         let storage = TestStorage::new();
         let mut sink = RecordingSink::new().fail_begin();
 
-        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+        let result = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await;
 
         assert!(result.is_err(), "begin failure must propagate");
         let err = result.unwrap_err().to_string();
@@ -3807,7 +4074,17 @@ mod tests {
         );
 
         let mut sink = RecordingSink::new().fail_finalize();
-        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+        let result = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await;
 
         assert!(result.is_err(), "finalize failure must propagate");
         let err = result.unwrap_err().to_string();

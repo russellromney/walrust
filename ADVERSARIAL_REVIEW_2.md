@@ -440,10 +440,27 @@ and
   from `None` every call (`sync.rs:1346, 1510`): a steady-state follower
   pulling 1 changeset/poll never verifies anything (F13 holds only
   intra-batch). API must accept/return the running checksum.
+  Status: Fixed — core pull APIs now take and return a `PullCursor { seq,
+  checksum }`, decode and verify the complete discovered chain from the caller's
+  checksum before applying to the follower DB or `PageReplaySink`, and hard-error
+  on gaps or checksum breaks. Proven by
+  `sync::tests::pull_incremental_rejects_first_changeset_with_wrong_anchor_checksum`,
+  `sync::tests::pull_into_sink_rejects_first_changeset_with_wrong_anchor_checksum`,
+  and
+  `sync::tests::pull_into_sink_errors_on_broken_chain_without_applying_pages`.
+  Root is unaffected: these pull APIs and `PageReplaySink` exist only in
+  `crates/walrust-core/`.
 - B3 — `restore_with_snapshot_source` applies the first incremental unverified
   (trait provides no anchor checksum, `snapshot_source.rs:40`,
   `sync.rs:1087-1135`) and returns Ok on a later chain break. Use
   `discover_strict_physical_chain` + add a checksum to the trait.
+  Status: Fixed — `SnapshotSource` now returns `SnapshotCheckpoint { seq,
+  checksum }`, and `restore_with_snapshot_source` verifies the first incremental
+  against the materialized base chain checksum before applying it. Later gaps and
+  chain breaks remain hard restore errors, and failed staged restores do not
+  publish over the existing output. Proven by
+  `sync::tests::restore_with_snapshot_source_rejects_first_incremental_with_wrong_anchor_checksum`.
+  Root is unaffected: `SnapshotSource` is a core-only extension point.
 - B4 — Shadow copy path uses the unvalidated reader `read_frames_as_pages`
   (`src/shadow.rs:198-199`; also `crates/walrust-core/src/shadow.rs:182`):
   no salt/checksum validation on the DEFAULT path; torn/stale frames shipped

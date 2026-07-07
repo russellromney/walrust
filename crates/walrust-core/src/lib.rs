@@ -37,12 +37,13 @@ pub use hadb_io::s3;
 // Re-export walrust-specific types
 pub use replay_sink::PageReplaySink;
 pub use replicator::Replicator;
-pub use snapshot_source::SnapshotSource;
+pub use snapshot_source::{SnapshotCheckpoint, SnapshotSource};
 pub use sync::{
     fetch_delta_envelope, list_delta_envelopes_after, publish_delta_envelope,
     pull_incremental_into_sink, restore_with_snapshot_source, run_wal_replication,
     sync_wal_fenced_delta, DeltaPublishResult, DiscoveredDelta, ExternalBaseCursor,
-    FencedDeltaSyncParams, LtxEntry, Manifest, ReplicationConfig, SnapshotOwnership, SyncState,
+    FencedDeltaSyncParams, LtxEntry, Manifest, PullCursor, ReplicationConfig, SnapshotOwnership,
+    SyncState,
 };
 
 // Fenced delta envelope codec.
