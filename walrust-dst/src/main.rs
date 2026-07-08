@@ -1060,14 +1060,16 @@ fn run_single_invariant(name: &str) -> anyhow::Result<()> {
         "production_published_deltas" | "production_deltas" => {
             invariants::prop_production_published_delta_restore()?
         }
+        "fenced_delta_restore" | "fenced_deltas" => invariants::prop_fenced_delta_restore()?,
         "snapshot_atomicity" => invariants::prop_snapshot_atomicity()?,
         "txid_monotonicity" => invariants::prop_txid_monotonicity()?,
         "binary_preservation" => invariants::prop_binary_preservation()?,
         "recovery_under_failure" => invariants::prop_recovery_under_failure()?,
         _ => anyhow::bail!(
             "Unknown invariant: {}. Available: transaction_recovery, point_in_time, \
-             wal_batching, production_published_deltas, snapshot_atomicity, \
-             txid_monotonicity, binary_preservation, recovery_under_failure",
+             wal_batching, production_published_deltas, fenced_delta_restore, \
+             snapshot_atomicity, txid_monotonicity, binary_preservation, \
+             recovery_under_failure",
             name
         ),
     }
@@ -1085,6 +1087,10 @@ fn run_all_invariants() -> anyhow::Result<()> {
         (
             "production_published_deltas",
             "Production core published deltas restore cleanly",
+        ),
+        (
+            "fenced_delta_restore",
+            "Fenced TLM_DELTA followers reconstruct the exact DB",
         ),
         ("snapshot_atomicity", "Snapshots are atomic"),
         ("txid_monotonicity", "TXIDs are monotonic"),

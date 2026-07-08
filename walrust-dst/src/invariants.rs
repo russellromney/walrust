@@ -474,6 +474,174 @@ pub fn prop_production_published_delta_restore() -> Result<()> {
 }
 
 // ============================================================================
+// Invariant 4b: Fenced external (TLM_DELTA) restore-from-published-deltas
+// ============================================================================
+
+/// Property: a follower reconstructs the EXACT database from the published
+/// fenced-delta envelope sequence alone — the reason the TLM_DELTA mode exists.
+///
+/// This drives the real production writer path — `Replicator` in external
+/// snapshot-ownership mode with `set_external_delta_base`, shipping `.tlmd`
+/// envelopes via `sync_wal_fenced_delta` — against the deterministic
+/// `MockStorageBackend`. It then plays the follower: starting from the external
+/// base file, it discovers the published envelopes (`list_delta_envelopes_after`),
+/// enforces the epoch/writer fence and the BLAKE3 envelope chain, and applies
+/// each envelope's LTX payload with the running DB checksum threaded through
+/// (`apply_changeset_to_db`). The reconstructed follower must pass
+/// `integrity_check` and match the source rows exactly.
+///
+/// If the follower's base checksum or the applied chain ever diverges from the
+/// writer's, `apply_changeset_to_db`'s chain verify fails loudly — so this
+/// property is self-validating, not a rubber stamp.
+pub fn prop_fenced_delta_restore() -> Result<()> {
+    use std::sync::Arc;
+    use walrust::walrust_core::ltx as core_ltx;
+    use walrust::walrust_core::external_delta;
+    use walrust::walrust_core::{
+        list_delta_envelopes_after, ReplicationConfig, Replicator, SnapshotOwnership,
+    };
+
+    let mut runner = proptest::test_runner::TestRunner::new(get_production_config());
+    let rt = tokio::runtime::Runtime::new()?;
+
+    const EPOCH: u64 = 7;
+    const WRITER_ID: &str = "dst-leader-A";
+    const BASE_ANCHOR: [u8; 32] = [0x11; 32];
+
+    let result = runner.run(
+        &(1usize..6, 1usize..5, 1usize..6, 42u64..1_000_000u64),
+        |(base_rows, batches, rows_per_batch, seed)| {
+            rt.block_on(async {
+                let tmpdir = TempDir::new().unwrap();
+                let db_path = tmpdir.path().join("fenced.db");
+                let base_copy = tmpdir.path().join("base.db");
+                let follower_path = tmpdir.path().join("follower.db");
+                let prefix = format!("fenced/{seed}/");
+                let name = "fenced-db";
+
+                // Writer: build a source DB and fold the base rows into the main
+                // file (the externally owned base state the follower already has).
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA wal_autocheckpoint=0;
+                     PRAGMA page_size=4096;
+                     CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+                )
+                .unwrap();
+                insert_item_batch(&conn, 1, base_rows, "base").unwrap();
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+                std::fs::copy(&db_path, &base_copy).unwrap();
+
+                let storage = MockStorageBackend::new(
+                    MockStorageConfig::new("fenced-delta-restore").with_seed(seed),
+                );
+                let config = ReplicationConfig {
+                    sync_interval: std::time::Duration::from_secs(3600),
+                    snapshot_interval: std::time::Duration::from_secs(3600),
+                    autonomous_snapshots: false,
+                    snapshot_ownership: SnapshotOwnership::External,
+                    ..Default::default()
+                };
+                let arc_storage: Arc<dyn StorageBackend> = Arc::new(storage);
+                let replicator = Replicator::try_new(arc_storage.clone(), &prefix, config)
+                    .expect("external replicator config");
+                replicator.add(name, &db_path).await.expect("external add");
+                // The external base seq is whatever the registration derived from
+                // the DB; the fenced chain must anchor at or past it.
+                let base_seq = replicator
+                    .current_seq(name)
+                    .await
+                    .expect("registered db has a current seq");
+                prop_assert!(
+                    replicator
+                        .set_external_delta_base(name, EPOCH, WRITER_ID, base_seq, BASE_ANCHOR)
+                        .await
+                        .expect("set external delta base"),
+                    "registered db must accept fenced delta base"
+                );
+
+                let mut next_id = base_rows as i64 + 1;
+                for batch in 0..batches {
+                    insert_item_batch(&conn, next_id, rows_per_batch, &format!("b{batch}")).unwrap();
+                    next_id += rows_per_batch as i64;
+                    // Best-effort flush. The Replicator's background loop shares
+                    // this DbState and may publish some commits itself, so we do
+                    // not assert a per-batch frame count — only that the full
+                    // published sequence reconstructs the exact DB below.
+                    replicator.flush(name).await.expect("fenced flush");
+                }
+                drop(conn);
+                // Drain any commit not yet shipped, then drop the replicator so no
+                // further deltas are published while the follower reconstructs.
+                replicator.flush(name).await.expect("final fenced flush");
+                drop(replicator);
+
+                // Follower: reconstruct from the base file + published envelopes.
+                std::fs::copy(&base_copy, &follower_path).unwrap();
+                let mut running_db = core_ltx::compute_checksum_from_file(&follower_path).unwrap();
+                let mut running_env = BASE_ANCHOR;
+
+                let deltas =
+                    list_delta_envelopes_after(arc_storage.as_ref(), &prefix, name, base_seq)
+                        .await
+                        .expect("list fenced deltas");
+                prop_assert!(
+                    !deltas.is_empty(),
+                    "at least one fenced delta must be published"
+                );
+
+                for (i, d) in deltas.iter().enumerate() {
+                    prop_assert_eq!(
+                        d.seq,
+                        base_seq + (i as u64) + 1,
+                        "envelope seq must be contiguous from base"
+                    );
+                    prop_assert_eq!(d.payload.epoch, EPOCH, "epoch fence");
+                    prop_assert_eq!(d.payload.writer_id.as_str(), WRITER_ID, "writer fence");
+                    prop_assert_eq!(
+                        d.payload.prev_checksum.as_slice(),
+                        running_env.as_slice(),
+                        "envelope chain break at seq {}",
+                        d.seq
+                    );
+                    // Recompute the stored-envelope checksum from the decoded
+                    // payload and confirm discovery agrees (byte-identity chain).
+                    let recomputed = external_delta::checksum(
+                        &external_delta::encode(&d.payload).expect("re-encode envelope"),
+                    );
+                    prop_assert_eq!(
+                        recomputed,
+                        d.envelope_checksum,
+                        "envelope checksum must be BLAKE3 of the stored bytes"
+                    );
+
+                    let applied = core_ltx::apply_changeset_to_db(
+                        &d.payload.ltx_payload,
+                        &follower_path,
+                        running_db,
+                    )
+                    .expect("apply fenced delta to follower");
+                    running_db = applied.checksum;
+                    running_env = d.envelope_checksum;
+                }
+
+                assert_integrity_ok(&follower_path).unwrap();
+                prop_assert_eq!(
+                    item_rows(&follower_path).unwrap(),
+                    item_rows(&db_path).unwrap(),
+                    "fenced follower must match source rows exactly"
+                );
+
+                Ok(())
+            })
+        },
+    );
+
+    result.map_err(|e| anyhow::anyhow!("Property test failed: {:?}", e))
+}
+
+// ============================================================================
 // Invariant 5: Snapshot Atomicity
 // ============================================================================
 
@@ -817,6 +985,12 @@ mod tests {
     fn test_prop_production_published_delta_restore() {
         std::env::set_var("PROPTEST_CASES", "5");
         prop_production_published_delta_restore().unwrap();
+    }
+
+    #[test]
+    fn test_prop_fenced_delta_restore() {
+        std::env::set_var("PROPTEST_CASES", "5");
+        prop_fenced_delta_restore().unwrap();
     }
 
     #[test]
