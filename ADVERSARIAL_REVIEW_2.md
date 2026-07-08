@@ -185,6 +185,53 @@ checked with `busy_timeout` in every live checkpoint site. Note: no dedicated
 pinned external dependency (Phase-0 decision), so the rollover event rides the
 `upload_failed` channel with a distinct message; that is the only residual.
 
+Adversarial review (Phase 2A, 2026-07-08): the two racing E2E cases as first
+written were GREEN FOR THE WRONG REASON and were rebuilt so the safety code is
+actually load-bearing (each now fails, for the right reason, when its protection
+is reverted):
+- `e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss` originally
+  used a single-page DB and never actually triggered rollover DETECTION (after
+  each external TRUNCATE the WAL was empty, so `read_header` returned `None` and
+  the flush returned early); the re-anchor branch never fired and the data
+  survived only because a single leaf page carries the whole table, so the final
+  incremental re-imaged everything. Rewritten to a deterministic, MULTI-PAGE
+  scenario: walrust reads batch A (recording the salt so the next reset is
+  detected), batch A2 is written on fresh pages but NOT read, an external
+  `wal_checkpoint(TRUNCATE)` (asserted `busy==0`, `ckpt>=log`) folds A+A2 and
+  resets the WAL, then a tiny tail batch B opens a new generation. The next flush
+  MUST re-anchor with a full snapshot to recover A2's pages. Revert-verified:
+  disabling the WalrustOwned re-anchor makes the restored DB fail
+  `integrity_check` (A2's pages missing).
+- `e2e_cli_watch_racing_checkpoint_no_data_loss` originally slept a fixed 2s and
+  ignored the TRUNCATE result. In practice the shadow blocker was NOT yet attached
+  at 2s (S3 discovery + initial snapshot are slower), so every racing TRUNCATE
+  succeeded (`busy==[0,0,0]`) and the "race" raced nothing; data survived only via
+  the single-page full-image path. Now it polls for blocker readiness
+  (`_walrust_seq` present), uses wide multi-page rows, and ASSERTS the pin engaged
+  (at least one racing TRUNCATE refused, `busy!=0`). Revert-verified: removing the
+  blocker's held read transaction makes every TRUNCATE succeed (`busy==[0,0,0]`)
+  and the test fails.
+
+Loud-event coverage (plan 2.1 "rollover in every mode emits a loud event"): the
+direct/independent root path emits `tracing::error!` + `notify_upload_failed`
+(this PR). The core walrust-owned re-anchor sites (`sync.rs` sync_wal_with_sequence
+and the `_with_retry` variant) were bumped from `warn!` to `error!` this review —
+an external checkpoint of a walrust-OWNED WAL is unexpected (we set
+autocheckpoint=0) so it does not spam in normal operation. Residual: the core
+library has NO webhook channel, so the webhook half is emitted only on the
+binary's paths; and shadow mode treats a salt change as a routine generation roll
+(walrust's OWN checkpoints legitimately change the salt, and the blocker is meant
+to prevent EXTERNAL rollover), so a blocker-failure external rollover in shadow
+mode is not distinctly alerted — recorded as a Phase-2B/observability residual.
+
+Residual (core walrust-owned first-checkpoint window): rollover DETECTION needs a
+previously-recorded salt, which is `None` immediately after a snapshot (the WAL is
+empty). An external checkpoint that folds un-read frames in that brief window,
+before walrust's first incremental read, is not detected as a rollover and its
+un-re-imaged pages can be lost. Steady-state operation (walrust reads the WAL every
+sync interval) is covered; this is the same class as the B4 restart-window
+residual and is recorded for Phase 2B state-durability.
+
 ### A4 — walrust's own checkpoint timer destroys unshipped frames
 - `src/sync/watch_shadow.rs:663-681`: comment says "First, ensure all shadow
   data is uploaded" — no such code exists. `ShadowWal::checkpoint()`
@@ -1017,6 +1064,12 @@ Phase 0+1 — independent audit (2026-07-08, fresh reviewer, review/phase-0-1-au
     `e2e_core_replicator_restore_round_trips_sqlite_rows`,
     `e2e_core_replicator_restart_reopens_state_and_restores_cleanly`, and
     `e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows`.
+    Known-flaky hardening (Phase 2A adversarial review, 2026-07-08): the core
+    SIGKILL child polled for its first published WAL frame with a 10s deadline,
+    which could trip under heavy sequential-test S3 latency (it passed standalone
+    and on re-run). `flush_until_frames` now uses a 30s deadline — it returns the
+    instant a frame is published, so this only affects the under-load path and has
+    no happy-path cost.
 3.2 DST drives the production pipeline (not testable.rs) for at least one
     property; restore-from-published-deltas test for phase-4 mode.
     Status: Fixed — `walrust-dst` now has

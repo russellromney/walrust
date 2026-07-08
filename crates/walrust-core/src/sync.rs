@@ -978,7 +978,11 @@ async fn sync_wal_with_sequence(
     if rollover_detected {
         match sequence {
             DeltaSequence::WalrustOwned => {
-                tracing::warn!(
+                // External checkpoint reset a walrust-owned WAL — unexpected (we own
+                // it, autocheckpoint should be 0). Log loudly and re-anchor. The core
+                // library has no webhook channel; the binary surfaces rollovers on
+                // its own direct/independent path via notify_upload_failed.
+                tracing::error!(
                     "{}: WAL rollover detected; publishing a new snapshot instead of an incremental across the gap",
                     state.name
                 );
@@ -1941,7 +1945,10 @@ pub async fn sync_wal_with_retry(
     } = read_next_wal_batch(state, &header).await?;
 
     if rollover_detected {
-        tracing::warn!(
+        // An external checkpoint reset a walrust-owned WAL — unexpected for a DB we
+        // own (autocheckpoint should be 0). Log loudly (the core library has no
+        // webhook channel; the binary surfaces it on its own paths) and re-anchor.
+        tracing::error!(
             "{}: WAL rollover detected; publishing a new snapshot instead of an incremental across the gap",
             state.name
         );

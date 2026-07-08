@@ -279,13 +279,16 @@ async fn legacy_manual_snapshot_is_owned_by_core() -> Result<()> {
 
 #[tokio::test]
 async fn legacy_manual_snapshot_folds_wal_resident_rows() -> Result<()> {
-    // B10 regression guard: an unblocked snapshot must fold WAL-resident commits
-    // into the base image rather than encode a stale main-DB file. With no
-    // concurrent reader the PASSIVE checkpoint in snapshot_database_to_storage
-    // folds everything; keep rows in an uncheckpointed WAL, snapshot, decode the
-    // LTX, and assert every row is present. (The manual `walrust snapshot` command
-    // adds a completeness-checked TRUNCATE fold on top of this — see
-    // sync::compact::snapshot — so it fails closed if a watcher pins the WAL.)
+    // B10 regression guard: a snapshot must include WAL-resident commits in the
+    // base image rather than encode a stale main-DB file. The fold here is done by
+    // the stable `VACUUM INTO` copy inside `encode_sqlite_snapshot_to_vec`, which
+    // captures a consistent (main DB + WAL) view; the PASSIVE checkpoint in
+    // snapshot_database_to_storage is belt-and-suspenders (redundant given VACUUM
+    // INTO). Keep rows in an uncheckpointed WAL, snapshot, decode the LTX, and
+    // assert every row is present — i.e. the snapshot's TXID coverage is honest and
+    // does not claim commits the image lacks. (The manual `walrust snapshot`
+    // command additionally runs a completeness-checked TRUNCATE fold before this —
+    // see sync::compact::snapshot — so it fails closed if a watcher pins the WAL.)
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("fold-source.db");
     {
