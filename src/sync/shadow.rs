@@ -8,6 +8,7 @@ use walrust_core::legacy_shadow;
 use walrust_core::legacy_shadow::ShadowEncodeResult;
 
 use crate::cache::LocalCache;
+use crate::errors::{classify_or_else, WalrustError};
 use crate::retention::{RetentionPolicy, SnapshotEntry};
 use crate::retry::{classify_error, ErrorKind, RetryPolicy};
 use crate::s3;
@@ -169,7 +170,9 @@ pub(crate) async fn run_compaction(
     name: &str,
     policy: &RetentionPolicy,
 ) -> Result<()> {
-    let discovered = discover_snapshots_from_s3(client, bucket, prefix, name).await?;
+    let discovered = discover_snapshots_from_s3(client, bucket, prefix, name)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     if discovered.is_empty() {
         return Ok(());
@@ -177,7 +180,9 @@ pub(crate) async fn run_compaction(
 
     let mut snapshot_entries: Vec<SnapshotEntry> = Vec::with_capacity(discovered.len());
     for (key, _gen, _min, max) in &discovered {
-        let meta = s3::head_object_meta(client, bucket, key).await?;
+        let meta = s3::head_object_meta(client, bucket, key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))?;
         snapshot_entries.push(SnapshotEntry {
             key: key.clone(),
             created_at: meta.last_modified,
@@ -190,8 +195,9 @@ pub(crate) async fn run_compaction(
     let storage = S3Storage::new(client.clone(), bucket.to_string());
     let plan_before_reachability =
         crate::retention::analyze_retention(&snapshot_entries, policy, now);
-    let plan =
-        plan_legacy_compaction(&storage, prefix, name, &snapshot_entries, policy, now).await?;
+    let plan = plan_legacy_compaction(&storage, prefix, name, &snapshot_entries, policy, now)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
     let before = plan.delete.len();
     let rescued = plan_before_reachability.delete.len().saturating_sub(before);
     if rescued > 0 {
@@ -216,7 +222,9 @@ pub(crate) async fn run_compaction(
 
     let keys_to_delete: Vec<String> = plan.delete.iter().map(|entry| entry.key.clone()).collect();
 
-    let deleted_count = s3::delete_objects(client, bucket, &keys_to_delete).await?;
+    let deleted_count = s3::delete_objects(client, bucket, &keys_to_delete)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     tracing::info!(
         "Compaction complete for {}: deleted {} snapshots, freed {:.2} MB",

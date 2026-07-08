@@ -1,10 +1,11 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use chrono::Utc;
 use hadb_storage_s3::S3Storage;
 use std::path::Path;
 use walrust_core::legacy_manifest::plan_legacy_compaction;
 use walrust_core::legacy_wal_sync::snapshot_database_to_storage;
 
+use crate::errors::{classify_or_else, WalrustError};
 use crate::retention::{RetentionPolicy, SnapshotEntry};
 use crate::s3::{self, create_client, parse_bucket};
 
@@ -18,12 +19,16 @@ pub async fn compact(
     force: bool,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint).await?;
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     // Discover snapshots from the S3 listing — the production watch path never
     // writes a manifest.json, so reading one made compact a silent no-op (F6).
     // The key here is the FULL S3 key (verify/restore use full keys too).
-    let discovered = discover_snapshots_from_s3(&client, &bucket_name, &prefix, name).await?;
+    let discovered = discover_snapshots_from_s3(&client, &bucket_name, &prefix, name)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     if discovered.is_empty() {
         println!("No snapshots found for database '{}'", name);
@@ -33,7 +38,9 @@ pub async fn compact(
     // HEAD each snapshot for size + last-modified to build retention entries.
     let mut snapshot_entries: Vec<SnapshotEntry> = Vec::with_capacity(discovered.len());
     for (key, _gen, _min, max) in &discovered {
-        let meta = s3::head_object_meta(&client, &bucket_name, key).await?;
+        let meta = s3::head_object_meta(&client, &bucket_name, key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))?;
         snapshot_entries.push(SnapshotEntry {
             key: key.clone(),
             created_at: meta.last_modified,
@@ -51,8 +58,9 @@ pub async fn compact(
     let storage = S3Storage::new(client.clone(), bucket_name.clone());
     let plan_before_reachability =
         crate::retention::analyze_retention(&snapshot_entries, policy, now);
-    let plan =
-        plan_legacy_compaction(&storage, &prefix, name, &snapshot_entries, policy, now).await?;
+    let plan = plan_legacy_compaction(&storage, &prefix, name, &snapshot_entries, policy, now)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
     let before = plan.delete.len();
     let rescued = plan_before_reachability.delete.len().saturating_sub(before);
     if rescued > 0 {
@@ -106,7 +114,9 @@ pub async fn compact(
 
     let keys_to_delete: Vec<String> = plan.delete.iter().map(|e| e.key.clone()).collect();
 
-    let deleted_count = s3::delete_objects(&client, &bucket_name, &keys_to_delete).await?;
+    let deleted_count = s3::delete_objects(&client, &bucket_name, &keys_to_delete)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     tracing::info!("Deleted {} snapshot files", deleted_count);
 
@@ -141,18 +151,21 @@ fn format_age(now: chrono::DateTime<Utc>, created_at: chrono::DateTime<Utc>) -> 
 
 /// Take immediate snapshot as LTX file
 pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> Result<()> {
-    let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint).await?;
-
     if !database.exists() {
-        return Err(anyhow!("Database not found: {}", database.display()));
+        return Err(
+            WalrustError::database(format!("Database not found: {}", database.display())).into(),
+        );
     }
 
     let name = database
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("Invalid database path"))?;
+        .ok_or_else(|| WalrustError::database("Invalid database path"))?;
 
+    let (bucket_name, prefix) = parse_bucket(bucket);
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
     let storage = S3Storage::new(client, bucket_name.clone());
     let output = snapshot_database_to_storage(&storage, &prefix, name, database).await?;
 

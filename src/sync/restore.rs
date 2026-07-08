@@ -1,5 +1,5 @@
 use crate::cache::LocalCache;
-use crate::errors::WalrustError;
+use crate::errors::{classify_or_else, WalrustError};
 use crate::s3::{self, create_client, parse_bucket};
 use anyhow::Result;
 use async_trait::async_trait;
@@ -34,31 +34,52 @@ impl StorageBackend for CachedLegacyStorage {
                 return Ok(Some(cache.read_ltx(txid)?));
             }
         }
-        self.s3.get(key).await
+        self.s3
+            .get(key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
     }
 
     async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
-        self.s3.put(key, data).await
+        self.s3
+            .put(key, data)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
     }
 
     async fn delete(&self, key: &str) -> Result<()> {
-        self.s3.delete(key).await
+        self.s3
+            .delete(key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
     }
 
     async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
-        self.s3.list(prefix, after).await
+        self.s3
+            .list(prefix, after)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
     }
 
     async fn exists(&self, key: &str) -> Result<bool> {
-        self.s3.exists(key).await
+        self.s3
+            .exists(key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
     }
 
     async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
-        self.s3.put_if_absent(key, data).await
+        self.s3
+            .put_if_absent(key, data)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
     }
 
     async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
-        self.s3.put_if_match(key, data, etag).await
+        self.s3
+            .put_if_match(key, data, etag)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
     }
 }
 
@@ -72,7 +93,9 @@ pub async fn restore(
     webhook: Option<std::sync::Arc<crate::webhook::WebhookSender>>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint).await?;
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     // Try to open local cache if provided
     let cache = if let Some(dir) = cache_dir {
@@ -120,7 +143,7 @@ pub async fn restore(
                     webhook.notify_corruption(&name, &error_msg).await;
                 });
             }
-            return Err(WalrustError::restore(e.to_string()).into());
+            return Err(classify_or_else(e, WalrustError::restore));
         }
     };
 
@@ -136,9 +159,13 @@ pub async fn restore(
 /// List databases in bucket
 pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint).await?;
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
-    let objects = s3::list_objects(&client, &bucket_name, &prefix).await?;
+    let objects = s3::list_objects(&client, &bucket_name, &prefix)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     // Extract unique database names (litestream format: db_name/GGGG/file.ltx)
     let mut dbs: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -160,14 +187,20 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
         for db in &dbs {
             // Discover state from S3 (litestream format)
             let (current_txid, _max_gen, _) =
-                discover_state_from_s3(&client, &bucket_name, &prefix, db).await?;
+                discover_state_from_s3(&client, &bucket_name, &prefix, db)
+                    .await
+                    .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
             // Count files in generation 0 (live incrementals)
             let live_files =
-                list_generation_files(&client, &bucket_name, &prefix, db, GENERATION_LIVE).await?;
+                list_generation_files(&client, &bucket_name, &prefix, db, GENERATION_LIVE)
+                    .await
+                    .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
             // Find snapshots (generation 1+)
-            let snapshot = find_latest_snapshot(&client, &bucket_name, &prefix, db).await?;
+            let snapshot = find_latest_snapshot(&client, &bucket_name, &prefix, db)
+                .await
+                .map_err(|e| classify_or_else(e, WalrustError::s3))?;
             let snapshot_info = match snapshot {
                 Some((gen, _, _, max_txid)) => format!("snapshot gen {} (TXID {})", gen, max_txid),
                 None => "no snapshot".to_string(),

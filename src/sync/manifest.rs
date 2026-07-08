@@ -1,7 +1,9 @@
 use anyhow::Result;
 use hadb_storage_s3::S3Storage;
+#[cfg(test)]
+pub(crate) use walrust_core::legacy_manifest::build_ltx_key;
 pub(crate) use walrust_core::legacy_manifest::{
-    build_ltx_key, database_prefix, is_snapshot, DiscoveredLtx, GENERATION_LIVE,
+    database_prefix, is_snapshot, DiscoveredLtx, GENERATION_LIVE,
 };
 use walrust_core::legacy_manifest::{
     discover_all_legacy_ltx, discover_legacy_snapshots, discover_legacy_state,

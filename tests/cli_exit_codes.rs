@@ -18,6 +18,17 @@ fn test_bucket_config() -> (String, Option<String>) {
     (bucket, endpoint)
 }
 
+fn command_with_dummy_s3_env() -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    command
+        .env("AWS_ACCESS_KEY_ID", "walrust-test")
+        .env("AWS_SECRET_ACCESS_KEY", "walrust-test")
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_MAX_ATTEMPTS", "1")
+        .env("AWS_EC2_METADATA_DISABLED", "true");
+    command
+}
+
 #[test]
 fn invalid_replicate_interval_exits_with_config_status() {
     let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
@@ -34,6 +45,27 @@ fn invalid_replicate_interval_exits_with_config_status() {
         output.status.code(),
         Some(2),
         "invalid CLI config should exit with config status; stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn invalid_replicate_source_exits_with_config_status() {
+    let output = command_with_dummy_s3_env()
+        .arg("replicate")
+        .arg("not-an-s3-source")
+        .arg("--local")
+        .arg("/tmp/walrust-replica.db")
+        .arg("--interval")
+        .arg("1ms")
+        .output()
+        .expect("walrust command should run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "invalid replica source should exit with config status; stdout={}; stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -62,6 +94,51 @@ fn missing_restore_backup_exits_with_restore_status() {
         output.status.code(),
         Some(6),
         "missing restore backup should exit with restore status; stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn missing_snapshot_database_exits_with_database_status() {
+    let tempdir = tempfile::tempdir().expect("tempdir should be created");
+    let missing_db = tempdir.path().join("missing.db");
+
+    let output = command_with_dummy_s3_env()
+        .arg("snapshot")
+        .arg(&missing_db)
+        .arg("--bucket")
+        .arg("s3://walrust-cli-exit-test")
+        .arg("--endpoint")
+        .arg("http://127.0.0.1:9")
+        .output()
+        .expect("walrust command should run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "missing snapshot database should exit with database status; stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn unreachable_verify_endpoint_exits_with_s3_status() {
+    let output = command_with_dummy_s3_env()
+        .arg("verify")
+        .arg(unique_name("unreachable-s3"))
+        .arg("--bucket")
+        .arg("s3://walrust-cli-exit-test")
+        .arg("--endpoint")
+        .arg("http://127.0.0.1:9")
+        .output()
+        .expect("walrust command should run");
+
+    assert_eq!(
+        output.status.code(),
+        Some(4),
+        "unreachable S3 endpoint should exit with S3 status; stdout={}; stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );

@@ -13,6 +13,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::errors::WalrustError;
 use crate::ltx;
 use crate::wal;
 use hadb_io::RetryPolicy;
@@ -435,12 +436,15 @@ async fn discover_latest_snapshot_at_or_before_in_namespace(
 }
 
 fn parse_point_in_time_seq(point_in_time: Option<&str>) -> Result<Option<u64>> {
-    point_in_time
+    Ok(point_in_time
         .map(|pit| {
-            pit.parse::<u64>()
-                .map_err(|_| anyhow!("Invalid point_in_time format. Use sequence/TXID number"))
+            pit.parse::<u64>().map_err(|_| {
+                anyhow::Error::from(WalrustError::restore(
+                    "Invalid point_in_time format. Use sequence/TXID number",
+                ))
+            })
         })
-        .transpose()
+        .transpose()?)
 }
 
 /// Get SQLite database page size from header.
@@ -1639,11 +1643,10 @@ pub async fn restore(
         )
         .await?
         .ok_or_else(|| {
-            anyhow!(
-                "No snapshot found for database '{}' at or before seq {}",
-                db_name,
-                target
-            )
+            WalrustError::restore_not_found(format!(
+                "snapshot unavailable for database '{}' at or before seq {}",
+                db_name, target
+            ))
         })?,
         None => discover_latest_snapshot_in_namespace(
             storage,
@@ -1653,7 +1656,12 @@ pub async fn restore(
             ChangesetKind::Physical,
         )
         .await?
-        .ok_or_else(|| anyhow!("No snapshot found for database '{}'", db_name))?,
+        .ok_or_else(|| {
+            WalrustError::restore_not_found(format!(
+                "snapshot unavailable for database '{}'",
+                db_name
+            ))
+        })?,
     };
 
     // Find incrementals after the snapshot
@@ -3006,6 +3014,22 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("journal_mode"), "{msg}");
         assert!(msg.contains("WAL"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn restore_no_snapshot_returns_typed_restore_error() {
+        let storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("restored.db");
+
+        let err = restore(&storage, "test/", "missing", &output, None)
+            .await
+            .expect_err("missing snapshot must be a typed restore error");
+
+        assert_eq!(
+            crate::errors::classify_error(&err),
+            crate::errors::ExitStatus::Restore
+        );
     }
 
     #[tokio::test]

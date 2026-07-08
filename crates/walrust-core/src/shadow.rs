@@ -131,14 +131,26 @@ impl ShadowWal {
         ensure_connection_in_wal_mode(&conn, db_path)?;
 
         // Disable auto-checkpoint on this connection without changing journal_mode.
-        conn.execute_batch("PRAGMA wal_autocheckpoint=0;")?;
+        conn.execute_batch(
+            "
+            PRAGMA busy_timeout=5000;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE IF NOT EXISTS _walrust_seq (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                value INTEGER NOT NULL
+            );
+            INSERT INTO _walrust_seq (id, value)
+            VALUES (1, 1)
+            ON CONFLICT(id) DO UPDATE SET value = value + 1;
+            ",
+        )?;
 
-        // Start a read transaction that will block checkpointing
-        // We use a simple query that keeps the transaction open
+        // Pin a real WAL frame. Reading sqlite_master can leave the blocker at
+        // read-mark 0, which does not prevent walRestartLog on later frames.
         conn.execute_batch("BEGIN DEFERRED;")?;
-
-        // Read from sqlite_master to establish the read transaction
-        let _: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))?;
+        let _: i64 = conn.query_row("SELECT value FROM _walrust_seq WHERE id = 1", [], |row| {
+            row.get(0)
+        })?;
 
         tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
 
@@ -480,6 +492,11 @@ impl ShadowWal {
     /// Get current generation
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    /// Current byte offset within the active shadow segment generation.
+    pub fn segment_offset(&self) -> u64 {
+        self.segment_offset
     }
 
     /// Get page size

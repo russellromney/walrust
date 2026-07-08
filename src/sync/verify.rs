@@ -1,6 +1,6 @@
-use crate::errors::WalrustError;
+use crate::errors::{classify_or_else, WalrustError};
 use crate::ltx::Checksum;
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use std::sync::Arc;
 
 use crate::ltx;
@@ -106,13 +106,16 @@ pub(crate) async fn validate_backup_integrity(
     prefix: &str,
     db_name: &str,
 ) -> Result<ValidationResult> {
-    let discovered = discover_all_ltx_from_s3(client, bucket, prefix, db_name).await?;
+    let discovered = discover_all_ltx_from_s3(client, bucket, prefix, db_name)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     if discovered.is_empty() {
-        return Err(anyhow!(
+        return Err(WalrustError::integrity(format!(
             "{}: no LTX files found during backup validation",
             db_name
-        ));
+        ))
+        .into());
     }
 
     let mut issues: Vec<VerifyIssue> = Vec::new();
@@ -161,13 +164,7 @@ pub(crate) async fn validate_backup_integrity(
                     }
                 }
             }
-            Err(e) => {
-                issues.push(VerifyIssue {
-                    filename: entry.key.clone(),
-                    issue: format!("Download failed: {}", e),
-                    is_orphan: false,
-                });
-            }
+            Err(e) => return Err(WalrustError::s3(format!("Download failed: {}", e)).into()),
         }
     }
     issues.extend(verify_ltx_chain(&verified_files));
@@ -248,7 +245,9 @@ pub async fn verify(
     webhook: Option<std::sync::Arc<crate::webhook::WebhookSender>>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint).await?;
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     println!(
         "Verifying integrity of '{}' in s3://{}/{}{}...",
@@ -257,8 +256,9 @@ pub async fn verify(
     println!();
 
     // Discover state from S3 (litestream format - no manifest)
-    let (current_txid, max_gen, _) =
-        discover_state_from_s3(&client, &bucket_name, &prefix, name).await?;
+    let (current_txid, max_gen, _) = discover_state_from_s3(&client, &bucket_name, &prefix, name)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     if current_txid == 0 {
         println!("No LTX files found for database: {}", name);
@@ -274,15 +274,18 @@ pub async fn verify(
     let mut all_files: Vec<(String, u64, u64, u64)> = Vec::new(); // (key, gen, min, max)
 
     // Get files from generation 0 (live incrementals)
-    let live_files =
-        list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE).await?;
+    let live_files = list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
     for (key, min, max) in live_files {
         all_files.push((key, GENERATION_LIVE, min, max));
     }
 
     // Get files from snapshot generations (1+)
     for gen in 1..=max_gen {
-        let gen_files = list_generation_files(&client, &bucket_name, &prefix, name, gen).await?;
+        let gen_files = list_generation_files(&client, &bucket_name, &prefix, name, gen)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))?;
         for (key, min, max) in gen_files {
             all_files.push((key, gen, min, max));
         }
@@ -383,14 +386,7 @@ pub async fn verify(
                     }
                 }
             }
-            Err(e) => {
-                println!("  WARNING {} - download failed!", filename);
-                issues.push(VerifyIssue {
-                    filename: key.clone(),
-                    issue: format!("Download failed: {}", e),
-                    is_orphan: false,
-                });
-            }
+            Err(e) => return Err(WalrustError::s3(format!("Download failed: {}", e)).into()),
         }
     }
     issues.extend(verify_ltx_chain(&verified_files));

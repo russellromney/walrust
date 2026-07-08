@@ -243,7 +243,7 @@ pub async fn read_frames_from(
     let frame_size = FRAME_HEADER_SIZE + page_size as u64;
 
     // Calculate start position
-    let start_pos = if start_offset == 0 {
+    let start_pos = if start_offset == 0 || start_offset > file_size {
         WAL_HEADER_SIZE
     } else {
         start_offset

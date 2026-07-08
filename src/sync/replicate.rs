@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 use walrust_core::legacy_replica;
 
+use crate::errors::{classify_or_else, WalrustError};
 #[cfg(test)]
 use crate::ltx;
 use crate::s3::{self, create_client};
@@ -35,9 +36,10 @@ pub async fn replicate(
     let source = source.strip_prefix("s3://").unwrap_or(source);
     let parts: Vec<&str> = source.splitn(2, '/').collect();
     if parts.len() < 2 {
-        return Err(anyhow!(
-            "Invalid source format. Expected: s3://bucket/dbname or s3://bucket/prefix/dbname"
-        ));
+        return Err(WalrustError::config(
+            "Invalid source format. Expected: s3://bucket/dbname or s3://bucket/prefix/dbname",
+        )
+        .into());
     }
 
     let bucket_name = parts[0];
@@ -52,7 +54,9 @@ pub async fn replicate(
         (String::new(), path_part.to_string())
     };
 
-    let client = create_client(endpoint).await?;
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     tracing::info!(
         "Starting replica: source=s3://{}/{}{}, local={}",
@@ -133,16 +137,23 @@ async fn replicate_poll(
     // Discover LTX files from the S3 listing. The production watch path writes
     // litestream-format objects and never a manifest.json, so reading a
     // manifest made replicate fail with "No LTX files found" (F6).
-    let files = discover_all_ltx_from_s3(client, bucket, prefix, db_name).await?;
+    let files = discover_all_ltx_from_s3(client, bucket, prefix, db_name)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     if files.is_empty() {
-        return Err(anyhow!("No LTX files found in S3 for '{}'", db_name));
+        return Err(WalrustError::restore_not_found(format!(
+            "no LTX files found in S3 for '{}'",
+            db_name
+        ))
+        .into());
     }
 
     // If we haven't initialized yet (current_txid = 0), bootstrap from snapshot
     if *current_txid == 0 || !local.exists() {
-        let snapshot =
-            latest_snapshot(&files).ok_or_else(|| anyhow!("No snapshot found for bootstrap"))?;
+        let snapshot = latest_snapshot(&files).ok_or_else(|| {
+            WalrustError::restore_not_found("snapshot unavailable for replica bootstrap")
+        })?;
         bootstrap_replica_from_snapshot(client, bucket, local, snapshot).await?;
         // After bootstrap, current_txid is the snapshot's max_txid
         *current_txid = snapshot.max_txid;
@@ -195,14 +206,14 @@ async fn replicate_poll(
                 .filter(|f| f.max_txid >= ltx_entry.min_txid)
                 .max_by_key(|f| f.max_txid)
                 .ok_or_else(|| {
-                    anyhow!(
+                    WalrustError::restore(format!(
                         "TXID gap in incremental chain (expected {}, got {} at {}) and no \
                          snapshot at or past TXID {} is available to re-bootstrap from",
                         *current_txid + 1,
                         ltx_entry.min_txid,
                         ltx_entry.key,
                         ltx_entry.min_txid
-                    )
+                    ))
                 })?;
             tracing::warn!(
                 "TXID gap in incremental chain: expected {}, got {}. Re-bootstrapping from \
@@ -219,8 +230,11 @@ async fn replicate_poll(
 
         tracing::debug!("Downloading incremental: {}", ltx_entry.key);
 
-        let ltx_data = s3::download_bytes(client, bucket, &ltx_entry.key).await?;
-        let apply_result = apply_incremental_atomically(&ltx_data, local)?;
+        let ltx_data = s3::download_bytes(client, bucket, &ltx_entry.key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+        let apply_result = apply_incremental_atomically(&ltx_data, local)
+            .map_err(|e| classify_or_else(e, WalrustError::integrity))?;
 
         tracing::info!(
             "Applied {} (TXID {}-{}, checksum: {:016x})",
@@ -260,9 +274,12 @@ async fn bootstrap_replica_from_snapshot(
         snapshot.max_txid
     );
 
-    let ltx_data = s3::download_bytes(client, bucket, &snapshot.key).await?;
+    let ltx_data = s3::download_bytes(client, bucket, &snapshot.key)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
-    let decode_result = legacy_replica::bootstrap_from_snapshot_bytes(&ltx_data, local)?;
+    let decode_result = legacy_replica::bootstrap_from_snapshot_bytes(&ltx_data, local)
+        .map_err(|e| classify_or_else(e, WalrustError::integrity))?;
 
     println!(
         "Bootstrapped from snapshot: {} pages, TXID {}, checksum: {:016x}",

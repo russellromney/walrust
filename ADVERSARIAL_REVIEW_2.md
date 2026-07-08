@@ -96,6 +96,16 @@ behavior and the watch path emits a rollover webhook event via
 `test_walrust_owned_flush_resnapshots_after_checkpoint_rollover`,
 `test_external_mode_refuses_checkpoint_rollover_until_reanchored`, and
 `test_fenced_external_mode_refuses_checkpoint_rollover_until_reanchored`.
+Second-pass gate review found the shadow blocker still only read
+`sqlite_master`, and CLI startup snapshots could leave copied pre-snapshot
+shadow bytes and active-WAL offsets out of sync. Core `ShadowWal` now writes
+and pins a real `_walrust_seq` WAL frame, exposes the shadow segment offset
+used by root watch state, root startup snapshots advance the shadow sync
+cursor past already-covered shadow bytes, and the WAL reader restarts at the
+header if SQLite reuses/truncates a WAL below the saved offset. Proven by the
+Soup-backed production-path
+`e2e_cli_watch_restore_round_trips_sqlite_rows` and the full
+`production_e2e` test binary.
 
 ### A4 — walrust's own checkpoint timer destroys unshipped frames
 - `src/sync/watch_shadow.rs:663-681`: comment says "First, ensure all shadow
@@ -886,3 +896,17 @@ and
     `missing_restore_backup_exits_with_restore_status` (missing production
     restore exited 1 instead of 6). The fixed tests now pass along with the
     root/core typed classifier tests.
+    Second-pass adversarial review found this was only partially landed:
+    database and S3 startup failures still collapsed to generic exit 1, core
+    restore no-snapshot failures were untyped, and core `Replicator` still
+    used `to_string().contains("No snapshot found")`. These were reproduced
+    before fixing with
+    `missing_snapshot_database_exits_with_database_status`,
+    `unreachable_verify_endpoint_exits_with_s3_status`,
+    `invalid_replicate_source_exits_with_config_status`, and
+    `sync::tests::restore_no_snapshot_returns_typed_restore_error`. The fix
+    adds typed `RestoreNotFound`, preserves typed causes through production
+    restore/verify/compact/replicate/watch paths, maps explicit S3/database
+    startup failures to typed errors, and replaces the core replica
+    no-snapshot string guard with a typed `WalrustError` downcast. The
+    second-pass tests now pass.

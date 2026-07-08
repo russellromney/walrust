@@ -44,6 +44,8 @@ pub enum WalrustError {
     Integrity(String),
     /// Restore errors (no snapshot found, PITR unavailable)
     Restore(String),
+    /// Restore requested data is absent.
+    RestoreNotFound(String),
     /// General/unknown errors
     General(String),
 }
@@ -57,6 +59,7 @@ impl WalrustError {
             WalrustError::S3(_) => ExitStatus::S3,
             WalrustError::Integrity(_) => ExitStatus::Integrity,
             WalrustError::Restore(_) => ExitStatus::Restore,
+            WalrustError::RestoreNotFound(_) => ExitStatus::Restore,
             WalrustError::General(_) => ExitStatus::General,
         }
     }
@@ -86,6 +89,11 @@ impl WalrustError {
         WalrustError::Restore(msg.into())
     }
 
+    /// Create a restore-not-found error
+    pub fn restore_not_found(msg: impl Into<String>) -> Self {
+        WalrustError::RestoreNotFound(msg.into())
+    }
+
     /// Create a general error
     pub fn general(msg: impl Into<String>) -> Self {
         WalrustError::General(msg.into())
@@ -100,6 +108,7 @@ impl fmt::Display for WalrustError {
             WalrustError::S3(msg) => write!(f, "S3 error: {}", msg),
             WalrustError::Integrity(msg) => write!(f, "integrity error: {}", msg),
             WalrustError::Restore(msg) => write!(f, "restore error: {}", msg),
+            WalrustError::RestoreNotFound(msg) => write!(f, "restore not found: {}", msg),
             WalrustError::General(msg) => write!(f, "{}", msg),
         }
     }
@@ -116,6 +125,18 @@ pub fn classify_error(err: &anyhow::Error) -> ExitStatus {
     }
 
     ExitStatus::General
+}
+
+/// Preserve an existing typed walrust error, or wrap an untyped error.
+pub fn classify_or_else(
+    err: anyhow::Error,
+    fallback: impl FnOnce(String) -> WalrustError,
+) -> anyhow::Error {
+    if classify_error(&err) == ExitStatus::General {
+        fallback(err.to_string()).into()
+    } else {
+        err
+    }
 }
 
 #[cfg(test)]
@@ -154,6 +175,10 @@ mod tests {
             ExitStatus::Restore
         );
         assert_eq!(
+            WalrustError::restore_not_found("test").exit_status(),
+            ExitStatus::Restore
+        );
+        assert_eq!(
             WalrustError::general("test").exit_status(),
             ExitStatus::General
         );
@@ -187,6 +212,9 @@ mod tests {
     #[test]
     fn test_classify_restore_errors() {
         let err = anyhow::Error::new(WalrustError::restore("snapshot unavailable"));
+        assert_eq!(classify_error(&err), ExitStatus::Restore);
+
+        let err = anyhow::Error::new(WalrustError::restore_not_found("snapshot unavailable"));
         assert_eq!(classify_error(&err), ExitStatus::Restore);
     }
 

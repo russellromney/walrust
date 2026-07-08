@@ -9,6 +9,7 @@ use crate::config::{
     parse_duration_string, CacheConfig, ResolvedDbConfig, SyncConfig, WebhookConfig,
 };
 use crate::dashboard::{self, MetricsState};
+use crate::errors::{classify_or_else, WalrustError};
 use crate::ltx;
 use crate::retention::RetentionPolicy;
 use crate::retry::{RetryConfig, RetryPolicy};
@@ -72,7 +73,11 @@ pub async fn watch_with_independent_tasks(
     };
 
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = Arc::new(create_client(endpoint).await?);
+    let client = Arc::new(
+        create_client(endpoint)
+            .await
+            .map_err(|e| WalrustError::s3(e.to_string()))?,
+    );
 
     // Set up retry policy and webhook sender
     let retry_policy = RetryPolicy::new(retry_config.clone());
@@ -96,7 +101,11 @@ pub async fn watch_with_independent_tasks(
     for db_config in databases {
         let db_path = &db_config.path;
         if !db_path.exists() {
-            return Err(anyhow!("Database not found: {}", db_path.display()));
+            return Err(WalrustError::database(format!(
+                "Database not found: {}",
+                db_path.display()
+            ))
+            .into());
         }
 
         let name = db_config.prefix.clone();
@@ -104,7 +113,9 @@ pub async fn watch_with_independent_tasks(
 
         // Discover state from S3 file listings (litestream format - no manifest)
         let (current_txid, _max_gen, _) =
-            discover_state_from_s3(&client, &bucket_name, &prefix, &name).await?;
+            discover_state_from_s3(&client, &bucket_name, &prefix, &name)
+                .await
+                .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
         // WAL offset and generation are local state - start fresh
         let wal_offset = 0u64;
@@ -481,12 +492,11 @@ async fn run_db_task(
                         }
                     }
                     Err(e) => {
-                        let error_msg = e.to_string();
-                        tracing::error!("{}: Sync failed: {}", db_name, error_msg);
+                        tracing::error!("{}: Sync failed: {}", db_name, e);
                         webhook_sender
-                            .notify_upload_failed(&db_name, &error_msg, 1)
+                            .notify_upload_failed(&db_name, &e.to_string(), 1)
                             .await;
-                        return Err(anyhow!("{}: sync failed: {}", db_name, error_msg));
+                        return Err(e.context(format!("{}: sync failed", db_name)));
                     }
                 }
             }

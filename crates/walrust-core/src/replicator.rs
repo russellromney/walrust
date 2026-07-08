@@ -25,6 +25,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::errors::WalrustError;
 use crate::sync::{self, ExternalBaseCursor, FencedDeltaSyncParams, ReplicationConfig, SyncState};
 use hadb_storage::StorageBackend;
 
@@ -472,7 +473,14 @@ impl Replicator {
         let seq = match sync::restore(self.storage.as_ref(), &prefix, name, output_path, None).await
         {
             Ok(seq) => seq,
-            Err(e) if e.to_string().contains("No snapshot found") => return Ok(None),
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<WalrustError>(),
+                    Some(WalrustError::RestoreNotFound(_))
+                ) =>
+            {
+                return Ok(None);
+            }
             Err(e) => return Err(e),
         };
 

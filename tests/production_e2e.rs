@@ -154,31 +154,6 @@ fn wait_for_file_or_child_exit(child: &mut Child, path: &Path, context: &str) ->
     }
 }
 
-fn wait_for_live_incremental(bucket_arg: &str, endpoint: Option<&str>, name: &str) -> Result<()> {
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        let (bucket, prefix) = walrust::s3::parse_bucket(bucket_arg);
-        let client = walrust::s3::create_client(endpoint).await?;
-        let db_prefix = format!("{prefix}{name}/0000/");
-        let deadline = Instant::now() + Duration::from_secs(20);
-
-        loop {
-            let objects = walrust::s3::list_objects(&client, &bucket, &db_prefix).await?;
-            if objects.iter().any(|key| key.ends_with(".ltx")) {
-                return Ok(());
-            }
-
-            if Instant::now() >= deadline {
-                anyhow::bail!(
-                    "timed out waiting for live incremental under s3://{bucket}/{db_prefix}"
-                );
-            }
-
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    })
-}
-
 fn core_replicator_config() -> walrust::walrust_core::ReplicationConfig {
     walrust::walrust_core::ReplicationConfig {
         sync_interval: Duration::from_millis(100),
@@ -265,6 +240,38 @@ fn run_cli_restore(
     run_cmd(restore, "walrust restore")
 }
 
+fn wait_for_cli_restore_rows(
+    name: &str,
+    bucket_arg: &str,
+    endpoint: Option<&str>,
+    restored_path: &Path,
+    expected_rows: &[(i64, String)],
+) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+
+    loop {
+        let _ = std::fs::remove_file(restored_path);
+        let attempt_error = match run_cli_restore(name, bucket_arg, endpoint, restored_path)
+            .and_then(|_| assert_integrity_ok(restored_path))
+            .and_then(|_| rows(restored_path))
+        {
+            Ok(actual_rows) if actual_rows == expected_rows => return Ok(()),
+            Ok(actual_rows) => anyhow::anyhow!(
+                "restored rows did not match yet: expected {:?}, got {:?}",
+                expected_rows,
+                actual_rows
+            ),
+            Err(err) => err,
+        };
+
+        if Instant::now() >= deadline {
+            return Err(attempt_error.context("timed out waiting for restore rows to match"));
+        }
+
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 fn run_cli_snapshot(db_path: &Path, bucket_arg: &str, endpoint: Option<&str>) -> Result<()> {
     let mut snapshot = Command::new(env!("CARGO_BIN_EXE_walrust"));
     snapshot
@@ -288,20 +295,25 @@ fn e2e_cli_watch_restore_round_trips_sqlite_rows() -> Result<()> {
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
 
-    let _setup = create_source_db(&db_path, 5)?;
+    let setup = create_source_db(&db_path, 5)?;
     let writer = open_external_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "cli")?;
+    let read_pin = pin_read_transaction(&db_path)?;
 
     let mut child = spawn_cli_watch(&db_path, &bucket_arg, endpoint.as_deref(), true)?;
 
     std::thread::sleep(Duration::from_secs(2));
     append_rows(&writer, 6, 10, "watch")?;
-    wait_for_live_incremental(&bucket_arg, endpoint.as_deref(), &name)?;
+    let expected_rows = rows(&db_path)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected_rows,
+    )?;
+    drop(read_pin);
     stop_child(&mut child);
-
-    run_cli_restore(&name, &bucket_arg, endpoint.as_deref(), &restored_path)?;
-
-    assert_integrity_ok(&restored_path)?;
-    assert_eq!(rows(&db_path)?, rows(&restored_path)?);
 
     Ok(())
 }
@@ -316,21 +328,27 @@ fn e2e_cli_watch_restore_round_trips_64kb_pages() -> Result<()> {
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
 
-    let _setup = create_source_db_with_page_size(&db_path, 4, 65_536)?;
+    let setup = create_source_db_with_page_size(&db_path, 4, 65_536)?;
     let writer = open_external_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "cli-64kb")?;
+    let read_pin = pin_read_transaction(&db_path)?;
 
     let mut child = spawn_cli_watch(&db_path, &bucket_arg, endpoint.as_deref(), true)?;
 
     std::thread::sleep(Duration::from_secs(2));
     append_rows(&writer, 5, 9, "watch-64kb")?;
-    wait_for_live_incremental(&bucket_arg, endpoint.as_deref(), &name)?;
+    let expected_rows = rows(&db_path)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected_rows,
+    )?;
+    drop(read_pin);
     stop_child(&mut child);
 
-    run_cli_restore(&name, &bucket_arg, endpoint.as_deref(), &restored_path)?;
-
-    assert_integrity_ok(&restored_path)?;
     assert_eq!(sqlite_page_size(&restored_path)?, 65_536);
-    assert_eq!(rows(&db_path)?, rows(&restored_path)?);
 
     Ok(())
 }
@@ -345,24 +363,33 @@ fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
 
-    let _setup = create_source_db(&db_path, 5)?;
+    let setup = create_source_db(&db_path, 5)?;
     let writer = open_external_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "cli-pre-kill")?;
+    let first_read_pin = pin_read_transaction(&db_path)?;
 
     let mut first = spawn_cli_watch(&db_path, &bucket_arg, endpoint.as_deref(), true)?;
     std::thread::sleep(Duration::from_secs(2));
     append_rows(&writer, 6, 8, "pre-kill")?;
     std::thread::sleep(Duration::from_secs(2));
+    drop(first_read_pin);
     stop_child(&mut first);
 
+    write_pin_frame(&setup, "cli-post-kill")?;
+    let second_read_pin = pin_read_transaction(&db_path)?;
     let mut second = spawn_cli_watch(&db_path, &bucket_arg, endpoint.as_deref(), true)?;
     std::thread::sleep(Duration::from_secs(2));
-    wait_for_live_incremental(&bucket_arg, endpoint.as_deref(), &name)?;
+    append_rows(&writer, 9, 10, "post-kill")?;
+    let expected_rows = rows(&db_path)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected_rows,
+    )?;
+    drop(second_read_pin);
     stop_child(&mut second);
-
-    run_cli_restore(&name, &bucket_arg, endpoint.as_deref(), &restored_path)?;
-
-    assert_integrity_ok(&restored_path)?;
-    assert_eq!(rows(&db_path)?, rows(&restored_path)?);
 
     Ok(())
 }

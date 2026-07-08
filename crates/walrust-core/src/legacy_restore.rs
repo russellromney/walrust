@@ -5,6 +5,7 @@ use hadb_storage::StorageBackend;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::errors::WalrustError;
 use crate::legacy_ltx;
 use crate::legacy_manifest::{
     discover_legacy_state, find_latest_legacy_snapshot, find_latest_legacy_snapshot_at_or_before,
@@ -114,10 +115,13 @@ pub async fn restore_legacy_ltx(
 ) -> Result<u64> {
     let (current_txid, _max_generation) = discover_legacy_state(storage, prefix, db_name).await?;
     if current_txid == 0 {
-        return Err(anyhow!("No LTX files found for database: {db_name}"));
+        return Err(WalrustError::restore_not_found(format!(
+            "no LTX files found for database: {db_name}"
+        ))
+        .into());
     }
 
-    let target_txid = point_in_time.unwrap_or(current_txid);
+    let mut target_txid = point_in_time.unwrap_or(current_txid);
     let snapshot = if point_in_time.is_some() {
         find_latest_legacy_snapshot_at_or_before(storage, prefix, db_name, target_txid).await?
     } else {
@@ -125,9 +129,11 @@ pub async fn restore_legacy_ltx(
     }
     .ok_or_else(|| {
         if point_in_time.is_some() {
-            anyhow!("No snapshot found for database {db_name} at or before TXID {target_txid}")
+            WalrustError::restore_not_found(format!(
+                "snapshot unavailable for database {db_name} at or before TXID {target_txid}"
+            ))
         } else {
-            anyhow!("No snapshot found for database: {db_name}")
+            WalrustError::restore_not_found(format!("snapshot unavailable for database: {db_name}"))
         }
     })?;
 
@@ -150,6 +156,14 @@ pub async fn restore_legacy_ltx(
 
     let incrementals =
         list_legacy_generation_files(storage, prefix, db_name, GENERATION_LIVE).await?;
+    if point_in_time.is_none() {
+        target_txid = incrementals
+            .iter()
+            .map(|(_, _, max_txid)| *max_txid)
+            .max()
+            .unwrap_or(target_txid)
+            .max(target_txid);
+    }
     let applicable: Vec<_> = incrementals
         .iter()
         .filter(|(_, min_txid, max_txid)| *min_txid > snapshot.max_txid && *max_txid <= target_txid)

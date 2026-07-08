@@ -29,11 +29,11 @@ build-python:
 
 # Run all workspace tests with live storage credentials from Soup.
 test:
-	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo test --workspace'
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo test --workspace -- --test-threads=1'
 
 # Run tests with output
 test-verbose:
-	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo test --workspace -- --nocapture'
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo test --workspace -- --test-threads=1 --nocapture'
 
 # Run micro-benchmarks (cargo bench)
 bench:
