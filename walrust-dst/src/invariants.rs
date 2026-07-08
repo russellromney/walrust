@@ -477,13 +477,16 @@ pub fn prop_production_published_delta_restore() -> Result<()> {
 // Invariant 4b: Fenced external (TLM_DELTA) restore-from-published-deltas
 // ============================================================================
 
-/// Follower-side fenced reconstruction: copy the external base, discover the
-/// published envelopes after `base_seq`, enforce the seq/epoch/writer fences
-/// and the BLAKE3 envelope chain, and apply each LTX payload with the running
-/// DB checksum threaded through. Fallible ON PURPOSE — the negative cases in
+/// Follower-side fenced reconstruction — a thin wrapper over the PRODUCTION
+/// API [`walrust::walrust_core::reconstruct_fenced_follower`]. The spec and the
+/// implementation have converged: this DST property drives the exact code a
+/// real follower runs (copy the external base, discover the published envelopes
+/// after `base_seq`, enforce the seq/epoch/writer fences and the BLAKE3
+/// envelope chain, apply each payload with the running DB checksum threaded
+/// through). Fallible ON PURPOSE — the negative cases in
 /// [`prop_fenced_delta_restore`] assert that a forged envelope (wrong epoch,
-/// wrong writer, broken chain) makes this return Err *before* any apply, not
-/// get silently applied.
+/// wrong writer, broken chain) makes the production API return Err *before* any
+/// apply, not get silently applied.
 ///
 /// Returns `(applied_count, head_envelope_checksum)`.
 #[allow(clippy::too_many_arguments)]
@@ -498,58 +501,18 @@ async fn fenced_follower_reconstruct(
     base_copy: &std::path::Path,
     follower_path: &std::path::Path,
 ) -> Result<(u64, [u8; 32])> {
-    use walrust::walrust_core::external_delta;
-    use walrust::walrust_core::list_delta_envelopes_after;
-    use walrust::walrust_core::ltx as core_ltx;
+    use walrust::walrust_core::{reconstruct_fenced_follower, FencedFollowerCursor};
 
-    std::fs::copy(base_copy, follower_path)?;
-    let mut running_db = core_ltx::compute_checksum_from_file(follower_path)?;
-    let mut running_env = base_anchor;
-
-    let deltas = list_delta_envelopes_after(storage, prefix, name, base_seq).await?;
-    let mut applied: u64 = 0;
-    for (i, d) in deltas.iter().enumerate() {
-        anyhow::ensure!(
-            d.seq == base_seq + (i as u64) + 1,
-            "envelope seq must be contiguous from base: got {} at position {i}",
-            d.seq
-        );
-        anyhow::ensure!(
-            d.payload.epoch == epoch,
-            "epoch fence: rejected envelope seq {} with epoch {} != cursor epoch {epoch}",
-            d.seq,
-            d.payload.epoch
-        );
-        anyhow::ensure!(
-            d.payload.writer_id == writer_id,
-            "writer fence: rejected envelope seq {} from writer {:?} != {writer_id:?}",
-            d.seq,
-            d.payload.writer_id
-        );
-        anyhow::ensure!(
-            d.payload.prev_checksum.as_slice() == running_env.as_slice(),
-            "envelope chain break at seq {}",
-            d.seq
-        );
-        // Recompute the stored-envelope checksum from the decoded payload and
-        // confirm discovery agrees (byte-identity chain).
-        let recomputed = external_delta::checksum(
-            &external_delta::encode(&d.payload)
-                .map_err(|e| anyhow::anyhow!("re-encode envelope: {e}"))?,
-        );
-        anyhow::ensure!(
-            recomputed == d.envelope_checksum,
-            "envelope checksum must be BLAKE3 of the stored bytes (seq {})",
-            d.seq
-        );
-
-        let step =
-            core_ltx::apply_changeset_to_db(&d.payload.ltx_payload, follower_path, running_db)?;
-        running_db = step.checksum;
-        running_env = d.envelope_checksum;
-        applied += 1;
-    }
-    Ok((applied, running_env))
+    let cursor = FencedFollowerCursor {
+        base_seq,
+        epoch,
+        writer_id: writer_id.to_string(),
+        base_envelope_checksum: base_anchor,
+    };
+    let result =
+        reconstruct_fenced_follower(storage, prefix, name, &cursor, base_copy, follower_path)
+            .await?;
+    Ok((result.applied, result.head_envelope_checksum))
 }
 
 /// Property: a follower reconstructs the EXACT database from the published
