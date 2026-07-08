@@ -49,8 +49,22 @@ fn sqlite_page_size(path: &Path) -> Result<u32> {
     Ok(conn.query_row("PRAGMA page_size", [], |row| row.get(0))?)
 }
 
+/// S3-backed tests run only when S3 credentials/an endpoint are configured.
+/// CI provisions MinIO and sets AWS_* env; local dev injects Tigris creds via
+/// Soup. On a clean machine with no S3 configured these tests skip so that a
+/// plain `cargo test --workspace` stays green (Phase 0.5).
+fn s3_test_enabled() -> bool {
+    std::env::var("AWS_ENDPOINT_URL_S3").is_ok()
+        || std::env::var("AWS_ENDPOINT_URL").is_ok()
+        || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+}
+
 #[tokio::test]
 async fn point_in_time_restore_uses_latest_snapshot_not_after_target() -> Result<()> {
+    if !s3_test_enabled() {
+        eprintln!("SKIP point_in_time_restore_uses_latest_snapshot_not_after_target: no S3 endpoint/credentials configured");
+        return Ok(());
+    }
     let (bucket_arg, endpoint) = test_bucket_config();
     let (bucket, prefix) = walrust::s3::parse_bucket(&bucket_arg);
     let client = walrust::s3::create_client(endpoint.as_deref()).await?;
@@ -95,6 +109,10 @@ async fn point_in_time_restore_uses_latest_snapshot_not_after_target() -> Result
 
 #[tokio::test]
 async fn restore_rejects_incremental_without_prior_chain_link() -> Result<()> {
+    if !s3_test_enabled() {
+        eprintln!("SKIP restore_rejects_incremental_without_prior_chain_link: no S3 endpoint/credentials configured");
+        return Ok(());
+    }
     let (bucket_arg, endpoint) = test_bucket_config();
     let (bucket, prefix) = walrust::s3::parse_bucket(&bucket_arg);
     let client = walrust::s3::create_client(endpoint.as_deref()).await?;
@@ -150,6 +168,10 @@ async fn restore_rejects_incremental_without_prior_chain_link() -> Result<()> {
 
 #[tokio::test]
 async fn failed_restore_preserves_existing_output_database() -> Result<()> {
+    if !s3_test_enabled() {
+        eprintln!("SKIP failed_restore_preserves_existing_output_database: no S3 endpoint/credentials configured");
+        return Ok(());
+    }
     let (bucket_arg, endpoint) = test_bucket_config();
     let (bucket, prefix) = walrust::s3::parse_bucket(&bucket_arg);
     let client = walrust::s3::create_client(endpoint.as_deref()).await?;

@@ -105,8 +105,22 @@ impl SnapshotSource for FileSnapshotSource {
 
 /// Happy path: materialize via snapshot source, no incrementals in S3.
 /// All S3 operations hit real Tigris.
+/// S3-backed tests run only when S3 credentials/an endpoint are configured.
+/// CI provisions MinIO and sets AWS_* env; local dev injects Tigris creds via
+/// Soup. On a clean machine with no S3 configured these tests skip so that a
+/// plain `cargo test --workspace` stays green (Phase 0.5).
+fn s3_test_enabled() -> bool {
+    std::env::var("AWS_ENDPOINT_URL_S3").is_ok()
+        || std::env::var("AWS_ENDPOINT_URL").is_ok()
+        || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+}
+
 #[tokio::test]
 async fn test_s3_restore_snapshot_source_no_incrementals() {
+    if !s3_test_enabled() {
+        eprintln!("SKIP test_s3_restore_snapshot_source_no_incrementals: no S3 endpoint/credentials configured");
+        return;
+    }
     let bucket = test_bucket();
     let endpoint = test_endpoint();
     let prefix = unique_prefix();
@@ -139,6 +153,10 @@ async fn test_s3_restore_snapshot_source_no_incrementals() {
 /// E2E: create base DB, sync WAL to real Tigris, then restore via snapshot source.
 #[tokio::test]
 async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
+    if !s3_test_enabled() {
+        eprintln!("SKIP test_s3_restore_snapshot_source_with_real_wal_sync: no S3 endpoint/credentials configured");
+        return;
+    }
     let bucket = test_bucket();
     let endpoint = test_endpoint();
     let prefix = unique_prefix();

@@ -383,6 +383,13 @@ mod tests {
 
     #[tokio::test]
     async fn replica_failed_incremental_apply_preserves_existing_database() -> Result<()> {
+        if std::env::var("AWS_ENDPOINT_URL_S3").is_err()
+            && std::env::var("AWS_ENDPOINT_URL").is_err()
+            && std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        {
+            eprintln!("SKIP replica_failed_incremental_apply_preserves_existing_database: no S3 endpoint/credentials configured");
+            return Ok(());
+        }
         let (bucket_arg, endpoint) = test_bucket_config();
         let (bucket, prefix) = s3::parse_bucket(&bucket_arg);
         let client = create_client(endpoint.as_deref()).await?;
@@ -437,6 +444,13 @@ mod tests {
     #[tokio::test]
     async fn replica_gap_without_future_snapshot_errors_and_preserves_existing_database(
     ) -> Result<()> {
+        if std::env::var("AWS_ENDPOINT_URL_S3").is_err()
+            && std::env::var("AWS_ENDPOINT_URL").is_err()
+            && std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        {
+            eprintln!("SKIP replica_gap_without_future_snapshot_errors_and_preserves_existing_database: no S3 endpoint/credentials configured");
+            return Ok(());
+        }
         let (bucket_arg, endpoint) = test_bucket_config();
         let (bucket, prefix) = s3::parse_bucket(&bucket_arg);
         let client = create_client(endpoint.as_deref()).await?;

@@ -269,6 +269,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_watch_auto_compaction_uses_listing_without_manifest() {
+        if std::env::var("AWS_ENDPOINT_URL_S3").is_err()
+            && std::env::var("AWS_ENDPOINT_URL").is_err()
+            && std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        {
+            eprintln!("SKIP test_watch_auto_compaction_uses_listing_without_manifest: no S3 endpoint/credentials configured");
+            return;
+        }
         let (bucket_arg, endpoint) = test_bucket_config();
         let (bucket, prefix) = s3::parse_bucket(&bucket_arg);
         let client = s3::create_client(endpoint.as_deref()).await.unwrap();

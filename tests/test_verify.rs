@@ -38,8 +38,22 @@ fn unique_db_name(prefix: &str) -> String {
 // INTEGRATION TESTS - Require S3 credentials
 // ============================================================================
 
+/// S3-backed tests run only when S3 credentials/an endpoint are configured.
+/// CI provisions MinIO and sets AWS_* env; local dev injects Tigris creds via
+/// Soup. On a clean machine with no S3 configured these tests skip so that a
+/// plain `cargo test --workspace` stays green (Phase 0.5).
+fn s3_test_enabled() -> bool {
+    std::env::var("AWS_ENDPOINT_URL_S3").is_ok()
+        || std::env::var("AWS_ENDPOINT_URL").is_ok()
+        || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+}
+
 #[test]
 fn test_verify_valid_backup() -> Result<()> {
+    if !s3_test_enabled() {
+        eprintln!("SKIP test_verify_valid_backup: no S3 endpoint/credentials configured");
+        return Ok(());
+    }
     let (bucket, endpoint) = test_bucket_config();
     let tempdir = TempDir::new()?;
     let db_path = tempdir.path().join("verify-test.db");
@@ -101,6 +115,10 @@ fn test_verify_valid_backup() -> Result<()> {
 
 #[test]
 fn test_verify_with_incrementals() -> Result<()> {
+    if !s3_test_enabled() {
+        eprintln!("SKIP test_verify_with_incrementals: no S3 endpoint/credentials configured");
+        return Ok(());
+    }
     let (bucket, endpoint) = test_bucket_config();
     let tempdir = TempDir::new()?;
     let db_path = tempdir.path().join("verify-incremental.db");
@@ -170,6 +188,10 @@ fn test_verify_with_incrementals() -> Result<()> {
 
 #[test]
 fn test_verify_no_backup_found() -> Result<()> {
+    if !s3_test_enabled() {
+        eprintln!("SKIP test_verify_no_backup_found: no S3 endpoint/credentials configured");
+        return Ok(());
+    }
     let (bucket, endpoint) = test_bucket_config();
     let db_name = unique_db_name("nonexistent-database");
 
@@ -206,6 +228,10 @@ fn test_verify_no_backup_found() -> Result<()> {
 
 #[test]
 fn test_verify_exit_codes() -> Result<()> {
+    if !s3_test_enabled() {
+        eprintln!("SKIP test_verify_exit_codes: no S3 endpoint/credentials configured");
+        return Ok(());
+    }
     let (bucket, endpoint) = test_bucket_config();
     let tempdir = TempDir::new()?;
     let db_path = tempdir.path().join("exit-code-test.db");
@@ -248,6 +274,10 @@ fn test_verify_exit_codes() -> Result<()> {
 
 #[test]
 fn test_verify_continuity_check() -> Result<()> {
+    if !s3_test_enabled() {
+        eprintln!("SKIP test_verify_continuity_check: no S3 endpoint/credentials configured");
+        return Ok(());
+    }
     let (bucket, endpoint) = test_bucket_config();
     let tempdir = TempDir::new()?;
     let db_path = tempdir.path().join("continuity-test.db");
@@ -353,6 +383,10 @@ fn test_verify_help_output() {
 
 #[test]
 fn test_verify_doesnt_double_count_file_sizes() -> Result<()> {
+    if !s3_test_enabled() {
+        eprintln!("SKIP test_verify_doesnt_double_count_file_sizes: no S3 endpoint/credentials configured");
+        return Ok(());
+    }
     // Regression test for the bug where total_size was counted twice
     let (bucket, endpoint) = test_bucket_config();
     let tempdir = TempDir::new()?;

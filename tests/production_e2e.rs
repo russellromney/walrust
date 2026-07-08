@@ -15,6 +15,29 @@ fn test_endpoint() -> Option<String> {
         .ok()
 }
 
+/// S3-backed E2E tests run only when S3 credentials/an endpoint are configured.
+/// CI provisions MinIO and sets AWS_* env; local dev injects Tigris creds via
+/// Soup. On a clean machine with no S3 configured these tests skip so that a
+/// plain `cargo test --workspace` stays green (Phase 0.5).
+fn s3_test_enabled() -> bool {
+    std::env::var("AWS_ENDPOINT_URL_S3").is_ok()
+        || std::env::var("AWS_ENDPOINT_URL").is_ok()
+        || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+}
+
+macro_rules! require_s3 {
+    ($name:literal) => {
+        if !s3_test_enabled() {
+            eprintln!(concat!(
+                "SKIP ",
+                $name,
+                ": no S3 endpoint/credentials configured (set AWS_ACCESS_KEY_ID or AWS_ENDPOINT_URL_S3)"
+            ));
+            return Ok(());
+        }
+    };
+}
+
 fn unique_name(prefix: &str) -> String {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -287,6 +310,7 @@ fn run_cli_snapshot(db_path: &Path, bucket_arg: &str, endpoint: Option<&str>) ->
 
 #[test]
 fn e2e_cli_watch_restore_round_trips_sqlite_rows() -> Result<()> {
+    require_s3!("e2e_cli_watch_restore_round_trips_sqlite_rows");
     let temp = TempDir::new()?;
     let name = unique_name("cli-e2e");
     let prefix = format!("e2e/{name}");
@@ -320,6 +344,7 @@ fn e2e_cli_watch_restore_round_trips_sqlite_rows() -> Result<()> {
 
 #[test]
 fn e2e_cli_watch_restore_round_trips_64kb_pages() -> Result<()> {
+    require_s3!("e2e_cli_watch_restore_round_trips_64kb_pages");
     let temp = TempDir::new()?;
     let name = unique_name("cli-64kb-e2e");
     let prefix = format!("e2e/{name}");
@@ -355,6 +380,7 @@ fn e2e_cli_watch_restore_round_trips_64kb_pages() -> Result<()> {
 
 #[test]
 fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
+    require_s3!("e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows");
     let temp = TempDir::new()?;
     let name = unique_name("cli-restart-e2e");
     let prefix = format!("e2e/{name}");
@@ -396,6 +422,7 @@ fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
 
 #[test]
 fn e2e_compaction_during_restore_keeps_backup_restorable() -> Result<()> {
+    require_s3!("e2e_compaction_during_restore_keeps_backup_restorable");
     let temp = TempDir::new()?;
     let name = unique_name("compact-race-e2e");
     let prefix = format!("e2e/{name}");
@@ -465,6 +492,7 @@ fn e2e_compaction_during_restore_keeps_backup_restorable() -> Result<()> {
 
 #[tokio::test]
 async fn e2e_core_replicator_restore_round_trips_sqlite_rows() -> Result<()> {
+    require_s3!("e2e_core_replicator_restore_round_trips_sqlite_rows");
     let temp = TempDir::new()?;
     let name = unique_name("core-e2e");
     let prefix = format!("e2e/{name}/");
@@ -499,6 +527,7 @@ async fn e2e_core_replicator_restore_round_trips_sqlite_rows() -> Result<()> {
 
 #[tokio::test]
 async fn e2e_core_replicator_restart_reopens_state_and_restores_cleanly() -> Result<()> {
+    require_s3!("e2e_core_replicator_restart_reopens_state_and_restores_cleanly");
     let temp = TempDir::new()?;
     let name = unique_name("core-restart-e2e");
     let prefix = format!("e2e/{name}/");
@@ -545,6 +574,7 @@ async fn e2e_core_replicator_restart_reopens_state_and_restores_cleanly() -> Res
 
 #[test]
 fn e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
+    require_s3!("e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows");
     let temp = TempDir::new()?;
     let name = unique_name("core-sigkill-e2e");
     let prefix = format!("e2e/{name}/");
