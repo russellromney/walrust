@@ -232,6 +232,46 @@ un-re-imaged pages can be lost. Steady-state operation (walrust reads the WAL ev
 sync interval) is covered; this is the same class as the B4 restart-window
 residual and is recorded for Phase 2B state-durability.
 
+Phase 2B (2026-07-08): ATTEMPTED, REVERTED — remains a documented residual. Two
+detection signals were tried and both rejected:
+- SQLite's offset-24 file change counter: unreliable in WAL mode — it only
+  advances when the DB *grows*, so a same-size external fold is invisible.
+- Raw DB-file hash baselined at snapshot, compared in the first-read window
+  (`wal_salt == None`): this correctly detects that the main file changed, but it
+  cannot distinguish a benign external PASSIVE checkpoint (which folds frames into
+  the file yet LEAVES them readable in the WAL — no loss) from a destructive
+  TRUNCATE/RESTART (frames gone from the WAL — loss). It therefore false-positives
+  on PASSIVE folds and fired a spurious re-anchor whose `checkpoint_wal(TRUNCATE)`
+  is blocked by the pinned-reader S3 E2Es (`e2e_core_replicator_*`,
+  `busy=1`). Since the goal is not to weaken those honest E2Es and the
+  PASSIVE-vs-reset distinction is not cheaply available in the first-read window
+  (there is no recorded salt for the folded-away generation), the change was
+  reverted. The residual stands: walrust-owned mode sets `autocheckpoint=0` so an
+  external checkpoint in this window is a shouldn't-happen edge, and the periodic
+  snapshot timer bounds the exposure (the next snapshot re-images the DB file,
+  which contains any externally-folded pages). A correct fix needs a cheap
+  WAL-reset signal in the window (e.g. recording the first post-snapshot WAL salt
+  as SQLite writes it, without a full read) and is left for a later phase.
+
+Phase 2B rollover-webhook plumbing (2026-07-08): CLOSED (the "core library has NO
+webhook channel" residual). Added `RolloverObserver` — a cloneable, `Debug`,
+default-noop event sink on `SyncState` and `ReplicationConfig`. The core emits a
+`RolloverEvent` on walrust-owned re-anchor (recovered=true), external-base refusal
+(recovered=false), and the B11 crash-window re-anchor; the `Replicator` and
+`run_replication`/`run_wal_replication` install the config's observer onto state.
+The root binary drives its own webhook-wired watch loops, so this channel is for
+library embedders (haqlite, etc.). Proven by
+`test_rollover_observer_fires_on_walrust_owned_reanchor` (revert-verified).
+
+Adversarial review (Phase 2B, 2026-07-08): the observer coverage was PARTIAL — it
+fired on the walrust-owned re-anchor, external-base refusal, and B11 re-anchor, but
+NOT on the fenced external-mode rollover refusal (`sync_wal_fenced_delta`), which is
+a fourth rollover site. Fixed: that refusal now emits a `recovered=false`
+`mode="fenced-external"` event before its bail, matching the external-base refusal.
+Proven by the new `test_rollover_observer_fires_on_fenced_external_refusal`
+(fenced flush after a forced TRUNCATE emits the event). All four core rollover
+sites now emit.
+
 ### A4 — walrust's own checkpoint timer destroys unshipped frames
 - `src/sync/watch_shadow.rs:663-681`: comment says "First, ensure all shadow
   data is uploaded" — no such code exists. `ShadowWal::checkpoint()`
@@ -391,6 +431,18 @@ production callers use `encode_sqlite_snapshot*`. Proven by
 `ltx::tests::test_encode_sqlite_snapshot_includes_wal_and_returns_encoded_checksum`
 in both trees.
 
+Verify (Phase 2B, 2026-07-08): VERIFIED already-fixed by convergence. Both named
+proofs pass. Revert-verified: replacing `state.db_checksum = Some(db_checksum)`
+(the checksum of the encoded snapshot bytes) with a post-upload
+`compute_checksum_from_file` re-read makes
+`take_snapshot_state_checksum_matches_uploaded_snapshot_bytes` FAIL (the mock
+mutates the source DB on PUT, so a second read no longer matches the uploaded
+bytes) — confirming the single-pass checksum-of-encoded-bytes is load-bearing.
+`take_snapshot`/`take_snapshot_with_retry` fold the WAL with a
+completeness-checked `checkpoint_wal` (TRUNCATE) and `reset_wal_cursor_after_snapshot`
+before encoding from the stable copy. No 2B code change needed for A7 itself
+(the first-checkpoint-window residual it left is closed under A3 above).
+
 ### A8 — Cache-mode uploads are unrestorable (key layout mismatch)
 - Uploader PUTs flat keys: `src/uploader.rs:100`
   `format!("{}/{:08}.ltx", prefix, txid)`. Discovery/restore parse only
@@ -416,6 +468,15 @@ snapshot selection, and live-generation listing also detect legacy flat
 because it does not use the root `LocalCache`/uploader/LTX S3 key path. Proven
 by `uploader::tests::test_uploader_basic_upload` and
 `sync::manifest::tests::build_ltx_key_normalizes_prefix_separator`.
+
+Verify (Phase 2B, 2026-07-08): VERIFIED already-fixed by convergence. The
+canonical key builder + legacy-flat detection are now owned by
+`crates/walrust-core/src/legacy_manifest.rs` (root `src/sync/manifest.rs`
+delegates). Revert-verified: dropping the `prefix_with_separator` normalization
+in `legacy_manifest::build_ltx_key` makes
+`legacy_manifest::tests::build_ltx_key_normalizes_prefix_separator` FAIL
+(`"base"` + `"db"` no longer normalizes to `base/db/...`). One layout across
+uploader / snapshot / discovery / restore. No 2B code change needed for A8.
 
 ### A9 — PIT restore can only use the newest snapshot; GFS retention is dead weight
 Status: Fixed — root restore now selects the latest snapshot whose `max_txid`
@@ -467,6 +528,26 @@ and refuses to reopen a remote chain head without a matching local WAL cursor
 proof. Proven by
 `test_external_mode_rejects_remote_chain_without_local_progress` and
 `test_external_mode_reopen_derives_head_without_remote_state`.
+
+Phase 2B (2026-07-08): remaining Session-5 A10 sub-items closed.
+- "stop seeding seq from the SQLite change counter on restart": the
+  walrust-owned reopen path (`Replicator::add_without_snapshot_with_wal_path`)
+  no longer seeds `current_seq` from the file change counter. `current_seq` now
+  comes only from the durable `state.json` (falling back to 0, never the change
+  counter), so a lost `state.json` cannot silently fork the object chain at an
+  unrelated seq. `current_txid` (change-detection only) keeps its change-counter
+  hint. Proven by
+  `test_walrust_owned_reopen_does_not_seed_seq_from_change_counter`
+  (revert-verified: restoring the change-counter seq seed makes it FAIL).
+- CAS + lineage + fenced fresh-lineage creation were already landed in earlier
+  waves (see the proofs above); re-confirmed passing.
+- `initialize_external_base_state`'s "current WAL size was all published"
+  assumption + `unwrap_or(0)`: already removed by convergence — the function now
+  sets `wal_offset = 0` when the remote chain has no delta after the base and
+  otherwise REQUIRES a matching local fsynced progress record (no WAL-size
+  guessing), verified present at `crates/walrust-core/src/sync.rs`
+  (`initialize_external_base_state`, `head.count == 0` branch + progress-anchor
+  checks). No 2B code change needed for this sub-item.
 
 Verify (Wave 1b, 2026-07-07): VERIFIED already-fixed (reload-half). All three
 named non-gated proofs pass and FAIL on revert. Dropping the salt/chain reload
@@ -707,6 +788,42 @@ locally (sandbox MinIO clock skew, see A6).
   per-frame checksum validation — same limitation as the existing checked
   page-map reader; the salt-change rollover check is unaffected. Persisting the
   chain in the shadow progress record is A10/2B state-durability scope.
+  Phase 2B (2026-07-08): CLOSED. `ShadowProgress` now persists `wal_copy_offset`,
+  `wal_salt`, and the running `wal_checksum_chain` at that offset (all
+  `serde(default)` for back-compat). On restart the root shadow watch loop
+  resumes the live-WAL read from the persisted offset and seeds `ShadowWal`'s
+  salt + chain via `ShadowWal::restore_read_cursor`, so the first post-restart
+  `copy_frames` validates the frame checksum chain per-frame from the resumed
+  offset (instead of re-reading — and re-appending — the whole live WAL from
+  offset 0), and detects a checkpoint that reset the WAL during downtime (salt
+  mismatch => rollover). Proven by
+  `shadow::tests::test_restore_read_cursor_resumes_without_re_reading_wal`,
+  `shadow::tests::test_restore_read_cursor_detects_downtime_checkpoint`
+  (revert-verified), and the extended
+  `legacy_shadow_progress_persistence_is_owned_by_core` round-trip.
+
+  Adversarial review (Phase 2B, 2026-07-08): two additions.
+  (a) Back-compat now has a dedicated proof: a pre-B4 progress file (no
+  `wal_copy_offset`/`wal_salt`/`wal_checksum_chain`) loads with no panic and falls
+  back conservatively — `wal_copy_offset` defaults to 0 (re-read from the WAL
+  head) and salt/chain to None (`restore_read_cursor` becomes a no-op, seeding
+  nothing stale). Proven by
+  `legacy_pre_b4_shadow_progress_loads_with_safe_defaults`. And
+  `test_restore_read_cursor_detects_downtime_checkpoint` was re-revert-verified
+  with a TRUE no-op `restore_read_cursor` (it FAILS: generation does not advance),
+  confirming the salt restore — not just the offset-shrink path — is load-bearing.
+  (b) Recovery-completeness scope: the downtime detection bumps the generation and
+  re-seeds per-frame validation, but does NOT eagerly re-snapshot. The frames an
+  external checkpoint folded away during downtime live in the main DB FILE and are
+  re-imaged by the next periodic snapshot (the snapshot timer re-reads the whole
+  DB file). An eager re-snapshot on every generation bump is deliberately NOT
+  wired because a generation bump in shadow mode is normally BENIGN (walrust's own
+  copy-then-checkpoint also bumps it), and the PASSIVE-fold-vs-destructive-reset
+  distinction is not cheaply available (the same residual class as the A3
+  first-checkpoint window and B5). So a downtime checkpoint's completeness is
+  bounded by `snapshot_interval`, matching the A3/B5 residual; it is not silent
+  loss (the generation-boundary chain re-seed keeps restore fail-closed on any gap
+  rather than short).
 - B5 — Shadow WAL salt seeded `(0,0)` when no WAL exists at startup and only
   updated inside the rollover branch (`src/shadow.rs:83-86, 184`): for a
   fresh DB, all future checkpoints are invisible. Also page_size defaults to
@@ -821,6 +938,58 @@ locally (sandbox MinIO clock skew, see A6).
   chain break misdiagnosed as stale lineage) (`sync.rs:473-493`).
   External-mode variant: lost PUT response => permanent equivocation wedge
   with no re-anchor path (`sync.rs:441-470, 684-717`).
+  Status: Fixed (Phase 2B, 2026-07-08). Two halves:
+  (1) Fail-loudly + typed. `put_changeset_if_absent` and
+  `publish_delta_envelope` already refuse a same-seq overwrite with different
+  bytes (CAS from earlier phases); that refusal is now a typed
+  `WalrustError::Equivocation` (exit 5) instead of an untyped bail, so callers
+  can classify it. Identical bytes remain an idempotent success (retry / lost
+  PUT-response safety).
+  (2) Recovery/re-anchor. In walrust-owned mode, a same-seq conflict whose
+  existing object is *provably our own* prior publish at that seq is adopted as
+  committed and the stream re-anchors with a fresh snapshot, folding in any
+  frames written after the crash. A foreign object, a second live writer's
+  divergent object, or garbage still hard-fails (typed equivocation).
+  External-base mode surfaces the typed equivocation; its documented recovery is
+  `initialize_external_base_state` from a new base (which already adopts a
+  matching same-seq changeset via `external_same_seq_changeset_checksum`).
+
+  Adversarial review (Phase 2B, 2026-07-08): the walrust-owned recovery's
+  ORIGINAL discriminator was `(seq match, prev_checksum match)` and was
+  documented as "the exact signature of a durable put whose save_state never
+  ran". That claim was OVERSTATED: `prev_checksum` is the pre-apply base
+  checksum, so ANY second live writer sharing the same lineage + base state
+  (e.g. an HA failover where the promoted node restored from the same backup and
+  the original node came back) publishes a DIFFERENT changeset at the same seq
+  with the IDENTICAL `(seq, prev_checksum)` signature. The recovery therefore
+  silently ADOPTED a second writer's object and re-anchored on it — actively
+  re-legitimizing split-brain (a regression versus the pre-B11 hard-fail).
+  Confirmed empirically by a two-writer test that the original code passed
+  through `Ok(1)` instead of erroring.
+
+  FIX (this review): the recovery is now gated on a durable, local, fsynced
+  publish-intent write-ahead record (`PublishIntent`,
+  `.walrust-<db>/publish-intent.json`, temp+fsync+rename+dir-fsync). Before each
+  walrust-owned CAS put, we load the PRIOR intent (the pre-crash one) and then
+  record the intent for THIS publish. A same-seq conflict is adopted ONLY if the
+  prior local intent names this exact publish (matching lineage, seq, base
+  checksum) AND the stored object's checksum is byte-for-byte the one we
+  recorded — proof THIS process authored it. A second writer records its own
+  intent on its OWN disk, so its object's checksum never matches ours and the
+  conflict correctly hard-fails; a failover node whose last intent is at a
+  different seq also hard-fails. This is a state-durability authorship proof, NOT
+  a distributed fence: a full writer-fencing/lease token is later-phase, but the
+  local intent closes the silent split-brain re-legitimization within Phase-2B
+  scope. Proven by
+  `sync::tests::walrust_owned_reanchors_after_crash_window_same_seq_conflict`
+  (revert-verified: disabling the adoption makes the post-crash row
+  unrestorable), the new
+  `sync::tests::walrust_owned_sync_rejects_second_writer_same_base_same_seq`
+  (revert-verified: it FAILED against the original `(seq, prev_checksum)`
+  discriminator and PASSES with the intent gate), and
+  `sync::tests::walrust_owned_sync_rejects_foreign_same_seq_changeset`; the
+  existing `walrust_owned_sync_rejects_divergent_existing_changeset` and
+  `publish_delta_envelope_rejects_same_seq_divergent_bytes` still pass.
 - B12 — journal_mode change away from WAL => replication silently freezes
   (0 frames forever, no error/webhook) (`wal_sync.rs:99-115`,
   `sync.rs:400-403`). `open_checkpoint_blocker` silently converts DELETE-mode

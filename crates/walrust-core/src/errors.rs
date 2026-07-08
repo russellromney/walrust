@@ -46,6 +46,12 @@ pub enum WalrustError {
     Restore(String),
     /// Restore requested data is absent.
     RestoreNotFound(String),
+    /// Same-seq changeset equivocation: an object already exists at a
+    /// sequence number with different bytes than we are about to publish.
+    /// Publishing over it would fork the chain for live followers, so the
+    /// write is refused. Recovery is a re-anchor (walrust-owned: a fresh
+    /// snapshot; external-base: re-initialize from a new external base).
+    Equivocation(String),
     /// General/unknown errors
     General(String),
 }
@@ -60,6 +66,7 @@ impl WalrustError {
             WalrustError::Integrity(_) => ExitStatus::Integrity,
             WalrustError::Restore(_) => ExitStatus::Restore,
             WalrustError::RestoreNotFound(_) => ExitStatus::Restore,
+            WalrustError::Equivocation(_) => ExitStatus::Integrity,
             WalrustError::General(_) => ExitStatus::General,
         }
     }
@@ -94,6 +101,21 @@ impl WalrustError {
         WalrustError::RestoreNotFound(msg.into())
     }
 
+    /// Create an equivocation error
+    pub fn equivocation(msg: impl Into<String>) -> Self {
+        WalrustError::Equivocation(msg.into())
+    }
+
+    /// True if any cause in an `anyhow` chain is a same-seq equivocation.
+    pub fn is_equivocation(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<WalrustError>(),
+                Some(WalrustError::Equivocation(_))
+            )
+        })
+    }
+
     /// Create a general error
     pub fn general(msg: impl Into<String>) -> Self {
         WalrustError::General(msg.into())
@@ -109,6 +131,7 @@ impl fmt::Display for WalrustError {
             WalrustError::Integrity(msg) => write!(f, "integrity error: {}", msg),
             WalrustError::Restore(msg) => write!(f, "restore error: {}", msg),
             WalrustError::RestoreNotFound(msg) => write!(f, "restore not found: {}", msg),
+            WalrustError::Equivocation(msg) => write!(f, "equivocation: {}", msg),
             WalrustError::General(msg) => write!(f, "{}", msg),
         }
     }

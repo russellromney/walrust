@@ -717,6 +717,32 @@ async fn test_walrust_owned_reload_state_transport_error_is_hard_error() -> Resu
 }
 
 #[tokio::test]
+async fn test_walrust_owned_reopen_does_not_seed_seq_from_change_counter() -> Result<()> {
+    // A10: on a walrust-owned reopen with no durable state.json, the publish
+    // sequence must NOT be seeded from SQLite's internal file change counter
+    // (which is unrelated to our seq and would silently fork the chain).
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("no-seed.db");
+    let conn = create_wal_db(&db_path, 5);
+    // Fold the WAL so the file change counter is written into the main DB.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
+    let cc = walrust::sync::change_counter_from_file(&db_path).expect("change counter");
+    assert!(cc > 0, "precondition: file change counter must be non-zero");
+
+    let replicator = Replicator::new(storage, "wal/", make_config());
+    replicator.add_without_snapshot("no-seed", &db_path).await?;
+    assert_eq!(
+        replicator.current_seq("no-seed").await,
+        Some(0),
+        "reopen without saved state must leave seq at 0, not the change counter ({cc})"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_remove_keeps_database_registered_when_final_sync_fails() -> Result<()> {
     let inner = MemStorage::new();
     let storage = PutFailsStorage::new(inner);
@@ -868,6 +894,42 @@ async fn test_walrust_owned_flush_resnapshots_after_checkpoint_rollover() -> Res
 }
 
 #[tokio::test]
+async fn test_rollover_observer_fires_on_walrust_owned_reanchor() -> Result<()> {
+    // Obligation 2: the core has no webhook client, so it surfaces rollover
+    // re-anchors through a RolloverObserver an embedder wires to its alerts.
+    use std::sync::{Arc, Mutex};
+    let events: Arc<Mutex<Vec<walrust::RolloverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rollover-observed.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let mut config = make_config();
+    config.rollover_observer = walrust::RolloverObserver::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    });
+    let replicator = Replicator::new(storage.clone(), "wal/", config);
+    replicator.add("rollover-observed", &db_path).await?;
+
+    write_rows(&conn, 100, 2);
+    replicator.flush("rollover-observed").await?;
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    write_rows(&conn, 200, 2);
+    replicator.flush("rollover-observed").await?;
+
+    let seen = events.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|e| e.mode == "walrust-owned" && e.recovered),
+        "a walrust-owned rollover re-anchor must emit a recovered RolloverEvent; got {seen:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_external_mode_refuses_checkpoint_rollover_until_reanchored() -> Result<()> {
     let storage = MemStorage::new();
     let dir = tempfile::tempdir().unwrap();
@@ -991,6 +1053,53 @@ async fn test_fenced_external_mode_refuses_checkpoint_rollover_until_reanchored(
         "retry must still refuse until re-anchor, got {retry_err}"
     );
 
+    drop(conn);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_rollover_observer_fires_on_fenced_external_refusal() -> Result<()> {
+    // Obligation 2 coverage gap: the fenced external-mode rollover REFUSAL is a
+    // rollover site too. It must surface a recovered=false RolloverEvent, not
+    // just an anyhow bail, so an embedder alerts on the poisoned stream.
+    use std::sync::{Arc, Mutex};
+    let events: Arc<Mutex<Vec<walrust::RolloverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("fenced-observed.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+
+    let mut config = make_external_config();
+    config.rollover_observer = walrust::RolloverObserver::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    });
+    let replicator =
+        Replicator::try_new(storage.clone(), "wal/", config).expect("external config valid");
+    replicator.add("fenced-observed", &db_path).await?;
+    replicator
+        .set_external_delta_base("fenced-observed", 7, "writer-a", base_seq, [0x42; 32])
+        .await?;
+
+    write_rows(&conn, 100, 2);
+    replicator.flush("fenced-observed").await?;
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    write_rows(&conn, 200, 2);
+    let _ = replicator
+        .flush("fenced-observed")
+        .await
+        .expect_err("fenced rollover must refuse");
+
+    let seen = events.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|e| e.mode == "fenced-external" && !e.recovered),
+        "a fenced external-mode rollover refusal must emit a recovered=false RolloverEvent; got {seen:?}"
+    );
     drop(conn);
     Ok(())
 }

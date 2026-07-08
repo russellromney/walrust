@@ -30,6 +30,9 @@ async fn legacy_shadow_progress_persistence_is_owned_by_core() -> Result<()> {
         db_checksum: Some(0xfeed_beef),
         shadow_sync_generation: shadow.generation(),
         shadow_sync_offset: 4096,
+        wal_copy_offset: 8192,
+        wal_salt: Some((0x1111_2222, 0x3333_4444)),
+        wal_checksum_chain: Some((0xaaaa_bbbb, 0xcccc_dddd)),
     };
 
     save_shadow_progress(shadow.shadow_dir(), "shadow-progress", &progress)?;
@@ -42,6 +45,61 @@ async fn legacy_shadow_progress_persistence_is_owned_by_core() -> Result<()> {
         progress.shadow_sync_generation
     );
     assert_eq!(loaded.shadow_sync_offset, progress.shadow_sync_offset);
+    // B4 restart-window: the live-WAL read cursor, salt, and running checksum
+    // chain must round-trip so the first post-restart read resumes validated.
+    assert_eq!(loaded.wal_copy_offset, progress.wal_copy_offset);
+    assert_eq!(loaded.wal_salt, progress.wal_salt);
+    assert_eq!(loaded.wal_checksum_chain, progress.wal_checksum_chain);
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_pre_b4_shadow_progress_loads_with_safe_defaults() -> Result<()> {
+    // B4 back-compat: a shadow progress file written BEFORE the B4 read-cursor
+    // fields existed (no wal_copy_offset / wal_salt / wal_checksum_chain) must
+    // still load -- no panic, no parse error -- and fall back conservatively:
+    // wal_copy_offset defaults to 0 (re-read from the WAL head) and salt/chain
+    // to None (restore_read_cursor becomes a no-op, so nothing stale is seeded).
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("legacy-progress.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(
+            "CREATE TABLE marker (id INTEGER PRIMARY KEY);
+             INSERT INTO marker (id) VALUES (1);",
+        )?;
+    }
+    let shadow = ShadowWal::new(&db_path).await?;
+
+    // A pre-B4 record: exactly the fields that existed before this PR.
+    let legacy_json = format!(
+        r#"{{
+            "version": 1,
+            "current_txid": 42,
+            "last_snapshot": null,
+            "db_checksum": 12345,
+            "shadow_sync_generation": {},
+            "shadow_sync_offset": 4096
+        }}"#,
+        shadow.generation()
+    );
+    std::fs::write(
+        walrust_core::legacy_shadow_watch::shadow_progress_path(shadow.shadow_dir()),
+        legacy_json,
+    )?;
+
+    let loaded =
+        load_shadow_progress(&shadow, "legacy-progress")?.expect("pre-B4 progress must still load");
+    assert_eq!(loaded.current_txid, 42);
+    assert_eq!(loaded.shadow_sync_offset, 4096);
+    // The new fields must default to their conservative fallbacks.
+    assert_eq!(loaded.wal_copy_offset, 0, "missing field must default to 0");
+    assert_eq!(loaded.wal_salt, None, "missing salt must default to None");
+    assert_eq!(
+        loaded.wal_checksum_chain, None,
+        "missing chain must default to None"
+    );
     Ok(())
 }
 

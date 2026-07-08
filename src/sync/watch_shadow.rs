@@ -374,7 +374,7 @@ pub async fn watch_with_shadow(
         let mut shadow_sync_offset = 0;
 
         // Create shadow WAL manager (this holds the checkpoint blocker)
-        let shadow = match ShadowWal::new(db_path).await {
+        let mut shadow = match ShadowWal::new(db_path).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("{}: Failed to create shadow WAL: {}", name, e);
@@ -382,19 +382,27 @@ pub async fn watch_with_shadow(
             }
         };
 
+        let mut restored_wal_copy_offset = 0u64;
         if let Some(progress) = load_shadow_progress(&shadow, &name)? {
             tracing::info!(
-                "{}: restored durable shadow progress (TXID: {}, generation: {}, offset: {})",
+                "{}: restored durable shadow progress (TXID: {}, generation: {}, offset: {}, wal_copy_offset: {})",
                 name,
                 progress.current_txid,
                 progress.shadow_sync_generation,
-                progress.shadow_sync_offset
+                progress.shadow_sync_offset,
+                progress.wal_copy_offset
             );
             current_txid = progress.current_txid;
             last_snapshot = progress.last_snapshot;
             db_checksum = progress.db_checksum;
             shadow_sync_generation = progress.shadow_sync_generation;
             shadow_sync_offset = progress.shadow_sync_offset;
+            // B4 restart-window: resume the live-WAL read cursor from the
+            // persisted offset, seeding the salt + running checksum chain so
+            // the first post-restart read validates per-frame (and does not
+            // re-append the whole live WAL from offset 0).
+            restored_wal_copy_offset = progress.wal_copy_offset;
+            shadow.restore_read_cursor(progress.wal_salt, progress.wal_checksum_chain);
         }
 
         tracing::info!(
@@ -437,7 +445,7 @@ pub async fn watch_with_shadow(
                 shadow,
                 shadow_sync_generation,
                 shadow_sync_offset,
-                wal_copy_offset: 0,
+                wal_copy_offset: restored_wal_copy_offset,
             },
         );
 

@@ -12,6 +12,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::errors::WalrustError;
 use crate::ltx;
@@ -173,6 +174,52 @@ pub struct PullCursor {
     pub checksum: u64,
 }
 
+/// A loud replication event the core surfaces to an embedding process (the CLI
+/// binary, haqlite, ...). The core library has no webhook client of its own, so
+/// this is the plumbing an embedder wires to its own alert channel.
+#[derive(Debug, Clone)]
+pub struct RolloverEvent {
+    /// Database name.
+    pub db_name: String,
+    /// Which sync mode observed the rollover.
+    pub mode: &'static str,
+    /// Whether walrust recovered (re-anchored with a snapshot) or refused
+    /// (hard-failed pending an external re-anchor).
+    pub recovered: bool,
+    /// Human-readable detail for the alert.
+    pub message: String,
+}
+
+/// Optional sink for [`RolloverEvent`]s. Cloneable (shares one `Arc`) and
+/// `Debug` (so it can live on `SyncState`/`ReplicationConfig`) without exposing
+/// the closure. Default is a no-op.
+#[derive(Clone, Default)]
+pub struct RolloverObserver(Option<Arc<dyn Fn(RolloverEvent) + Send + Sync>>);
+
+impl std::fmt::Debug for RolloverObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "RolloverObserver(set)"
+        } else {
+            "RolloverObserver(none)"
+        })
+    }
+}
+
+impl RolloverObserver {
+    /// Build an observer from a callback.
+    pub fn new(f: impl Fn(RolloverEvent) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(f)))
+    }
+
+    /// Deliver an event if an observer is installed.
+    pub fn emit(&self, event: RolloverEvent) {
+        if let Some(f) = &self.0 {
+            f(event);
+        }
+    }
+}
+
 /// State for a single database being synced.
 #[derive(Debug, Clone)]
 pub struct SyncState {
@@ -209,6 +256,9 @@ pub struct SyncState {
     /// validation for the next incremental read so a torn tail frame is rejected
     /// rather than shipped.
     pub wal_checksum_chain: Option<(u32, u32)>,
+    /// Runtime-only sink for loud rollover events. Not persisted; the embedder
+    /// installs it (e.g. wired to the CLI's webhook sender).
+    pub rollover_observer: RolloverObserver,
 }
 
 impl SyncState {
@@ -240,6 +290,7 @@ impl SyncState {
             db_checksum: None,
             wal_salt: None,
             wal_checksum_chain: None,
+            rollover_observer: RolloverObserver::default(),
         })
     }
 
@@ -759,6 +810,130 @@ fn load_external_base_progress(state: &SyncState) -> Result<Option<ExternalBaseL
     Ok(Some(progress))
 }
 
+/// Local, fsynced write-ahead record of the walrust-owned changeset we are
+/// about to publish. It is the self-authorship proof the B11 crash-window
+/// recovery is gated on: a same-seq CAS conflict is only adopted as *our own*
+/// prior crashed publish if the object at that seq is byte-for-byte the one THIS
+/// process recorded here (matching lineage, seq, base checksum, AND the exact
+/// changeset checksum we computed). A second live writer sharing the same
+/// lineage/base -- the split-brain case -- records its OWN intent on its OWN
+/// disk, so its object's checksum never matches ours and the conflict correctly
+/// hard-fails instead of silently re-legitimizing split-brain.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PublishIntent {
+    version: u32,
+    lineage_id: Option<String>,
+    seq: u64,
+    pre_checksum: u64,
+    changeset_checksum: u64,
+}
+
+fn publish_intent_path(state: &SyncState) -> PathBuf {
+    local_progress_dir_for(&state.db_path).join("publish-intent.json")
+}
+
+/// Persist (temp + fsync + rename + dir fsync) the publish intent BEFORE the
+/// remote CAS put, so a crash in the put-then-save_state window leaves durable
+/// proof of what we published.
+fn save_publish_intent(
+    state: &SyncState,
+    seq: u64,
+    pre_checksum: u64,
+    changeset_checksum: u64,
+) -> Result<()> {
+    let intent_path = publish_intent_path(state);
+    let intent_dir = intent_path
+        .parent()
+        .ok_or_else(|| anyhow!("invalid publish-intent path {}", intent_path.display()))?;
+    fs::create_dir_all(intent_dir).map_err(|e| {
+        anyhow!(
+            "{}: failed to create local publish-intent directory {}: {}",
+            state.name,
+            intent_dir.display(),
+            e
+        )
+    })?;
+
+    let tmp_path = intent_path.with_extension("json.tmp");
+    let intent = PublishIntent {
+        version: 1,
+        lineage_id: state.lineage_id.clone(),
+        seq,
+        pre_checksum,
+        changeset_checksum,
+    };
+    let bytes = serde_json::to_vec_pretty(&intent)?;
+    {
+        let mut file = File::create(&tmp_path).map_err(|e| {
+            anyhow!(
+                "{}: failed to create temporary publish-intent file {}: {}",
+                state.name,
+                tmp_path.display(),
+                e
+            )
+        })?;
+        file.write_all(&bytes).map_err(|e| {
+            anyhow!(
+                "{}: failed to write temporary publish-intent file {}: {}",
+                state.name,
+                tmp_path.display(),
+                e
+            )
+        })?;
+        file.sync_all().map_err(|e| {
+            anyhow!(
+                "{}: failed to fsync temporary publish-intent file {}: {}",
+                state.name,
+                tmp_path.display(),
+                e
+            )
+        })?;
+    }
+    fs::rename(&tmp_path, &intent_path).map_err(|e| {
+        anyhow!(
+            "{}: failed to install publish-intent file {}: {}",
+            state.name,
+            intent_path.display(),
+            e
+        )
+    })?;
+    fsync_dir(intent_dir)?;
+    Ok(())
+}
+
+fn load_publish_intent(state: &SyncState) -> Result<Option<PublishIntent>> {
+    let intent_path = publish_intent_path(state);
+    let bytes = match fs::read(&intent_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow!(
+                "{}: failed to read local publish-intent file {}: {}",
+                state.name,
+                intent_path.display(),
+                e
+            ));
+        }
+    };
+    let intent: PublishIntent = serde_json::from_slice(&bytes).map_err(|e| {
+        anyhow!(
+            "{}: failed to parse local publish-intent file {}: {}",
+            state.name,
+            intent_path.display(),
+            e
+        )
+    })?;
+    if intent.version != 1 {
+        anyhow::bail!(
+            "{}: unsupported publish-intent version {} in {}",
+            state.name,
+            intent.version,
+            intent_path.display()
+        );
+    }
+    Ok(Some(intent))
+}
+
 // ============================================================================
 // Core sync operations
 // ============================================================================
@@ -834,13 +1009,11 @@ async fn put_changeset_if_absent(
             )
         })?;
     if existing != bytes {
-        anyhow::bail!(
+        return Err(WalrustError::equivocation(format!(
             "{}: {} duplicate changeset seq {}; refusing overwrite at {}",
-            db_name,
-            mode,
-            seq,
-            key
-        );
+            db_name, mode, seq, key
+        ))
+        .into());
     }
 
     tracing::info!(
@@ -850,6 +1023,60 @@ async fn put_changeset_if_absent(
         seq
     );
     Ok(())
+}
+
+/// B11 crash-window discriminator. Returns `Some(post_checksum)` only when the
+/// object already at `key` is provably *our own* prior publish for `seq` — the
+/// signature of a put that succeeded durably but whose `save_state` never ran
+/// before a crash. Two conditions must BOTH hold:
+///
+/// 1. `prior_intent` — the local, fsynced write-ahead record THIS process wrote
+///    before that put — names this exact publish (matching lineage, seq, and
+///    base checksum). A process that never published this object has no such
+///    record; a different writer records its own intent on its own disk.
+/// 2. The stored object decodes as a physical changeset at `seq` whose
+///    `prev_checksum` equals our base checksum AND whose checksum is
+///    byte-for-byte the one we recorded in the intent.
+///
+/// This is what distinguishes a self-crash from a second live writer sharing the
+/// same lineage/base (split-brain): the second writer's object encodes different
+/// bytes, so its checksum never matches our recorded intent, and the conflict
+/// correctly hard-fails instead of being silently adopted. Returns `None` (=>
+/// hard equivocation) for a missing/mismatched intent, undecodable bytes, a
+/// different base, or a checksum that is not the one we authored.
+async fn existing_changeset_is_our_publish(
+    storage: &dyn StorageBackend,
+    key: &str,
+    seq: u64,
+    our_pre_checksum: u64,
+    lineage_id: Option<&str>,
+    prior_intent: Option<&PublishIntent>,
+) -> Result<Option<u64>> {
+    let Some(intent) = prior_intent else {
+        return Ok(None);
+    };
+    // The local write-ahead record must name THIS publish (self-authorship).
+    if intent.seq != seq
+        || intent.pre_checksum != our_pre_checksum
+        || intent.lineage_id.as_deref() != lineage_id
+    {
+        return Ok(None);
+    }
+    let Some(existing) = storage.get(key).await? else {
+        return Ok(None);
+    };
+    let decoded = match ltx::decode_sqlite_changeset(&existing) {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    if decoded.header.seq == seq
+        && decoded.header.prev_checksum == our_pre_checksum
+        && decoded.checksum == intent.changeset_checksum
+    {
+        Ok(Some(decoded.checksum))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Result of reading the next batch of WAL frames for a sync site.
@@ -986,6 +1213,15 @@ async fn sync_wal_with_sequence(
                     "{}: WAL rollover detected; publishing a new snapshot instead of an incremental across the gap",
                     state.name
                 );
+                state.rollover_observer.emit(RolloverEvent {
+                    db_name: state.name.clone(),
+                    mode: "walrust-owned",
+                    recovered: true,
+                    message: format!(
+                        "{}: WAL rollover detected; re-anchoring with a fresh snapshot",
+                        state.name
+                    ),
+                });
                 take_snapshot(storage, prefix, state).await?;
                 save_state(storage, prefix, state).await?;
                 return Ok(1);
@@ -995,10 +1231,17 @@ async fn sync_wal_with_sequence(
                 state.wal_generation = previous_wal_generation;
                 state.wal_salt = previous_wal_salt;
                 state.wal_checksum_chain = previous_wal_checksum_chain;
-                anyhow::bail!(
+                let message = format!(
                     "{}: WAL rollover detected after external base; refusing to publish deltas until the external base is re-anchored",
                     state.name
                 );
+                state.rollover_observer.emit(RolloverEvent {
+                    db_name: state.name.clone(),
+                    mode: "external-base",
+                    recovered: false,
+                    message: message.clone(),
+                });
+                anyhow::bail!(message);
             }
         }
     }
@@ -1056,7 +1299,14 @@ async fn sync_wal_with_sequence(
             .await?;
         }
         DeltaSequence::WalrustOwned => {
-            put_changeset_if_absent(
+            // B11: load the PRIOR local publish-intent (the pre-crash one, if
+            // any) BEFORE overwriting it -- that is the self-authorship proof a
+            // same-seq conflict is checked against -- then durably record the
+            // intent for THIS publish ahead of the CAS put so a crash in the
+            // put-then-save_state window leaves proof of what we published.
+            let prior_intent = load_publish_intent(state)?;
+            save_publish_intent(state, new_seq, pre_checksum, post_checksum)?;
+            if let Err(e) = put_changeset_if_absent(
                 storage,
                 &changeset_key,
                 &changeset_bytes,
@@ -1064,7 +1314,52 @@ async fn sync_wal_with_sequence(
                 new_seq,
                 "walrust-owned",
             )
-            .await?;
+            .await
+            {
+                // B11 recovery: close the put-then-save_state crash window.
+                // If the conflicting object is PROVABLY our own prior publish at
+                // this seq (matching local publish-intent + byte-identical
+                // checksum, see existing_changeset_is_our_publish), adopt it as
+                // committed and re-anchor with a fresh snapshot so any frames
+                // written after the crash are folded in. A foreign object, a
+                // second live writer's divergent object, or garbage still
+                // propagates as a hard equivocation error.
+                if WalrustError::is_equivocation(&e) {
+                    if let Some(adopted_post) = existing_changeset_is_our_publish(
+                        storage,
+                        &changeset_key,
+                        new_seq,
+                        pre_checksum,
+                        state.lineage_id.as_deref(),
+                        prior_intent.as_ref(),
+                    )
+                    .await?
+                    {
+                        tracing::error!(
+                            "{}: same-seq changeset conflict at seq {} from a prior crashed publish; \
+                             adopting it and re-anchoring with a fresh snapshot",
+                            state.name,
+                            new_seq
+                        );
+                        state.rollover_observer.emit(RolloverEvent {
+                            db_name: state.name.clone(),
+                            mode: "walrust-owned",
+                            recovered: true,
+                            message: format!(
+                                "{}: same-seq changeset conflict at seq {} from a prior crashed publish; re-anchoring with a fresh snapshot",
+                                state.name, new_seq
+                            ),
+                        });
+                        state.current_seq = new_seq;
+                        state.current_txid = max_txid;
+                        state.db_checksum = Some(adopted_post);
+                        take_snapshot(storage, prefix, state).await?;
+                        save_state(storage, prefix, state).await?;
+                        return Ok(1);
+                    }
+                }
+                return Err(e);
+            }
         }
     }
 
@@ -1344,11 +1639,12 @@ pub async fn publish_delta_envelope(
                 )
             })?;
         if existing != envelope {
-            anyhow::bail!(
+            return Err(WalrustError::equivocation(format!(
                 "{db_name}: delta envelope seq {} already exists with different bytes at {key}; \
                  refusing overwrite (writer equivocation at the same seq)",
                 payload.seq
-            );
+            ))
+            .into());
         }
         tracing::info!(
             "{db_name}: delta envelope seq {} already present with identical bytes; idempotent re-publish",
@@ -1482,10 +1778,17 @@ pub async fn sync_wal_fenced_delta(
         state.wal_generation = previous_wal_generation;
         state.wal_salt = previous_wal_salt;
         state.wal_checksum_chain = previous_wal_checksum_chain;
-        anyhow::bail!(
+        let message = format!(
             "{}: WAL rollover detected in fenced external mode; refusing to publish deltas until the external base is re-anchored",
             state.name
         );
+        state.rollover_observer.emit(RolloverEvent {
+            db_name: state.name.clone(),
+            mode: "fenced-external",
+            recovered: false,
+            message: message.clone(),
+        });
+        anyhow::bail!(message);
     }
 
     if page_map.is_empty() {
@@ -2392,6 +2695,9 @@ pub struct ReplicationConfig {
     /// `External` means some other layer owns the checkpointed base state
     /// and walrust should only ship / replay WAL deltas after that point.
     pub snapshot_ownership: SnapshotOwnership,
+    /// Optional sink for loud rollover events (re-anchor / refusal). The core
+    /// has no webhook client; an embedder wires this to its own alert channel.
+    pub rollover_observer: RolloverObserver,
 }
 
 /// Ownership of the base database state.
@@ -2418,6 +2724,7 @@ impl Default for ReplicationConfig {
             db_name: None,
             autonomous_snapshots: true,
             snapshot_ownership: SnapshotOwnership::Walrust,
+            rollover_observer: RolloverObserver::default(),
         }
     }
 }
@@ -2461,6 +2768,7 @@ pub async fn run_replication(
     if let Some(ref name) = config.db_name {
         state.name = name.clone();
     }
+    state.rollover_observer = config.rollover_observer.clone();
 
     if db_path.exists() {
         state.init_checksum()?;
@@ -2543,6 +2851,9 @@ pub async fn run_wal_replication(
     config.validate()?;
     state.current_seq = initial_seq;
     state.current_txid = initial_seq; // Keep txid in sync for initial state
+    if state.rollover_observer.0.is_none() {
+        state.rollover_observer = config.rollover_observer.clone();
+    }
 
     if state.db_checksum.is_none() && state.db_path.exists() {
         state.init_checksum()?;
@@ -4441,6 +4752,233 @@ mod tests {
             storage.get(&key).await.unwrap(),
             Some(existing),
             "failed CAS publish must leave the existing object intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn walrust_owned_reanchors_after_crash_window_same_seq_conflict() {
+        // B11: a crash between a durable changeset put and its save_state
+        // leaves our own object at seq N. On restart we reload the stale
+        // cursor; if more commits landed we re-encode *different* bytes at
+        // seq N. Recovery must adopt the durable object and re-anchor with a
+        // fresh snapshot (no wedge, no data loss), not hard-fail.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("owned-crash.db");
+        let restored_path = dir.path().join("restored.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            ",
+        )
+        .unwrap();
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path.clone()).unwrap();
+        state.name = "owned_crash".to_string();
+        state.init_checksum().unwrap();
+        take_snapshot_with_retry(&storage, "p/", &mut state, &RetryPolicy::default_policy())
+            .await
+            .unwrap();
+
+        // Snapshot of the reload cursor as it would be persisted BEFORE the
+        // seq-2 incremental publishes (i.e. what a crashed process reloads).
+        let crashed_seq = state.current_seq;
+        let crashed_txid = state.current_txid;
+        let crashed_checksum = state.db_checksum;
+        let crashed_offset = state.wal_offset;
+        let crashed_gen = state.wal_generation;
+        let crashed_salt = state.wal_salt;
+        let crashed_chain = state.wal_checksum_chain;
+
+        // Durable publish of seq 2 (this is the write that survives the crash).
+        conn.execute("INSERT INTO items (id, value) VALUES (2, 'delta')", [])
+            .unwrap();
+        sync_wal(&storage, "p/", &mut state).await.unwrap();
+        let seq2_key = build_changeset_key("p/", &state.name, GENERATION_LIVE, 2);
+        assert!(
+            storage.get(&seq2_key).await.unwrap().is_some(),
+            "seq 2 incremental must be durably published pre-crash"
+        );
+
+        // Simulate the crash: save_state never ran, so reload the stale cursor.
+        state.current_seq = crashed_seq;
+        state.current_txid = crashed_txid;
+        state.db_checksum = crashed_checksum;
+        state.wal_offset = crashed_offset;
+        state.wal_generation = crashed_gen;
+        state.wal_salt = crashed_salt;
+        state.wal_checksum_chain = crashed_chain;
+
+        // A new commit lands after the crash, before the next sync.
+        conn.execute(
+            "INSERT INTO items (id, value) VALUES (3, 'after-crash')",
+            [],
+        )
+        .unwrap();
+
+        // The next sync re-encodes different bytes at seq 2 -> CAS conflict ->
+        // recovery re-anchors with a snapshot at seq 3.
+        sync_wal(&storage, "p/", &mut state)
+            .await
+            .expect("crash-window conflict must recover, not wedge");
+        assert_eq!(
+            state.current_seq, 3,
+            "re-anchor must land a snapshot at seq 3"
+        );
+        let snap3_key = build_changeset_key("p/", &state.name, GENERATION_SNAPSHOT, 3);
+        assert!(
+            storage.get(&snap3_key).await.unwrap().is_some(),
+            "recovery must publish a fresh snapshot at seq 3"
+        );
+
+        // Restore must round-trip all three committed rows.
+        restore(&storage, "p/", &state.name, &restored_path, None)
+            .await
+            .expect("restore after re-anchor");
+        let rconn = rusqlite::Connection::open(&restored_path).unwrap();
+        let count: i64 = rconn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "all rows including the post-crash commit must restore"
+        );
+        let integrity: String = rconn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn walrust_owned_sync_rejects_foreign_same_seq_changeset() {
+        // B11 discriminator: a same-seq object that is NOT our own prefix
+        // (undecodable/foreign bytes) must remain a hard equivocation error,
+        // never silently re-anchored.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("owned-foreign.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            ",
+        )
+        .unwrap();
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path.clone()).unwrap();
+        state.name = "owned_foreign".to_string();
+        state.init_checksum().unwrap();
+        take_snapshot_with_retry(&storage, "p/", &mut state, &RetryPolicy::default_policy())
+            .await
+            .unwrap();
+
+        conn.execute("INSERT INTO items (id, value) VALUES (2, 'delta')", [])
+            .unwrap();
+        let next_seq = state.current_seq + 1;
+        let key = build_changeset_key("p/", &state.name, GENERATION_LIVE, next_seq);
+        storage
+            .put(&key, b"foreign non-changeset bytes")
+            .await
+            .unwrap();
+
+        let err = sync_wal(&storage, "p/", &mut state)
+            .await
+            .expect_err("foreign same-seq object must hard-fail");
+        assert!(
+            WalrustError::is_equivocation(&err),
+            "must be a typed equivocation error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn walrust_owned_sync_rejects_second_writer_same_base_same_seq() {
+        // B11 split-brain: TWO live writers that share the same lineage/base
+        // (e.g. an HA failover where the promoted node restored from the same
+        // backup and the original node came back) each publish a DIFFERENT
+        // changeset at the same seq with the SAME prev_checksum (both anchored
+        // at the shared base state). The crash-window discriminator must NOT
+        // misclassify the OTHER writer's object as our own crashed publish and
+        // silently adopt it -- that would re-legitimize split-brain. It must
+        // hard-fail loudly so the operator sees the equivocation, because a
+        // process that never itself published this object has no self-authorship
+        // proof for it.
+        let storage = MutStorage::new();
+
+        // Writer B establishes the shared stream: base + snapshot at seq 1.
+        let dir_b = tempfile::TempDir::new().unwrap();
+        let db_b = dir_b.path().join("split.db");
+        let conn_b = rusqlite::Connection::open(&db_b).unwrap();
+        conn_b
+            .execute_batch(
+                "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            ",
+            )
+            .unwrap();
+        let mut state_b = SyncState::new(db_b.clone()).unwrap();
+        state_b.name = "split".to_string();
+        state_b.init_checksum().unwrap();
+        take_snapshot_with_retry(&storage, "p/", &mut state_b, &RetryPolicy::default_policy())
+            .await
+            .unwrap();
+
+        // The shared base cursor both writers restore to.
+        let base_seq = state_b.current_seq;
+        let base_checksum = state_b.db_checksum;
+
+        // Writer A is a SECOND live writer on its own physical DB, anchored to
+        // the SAME lineage (same name/prefix => same key namespace) and the SAME
+        // base checksum -- the split-brain precondition after a shared restore.
+        let dir_a = tempfile::TempDir::new().unwrap();
+        let db_a = dir_a.path().join("split.db");
+        let conn_a = rusqlite::Connection::open(&db_a).unwrap();
+        conn_a
+            .execute_batch(
+                "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            INSERT INTO items (id, value) VALUES (2, 'from-A');
+            ",
+            )
+            .unwrap();
+        let mut state_a = SyncState::new(db_a.clone()).unwrap();
+        state_a.name = "split".to_string();
+        state_a.current_seq = base_seq;
+        state_a.db_checksum = base_checksum;
+
+        // Writer B publishes a real seq-2 changeset (its own divergent data).
+        conn_b
+            .execute("INSERT INTO items (id, value) VALUES (2, 'from-B')", [])
+            .unwrap();
+        sync_wal(&storage, "p/", &mut state_b).await.unwrap();
+        let seq2_key = build_changeset_key("p/", "split", GENERATION_LIVE, base_seq + 1);
+        assert!(
+            storage.get(&seq2_key).await.unwrap().is_some(),
+            "writer B must have published seq {}",
+            base_seq + 1
+        );
+
+        // Writer A now tries to publish ITS OWN seq-2 changeset. Same seq, same
+        // prev_checksum (shared base), different bytes => CAS conflict. A did not
+        // publish B's object, so it must NOT adopt it -- hard-fail loudly.
+        let err = sync_wal(&storage, "p/", &mut state_a)
+            .await
+            .expect_err("a second writer's same-seq object must hard-fail, not be adopted");
+        assert!(
+            WalrustError::is_equivocation(&err),
+            "second-writer conflict must surface as a typed equivocation, got: {err}"
         );
     }
 
