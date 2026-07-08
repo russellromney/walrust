@@ -559,6 +559,14 @@ pub async fn snapshot_database_to_storage(
     name: &str,
     database: &Path,
 ) -> Result<SnapshotUploadOutput> {
+    // Best-effort PASSIVE checkpoint before encoding. This path is shared by the
+    // shadow watch loop, whose checkpoint blocker deliberately pins a live WAL
+    // frame — a TRUNCATE here would hard-fail with busy!=0 on every tick, and the
+    // shadow WAL already carries any un-folded frames as incrementals, so a full
+    // fold is neither possible nor required here. The manual `walrust snapshot`
+    // command (which has no shadow to carry incrementals) performs its own
+    // completeness-checked TRUNCATE fold before calling this (see
+    // `sync::compact::snapshot`).
     checkpoint_wal_passive(database).await?;
 
     let page_size = get_page_size(database).await?;

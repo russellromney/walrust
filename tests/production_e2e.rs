@@ -95,6 +95,17 @@ fn write_pin_frame(conn: &Connection, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Force a TRUNCATE checkpoint from `conn`. Returns the `(busy, log, checkpointed)`
+/// result row. When a reader pins a live WAL frame (e.g. the shadow blocker),
+/// `busy` will be non-zero and the WAL is NOT reset — this is the mechanism under
+/// test in the racing variants.
+fn force_truncate_checkpoint(conn: &Connection) -> Result<(i64, i64, i64)> {
+    let row = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+    })?;
+    Ok(row)
+}
+
 fn append_rows(conn: &Connection, start: i64, end: i64, label: &str) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let result = (|| -> Result<()> {
@@ -229,6 +240,39 @@ fn spawn_cli_watch(
         watch.arg("--endpoint").arg(endpoint);
     }
     watch.spawn().context("spawn walrust watch")
+}
+
+/// Spawn `walrust watch --independent-tasks` with a short snapshot interval, for
+/// exercising the independent (poll) mode's periodic-snapshot re-anchor (B6).
+fn spawn_cli_watch_independent(
+    db_path: &Path,
+    bucket_arg: &str,
+    endpoint: Option<&str>,
+    snapshot_interval_secs: u64,
+) -> Result<Child> {
+    let mut watch = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    watch
+        .arg("watch")
+        .arg(db_path)
+        .arg("--bucket")
+        .arg(bucket_arg)
+        .arg("--independent-tasks")
+        .arg("--snapshot-interval")
+        .arg(snapshot_interval_secs.to_string())
+        .arg("--wal-sync-interval")
+        .arg("1")
+        .arg("--checkpoint-interval")
+        .arg("999999")
+        .arg("--on-startup")
+        .arg("true")
+        .arg("--no-metrics")
+        .arg("--no-cache");
+    if let Some(endpoint) = endpoint {
+        watch.arg("--endpoint").arg(endpoint);
+    }
+    watch
+        .spawn()
+        .context("spawn walrust watch --independent-tasks")
 }
 
 struct CoreSigkillHelperArgs<'a> {
@@ -522,6 +566,167 @@ async fn e2e_core_replicator_restore_round_trips_sqlite_rows() -> Result<()> {
     assert_integrity_ok(&restored_path)?;
     assert_eq!(rows(&db_path)?, rows(&restored_path)?);
 
+    Ok(())
+}
+
+/// RACING variant (closes the A3/A4 Phase-2A scope note): a co-resident external
+/// connection with autocheckpoint enabled AND explicit TRUNCATE checkpoints races
+/// the in-flight core flush, with NO pinned reader suppressing it. The
+/// walrust-owned engine must re-anchor (re-snapshot from the main DB, into which
+/// the checkpoint folded the frames) rather than silently drop them.
+#[tokio::test]
+async fn e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss() -> Result<()> {
+    require_s3!("e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss");
+    let temp = TempDir::new()?;
+    let name = unique_name("core-race-e2e");
+    let prefix = format!("e2e/{name}/");
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+
+    let _setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_autocheckpoint_connection(&db_path)?;
+
+    let storage = walrust::s3_backend_from_env(test_bucket(), test_endpoint().as_deref()).await?;
+    let replicator =
+        walrust::walrust_core::Replicator::new(storage, &prefix, core_replicator_config());
+    replicator.add(&name, &db_path).await?;
+
+    // No pin_read_transaction: the external TRUNCATE checkpoints DO reset the WAL
+    // and fold committed frames into the main DB, starting new generations. Each
+    // flush after a rollover must re-anchor with a fresh snapshot.
+    append_rows(&writer, 6, 10, "race")?;
+    let (busy1, _, _) = force_truncate_checkpoint(&writer)?;
+    anyhow::ensure!(
+        busy1 == 0,
+        "unpinned external TRUNCATE should reset the WAL (busy={busy1})"
+    );
+    replicator.flush(&name).await?; // observe rollover 1 -> re-snapshot
+
+    append_rows(&writer, 11, 15, "race")?;
+    force_truncate_checkpoint(&writer)?; // rollover 2 (rows 11-15 folded)
+    replicator.flush(&name).await?; // observe rollover 2 -> re-snapshot
+
+    append_rows(&writer, 16, 20, "race")?; // stays in the fresh WAL
+    for _ in 0..5 {
+        replicator.flush(&name).await?;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let expected = rows(&db_path)?;
+    let restored_seq = replicator.restore(&name, &restored_path).await?;
+    anyhow::ensure!(
+        restored_seq.is_some(),
+        "restore should find data after racing checkpoints"
+    );
+    assert_integrity_ok(&restored_path)?;
+    assert_eq!(
+        expected,
+        rows(&restored_path)?,
+        "no data loss across racing external checkpoints"
+    );
+
+    Ok(())
+}
+
+/// RACING variant for the CLI shadow watch stack (closes the A3/A4 Phase-2A scope
+/// note): NO pinned reader; an external autocheckpoint connection issues explicit
+/// TRUNCATE checkpoints racing the live watch sync. The shadow blocker pins a live
+/// WAL frame, so the external checkpoints must be blocked (or captured) and restore
+/// must round-trip every committed row. If the watcher instead dies, that is a loud
+/// failure we surface — never silent loss.
+#[test]
+fn e2e_cli_watch_racing_checkpoint_no_data_loss() -> Result<()> {
+    require_s3!("e2e_cli_watch_racing_checkpoint_no_data_loss");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-race");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "cli-race")?;
+
+    // Deliberately NO pin_read_transaction — this is the racing variant.
+    let mut child = spawn_cli_watch(&db_path, &bucket_arg, endpoint.as_deref(), true)?;
+    std::thread::sleep(Duration::from_secs(2)); // let watch attach its checkpoint blocker
+
+    for batch in 0..3i64 {
+        let start = 6 + batch * 5;
+        append_rows(&writer, start, start + 4, "cli-race")?;
+        // Race an explicit TRUNCATE against the in-flight watch sync. With the
+        // shadow blocker pinning a live frame this returns busy != 0 and does not
+        // reset the WAL; either way it must not cause data loss.
+        let _ = force_truncate_checkpoint(&writer);
+        std::thread::sleep(Duration::from_millis(400));
+    }
+
+    let expected_rows = rows(&db_path)?;
+
+    if let Some(status) = child.try_wait()? {
+        anyhow::bail!("watch process exited early during checkpoint race: {status}");
+    }
+
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected_rows,
+    )?;
+
+    stop_child(&mut child);
+    Ok(())
+}
+
+/// B6: the independent (poll) watch mode now runs a periodic snapshot timer, so a
+/// low-write DB whose WAL is reset by an external checkpoint still re-anchors its
+/// remote base on a cadence. Drive the real independent watch task through a
+/// checkpoint reset and assert the backup still round-trips.
+#[test]
+fn e2e_cli_watch_independent_snapshot_timer_round_trips_through_reset() -> Result<()> {
+    require_s3!("e2e_cli_watch_independent_snapshot_timer_round_trips_through_reset");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-indep");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+
+    let _setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_autocheckpoint_connection(&db_path)?;
+
+    // Short snapshot interval so the periodic re-anchor fires during the test.
+    let mut child = spawn_cli_watch_independent(&db_path, &bucket_arg, endpoint.as_deref(), 2)?;
+    std::thread::sleep(Duration::from_secs(2));
+
+    append_rows(&writer, 6, 10, "indep")?;
+    // Independent mode holds no checkpoint blocker, so this reset succeeds and
+    // folds rows into the main DB; the snapshot timer must re-anchor from it.
+    force_truncate_checkpoint(&writer)?;
+    append_rows(&writer, 11, 12, "indep")?;
+
+    // Let the 2s snapshot timer fire at least once past the reset.
+    std::thread::sleep(Duration::from_secs(5));
+
+    let expected_rows = rows(&db_path)?;
+
+    if let Some(status) = child.try_wait()? {
+        anyhow::bail!("independent watch exited early: {status}");
+    }
+
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected_rows,
+    )?;
+
+    stop_child(&mut child);
     Ok(())
 }
 

@@ -276,3 +276,53 @@ async fn legacy_manual_snapshot_is_owned_by_core() -> Result<()> {
     assert!(output.size_bytes > 0);
     Ok(())
 }
+
+#[tokio::test]
+async fn legacy_manual_snapshot_folds_wal_resident_rows() -> Result<()> {
+    // B10 regression guard: an unblocked snapshot must fold WAL-resident commits
+    // into the base image rather than encode a stale main-DB file. With no
+    // concurrent reader the PASSIVE checkpoint in snapshot_database_to_storage
+    // folds everything; keep rows in an uncheckpointed WAL, snapshot, decode the
+    // LTX, and assert every row is present. (The manual `walrust snapshot` command
+    // adds a completeness-checked TRUNCATE fold on top of this — see
+    // sync::compact::snapshot — so it fails closed if a watcher pins the WAL.)
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("fold-source.db");
+    {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        // Prevent auto-checkpoint so the rows stay resident in the WAL, not the
+        // main DB file — the exact condition a PASSIVE checkpoint could miss.
+        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT);")?;
+        for id in 1..=25 {
+            conn.execute(
+                "INSERT INTO t (id, value) VALUES (?1, ?2)",
+                rusqlite::params![id, format!("row-{id}")],
+            )?;
+        }
+        // Row data now lives in the -wal file; the main DB file is still empty of
+        // these rows. Do NOT checkpoint here.
+    }
+
+    let storage = MemoryStorage::default();
+    let output = snapshot_database_to_storage(&storage, "backups", "fold-source", &db_path).await?;
+
+    let bytes = storage
+        .get(&output.key)
+        .await?
+        .expect("snapshot object should exist");
+
+    let restored = dir.path().join("restored.db");
+    walrust_core::legacy_ltx::decode_to_db(std::io::Cursor::new(bytes), &restored)?;
+
+    let conn = rusqlite::Connection::open(&restored)?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))?;
+    assert_eq!(
+        count, 25,
+        "all WAL-resident rows must be folded into snapshot"
+    );
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    assert_eq!(integrity, "ok");
+    Ok(())
+}
