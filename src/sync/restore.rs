@@ -18,20 +18,80 @@ struct CachedLegacyStorage {
     cache: Option<LocalCache>,
 }
 
-fn key_max_txid(key: &str) -> Option<u64> {
+/// Parse the (min_txid, max_txid) interval an object KEY names.
+///
+/// Canonical keys are `db/GEN/min-max.ltx`; the legacy flat shape `00000003.ltx`
+/// covers a single TXID (min == max).
+fn key_txid_range(key: &str) -> Option<(u64, u64)> {
     let filename = key.rsplit('/').next().unwrap_or(key);
     parse_ltx_filename(filename)
-        .map(|(_, max_txid)| max_txid)
-        .or_else(|| parse_legacy_flat_ltx_filename(filename))
+        .or_else(|| parse_legacy_flat_ltx_filename(filename).map(|txid| (txid, txid)))
+}
+
+/// Decide whether the local cache can satisfy a request for `key`.
+///
+/// Returns `Some(bytes)` ONLY when the cache holds an LTX that (a) decodes and
+/// verifies internally (`verify_ltx`, which runs even for litestream NO_CHECKSUM
+/// files) and (b) whose encoded `(min, max)` TXID range matches the range the KEY
+/// names. A bare max-TXID match is NOT sufficient (B13): two objects from
+/// different generations / lineages can share a max TXID, and substituting one
+/// for the other silently corrupts a restore. Any mismatch or verification
+/// failure returns `None` so the caller falls back to authoritative remote
+/// storage instead of trusting an ambiguous local copy.
+fn cache_substitute_for_key(cache: &LocalCache, key: &str) -> Option<Vec<u8>> {
+    let (min_txid, max_txid) = key_txid_range(key)?;
+    if !cache.has_txid(max_txid) {
+        return None;
+    }
+    let bytes = match cache.read_ltx(max_txid) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!(
+                "Cache read for TXID {} failed ({e}); falling back to S3",
+                max_txid
+            );
+            return None;
+        }
+    };
+    match walrust_core::legacy_ltx::verify_ltx(std::io::Cursor::new(&bytes)) {
+        Ok(header) => {
+            let cached = (header.min_txid.into_inner(), header.max_txid.into_inner());
+            if cached == (min_txid, max_txid) {
+                tracing::debug!(
+                    "Reading TXID {}-{} from cache for {}",
+                    min_txid,
+                    max_txid,
+                    key
+                );
+                Some(bytes)
+            } else {
+                tracing::warn!(
+                    "Cache entry for max TXID {} spans {:?} but key {} names {:?}; \
+                     not substituting (lineage/generation mismatch), falling back to S3",
+                    max_txid,
+                    cached,
+                    key,
+                    (min_txid, max_txid)
+                );
+                None
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Cached LTX for TXID {} failed verification ({e}); falling back to S3",
+                max_txid
+            );
+            None
+        }
+    }
 }
 
 #[async_trait]
 impl StorageBackend for CachedLegacyStorage {
     async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-        if let (Some(cache), Some(txid)) = (&self.cache, key_max_txid(key)) {
-            if cache.has_txid(txid) {
-                tracing::debug!("Reading TXID {} from cache", txid);
-                return Ok(Some(cache.read_ltx(txid)?));
+        if let Some(cache) = &self.cache {
+            if let Some(bytes) = cache_substitute_for_key(cache, key) {
+                return Ok(Some(bytes));
             }
         }
         self.s3
@@ -217,4 +277,51 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use walrust_core::legacy_manifest::build_ltx_key;
+
+    fn make_snapshot_ltx(txid: u64) -> Vec<u8> {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("src.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t (v) VALUES ('a'), ('b'), ('c');",
+        )
+        .unwrap();
+        drop(conn);
+        let (bytes, _cs) =
+            walrust_core::legacy_ltx::encode_sqlite_snapshot_to_vec(&db_path, 4096, txid).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn cache_substitution_binds_to_key_txid_range_not_bare_txid() {
+        // A snapshot LTX always spans (1, txid).
+        let bytes = make_snapshot_ltx(5);
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = LocalCache::new_at(cache_dir.path()).unwrap();
+        cache.write_snapshot_ltx(5, &bytes).unwrap();
+
+        // Matching key db/GEN/1-5.ltx: range (1,5) matches the cached bytes.
+        let matching = build_ltx_key("prefix", "db", 1, 1, 5);
+        assert_eq!(
+            cache_substitute_for_key(&cache, &matching).as_deref(),
+            Some(bytes.as_slice()),
+            "matching range must substitute from cache"
+        );
+
+        // Divergent key with the SAME max TXID but a different min names a
+        // DIFFERENT object (e.g. an incremental 3-5). Bare-TXID substitution (the
+        // B13 bug) returns the wrong cached bytes; the fix must refuse it.
+        let divergent = build_ltx_key("prefix", "db", 0, 3, 5);
+        assert!(
+            cache_substitute_for_key(&cache, &divergent).is_none(),
+            "same max TXID but different range must NOT be substituted from cache (B13)"
+        );
+    }
 }
