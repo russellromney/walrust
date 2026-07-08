@@ -1378,6 +1378,104 @@ mod tests {
         tokio::fs::remove_file(&path).await.ok();
     }
 
+    /// Build a large valid WAL whose checked read spans enough spawn_blocking
+    /// round-trips that a mid-read reset (rename) reliably lands after the
+    /// reader has opened its fd but before it runs the post-read guard.
+    fn build_large_valid_wal(
+        page_size: u32,
+        salt: (u32, u32),
+        frame_count: u32,
+        fill: u8,
+    ) -> Vec<u8> {
+        let frames: Vec<(u32, u32, u8)> = (0..frame_count)
+            .map(|i| (i % 64 + 1, 100u32, fill.wrapping_add((i & 0xFF) as u8)))
+            .collect();
+        build_valid_wal(page_size, salt, &frames)
+    }
+
+    // B1 CALL-SITE COVERAGE: the two tests below drive the guard through the
+    // REAL checked reader (not the helper directly), so neutering the call at
+    // the reader's call site makes them fail. They exploit Unix open-fd
+    // semantics: the reader opens its fd on generation A, a concurrent task
+    // atomically renames a different-generation file over the path mid-read,
+    // and the reader keeps reading generation A from its held fd while the
+    // post-read `detect_reset_during_read` re-opens the path and sees the reset.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_checked_reader_call_site_rejects_reset_shrink_during_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("racing-shrink.db-wal");
+        let page_size = 4096u32;
+        let salt = (0x1111_1111u32, 0x2222_2222u32);
+
+        // Large gen-A WAL (~12 MiB, thousands of spawn_blocking read round-trips).
+        let gen_a = build_large_valid_wal(page_size, salt, 3000, 0xA0);
+        tokio::fs::write(&path, &gen_a).await.unwrap();
+
+        // Small gen-B WAL (checkpoint TRUNCATE + restart shrinks the file).
+        let gen_b = build_valid_wal(
+            page_size,
+            (0x3333_3333, 0x4444_4444),
+            &[(1, 1, 0xEE), (2, 2, 0xFF)],
+        );
+        let gen_b_path = dir.path().join("racing-shrink.db-wal.genB");
+        tokio::fs::write(&gen_b_path, &gen_b).await.unwrap();
+
+        let path2 = path.clone();
+        let swapper = tokio::spawn(async move {
+            // The reader's File::open completes in microseconds; this sleep
+            // guarantees the rename lands after it. The read of ~12 MiB (many
+            // page-sized read_exact round-trips) runs for far longer than this,
+            // so the post-read guard re-stats the path only after the rename.
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+            tokio::fs::rename(&gen_b_path, &path2).await.unwrap();
+        });
+
+        let res = read_frames_as_pages_checked(&path, page_size, 0, None).await;
+        swapper.await.unwrap();
+
+        let err = res.expect_err(
+            "a WAL that shrank (reset) during the read must hard-error at the reader call site",
+        );
+        assert!(
+            err.to_string().contains("shrank during read"),
+            "expected a shrink error, got: {err}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_checked_reader_call_site_rejects_salt_change_during_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("racing-salt.db-wal");
+        let page_size = 4096u32;
+        let salt_a = (0x1111_1111u32, 0x2222_2222u32);
+
+        // Gen A and gen B have identical size (same frame count) but different
+        // salts, so the guard cannot trip on shrink — only the salt re-check
+        // detects the cross-generation read.
+        let gen_a = build_large_valid_wal(page_size, salt_a, 3000, 0xA0);
+        let gen_b = build_large_valid_wal(page_size, (0x5555_5555, 0x6666_6666), 3000, 0xB0);
+        assert_eq!(gen_a.len(), gen_b.len(), "gen A/B must be the same size");
+        tokio::fs::write(&path, &gen_a).await.unwrap();
+        let gen_b_path = dir.path().join("racing-salt.db-wal.genB");
+        tokio::fs::write(&gen_b_path, &gen_b).await.unwrap();
+
+        let path2 = path.clone();
+        let swapper = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(3)).await;
+            tokio::fs::rename(&gen_b_path, &path2).await.unwrap();
+        });
+
+        let res = read_frames_as_pages_checked(&path, page_size, 0, None).await;
+        swapper.await.unwrap();
+
+        let err = res
+            .expect_err("a WAL whose header salt changed (reset) during the read must hard-error at the reader call site");
+        assert!(
+            err.to_string().contains("salt changed during read"),
+            "expected a salt-change error, got: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn test_checked_reader_stops_at_torn_tail() {
         // A torn tail frame whose db_size is non-zero must NOT be treated as a

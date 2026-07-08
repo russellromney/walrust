@@ -323,5 +323,16 @@ mod tests {
             cache_substitute_for_key(&cache, &divergent).is_none(),
             "same max TXID but different range must NOT be substituted from cache (B13)"
         );
+
+        // A key whose filename does not parse into a TXID interval must not
+        // panic and must fall back to authoritative S3 (returns None).
+        assert!(
+            cache_substitute_for_key(&cache, "db/GEN/not-an-ltx-name").is_none(),
+            "unparseable key must fall back to S3, not substitute or crash"
+        );
+        assert!(
+            cache_substitute_for_key(&cache, "").is_none(),
+            "empty key must fall back to S3"
+        );
     }
 }

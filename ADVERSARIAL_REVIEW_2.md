@@ -500,6 +500,16 @@ snapshot at-or-before it). The core-only non-gated proof passes; the root
 `point_in_time_restore_uses_latest_snapshot_not_after_target` is S3-gated
 (runs in CI/Soup).
 
+Verify (Phase 2C review, 2026-07-08): swept every user-facing PIT string
+(`grep -ri "8601|point.in.time|PITR|timestamp"` across src, docs, README).
+CLI help (`main.rs`: "Restore to specific TXID/sequence number"), the parser
+error (`restore.rs`: "Use TXID (number)"), the docs site, and README are all
+correct. FOUND ONE MISSED false promise: the Python binding docstring
+(`src/python.rs`) still read "point_in_time: Optional ISO 8601 timestamp" —
+corrected to document a TXID/sequence number and that timestamp PITR is not
+implemented. `src/sync/types.rs` "Upload timestamp (ISO 8601)" is an internal
+`created_at` field description (accurate), not the restore param.
+
 - `src/sync/restore.rs:84` hard-codes `find_latest_snapshot` (no target
   param). If `target_txid < snapshot_max_txid`, restore always fails
   ("overshot") even when an older retained snapshot + incrementals cover the
@@ -806,6 +816,23 @@ locally (sandbox MinIO clock skew, see A6).
   `..._rejects_salt_change`, and `..._accepts_stable_or_grown_wal`
   (revert-verified: neutering `detect_reset_during_read` to `Ok(())` makes the
   two rejection tests FAIL). Root uses these core readers via the shim.
+  Verify (Phase 2C review, 2026-07-08): the three original proofs exercised the
+  guard HELPER directly, not the reader CALL SITE — neutering both call-site
+  invocations (`if false { detect_reset_during_read(..) }`) left the ENTIRE
+  walrust-core suite green (vacuous-guard soft spot confirmed). Added two
+  call-site integration tests
+  (`wal::tests::test_checked_reader_call_site_rejects_reset_shrink_during_read`,
+  `..._rejects_salt_change_during_read`) that drive the guard through the real
+  `read_frames_as_pages_checked`: the reader opens its fd on generation A, a
+  concurrent task atomically renames a smaller/different-salt generation over
+  the path mid-read (Unix open-fd semantics keep the read on gen A), and the
+  post-read guard re-opens the path and hard-errors. Both FAIL with the call
+  site neutered and PASS restored (revert-verified). Pass-2 hard-error path:
+  reached only under in-place mid-call frame rewrite (SQLite RESTART reuse);
+  the early `Err` return mutates no caller state (chain seed / page_map are
+  locals returned only on `Ok`), and the sole production caller
+  (`legacy_wal_sync.rs:234` via `?`) does not advance offset/chain/txid on
+  `Err`, so a retry re-reads consistently.
 - B2 — `pull_incremental` / `pull_incremental_into_sink` re-anchor the chain
   from `None` every call (`sync.rs:1346, 1510`): a steady-state follower
   pulling 1 changeset/poll never verifies anything (F13 holds only
@@ -1132,6 +1159,22 @@ locally (sandbox MinIO clock skew, see A6).
   (revert-verified: restoring the bare-`has_txid` substitution makes it FAIL —
   a same-max/different-min key wrongly returns the cached bytes). Core is
   unaffected: this cache-over-S3 substitution is a root-only restore adapter.
+  Verify (Phase 2C review, 2026-07-08): revert-verified independently
+  (`if true || cached == (min,max)` → test FAILS). Attack edges checked:
+  (a) NO_CHECKSUM litestream files — `verify_ltx` parses the header + decodes
+  every page regardless of the NO_CHECKSUM flag (that flag only skips the
+  per-page checksum COMPARE, not the header/range decode), so the decoded
+  `(min,max)` used for the binding is authoritative even for those files; the
+  restore chain separately re-checks DB-anchored pre/post checksums.
+  (b) Interval parse failures — `key_txid_range` returns `None` and
+  `cache_substitute_for_key` short-circuits to S3 (no panic); added assertions
+  for an unparseable key and an empty key to the proof.
+  (c) SNAPSHOT vs INCREMENTAL at the same key — the cache holds one file per
+  max-TXID; the binding compares the DECODED `(min,max)` to the key range, so a
+  cached snapshot (min=1) never satisfies an incremental key (min>1) and vice
+  versa. Residual: a same-`(min,max)` collision across generations after a
+  TXID-rewinding reset would pass the binding, but is backstopped by the
+  DB-anchored restore chain checksums (documented, later-phase).
 - B14 — `list_delta_envelopes_after` never asserts payload.seq == key-derived
   seq (`sync.rs:748-767`); genesis sentinel ambiguity (empty vs 32 zero
   bytes) in `external_delta.rs`.
