@@ -37,18 +37,7 @@ pub(crate) struct DbState {
 }
 
 /// Input for concurrent WAL sync (immutable snapshot of state)
-#[derive(Clone)]
-pub(crate) struct SyncInput {
-    pub(crate) db_path: PathBuf,
-    pub(crate) name: String,
-    pub(crate) wal_path: PathBuf,
-    pub(crate) wal_offset: u64,
-    pub(crate) wal_generation: u64,
-    pub(crate) current_txid: u64,
-    pub(crate) db_checksum: Option<u64>,
-    pub(crate) wal_salt: Option<(u32, u32)>,
-    pub(crate) wal_checksum_chain: Option<(u32, u32)>,
-}
+pub(crate) use walrust_core::legacy_wal_sync::SyncInput;
 
 impl From<&DbState> for SyncInput {
     fn from(state: &DbState) -> Self {
@@ -66,19 +55,38 @@ impl From<&DbState> for SyncInput {
     }
 }
 
-/// Output from concurrent WAL sync (changes to apply to state)
-pub(crate) struct SyncOutput {
-    pub(crate) db_path: PathBuf,
-    pub(crate) frame_count: u64,
-    pub(crate) new_wal_offset: u64,
-    pub(crate) new_current_txid: u64,
-    pub(crate) new_db_checksum: Option<u64>,
-    /// If checkpoint was detected, new generation
-    pub(crate) checkpoint_detected: bool,
-    pub(crate) new_wal_generation: u64,
-    pub(crate) new_wal_salt: Option<(u32, u32)>,
-    pub(crate) new_wal_checksum_chain: Option<(u32, u32)>,
+impl From<&DbState> for walrust_core::legacy_wal_sync::WatchedDbState {
+    fn from(state: &DbState) -> Self {
+        Self {
+            db_path: state.db_path.clone(),
+            name: state.name.clone(),
+            wal_path: state.wal_path.clone(),
+            wal_offset: state.wal_offset,
+            wal_generation: state.wal_generation,
+            current_txid: state.current_txid,
+            db_checksum: state.db_checksum,
+            wal_salt: state.wal_salt,
+            wal_checksum_chain: state.wal_checksum_chain,
+        }
+    }
 }
+
+impl DbState {
+    pub(crate) fn apply_watched_state(
+        &mut self,
+        state: &walrust_core::legacy_wal_sync::WatchedDbState,
+    ) {
+        self.wal_offset = state.wal_offset;
+        self.wal_generation = state.wal_generation;
+        self.current_txid = state.current_txid;
+        self.db_checksum = state.db_checksum;
+        self.wal_salt = state.wal_salt;
+        self.wal_checksum_chain = state.wal_checksum_chain;
+    }
+}
+
+/// Output from concurrent WAL sync (changes to apply to state)
+pub(crate) use walrust_core::legacy_wal_sync::SyncOutput;
 
 /// Entry in the manifest tracking LTX files
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,44 +143,13 @@ impl Default for TriggerState {
 }
 
 /// State for shadow WAL mode databases
-pub(crate) struct ShadowDbState {
-    /// Base database state
-    pub(crate) name: String,
-    pub(crate) db_path: PathBuf,
-    pub(crate) wal_path: PathBuf,
-    pub(crate) current_txid: u64,
-    pub(crate) last_snapshot: Option<chrono::DateTime<Utc>>,
-    pub(crate) db_checksum: Option<u64>,
-    /// Shadow WAL manager (owns the checkpoint blocker)
-    pub(crate) shadow: ShadowWal,
-    /// Offset within shadow segments for upload tracking
-    pub(crate) shadow_sync_offset: u64,
-    /// WAL offset for copy_frames tracking
-    pub(crate) wal_copy_offset: u64,
-}
+pub(crate) use walrust_core::legacy_shadow_watch::ShadowWatchState as ShadowDbState;
 
 /// Input for concurrent shadow sync
-#[derive(Clone)]
-pub(crate) struct ShadowSyncInput {
-    pub(crate) db_path: PathBuf,
-    pub(crate) name: String,
-    pub(crate) current_txid: u64,
-    pub(crate) db_checksum: Option<u64>,
-    pub(crate) generation: u64,
-    pub(crate) shadow_sync_offset: u64,
-    pub(crate) page_size: u32,
-    pub(crate) shadow_dir: PathBuf,
-}
+pub(crate) use walrust_core::legacy_shadow::ShadowSyncInput;
 
 /// Output from concurrent shadow sync
-#[derive(Debug)]
-pub(crate) struct ShadowSyncOutput {
-    pub(crate) db_path: PathBuf,
-    pub(crate) frame_count: u64,
-    pub(crate) new_shadow_sync_offset: u64,
-    pub(crate) new_current_txid: u64,
-    pub(crate) new_db_checksum: Option<u64>,
-}
+pub(crate) use walrust_core::legacy_shadow::ShadowSyncOutput;
 
 /// State for independent database task
 pub(crate) struct DbTaskState {
@@ -192,6 +169,9 @@ pub(crate) struct CacheState {
     pub(crate) shadow: Arc<tokio::sync::Mutex<ShadowWal>>,
     /// Channel to send upload notifications to uploader task
     pub(crate) upload_tx: mpsc::Sender<crate::uploader::UploadMessage>,
+    /// Uploader task handle so shutdown can verify the drain completed.
+    pub(crate) upload_handle:
+        Option<tokio::task::JoinHandle<anyhow::Result<crate::uploader::UploaderStats>>>,
     /// Cache config for cleanup parameters
     pub(crate) retention_duration: chrono::Duration,
     pub(crate) max_cache_size: u64,

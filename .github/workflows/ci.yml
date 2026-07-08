@@ -1,0 +1,99 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_ENDPOINT_URL: http://127.0.0.1:9000
+  AWS_ENDPOINT_URL_S3: http://127.0.0.1:9000
+  AWS_REGION: us-east-1
+  TIERED_TEST_BUCKET: walrust-ci
+
+jobs:
+  test:
+    name: fmt, clippy, tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Service containers can't be given a command, and minio/minio requires
+      # `server /data`, so start it with docker run instead.
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/live && exit 0
+            sleep 2
+          done
+          echo "MinIO failed to become healthy" >&2
+          docker logs minio >&2
+          exit 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      - name: Install Litestream
+        run: |
+          curl -fsSL -o litestream.tar.gz \
+            https://github.com/benbjohnson/litestream/releases/download/v0.5.14/litestream-0.5.14-linux-x86_64.tar.gz
+          tar -xzf litestream.tar.gz
+          sudo mv litestream /usr/local/bin/
+          litestream version
+
+      - name: Create MinIO bucket
+        run: |
+          python -m pip install --user minio
+          python - <<'PY'
+          from minio import Minio
+
+          client = Minio(
+              "127.0.0.1:9000",
+              access_key="minioadmin",
+              secret_key="minioadmin",
+              secure=False,
+          )
+          bucket = "walrust-ci"
+          if not client.bucket_exists(bucket):
+              client.make_bucket(bucket)
+          print(f"Bucket {bucket} ready")
+          PY
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      - name: Test
+        run: make test USE_SOUP=0

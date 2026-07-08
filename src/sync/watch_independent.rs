@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -9,6 +9,7 @@ use crate::config::{
     parse_duration_string, CacheConfig, ResolvedDbConfig, SyncConfig, WebhookConfig,
 };
 use crate::dashboard::{self, MetricsState};
+use crate::errors::{classify_or_else, WalrustError};
 use crate::ltx;
 use crate::retention::RetentionPolicy;
 use crate::retry::{RetryConfig, RetryPolicy};
@@ -72,7 +73,11 @@ pub async fn watch_with_independent_tasks(
     };
 
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = Arc::new(create_client(endpoint).await?);
+    let client = Arc::new(
+        create_client(endpoint)
+            .await
+            .map_err(|e| WalrustError::s3(e.to_string()))?,
+    );
 
     // Set up retry policy and webhook sender
     let retry_policy = RetryPolicy::new(retry_config.clone());
@@ -96,7 +101,11 @@ pub async fn watch_with_independent_tasks(
     for db_config in databases {
         let db_path = &db_config.path;
         if !db_path.exists() {
-            return Err(anyhow!("Database not found: {}", db_path.display()));
+            return Err(WalrustError::database(format!(
+                "Database not found: {}",
+                db_path.display()
+            ))
+            .into());
         }
 
         let name = db_config.prefix.clone();
@@ -104,7 +113,9 @@ pub async fn watch_with_independent_tasks(
 
         // Discover state from S3 file listings (litestream format - no manifest)
         let (current_txid, _max_gen, _) =
-            discover_state_from_s3(&client, &bucket_name, &prefix, &name).await?;
+            discover_state_from_s3(&client, &bucket_name, &prefix, &name)
+                .await
+                .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
         // WAL offset and generation are local state - start fresh
         let wal_offset = 0u64;
@@ -238,8 +249,7 @@ pub async fn watch_with_independent_tasks(
                 })?;
             }
 
-            // Create LocalCache
-            let cache = Arc::new(LocalCache::new(&cache_dir)?);
+            let cache = Arc::new(LocalCache::new_at(&cache_dir)?);
             tracing::debug!(
                 "{}: LocalCache initialized at {}",
                 name,
@@ -272,27 +282,23 @@ pub async fn watch_with_independent_tasks(
                 Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
 
             // Create Uploader
-            let s3_prefix = format!("{}/{}", prefix, name);
             let uploader = Arc::new(Uploader::new(
                 name.clone(),
                 Arc::clone(&cache),
                 storage,
-                s3_prefix,
+                prefix.clone(),
                 Arc::new(retry_policy.clone()),
                 Arc::clone(&webhook_sender),
                 cache_config.uploader_concurrency,
             ));
 
-            // Spawn uploader task and get channel
-            // Note: JoinHandle is intentionally dropped here. Independent tasks
-            // outlive the uploader via the runtime's 10s shutdown timeout, giving
-            // uploaders time to drain after receiving Shutdown.
-            let (upload_tx, _uploader_handle) = spawn_uploader(uploader);
+            let (upload_tx, uploader_handle) = spawn_uploader(uploader);
 
             Some(CacheState {
                 cache,
                 shadow,
                 upload_tx,
+                upload_handle: Some(uploader_handle),
                 retention_duration: *retention,
                 max_cache_size: cache_config.max_size,
             })
@@ -310,7 +316,7 @@ pub async fn watch_with_independent_tasks(
         let shutdown_rx = shutdown_tx.subscribe();
 
         let handle = tokio::spawn(async move {
-            if let Err(e) = run_db_task(
+            let result = run_db_task(
                 task_state,
                 client,
                 bucket,
@@ -321,10 +327,13 @@ pub async fn watch_with_independent_tasks(
                 shutdown_rx,
                 cache_state,
             )
-            .await
-            {
+            .await;
+
+            if let Err(e) = &result {
                 tracing::error!("{}: Task failed: {}", name, e);
             }
+
+            result
         });
 
         task_handles.push(handle);
@@ -368,14 +377,38 @@ pub async fn watch_with_independent_tasks(
     // Wait for all tasks to complete (with timeout)
     let shutdown_timeout = Duration::from_secs(10);
     match tokio::time::timeout(shutdown_timeout, async {
+        let mut first_error = None;
         for handle in task_handles {
-            let _ = handle.await;
+            match handle.await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!("Database task shutdown failed: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Database task panicked during shutdown: {}", e);
+                    if first_error.is_none() {
+                        first_error = Some(anyhow!("database task panicked during shutdown: {e}"));
+                    }
+                }
+            }
+        }
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
         }
     })
     .await
     {
-        Ok(_) => tracing::info!("All tasks shut down gracefully"),
-        Err(_) => tracing::warn!("Shutdown timeout - some tasks may not have completed"),
+        Ok(Ok(())) => tracing::info!("All tasks shut down gracefully"),
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(anyhow!(
+                "shutdown timeout - some tasks may not have completed"
+            ))
+        }
     }
 
     tracing::info!("walrust shutdown complete");
@@ -391,7 +424,7 @@ async fn run_db_task(
     webhook_sender: Arc<WebhookSender>,
     metrics_state: Arc<MetricsState>,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
-    cache_state: Option<CacheState>,
+    mut cache_state: Option<CacheState>,
 ) -> Result<()> {
     let db_name = state.db_state.name.clone();
     let wal_path = state.db_state.wal_path.clone();
@@ -416,9 +449,6 @@ async fn run_db_task(
     let mut cleanup_timer = tokio::time::interval(Duration::from_secs(300));
     cleanup_timer.tick().await; // Skip first immediate tick
 
-    // Track last synced WAL size to detect changes
-    let mut last_synced_wal_size: u64 = std::fs::metadata(&wal_path).map(|m| m.len()).unwrap_or(0);
-
     tracing::debug!(
         "{}: Task started, polling every {}s (WAL: {})",
         db_name,
@@ -431,38 +461,42 @@ async fn run_db_task(
             // Shutdown signal
             _ = shutdown_rx.recv() => {
                 // Final sync before shutdown
-                let current_wal_size = std::fs::metadata(&wal_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-                if current_wal_size > last_synced_wal_size {
-                    let _ = do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await;
-                }
+                do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref())
+                    .await
+                    .with_context(|| format!("{}: final sync before shutdown failed", db_name))?;
                 // Signal uploader to shutdown if cache is enabled
-                if let Some(ref cache) = cache_state {
-                    let _ = cache.upload_tx.send(UploadMessage::Shutdown).await;
+                if let Some(mut cache) = cache_state.take() {
+                    cache.upload_tx
+                        .send(UploadMessage::Shutdown)
+                        .await
+                        .map_err(|e| anyhow!("{}: failed to send uploader shutdown: {}", db_name, e))?;
+
+                    if let Some(handle) = cache.upload_handle.take() {
+                        let stats = tokio::time::timeout(Duration::from_secs(10), handle)
+                            .await
+                            .map_err(|_| anyhow!("{}: uploader drain timed out", db_name))?
+                            .map_err(|e| anyhow!("{}: uploader task panicked: {}", db_name, e))?
+                            .with_context(|| format!("{}: uploader drain failed", db_name))?;
+                        tracing::debug!("{}: Uploader drained successfully: {:?}", db_name, stats);
+                    }
                 }
                 break;
             }
 
             // Poll timer - check WAL size and sync if changed
             _ = poll_timer.tick() => {
-                let current_wal_size = std::fs::metadata(&wal_path)
-                    .map(|m| m.len())
-                    .unwrap_or(0);
-
-                // Only sync if WAL has grown
-                if current_wal_size > last_synced_wal_size {
-                    match do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await {
-                        Ok(frame_count) => {
-                            if frame_count > 0 {
-                                tracing::debug!("{}: Synced {} frames", db_name, frame_count);
-                            }
-                            last_synced_wal_size = current_wal_size;
+                match do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref()).await {
+                    Ok(frame_count) => {
+                        if frame_count > 0 {
+                            tracing::debug!("{}: Synced {} frames", db_name, frame_count);
                         }
-                        Err(e) => {
-                            tracing::error!("{}: Sync failed: {}", db_name, e);
-                            // Don't update last_synced_wal_size on failure - will retry next tick
-                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("{}: Sync failed: {}", db_name, e);
+                        webhook_sender
+                            .notify_upload_failed(&db_name, &e.to_string(), 1)
+                            .await;
+                        return Err(e.context(format!("{}: sync failed", db_name)));
                     }
                 }
             }

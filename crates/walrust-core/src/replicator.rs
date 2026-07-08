@@ -11,18 +11,21 @@
 //! replicator.add("tenant-1", Path::new("/data/tenant-1.db")).await?;
 //! replicator.add("tenant-2", Path::new("/data/tenant-2.db")).await?;
 //! // ... background loop syncs both every tick ...
-//! replicator.remove("tenant-1").await;  // final sync, then drop
+//! replicator.remove("tenant-1").await?;  // final sync, then drop
 //! ```
 
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex, Weak};
 
-use anyhow::Result;
+use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
+use serde::Deserialize;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::RwLock;
 use tokio::task::{JoinHandle, JoinSet};
 
+use crate::errors::WalrustError;
 use crate::sync::{self, ExternalBaseCursor, FencedDeltaSyncParams, ReplicationConfig, SyncState};
 use hadb_storage::StorageBackend;
 
@@ -49,6 +52,28 @@ struct DbState {
     /// `Some` when this database ships fenced TLM_DELTA envelopes.
     /// `None` = legacy behavior (walrust-owned or external `.hadbp`).
     fenced_delta_chain: Option<FencedDeltaChainState>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct SavedSyncState {
+    #[serde(default)]
+    wal_offset: Option<u64>,
+    #[serde(default)]
+    wal_generation: Option<u64>,
+    #[serde(default)]
+    current_seq: Option<u64>,
+    #[serde(default)]
+    lineage_id: Option<String>,
+    #[serde(default)]
+    current_txid: Option<u64>,
+    #[serde(default)]
+    db_checksum: Option<u64>,
+    #[serde(default)]
+    last_snapshot: Option<DateTime<Utc>>,
+    #[serde(default)]
+    wal_salt: Option<(u32, u32)>,
+    #[serde(default)]
+    wal_checksum_chain: Option<(u32, u32)>,
 }
 
 /// Dispatch one sync for a database: fenced TLM_DELTA when configured,
@@ -214,6 +239,7 @@ impl Replicator {
         }
 
         let prefix = self.prefix.clone();
+        sync::ensure_no_saved_state(self.storage.as_ref(), &prefix, name).await?;
 
         // Build state and take initial snapshot OUTSIDE the map lock
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
@@ -226,6 +252,7 @@ impl Replicator {
             state.current_txid = base_change_counter;
         }
 
+        state.ensure_lineage_id();
         sync::take_snapshot_with_retry(
             self.storage.as_ref(),
             &prefix,
@@ -233,6 +260,7 @@ impl Replicator {
             &self.config.retry_policy,
         )
         .await?;
+        sync::save_initial_state(self.storage.as_ref(), &prefix, &state).await?;
 
         let db_state = Arc::new(AsyncMutex::new(DbState {
             state,
@@ -297,34 +325,46 @@ impl Replicator {
         // External-base mode returned above and derives its cursor from the
         // caller's base plus the physical changeset chain.
         let state_key = format!("{}{}/state.json", prefix, name);
-        if let Ok(Some(data)) = self.storage.get(&state_key).await {
-            if let Ok(saved) = serde_json::from_slice::<serde_json::Value>(&data) {
-                let saved_offset = saved.get("wal_offset").and_then(|v| v.as_u64());
-                if let Some(seq) = saved.get("current_seq").and_then(|v| v.as_u64()) {
-                    state.current_seq = seq;
-                }
-                if let Some(offset) = saved_offset {
-                    state.wal_offset = offset;
-                }
-                if let Some(gen) = saved.get("wal_generation").and_then(|v| v.as_u64()) {
-                    state.wal_generation = gen;
-                }
-                if let Some(txid) = saved.get("current_txid").and_then(|v| v.as_u64()) {
-                    state.current_txid = txid;
-                }
-                if let Some(checksum) = saved.get("db_checksum").and_then(|v| v.as_u64()) {
-                    state.db_checksum = Some(checksum);
-                }
-                tracing::info!(
-                    "Replicator: loaded state for '{}': seq={}, gen={}, txid={}, offset={}, checksum={:?}",
-                    name,
-                    state.current_seq,
-                    state.wal_generation,
-                    state.current_txid,
-                    state.wal_offset,
-                    state.db_checksum,
-                );
+        if let Some(data) = self
+            .storage
+            .get(&state_key)
+            .await
+            .with_context(|| format!("failed to load saved replication state {state_key}"))?
+        {
+            let saved = serde_json::from_slice::<SavedSyncState>(&data)
+                .with_context(|| format!("failed to parse saved replication state {state_key}"))?;
+            if let Some(seq) = saved.current_seq {
+                state.current_seq = seq;
             }
+            state.lineage_id = saved.lineage_id;
+            if let Some(offset) = saved.wal_offset {
+                state.wal_offset = offset;
+            }
+            if let Some(gen) = saved.wal_generation {
+                state.wal_generation = gen;
+            }
+            if let Some(txid) = saved.current_txid {
+                state.current_txid = txid;
+            }
+            if let Some(checksum) = saved.db_checksum {
+                state.db_checksum = Some(checksum);
+            }
+            if let Some(last_snapshot) = saved.last_snapshot {
+                state.last_snapshot = Some(last_snapshot);
+            }
+            state.wal_salt = saved.wal_salt;
+            state.wal_checksum_chain = saved.wal_checksum_chain;
+            tracing::info!(
+                "Replicator: loaded state for '{}': seq={}, gen={}, txid={}, offset={}, checksum={:?}, wal_salt={:?}, wal_checksum_chain={:?}",
+                name,
+                state.current_seq,
+                state.wal_generation,
+                state.current_txid,
+                state.wal_offset,
+                state.db_checksum,
+                state.wal_salt,
+                state.wal_checksum_chain,
+            );
         }
 
         let db_state = Arc::new(AsyncMutex::new(DbState {
@@ -388,31 +428,35 @@ impl Replicator {
 
     /// Remove a database from replication.
     ///
-    /// Does a final sync before removing — blocks until the sync completes
-    /// (or fails). The caller should checkpoint/close the database AFTER this returns.
-    pub async fn remove(&self, name: &str) {
-        let entry = self.databases.write().await.remove(name);
+    /// Does a final sync before removing — blocks until the sync completes.
+    /// The caller should checkpoint/close the database only after this returns `Ok(())`.
+    pub async fn remove(&self, name: &str) -> Result<()> {
+        let entry = {
+            let databases = self.databases.read().await;
+            databases.get(name).cloned()
+        };
 
         if let Some(db_state) = entry {
             let mut s = db_state.lock().await;
             let prefix = s.prefix.clone();
             let external = self.config.snapshot_ownership.is_external();
-            let sync_result = sync_one_db(self.storage.as_ref(), &prefix, &mut s, external).await;
-            match sync_result {
-                Ok(frames) if frames > 0 => {
-                    tracing::info!(
-                        "Replicator: final sync for '{}' captured {} frames",
-                        name,
-                        frames
-                    );
-                }
-                Err(e) => {
-                    tracing::error!("Replicator: final sync for '{}' failed: {}", name, e);
-                }
-                _ => {}
+            let frames = sync_one_db(self.storage.as_ref(), &prefix, &mut s, external)
+                .await
+                .with_context(|| format!("Replicator: final sync for '{name}' failed"))?;
+            if frames > 0 {
+                tracing::info!(
+                    "Replicator: final sync for '{}' captured {} frames",
+                    name,
+                    frames
+                );
             }
+            drop(s);
+
+            self.databases.write().await.remove(name);
             tracing::info!("Replicator: removed '{}'", name);
         }
+
+        Ok(())
     }
 
     /// Restore a database from S3.
@@ -429,7 +473,14 @@ impl Replicator {
         let seq = match sync::restore(self.storage.as_ref(), &prefix, name, output_path, None).await
         {
             Ok(seq) => seq,
-            Err(e) if e.to_string().contains("No snapshot found") => return Ok(None),
+            Err(e)
+                if matches!(
+                    e.downcast_ref::<WalrustError>(),
+                    Some(WalrustError::RestoreNotFound(_))
+                ) =>
+            {
+                return Ok(None);
+            }
             Err(e) => return Err(e),
         };
 
@@ -520,6 +571,7 @@ impl Replicator {
         state.state.current_seq = base.seq;
         state.state.current_txid = base.seq;
         state.state.db_checksum = Some(base.checksum);
+        state.state.external_base = Some(base);
         tracing::info!(
             "{}: adopted external base cursor seq {} checksum {:016x}",
             name,

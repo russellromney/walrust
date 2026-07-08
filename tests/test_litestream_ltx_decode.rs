@@ -107,7 +107,7 @@ fn test_decode_litestream_ltx() {
 
         // Check the header to see if this is a snapshot or incremental
         let cursor = std::io::Cursor::new(&ltx_data);
-        match litepages::Decoder::new(cursor) {
+        match walrust::ltx::Decoder::new(cursor) {
             Ok((decoder, header)) => {
                 println!("  Header decoded successfully:");
                 println!(

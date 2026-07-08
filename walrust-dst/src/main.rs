@@ -978,14 +978,17 @@ fn run_single_invariant(name: &str) -> anyhow::Result<()> {
         "transaction_recovery" => invariants::prop_transaction_recovery()?,
         "point_in_time" | "pitr" => invariants::prop_point_in_time_restore()?,
         "wal_batching" => invariants::prop_wal_batching_no_loss()?,
+        "production_published_deltas" | "production_deltas" => {
+            invariants::prop_production_published_delta_restore()?
+        }
         "snapshot_atomicity" => invariants::prop_snapshot_atomicity()?,
         "txid_monotonicity" => invariants::prop_txid_monotonicity()?,
         "binary_preservation" => invariants::prop_binary_preservation()?,
         "recovery_under_failure" => invariants::prop_recovery_under_failure()?,
         _ => anyhow::bail!(
             "Unknown invariant: {}. Available: transaction_recovery, point_in_time, \
-             wal_batching, snapshot_atomicity, txid_monotonicity, binary_preservation, \
-             recovery_under_failure",
+             wal_batching, production_published_deltas, snapshot_atomicity, \
+             txid_monotonicity, binary_preservation, recovery_under_failure",
             name
         ),
     }
@@ -1000,6 +1003,10 @@ fn run_all_invariants() -> anyhow::Result<()> {
         ),
         ("point_in_time", "Point-in-time restore gives exact state"),
         ("wal_batching", "WAL batching never loses frames"),
+        (
+            "production_published_deltas",
+            "Production core published deltas restore cleanly",
+        ),
         ("snapshot_atomicity", "Snapshots are atomic"),
         ("txid_monotonicity", "TXIDs are monotonic"),
         ("binary_preservation", "Restored DB is byte-identical"),

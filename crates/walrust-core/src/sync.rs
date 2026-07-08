@@ -8,8 +8,12 @@ use anyhow::{anyhow, Result};
 use chrono::Utc;
 use hadb_changeset::storage::{self as cs_storage, ChangesetKind, DiscoveredChangeset};
 use serde::{Deserialize, Serialize};
+use std::fs::{self, File};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
+use crate::errors::WalrustError;
 use crate::ltx;
 use crate::wal;
 use hadb_io::RetryPolicy;
@@ -18,6 +22,56 @@ use hadb_storage::StorageBackend;
 // ============================================================================
 // Helpers
 // ============================================================================
+
+struct AtomicRestore {
+    path: PathBuf,
+    published: bool,
+}
+
+impl AtomicRestore {
+    fn new(output: &Path) -> Self {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let parent = output.parent().unwrap_or_else(|| Path::new("."));
+        let file_name = output
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("restored.db");
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let path = parent.join(format!(
+            ".{file_name}.restore-{}-{id}.tmp",
+            std::process::id()
+        ));
+        Self {
+            path,
+            published: false,
+        }
+    }
+
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn publish(mut self, output: &Path) -> Result<()> {
+        std::fs::rename(&self.path, output).map_err(|e| {
+            anyhow!(
+                "failed to atomically publish restored database {} over {}: {e}",
+                self.path.display(),
+                output.display()
+            )
+        })?;
+        self.published = true;
+        Ok(())
+    }
+}
+
+impl Drop for AtomicRestore {
+    fn drop(&mut self) {
+        if !self.published {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
 
 /// Extract SQLite's file change counter from WAL page data.
 ///
@@ -100,6 +154,25 @@ pub struct Manifest {
     pub last_checksum: Option<u64>,
 }
 
+/// Explicit base cursor for callers whose checkpoint/base state is owned by
+/// another layer, such as Turbolite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExternalBaseCursor {
+    /// The durable base replay sequence. Delta objects must start at `seq + 1`.
+    pub seq: u64,
+    /// Checksum of the materialized base. The first delta must chain from this.
+    pub checksum: u64,
+}
+
+/// Follower cursor for incremental pull APIs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PullCursor {
+    /// Highest HADBP sequence already applied by the follower.
+    pub seq: u64,
+    /// Running HADBP checksum at `seq`. The next changeset must chain from it.
+    pub checksum: u64,
+}
+
 /// State for a single database being synced.
 #[derive(Debug, Clone)]
 pub struct SyncState {
@@ -115,6 +188,13 @@ pub struct SyncState {
     pub wal_generation: u64,
     /// Current sequence number (HADBP seq, increments per sync)
     pub current_seq: u64,
+    /// Walrust-owned stream lineage. When set, HADBP objects are written under
+    /// a lineage namespace so cold starts cannot silently reuse an old chain.
+    pub lineage_id: Option<String>,
+    /// External-base cursor this state is anchored to, if snapshot ownership is
+    /// outside walrust. Used to persist a local WAL-offset proof for the remote
+    /// object-chain head without writing remote `state.json`.
+    pub external_base: Option<ExternalBaseCursor>,
     /// Current transaction ID (SQLite change counter, for change detection only)
     pub current_txid: u64,
     /// Last snapshot time
@@ -129,16 +209,6 @@ pub struct SyncState {
     /// validation for the next incremental read so a torn tail frame is rejected
     /// rather than shipped.
     pub wal_checksum_chain: Option<(u32, u32)>,
-}
-
-/// Explicit base cursor for callers whose checkpoint/base state is owned by
-/// another layer, such as Turbolite.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct ExternalBaseCursor {
-    /// The durable base replay sequence. Delta objects must start at `seq + 1`.
-    pub seq: u64,
-    /// Checksum of the materialized base. The first delta must chain from this.
-    pub checksum: u64,
 }
 
 impl SyncState {
@@ -163,12 +233,21 @@ impl SyncState {
             wal_offset: 0,
             wal_generation: 0,
             current_seq: 0,
+            lineage_id: None,
+            external_base: None,
             current_txid: 0,
             last_snapshot: None,
             db_checksum: None,
             wal_salt: None,
             wal_checksum_chain: None,
         })
+    }
+
+    /// Ensure this walrust-owned stream has a durable object namespace.
+    pub fn ensure_lineage_id(&mut self) -> &str {
+        self.lineage_id
+            .get_or_insert_with(|| uuid::Uuid::new_v4().simple().to_string())
+            .as_str()
     }
 
     /// Initialize checksum from database file.
@@ -198,6 +277,176 @@ fn build_changeset_key(prefix: &str, db_name: &str, generation: u64, seq: u64) -
     cs_storage::format_key(prefix, db_name, generation, seq, ChangesetKind::Physical)
 }
 
+fn build_lineage_changeset_key(
+    prefix: &str,
+    db_name: &str,
+    lineage_id: &str,
+    generation: u64,
+    seq: u64,
+) -> String {
+    format!(
+        "{}{}/lineages/{}/{:04x}/{:016x}.{}",
+        prefix,
+        db_name,
+        lineage_id,
+        generation,
+        seq,
+        ChangesetKind::Physical.extension()
+    )
+}
+
+fn build_state_changeset_key(prefix: &str, state: &SyncState, generation: u64, seq: u64) -> String {
+    match state.lineage_id.as_deref() {
+        Some(lineage_id) => {
+            build_lineage_changeset_key(prefix, &state.name, lineage_id, generation, seq)
+        }
+        None => build_changeset_key(prefix, &state.name, generation, seq),
+    }
+}
+
+fn lineage_generation_prefix(
+    prefix: &str,
+    db_name: &str,
+    lineage_id: &str,
+    generation: u64,
+) -> String {
+    format!(
+        "{}{}/lineages/{}/{:04x}/",
+        prefix, db_name, lineage_id, generation
+    )
+}
+
+fn state_key(prefix: &str, db_name: &str) -> String {
+    format!("{}{}/state.json", prefix, db_name)
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RemoteSyncState {
+    #[serde(default)]
+    lineage_id: Option<String>,
+}
+
+async fn active_lineage_id(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+) -> Result<Option<String>> {
+    let key = state_key(prefix, db_name);
+    let Some(data) = storage
+        .get(&key)
+        .await
+        .map_err(|e| anyhow!("failed to load replication state {key}: {e}"))?
+    else {
+        return Ok(None);
+    };
+    let remote = serde_json::from_slice::<RemoteSyncState>(&data)
+        .map_err(|e| anyhow!("failed to parse replication state {key}: {e}"))?;
+    Ok(remote.lineage_id)
+}
+
+async fn discover_after_in_namespace(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    lineage_id: Option<&str>,
+    generation: u64,
+    after_seq: u64,
+    kind: ChangesetKind,
+) -> Result<Vec<DiscoveredChangeset>> {
+    if generation == GENERATION_LIVE && lineage_id.is_none() {
+        return cs_storage::discover_after(storage, prefix, db_name, after_seq, kind).await;
+    }
+
+    let ext = kind.extension();
+    let gen_prefix = match lineage_id {
+        Some(lineage_id) => lineage_generation_prefix(prefix, db_name, lineage_id, generation),
+        None => format!("{}{}/{:04x}/", prefix, db_name, generation),
+    };
+    let start_after_key = format!("{}{:016x}.{}", gen_prefix, after_seq, ext);
+    let keys = storage.list(&gen_prefix, Some(&start_after_key)).await?;
+
+    let mut changesets = Vec::new();
+    for key in keys {
+        let Some(filename) = key.strip_prefix(&gen_prefix) else {
+            continue;
+        };
+        if !filename.ends_with(&format!(".{}", ext)) {
+            continue;
+        }
+        let hex_part = &filename[..filename.len() - ext.len() - 1];
+        let Ok(seq) = u64::from_str_radix(hex_part, 16) else {
+            continue;
+        };
+        if seq <= after_seq {
+            continue;
+        }
+        changesets.push(DiscoveredChangeset { key, seq, kind });
+    }
+
+    changesets.sort_by_key(|c| c.seq);
+    Ok(changesets)
+}
+
+async fn discover_latest_snapshot_in_namespace(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    lineage_id: Option<&str>,
+    kind: ChangesetKind,
+) -> Result<Option<DiscoveredChangeset>> {
+    if lineage_id.is_none() {
+        return cs_storage::discover_latest_snapshot(storage, prefix, db_name, kind).await;
+    }
+
+    let mut snapshots = discover_after_in_namespace(
+        storage,
+        prefix,
+        db_name,
+        lineage_id,
+        GENERATION_SNAPSHOT,
+        0,
+        kind,
+    )
+    .await?;
+    snapshots.sort_by_key(|c| c.seq);
+    Ok(snapshots.pop())
+}
+
+async fn discover_latest_snapshot_at_or_before_in_namespace(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    lineage_id: Option<&str>,
+    target_seq: u64,
+    kind: ChangesetKind,
+) -> Result<Option<DiscoveredChangeset>> {
+    let mut snapshots = discover_after_in_namespace(
+        storage,
+        prefix,
+        db_name,
+        lineage_id,
+        GENERATION_SNAPSHOT,
+        0,
+        kind,
+    )
+    .await?;
+    snapshots.retain(|changeset| changeset.seq <= target_seq);
+    snapshots.sort_by_key(|c| c.seq);
+    Ok(snapshots.pop())
+}
+
+fn parse_point_in_time_seq(point_in_time: Option<&str>) -> Result<Option<u64>> {
+    Ok(point_in_time
+        .map(|pit| {
+            pit.parse::<u64>().map_err(|_| {
+                anyhow::Error::from(WalrustError::restore(
+                    "Invalid point_in_time format. Use sequence/TXID number",
+                ))
+            })
+        })
+        .transpose()?)
+}
+
 /// Get SQLite database page size from header.
 async fn get_page_size(db_path: &Path) -> Result<u32> {
     use tokio::io::AsyncReadExt;
@@ -209,6 +458,40 @@ async fn get_page_size(db_path: &Path) -> Result<u32> {
     let page_size = if page_size == 1 { 65536 } else { page_size };
 
     Ok(page_size)
+}
+
+async fn checkpoint_wal(db_path: &Path) -> Result<()> {
+    let db_path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 || checkpointed_frames < log_frames {
+            anyhow::bail!(
+                "{}: snapshot checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
+                db_path.display(),
+                busy,
+                log_frames,
+                checkpointed_frames
+            );
+        }
+        Ok(())
+    })
+    .await?
+}
+
+async fn reset_wal_cursor_after_snapshot(state: &mut SyncState) {
+    state.wal_offset = 0;
+    state.wal_generation += 1;
+    state.wal_salt = wal::read_header(&state.wal_path)
+        .await
+        .ok()
+        .flatten()
+        .map(|h| h.salt());
+    state.wal_checksum_chain = None;
 }
 
 // ============================================================================
@@ -254,19 +537,226 @@ pub async fn save_state(
     prefix: &str,
     state: &SyncState,
 ) -> Result<()> {
-    let state_key = format!("{}{}/state.json", prefix, state.name);
-    let state_json = serde_json::json!({
+    let state_key = state_key(prefix, &state.name);
+    let data = state_json_bytes(state)?;
+    storage.put(&state_key, &data).await
+}
+
+fn state_json_bytes(state: &SyncState) -> Result<Vec<u8>> {
+    let state_json = state_json_value(state);
+    Ok(serde_json::to_vec(&state_json)?)
+}
+
+fn state_json_value(state: &SyncState) -> serde_json::Value {
+    serde_json::json!({
         "wal_offset": state.wal_offset,
         "wal_generation": state.wal_generation,
         "current_seq": state.current_seq,
+        "lineage_id": state.lineage_id.as_deref(),
         "current_txid": state.current_txid,
         "db_checksum": state.db_checksum,
         "last_snapshot": state.last_snapshot,
         "wal_salt": state.wal_salt,
         "wal_checksum_chain": state.wal_checksum_chain,
-    });
-    let data = serde_json::to_vec(&state_json)?;
-    storage.put(&state_key, &data).await
+    })
+}
+
+/// Fail if a walrust-owned database already has an active remote state.
+///
+/// Fresh walrust-owned `add()` creates a new lineage. If `state.json` already
+/// exists, another lineage is active and callers must restore/reopen explicitly
+/// instead of silently replacing the active namespace.
+pub async fn ensure_no_saved_state(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+) -> Result<()> {
+    let state_key = state_key(prefix, db_name);
+    if storage.exists(&state_key).await? {
+        anyhow::bail!(
+            "{}: database already has replication state at {}; use add_without_snapshot after restoring/reopening instead of creating a new walrust-owned lineage",
+            db_name,
+            state_key
+        );
+    }
+    Ok(())
+}
+
+/// Save the initial walrust-owned state only if no active state exists.
+///
+/// This is the race-closing half of [`ensure_no_saved_state`]: two creators can
+/// both observe absence, but only one may publish the active `state.json`.
+pub async fn save_initial_state(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &SyncState,
+) -> Result<()> {
+    let state_key = state_key(prefix, &state.name);
+    let data = state_json_bytes(state)?;
+    let cas = storage.put_if_absent(&state_key, &data).await?;
+    if cas.success {
+        return Ok(());
+    }
+
+    anyhow::bail!(
+        "{}: database already has replication state at {}; refusing to replace active walrust-owned lineage",
+        state.name,
+        state_key
+    );
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExternalBaseLocalProgress {
+    version: u32,
+    base_seq: u64,
+    base_checksum: u64,
+    current_seq: u64,
+    db_checksum: u64,
+    wal_offset: u64,
+    wal_generation: u64,
+    wal_salt: Option<(u32, u32)>,
+    wal_checksum_chain: Option<(u32, u32)>,
+}
+
+impl ExternalBaseLocalProgress {
+    fn from_state(state: &SyncState) -> Result<Self> {
+        let base = state.external_base.ok_or_else(|| {
+            anyhow!(
+                "{}: cannot save external-base progress without an external base anchor",
+                state.name
+            )
+        })?;
+        let db_checksum = state.db_checksum.ok_or_else(|| {
+            anyhow!(
+                "{}: cannot save external-base progress without current checksum",
+                state.name
+            )
+        })?;
+        Ok(Self {
+            version: 1,
+            base_seq: base.seq,
+            base_checksum: base.checksum,
+            current_seq: state.current_seq,
+            db_checksum,
+            wal_offset: state.wal_offset,
+            wal_generation: state.wal_generation,
+            wal_salt: state.wal_salt,
+            wal_checksum_chain: state.wal_checksum_chain,
+        })
+    }
+}
+
+fn local_progress_dir_for(db_path: &Path) -> PathBuf {
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let stem = db_path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or("database");
+    parent.join(format!(".walrust-{stem}"))
+}
+
+fn external_base_progress_path(state: &SyncState) -> PathBuf {
+    local_progress_dir_for(&state.db_path).join("external-base-progress.json")
+}
+
+fn fsync_dir(path: &Path) -> Result<()> {
+    File::open(path)?
+        .sync_all()
+        .map_err(|e| anyhow!("failed to fsync directory {}: {}", path.display(), e))
+}
+
+fn save_external_base_progress(state: &SyncState) -> Result<()> {
+    let progress_path = external_base_progress_path(state);
+    let progress_dir = progress_path.parent().ok_or_else(|| {
+        anyhow!(
+            "invalid external-base progress path {}",
+            progress_path.display()
+        )
+    })?;
+    fs::create_dir_all(progress_dir).map_err(|e| {
+        anyhow!(
+            "{}: failed to create local external-base progress directory {}: {}",
+            state.name,
+            progress_dir.display(),
+            e
+        )
+    })?;
+
+    let tmp_path = progress_path.with_extension("json.tmp");
+    let progress = ExternalBaseLocalProgress::from_state(state)?;
+    let bytes = serde_json::to_vec_pretty(&progress)?;
+
+    {
+        let mut file = File::create(&tmp_path).map_err(|e| {
+            anyhow!(
+                "{}: failed to create temporary local external-base progress file {}: {}",
+                state.name,
+                tmp_path.display(),
+                e
+            )
+        })?;
+        file.write_all(&bytes).map_err(|e| {
+            anyhow!(
+                "{}: failed to write temporary local external-base progress file {}: {}",
+                state.name,
+                tmp_path.display(),
+                e
+            )
+        })?;
+        file.sync_all().map_err(|e| {
+            anyhow!(
+                "{}: failed to fsync temporary local external-base progress file {}: {}",
+                state.name,
+                tmp_path.display(),
+                e
+            )
+        })?;
+    }
+
+    fs::rename(&tmp_path, &progress_path).map_err(|e| {
+        anyhow!(
+            "{}: failed to install local external-base progress file {}: {}",
+            state.name,
+            progress_path.display(),
+            e
+        )
+    })?;
+    fsync_dir(progress_dir)?;
+    Ok(())
+}
+
+fn load_external_base_progress(state: &SyncState) -> Result<Option<ExternalBaseLocalProgress>> {
+    let progress_path = external_base_progress_path(state);
+    let bytes = match fs::read(&progress_path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(anyhow!(
+                "{}: failed to read local external-base progress file {}: {}",
+                state.name,
+                progress_path.display(),
+                e
+            ));
+        }
+    };
+
+    let progress: ExternalBaseLocalProgress = serde_json::from_slice(&bytes).map_err(|e| {
+        anyhow!(
+            "{}: failed to parse local external-base progress file {}: {}",
+            state.name,
+            progress_path.display(),
+            e
+        )
+    })?;
+    if progress.version != 1 {
+        anyhow::bail!(
+            "{}: unsupported local external-base progress version {} in {}",
+            state.name,
+            progress.version,
+            progress_path.display()
+        );
+    }
+    Ok(Some(progress))
 }
 
 // ============================================================================
@@ -319,6 +809,49 @@ async fn get_existing_after_failed_cas(
     Ok(None)
 }
 
+async fn put_changeset_if_absent(
+    storage: &dyn StorageBackend,
+    key: &str,
+    bytes: &[u8],
+    db_name: &str,
+    seq: u64,
+    mode: &str,
+) -> Result<()> {
+    let cas = storage.put_if_absent(key, bytes).await?;
+    if cas.success {
+        return Ok(());
+    }
+
+    let existing = get_existing_after_failed_cas(storage, key)
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}: {} duplicate changeset seq {} vanished after CAS failure at {}",
+                db_name,
+                mode,
+                seq,
+                key
+            )
+        })?;
+    if existing != bytes {
+        anyhow::bail!(
+            "{}: {} duplicate changeset seq {}; refusing overwrite at {}",
+            db_name,
+            mode,
+            seq,
+            key
+        );
+    }
+
+    tracing::info!(
+        "{}: {} changeset seq {} already exists with identical bytes; treating publish as idempotent",
+        db_name,
+        mode,
+        seq
+    );
+    Ok(())
+}
+
 /// Result of reading the next batch of WAL frames for a sync site.
 struct WalBatch {
     page_map: std::collections::HashMap<u32, Vec<u8>>,
@@ -326,6 +859,7 @@ struct WalBatch {
     new_offset: u64,
     final_db_size: u32,
     commit_count: u64,
+    rollover_detected: bool,
 }
 
 /// Detect WAL rollover (by size *or* salt change) and read the next batch of
@@ -347,7 +881,9 @@ async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> 
     let size_rollover = size < state.wal_offset;
     let salt_rollover = matches!(state.wal_salt, Some(prev) if prev != current_salt);
 
-    if size_rollover || salt_rollover {
+    let rollover_detected = size_rollover || salt_rollover;
+
+    if rollover_detected {
         tracing::info!(
             "{}: WAL rollover detected (size_rollover={}, salt_rollover={}); resetting offset",
             state.name,
@@ -355,7 +891,6 @@ async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> 
             salt_rollover
         );
         state.wal_offset = 0;
-        state.wal_generation += 1;
         // New generation: chain must re-seed from the new header.
         state.wal_checksum_chain = None;
     }
@@ -388,7 +923,28 @@ async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> 
         new_offset,
         final_db_size,
         commit_count,
+        rollover_detected,
     })
+}
+
+async fn ensure_database_in_wal_mode(db_path: &Path, db_name: &str) -> Result<()> {
+    let db_path = db_path.to_path_buf();
+    let mode = tokio::task::spawn_blocking(move || -> Result<String> {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        Ok(mode)
+    })
+    .await??;
+
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{}: SQLite journal_mode is '{}', expected WAL; replication cannot continue",
+            db_name,
+            mode
+        ))
+    }
 }
 
 async fn sync_wal_with_sequence(
@@ -399,16 +955,49 @@ async fn sync_wal_with_sequence(
 ) -> Result<u64> {
     let header = match wal::read_header(&state.wal_path).await? {
         Some(h) => h,
-        None => return Ok(0),
+        None => {
+            ensure_database_in_wal_mode(&state.db_path, &state.name).await?;
+            return Ok(0);
+        }
     };
+
+    let previous_wal_offset = state.wal_offset;
+    let previous_wal_generation = state.wal_generation;
+    let previous_wal_salt = state.wal_salt;
+    let previous_wal_checksum_chain = state.wal_checksum_chain;
 
     let WalBatch {
         page_map,
         frame_count,
         new_offset,
-        final_db_size: _max_db_size,
+        final_db_size,
         commit_count,
+        rollover_detected,
     } = read_next_wal_batch(state, &header).await?;
+
+    if rollover_detected {
+        match sequence {
+            DeltaSequence::WalrustOwned => {
+                tracing::warn!(
+                    "{}: WAL rollover detected; publishing a new snapshot instead of an incremental across the gap",
+                    state.name
+                );
+                take_snapshot(storage, prefix, state).await?;
+                save_state(storage, prefix, state).await?;
+                return Ok(1);
+            }
+            DeltaSequence::ExternalChangeCounter => {
+                state.wal_offset = previous_wal_offset;
+                state.wal_generation = previous_wal_generation;
+                state.wal_salt = previous_wal_salt;
+                state.wal_checksum_chain = previous_wal_checksum_chain;
+                anyhow::bail!(
+                    "{}: WAL rollover detected after external base; refusing to publish deltas until the external base is re-anchored",
+                    state.name
+                );
+            }
+        }
+    }
 
     if page_map.is_empty() {
         return Ok(0);
@@ -432,45 +1021,46 @@ async fn sync_wal_with_sequence(
         DeltaSequence::WalrustOwned | DeltaSequence::ExternalChangeCounter => state.current_seq + 1,
     };
 
-    let (changeset_bytes, post_checksum) =
-        ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;
+    if final_db_size == 0 {
+        anyhow::bail!(
+            "{}: WAL commit produced end_page_count=0 with {} dirty pages; refusing to publish a truncating changeset",
+            state.name,
+            pages.len()
+        );
+    }
+    let (changeset_bytes, post_checksum) = ltx::encode_wal_changes_with_end_page_count(
+        &pages,
+        header.page_size,
+        new_seq,
+        pre_checksum,
+        final_db_size as u64,
+    )?;
 
     let changeset_size = changeset_bytes.len() as u64;
-    let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_LIVE, new_seq);
+    let changeset_key = build_state_changeset_key(prefix, state, GENERATION_LIVE, new_seq);
 
     match sequence {
         DeltaSequence::ExternalChangeCounter => {
-            let cas = storage
-                .put_if_absent(&changeset_key, &changeset_bytes)
-                .await?;
-            if !cas.success {
-                let existing = get_existing_after_failed_cas(storage, &changeset_key)
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "{}: external-base duplicate changeset seq {} vanished after CAS failure at {}",
-                            state.name,
-                            new_seq,
-                            changeset_key
-                        )
-                    })?;
-                if existing != changeset_bytes {
-                    anyhow::bail!(
-                        "{}: external-base duplicate changeset seq {}; refusing overwrite at {}",
-                        state.name,
-                        new_seq,
-                        changeset_key
-                    );
-                }
-                tracing::info!(
-                    "{}: external-base changeset seq {} already exists with identical bytes; treating publish as idempotent",
-                    state.name,
-                    new_seq
-                );
-            }
+            put_changeset_if_absent(
+                storage,
+                &changeset_key,
+                &changeset_bytes,
+                &state.name,
+                new_seq,
+                "external-base",
+            )
+            .await?;
         }
         DeltaSequence::WalrustOwned => {
-            storage.put(&changeset_key, &changeset_bytes).await?;
+            put_changeset_if_absent(
+                storage,
+                &changeset_key,
+                &changeset_bytes,
+                &state.name,
+                new_seq,
+                "walrust-owned",
+            )
+            .await?;
         }
     }
 
@@ -488,8 +1078,15 @@ async fn sync_wal_with_sequence(
     state.current_txid = max_txid;
     state.db_checksum = Some(post_checksum);
 
-    if matches!(sequence, DeltaSequence::WalrustOwned) {
-        save_state(storage, prefix, state).await?;
+    match sequence {
+        DeltaSequence::WalrustOwned => {
+            save_state(storage, prefix, state).await?;
+        }
+        DeltaSequence::ExternalChangeCounter => {
+            if state.external_base.is_some() {
+                save_external_base_progress(state)?;
+            }
+        }
     }
 
     Ok(frame_count as u64)
@@ -509,6 +1106,7 @@ pub async fn initialize_external_base_state(
     state.db_checksum = Some(base.checksum);
     state.wal_offset = 0;
     state.wal_generation = 0;
+    state.external_base = Some(base);
 
     let head = match cs_storage::discover_strict_physical_chain(
         storage,
@@ -550,11 +1148,50 @@ pub async fn initialize_external_base_state(
     state.current_txid = head.seq;
     state.db_checksum = Some(head.checksum);
 
-    // The object chain is authoritative for seq/checksum. WAL offset is only
-    // a local process cursor. On restart after already-published deltas, skip
-    // the bytes currently present; new writes will extend the WAL beyond this
-    // point and be captured normally.
-    state.wal_offset = crate::wal::get_wal_size(&state.wal_path).await.unwrap_or(0);
+    // The object chain is authoritative for seq/checksum. If no external
+    // delta object exists after the base, locally present WAL bytes are not
+    // proven durable remotely and must be read from the beginning. If the
+    // chain is ahead, a local fsynced progress record must map that exact
+    // chain head to the local WAL cursor; guessing from current WAL size would
+    // skip unpublished bytes after restart.
+    if head.count == 0 {
+        state.wal_offset = 0;
+        state.wal_generation = 0;
+        state.wal_salt = None;
+        state.wal_checksum_chain = None;
+    } else {
+        let progress = load_external_base_progress(state)?.ok_or_else(|| {
+            anyhow!(
+                "{}: remote external-base chain is at seq {} but no matching local external-base progress file exists; refusing to guess WAL offset",
+                state.name,
+                head.seq
+            )
+        })?;
+        if progress.base_seq != base.seq || progress.base_checksum != base.checksum {
+            anyhow::bail!(
+                "{}: local external-base progress anchor mismatch (progress base seq/checksum {}:{:016x}, requested {}:{:016x})",
+                state.name,
+                progress.base_seq,
+                progress.base_checksum,
+                base.seq,
+                base.checksum
+            );
+        }
+        if progress.current_seq != head.seq || progress.db_checksum != head.checksum {
+            anyhow::bail!(
+                "{}: local external-base progress does not match remote chain head (progress seq/checksum {}:{:016x}, remote {}:{:016x})",
+                state.name,
+                progress.current_seq,
+                progress.db_checksum,
+                head.seq,
+                head.checksum
+            );
+        }
+        state.wal_offset = progress.wal_offset;
+        state.wal_generation = progress.wal_generation;
+        state.wal_salt = progress.wal_salt;
+        state.wal_checksum_chain = progress.wal_checksum_chain;
+    }
 
     Ok(())
 }
@@ -572,7 +1209,7 @@ async fn external_same_seq_changeset_checksum(
     let Some(data) = storage.get(&base_key).await? else {
         return Ok(None);
     };
-    let changeset = hadb_changeset::physical::decode(&data).map_err(|e| {
+    let changeset = ltx::decode_sqlite_changeset(&data).map_err(|e| {
         anyhow!(
             "failed to decode external base changeset at {}: {}",
             base_key,
@@ -816,8 +1453,16 @@ pub async fn sync_wal_fenced_delta(
 ) -> Result<Option<DeltaPublishResult>> {
     let header = match wal::read_header(&state.wal_path).await? {
         Some(h) => h,
-        None => return Ok(None),
+        None => {
+            ensure_database_in_wal_mode(&state.db_path, &state.name).await?;
+            return Ok(None);
+        }
     };
+
+    let previous_wal_offset = state.wal_offset;
+    let previous_wal_generation = state.wal_generation;
+    let previous_wal_salt = state.wal_salt;
+    let previous_wal_checksum_chain = state.wal_checksum_chain;
 
     let WalBatch {
         page_map,
@@ -825,7 +1470,19 @@ pub async fn sync_wal_fenced_delta(
         new_offset,
         final_db_size,
         commit_count,
+        rollover_detected,
     } = read_next_wal_batch(state, &header).await?;
+
+    if rollover_detected {
+        state.wal_offset = previous_wal_offset;
+        state.wal_generation = previous_wal_generation;
+        state.wal_salt = previous_wal_salt;
+        state.wal_checksum_chain = previous_wal_checksum_chain;
+        anyhow::bail!(
+            "{}: WAL rollover detected in fenced external mode; refusing to publish deltas until the external base is re-anchored",
+            state.name
+        );
+    }
 
     if page_map.is_empty() {
         return Ok(None);
@@ -844,9 +1501,6 @@ pub async fn sync_wal_fenced_delta(
 
     let new_seq = state.current_seq + 1;
 
-    let (ltx_bytes, post_checksum) =
-        ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;
-
     // `final_db_size` is the database size in pages after the last
     // commit frame in this batch — the authoritative end_page_count.
     // Guard against a zero: page_map is non-empty here (we returned
@@ -862,6 +1516,13 @@ pub async fn sync_wal_fenced_delta(
         );
     }
     let end_page_count = final_db_size as u64;
+    let (ltx_bytes, post_checksum) = ltx::encode_wal_changes_with_end_page_count(
+        &pages,
+        header.page_size,
+        new_seq,
+        pre_checksum,
+        end_page_count,
+    )?;
 
     let payload = DeltaPayloadV1 {
         seq: new_seq,
@@ -907,6 +1568,7 @@ pub async fn take_snapshot(
     state: &mut SyncState,
 ) -> Result<()> {
     let timestamp = Utc::now();
+    checkpoint_wal(&state.db_path).await?;
     let page_size = get_page_size(&state.db_path).await?;
 
     // Use the file change counter as a txid source when available.
@@ -922,14 +1584,22 @@ pub async fn take_snapshot(
     let new_seq = state.current_seq + 1;
 
     let prev_checksum = state.db_checksum.unwrap_or(0);
-    let changeset_bytes = ltx::encode_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let snapshot = ltx::encode_sqlite_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let db_checksum = snapshot.checksum;
+    let changeset_bytes = snapshot.bytes;
 
     let changeset_size = changeset_bytes.len() as u64;
-    let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_SNAPSHOT, new_seq);
+    let changeset_key = build_state_changeset_key(prefix, state, GENERATION_SNAPSHOT, new_seq);
 
-    storage.put(&changeset_key, &changeset_bytes).await?;
-
-    let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
+    put_changeset_if_absent(
+        storage,
+        &changeset_key,
+        &changeset_bytes,
+        &state.name,
+        new_seq,
+        "walrust-owned snapshot",
+    )
+    .await?;
 
     tracing::info!(
         "{}: HADBP snapshot uploaded ({} bytes, seq {}) -> {}",
@@ -943,6 +1613,7 @@ pub async fn take_snapshot(
     state.current_txid = new_txid;
     state.last_snapshot = Some(timestamp);
     state.db_checksum = Some(db_checksum);
+    reset_wal_cursor_after_snapshot(state).await;
 
     Ok(())
 }
@@ -956,23 +1627,57 @@ pub async fn restore(
     prefix: &str,
     db_name: &str,
     output: &Path,
-    _point_in_time: Option<&str>,
+    point_in_time: Option<&str>,
 ) -> Result<u64> {
-    // Find latest snapshot
-    let snapshot =
-        cs_storage::discover_latest_snapshot(storage, prefix, db_name, ChangesetKind::Physical)
-            .await?
-            .ok_or_else(|| anyhow!("No snapshot found for database '{}'", db_name))?;
+    let target_seq = parse_point_in_time_seq(point_in_time)?;
+
+    let lineage_id = active_lineage_id(storage, prefix, db_name).await?;
+    let snapshot = match target_seq {
+        Some(target) => discover_latest_snapshot_at_or_before_in_namespace(
+            storage,
+            prefix,
+            db_name,
+            lineage_id.as_deref(),
+            target,
+            ChangesetKind::Physical,
+        )
+        .await?
+        .ok_or_else(|| {
+            WalrustError::restore_not_found(format!(
+                "snapshot unavailable for database '{}' at or before seq {}",
+                db_name, target
+            ))
+        })?,
+        None => discover_latest_snapshot_in_namespace(
+            storage,
+            prefix,
+            db_name,
+            lineage_id.as_deref(),
+            ChangesetKind::Physical,
+        )
+        .await?
+        .ok_or_else(|| {
+            WalrustError::restore_not_found(format!(
+                "snapshot unavailable for database '{}'",
+                db_name
+            ))
+        })?,
+    };
 
     // Find incrementals after the snapshot
-    let incrementals = cs_storage::discover_after(
+    let mut incrementals = discover_after_in_namespace(
         storage,
         prefix,
         db_name,
+        lineage_id.as_deref(),
+        GENERATION_LIVE,
         snapshot.seq,
         ChangesetKind::Physical,
     )
     .await?;
+    if let Some(target) = target_seq {
+        incrementals.retain(|changeset| changeset.seq <= target);
+    }
 
     tracing::info!(
         "Restoring from snapshot (seq {}) + {} incrementals",
@@ -980,54 +1685,52 @@ pub async fn restore(
         incrementals.len()
     );
 
+    let staged_restore = AtomicRestore::new(output);
+    let staged_output = staged_restore.path();
+
     // Apply snapshot
     let snapshot_data = storage
         .get(&snapshot.key)
         .await?
         .ok_or_else(|| anyhow!("snapshot key {} not found", snapshot.key))?;
-    let decode_result = ltx::decode_to_db(&snapshot_data, output)?;
+    let decode_result = ltx::decode_to_db(&snapshot_data, staged_output)?;
     tracing::info!(
         "Restored snapshot to {} (checksum: {:016x})",
-        output.display(),
+        staged_output.display(),
         decode_result.checksum
     );
 
     let mut restored_seq = snapshot.seq;
     let mut current_checksum = decode_result.checksum;
 
-    // Apply incrementals in order. If a checksum chain doesn't match,
-    // it's from a previous lineage (e.g., a prior leader). Stop applying.
+    // Apply incrementals in order. A gap or checksum-chain break means the
+    // restore cannot prove success, so it is a hard error.
     for inc in &incrementals {
+        let expected_seq = restored_seq + 1;
+        if inc.seq != expected_seq {
+            return Err(anyhow!(
+                "restore incremental gap: expected seq {expected_seq}, got seq {} at {}",
+                inc.seq,
+                inc.key
+            ));
+        }
+
         let data = storage
             .get(&inc.key)
             .await?
             .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
-        match ltx::apply_changeset_to_db(&data, output, current_checksum) {
-            Ok(result) => {
-                tracing::info!(
-                    "Applied incremental (seq {}, checksum: {:016x})",
-                    inc.seq,
-                    result.checksum
-                );
-                restored_seq = inc.seq;
-                current_checksum = result.checksum;
-            }
-            Err(e) if e.to_string().contains("Checksum chain broken") => {
-                tracing::info!(
-                    "Skipping {} stale incrementals from previous lineage (seq {}+)",
-                    incrementals.len()
-                        - incrementals
-                            .iter()
-                            .position(|f| f.key == inc.key)
-                            .unwrap_or(0),
-                    inc.seq
-                );
-                break;
-            }
-            Err(e) => return Err(e),
-        }
+        let result = ltx::apply_changeset_to_db(&data, staged_output, current_checksum)?;
+        tracing::info!(
+            "Applied incremental (seq {}, checksum: {:016x})",
+            inc.seq,
+            result.checksum
+        );
+        restored_seq = inc.seq;
+        current_checksum = result.checksum;
     }
 
+    verify_sqlite_integrity(staged_output)?;
+    staged_restore.publish(output)?;
     Ok(restored_seq)
 }
 
@@ -1045,11 +1748,15 @@ pub async fn restore_with_snapshot_source(
     output: &Path,
     snapshot_source: &dyn crate::snapshot_source::SnapshotSource,
 ) -> Result<u64> {
+    let staged_restore = AtomicRestore::new(output);
+    let staged_output = staged_restore.path();
+
     // Step 1: materialize the base DB from the external snapshot source
-    let checkpoint_version = snapshot_source.materialize(output).await?;
+    let checkpoint = snapshot_source.materialize(staged_output).await?;
     tracing::info!(
-        "Materialized base DB from snapshot source (checkpoint version {})",
-        checkpoint_version,
+        "Materialized base DB from snapshot source (checkpoint version {}, checksum {:016x})",
+        checkpoint.seq,
+        checkpoint.checksum,
     );
 
     // Step 2: discover incremental changesets newer than the checkpoint version.
@@ -1057,7 +1764,7 @@ pub async fn restore_with_snapshot_source(
         storage,
         prefix,
         db_name,
-        checkpoint_version,
+        checkpoint.seq,
         ChangesetKind::Physical,
     )
     .await?;
@@ -1065,76 +1772,76 @@ pub async fn restore_with_snapshot_source(
     if incrementals.is_empty() {
         tracing::info!(
             "No incremental changesets to apply (up to date at version {})",
-            checkpoint_version
+            checkpoint.seq
         );
-        return Ok(checkpoint_version);
+        verify_sqlite_integrity(staged_output)?;
+        staged_restore.publish(output)?;
+        return Ok(checkpoint.seq);
     }
 
     tracing::info!(
         "Applying {} incremental changesets after checkpoint version {}",
         incrementals.len(),
-        checkpoint_version,
+        checkpoint.seq,
     );
 
-    // Step 3: apply incrementals in order, verifying the HADBP checksum chain.
-    //
-    // When restoring from an external snapshot source we do not have the HADBP
-    // checksum of the materialized base, so the *first* incremental cannot be
-    // chain-verified against the snapshot — it establishes the chain. Every
-    // subsequent incremental must chain from the prior one; a break means the
-    // object belongs to a different lineage (e.g. a stale delta from a prior
-    // leader sitting at an in-range seq) and must NOT be applied wholesale.
-    let mut restored_seq = checkpoint_version;
-    let mut current_checksum: Option<u64> = None;
+    // Step 3: apply incrementals in order, verifying every file against the
+    // materialized base checksum. A gap or chain break means the restore cannot
+    // prove success, so it is a hard error.
+    let mut cursor = PullCursor {
+        seq: checkpoint.seq,
+        checksum: checkpoint.checksum,
+    };
     for inc in incrementals.iter() {
+        let expected_seq = cursor.seq + 1;
+        if inc.seq != expected_seq {
+            return Err(anyhow!(
+                "restore incremental gap: expected seq {expected_seq}, got seq {} at {}",
+                inc.seq,
+                inc.key
+            ));
+        }
+
         let data = storage
             .get(&inc.key)
             .await?
             .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
-        let changeset = hadb_changeset::physical::decode(&data)
+        let changeset = ltx::decode_sqlite_changeset(&data)
             .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", inc.key, e))?;
 
-        // Verify the chain for every incremental after the first one.
-        if let Some(prev) = current_checksum {
-            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
-                tracing::warn!(
-                    "Stopping restore at seq {}: checksum chain broken ({}); \
-                     remaining incrementals are from a different lineage",
-                    inc.seq,
-                    e
-                );
-                break;
-            }
-        }
+        hadb_changeset::physical::verify_chain(cursor.checksum, &changeset)
+            .map_err(|e| anyhow!("Checksum chain broken at seq {}: {}", inc.seq, e))?;
 
-        // Apply pages directly (SQLite 1-based page offsets)
-        use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write as IoWrite};
-
-        let page_size = changeset.header.page_size as u64;
-        let mut file = OpenOptions::new()
-            .write(true)
-            .open(output)
-            .map_err(|e| anyhow!("Failed to open database for apply: {}", e))?;
-
-        for page in &changeset.pages {
-            let offset = (page.page_id.to_u64() - 1) * page_size;
-            file.seek(SeekFrom::Start(offset))?;
-            file.write_all(&page.data)?;
-        }
-        file.sync_all()?;
-        drop(file);
+        ltx::apply_decoded_changeset_to_db(&changeset, staged_output)?;
 
         tracing::info!(
             "Applied incremental (seq {}, checksum: {:016x})",
             inc.seq,
             changeset.checksum
         );
-        restored_seq = inc.seq;
-        current_checksum = Some(changeset.checksum);
+        cursor = PullCursor {
+            seq: inc.seq,
+            checksum: changeset.checksum,
+        };
     }
 
-    Ok(restored_seq)
+    verify_sqlite_integrity(staged_output)?;
+    staged_restore.publish(output)?;
+    Ok(cursor.seq)
+}
+
+fn verify_sqlite_integrity(path: &Path) -> Result<()> {
+    let conn = rusqlite::Connection::open(path)
+        .map_err(|e| anyhow!("failed to open restored database for integrity_check: {e}"))?;
+    let result: String = conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .map_err(|e| anyhow!("failed to run integrity_check on restored database: {e}"))?;
+    if result != "ok" {
+        return Err(anyhow!(
+            "restored database failed integrity_check: {result}"
+        ));
+    }
+    Ok(())
 }
 
 // ============================================================================
@@ -1149,6 +1856,7 @@ pub async fn take_snapshot_with_retry(
     retry_policy: &RetryPolicy,
 ) -> Result<()> {
     let timestamp = Utc::now();
+    checkpoint_wal(&state.db_path).await?;
     let page_size = get_page_size(&state.db_path).await?;
 
     let cc = change_counter_from_file(&state.db_path).unwrap_or(0);
@@ -1161,23 +1869,35 @@ pub async fn take_snapshot_with_retry(
 
     let new_seq = state.current_seq + 1;
     let prev_checksum = state.db_checksum.unwrap_or(0);
-    let changeset_bytes = ltx::encode_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let snapshot = ltx::encode_sqlite_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let db_checksum = snapshot.checksum;
+    let changeset_bytes = snapshot.bytes;
 
     let changeset_size = changeset_bytes.len() as u64;
-    let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_SNAPSHOT, new_seq);
+    let changeset_key = build_state_changeset_key(prefix, state, GENERATION_SNAPSHOT, new_seq);
 
     // Share buffer across retry attempts via Arc to avoid per-attempt clones
     let upload_buffer = std::sync::Arc::new(changeset_bytes);
     let upload_key = changeset_key.clone();
+    let upload_name = state.name.clone();
     retry_policy
         .execute_with_context("upload snapshot", || {
             let data_arc = std::sync::Arc::clone(&upload_buffer);
             let key = upload_key.clone();
-            async move { storage.put(&key, &data_arc).await }
+            let name = upload_name.clone();
+            async move {
+                put_changeset_if_absent(
+                    storage,
+                    &key,
+                    data_arc.as_slice(),
+                    &name,
+                    new_seq,
+                    "walrust-owned snapshot",
+                )
+                .await
+            }
         })
         .await?;
-
-    let db_checksum = ltx::compute_checksum_from_file(&state.db_path)?;
 
     tracing::info!(
         "{}: HADBP snapshot uploaded ({} bytes, seq {}) -> {}",
@@ -1191,6 +1911,7 @@ pub async fn take_snapshot_with_retry(
     state.current_txid = new_txid;
     state.last_snapshot = Some(timestamp);
     state.db_checksum = Some(db_checksum);
+    reset_wal_cursor_after_snapshot(state).await;
 
     Ok(())
 }
@@ -1204,16 +1925,30 @@ pub async fn sync_wal_with_retry(
 ) -> Result<u64> {
     let header = match wal::read_header(&state.wal_path).await? {
         Some(h) => h,
-        None => return Ok(0),
+        None => {
+            ensure_database_in_wal_mode(&state.db_path, &state.name).await?;
+            return Ok(0);
+        }
     };
 
     let WalBatch {
         page_map,
         frame_count,
         new_offset,
-        final_db_size: _max_db_size,
+        final_db_size,
         commit_count,
+        rollover_detected,
     } = read_next_wal_batch(state, &header).await?;
+
+    if rollover_detected {
+        tracing::warn!(
+            "{}: WAL rollover detected; publishing a new snapshot instead of an incremental across the gap",
+            state.name
+        );
+        take_snapshot_with_retry(storage, prefix, state, retry_policy).await?;
+        save_state(storage, prefix, state).await?;
+        return Ok(1);
+    }
 
     if page_map.is_empty() {
         return Ok(0);
@@ -1232,19 +1967,43 @@ pub async fn sync_wal_with_retry(
 
     let new_seq = state.current_seq + 1;
 
-    let (changeset_bytes, post_checksum) =
-        ltx::encode_wal_changes(&pages, header.page_size, new_seq, pre_checksum)?;
+    if final_db_size == 0 {
+        anyhow::bail!(
+            "{}: WAL commit produced end_page_count=0 with {} dirty pages; refusing to publish a truncating changeset",
+            state.name,
+            pages.len()
+        );
+    }
+    let (changeset_bytes, post_checksum) = ltx::encode_wal_changes_with_end_page_count(
+        &pages,
+        header.page_size,
+        new_seq,
+        pre_checksum,
+        final_db_size as u64,
+    )?;
 
     let changeset_size = changeset_bytes.len() as u64;
-    let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_LIVE, new_seq);
+    let changeset_key = build_state_changeset_key(prefix, state, GENERATION_LIVE, new_seq);
 
     let upload_buffer = std::sync::Arc::new(changeset_bytes);
     let upload_key = changeset_key.clone();
+    let upload_name = state.name.clone();
     retry_policy
         .execute_with_context("upload WAL changes", || {
             let data_arc = std::sync::Arc::clone(&upload_buffer);
             let key = upload_key.clone();
-            async move { storage.put(&key, &data_arc).await }
+            let name = upload_name.clone();
+            async move {
+                put_changeset_if_absent(
+                    storage,
+                    &key,
+                    data_arc.as_slice(),
+                    &name,
+                    new_seq,
+                    "walrust-owned",
+                )
+                .await
+            }
         })
         .await?;
 
@@ -1282,7 +2041,7 @@ pub async fn sync_wal_and_manifest(
 
     if frames > 0 {
         let new_seq = state.current_seq;
-        let changeset_key = build_changeset_key(prefix, &state.name, GENERATION_LIVE, new_seq);
+        let changeset_key = build_state_changeset_key(prefix, state, GENERATION_LIVE, new_seq);
 
         manifest.files.push(LtxEntry {
             filename: changeset_key,
@@ -1303,10 +2062,69 @@ pub async fn sync_wal_and_manifest(
 /// Maximum concurrent S3 downloads for incremental pulling.
 const PULL_CONCURRENCY: usize = 8;
 
+struct DecodedPullChangeset {
+    seq: u64,
+    key: String,
+    changeset: hadb_changeset::physical::PhysicalChangeset,
+}
+
+async fn download_decode_pull_changesets(
+    storage: &dyn StorageBackend,
+    files: &[DiscoveredChangeset],
+) -> Result<Vec<DecodedPullChangeset>> {
+    let downloaded = download_parallel(storage, files, PULL_CONCURRENCY).await;
+    let mut decoded = Vec::with_capacity(files.len());
+
+    for (file, data) in files.iter().zip(downloaded.into_iter()) {
+        let data = data?;
+        let changeset = ltx::decode_sqlite_changeset(&data)
+            .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", file.key, e))?;
+        decoded.push(DecodedPullChangeset {
+            seq: file.seq,
+            key: file.key.clone(),
+            changeset,
+        });
+    }
+
+    Ok(decoded)
+}
+
+fn verify_decoded_pull_chain(
+    decoded: &[DecodedPullChangeset],
+    current: PullCursor,
+    context: &str,
+) -> Result<PullCursor> {
+    let mut cursor = current;
+    for entry in decoded {
+        let expected_seq = cursor.seq + 1;
+        if entry.seq != expected_seq {
+            return Err(anyhow!(
+                "{context} incremental gap: expected seq {expected_seq}, got seq {} at {}",
+                entry.seq,
+                entry.key
+            ));
+        }
+
+        hadb_changeset::physical::verify_chain(cursor.checksum, &entry.changeset).map_err(|e| {
+            anyhow!(
+                "{context} checksum chain broken at seq {} ({}): {}",
+                entry.seq,
+                entry.key,
+                e
+            )
+        })?;
+        cursor = PullCursor {
+            seq: entry.seq,
+            checksum: entry.changeset.checksum,
+        };
+    }
+    Ok(cursor)
+}
+
 /// Pull and apply new HADBP changesets from S3 that are ahead of `current_seq`.
 ///
 /// This is the follower's replication primitive. Call it in a loop (e.g., every 1s)
-/// to stay in sync with the leader. Returns the new highest applied seq.
+/// to stay in sync with the leader. Returns the new highest applied cursor.
 ///
 /// Optimizations:
 /// - Uses `start_after` on S3 LIST to skip past already-applied changesets
@@ -1316,90 +2134,41 @@ pub async fn pull_incremental(
     prefix: &str,
     db_name: &str,
     db_path: &Path,
-    current_seq: u64,
-) -> Result<u64> {
-    let new_files = cs_storage::discover_after(
+    current: PullCursor,
+) -> Result<PullCursor> {
+    let lineage_id = active_lineage_id(storage, prefix, db_name).await?;
+    let new_files = discover_after_in_namespace(
         storage,
         prefix,
         db_name,
-        current_seq,
+        lineage_id.as_deref(),
+        GENERATION_LIVE,
+        current.seq,
         ChangesetKind::Physical,
     )
     .await?;
 
     if new_files.is_empty() {
-        return Ok(current_seq);
+        return Ok(current);
     }
 
-    // Download concurrently, apply sequentially (checksum chain is serial)
-    let downloaded = download_parallel(storage, &new_files, PULL_CONCURRENCY).await;
+    let decoded = download_decode_pull_changesets(storage, &new_files).await?;
+    let verified_cursor = verify_decoded_pull_chain(&decoded, current, "pull_incremental")?;
 
-    let mut applied_seq = current_seq;
-    let mut applied_count = 0u64;
-    let mut stale_count = 0u64;
-
-    // For followers pulling incrementals we don't have the prev_checksum of the
-    // base, so the first changeset establishes the chain. Every changeset after
-    // it must chain from the prior one; a break means a stale object from a
-    // different lineage is sitting at an in-range seq and must NOT be applied —
-    // we stop rather than corrupting the follower's database.
-    let mut current_checksum: Option<u64> = None;
-    for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
-        let data = data?;
-        let changeset = match hadb_changeset::physical::decode(&data) {
-            Ok(cs) => cs,
-            Err(e) => {
-                tracing::error!("Failed to decode changeset at {}: {}", file.key, e);
-                return Err(anyhow!("Failed to decode changeset: {}", e));
-            }
-        };
-
-        if let Some(prev) = current_checksum {
-            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
-                tracing::warn!(
-                    "Stopping pull at seq {}: checksum chain broken ({}); \
-                     remaining changesets are from a different lineage",
-                    file.seq,
-                    e
-                );
-                stale_count = new_files.len() as u64 - applied_count;
-                break;
-            }
-        }
-
-        // Apply pages (SQLite 1-based page offsets)
-        use std::fs::OpenOptions;
-        use std::io::{Seek, SeekFrom, Write as IoWrite};
-
-        let page_size = changeset.header.page_size as u64;
-        let mut db_file = OpenOptions::new()
-            .write(true)
-            .open(db_path)
-            .map_err(|e| anyhow!("Failed to open database for apply: {}", e))?;
-
-        for page in &changeset.pages {
-            let offset = (page.page_id.to_u64() - 1) * page_size;
-            db_file.seek(SeekFrom::Start(offset))?;
-            db_file.write_all(&page.data)?;
-        }
-        db_file.sync_all()?;
-
-        applied_seq = file.seq;
-        applied_count += 1;
-        current_checksum = Some(changeset.checksum);
+    for entry in &decoded {
+        ltx::apply_decoded_changeset_to_db(&entry.changeset, db_path)?;
     }
 
-    if applied_count > 0 {
+    if !decoded.is_empty() {
         tracing::info!(
-            "Pulled {} HADBP changesets (skipped {} stale), seq {} -> {}",
-            applied_count,
-            stale_count,
-            current_seq,
-            applied_seq
+            "Pulled {} HADBP changesets, seq {} -> {}",
+            decoded.len(),
+            current.seq,
+            verified_cursor.seq
         );
     }
 
-    Ok(applied_seq)
+    Ok(verified_cursor)
 }
 
 /// Pull and apply new HADBP changesets from S3 through a `PageReplaySink`,
@@ -1431,8 +2200,8 @@ pub async fn pull_incremental_into_sink(
     prefix: &str,
     db_name: &str,
     sink: &mut dyn crate::replay_sink::PageReplaySink,
-    current_seq: u64,
-) -> Result<u64> {
+    current: PullCursor,
+) -> Result<PullCursor> {
     // begin() may fail; if it does, abort() is still called as a
     // best-effort cleanup so the contract "exactly one of finalize or
     // abort per invocation" holds even on early failure. Sinks must
@@ -1442,11 +2211,10 @@ pub async fn pull_incremental_into_sink(
         return Err(begin_err);
     }
 
-    let result =
-        pull_incremental_into_sink_inner(storage, prefix, db_name, sink, current_seq).await;
+    let result = pull_incremental_into_sink_inner(storage, prefix, db_name, sink, current).await;
 
     match result {
-        Ok(applied_seq) => {
+        Ok(applied_cursor) => {
             // finalize() may fail mid-install (the Turbolite sink
             // writes pages, marks bitmap, bumps generation, etc. — any
             // step can fail). On failure we still need to give the
@@ -1455,7 +2223,7 @@ pub async fn pull_incremental_into_sink(
                 try_abort(sink, &finalize_err);
                 return Err(finalize_err);
             }
-            Ok(applied_seq)
+            Ok(applied_cursor)
         }
         Err(e) => {
             try_abort(sink, &e);
@@ -1482,50 +2250,33 @@ async fn pull_incremental_into_sink_inner(
     prefix: &str,
     db_name: &str,
     sink: &mut dyn crate::replay_sink::PageReplaySink,
-    current_seq: u64,
-) -> Result<u64> {
-    let new_files = cs_storage::discover_after(
+    current: PullCursor,
+) -> Result<PullCursor> {
+    let lineage_id = active_lineage_id(storage, prefix, db_name).await?;
+    let new_files = discover_after_in_namespace(
         storage,
         prefix,
         db_name,
-        current_seq,
+        lineage_id.as_deref(),
+        GENERATION_LIVE,
+        current.seq,
         ChangesetKind::Physical,
     )
     .await?;
 
     if new_files.is_empty() {
-        return Ok(current_seq);
+        return Ok(current);
     }
 
-    let downloaded = download_parallel(storage, &new_files, PULL_CONCURRENCY).await;
+    let decoded = download_decode_pull_changesets(storage, &new_files).await?;
+    let verified_cursor =
+        verify_decoded_pull_chain(&decoded, current, "pull_incremental_into_sink")?;
 
-    let mut applied_seq = current_seq;
-    let mut applied_count = 0u64;
-
-    // The first changeset establishes the chain; each subsequent one must chain
-    // from the prior. A break means a stale object from a different lineage at
-    // an in-range seq — stop before routing its pages into the sink (the sink
-    // commits per changeset, so a mis-chained changeset must be rejected whole,
-    // not partially applied).
-    let mut current_checksum: Option<u64> = None;
-    for (file, data) in new_files.iter().zip(downloaded.into_iter()) {
-        let data = data?;
-        let changeset = hadb_changeset::physical::decode(&data)
-            .map_err(|e| anyhow!("Failed to decode changeset at {}: {}", file.key, e))?;
-
-        if let Some(prev) = current_checksum {
-            if let Err(e) = hadb_changeset::physical::verify_chain(prev, &changeset) {
-                tracing::warn!(
-                    "pull_incremental_into_sink: stopping at seq {}: checksum chain broken \
-                     ({}); remaining changesets are from a different lineage",
-                    file.seq,
-                    e
-                );
-                break;
+    for entry in &decoded {
+        for page in &entry.changeset.pages {
+            if page.data.is_empty() {
+                continue;
             }
-        }
-
-        for page in &changeset.pages {
             // SQLite 1-based page id straight from the HADBP changeset.
             let sqlite_page_id: u32 = page
                 .page_id
@@ -1535,23 +2286,19 @@ async fn pull_incremental_into_sink_inner(
             sink.apply_page(sqlite_page_id, &page.data)?;
         }
 
-        sink.commit_changeset(file.seq)?;
-
-        applied_seq = file.seq;
-        applied_count += 1;
-        current_checksum = Some(changeset.checksum);
+        sink.commit_changeset(entry.seq)?;
     }
 
-    if applied_count > 0 {
+    if !decoded.is_empty() {
         tracing::info!(
             "pull_incremental_into_sink: applied {} HADBP changesets, seq {} -> {}",
-            applied_count,
-            current_seq,
-            applied_seq
+            decoded.len(),
+            current.seq,
+            verified_cursor.seq
         );
     }
 
-    Ok(applied_seq)
+    Ok(verified_cursor)
 }
 
 /// Download one S3 object, returning its index for ordered reassembly.
@@ -1712,7 +2459,9 @@ pub async fn run_replication(
         state.init_checksum()?;
     }
 
+    state.ensure_lineage_id();
     take_snapshot_with_retry(storage, prefix, &mut state, &config.retry_policy).await?;
+    save_state(storage, prefix, &state).await?;
     tracing::info!(
         "{}: Initial snapshot taken, starting replication loop",
         state.name
@@ -1720,6 +2469,7 @@ pub async fn run_replication(
 
     let mut sync_timer = tokio::time::interval(config.sync_interval);
     let mut snapshot_timer = tokio::time::interval(config.snapshot_interval);
+    sync_timer.tick().await;
     snapshot_timer.tick().await;
 
     loop {
@@ -1731,7 +2481,7 @@ pub async fn run_replication(
                             tracing::info!("{}: Final sync captured {} frames before shutdown", state.name, frames);
                         }
                         Err(e) => {
-                            tracing::warn!("{}: Final sync failed: {}", state.name, e);
+                            return Err(anyhow!("{}: Final sync failed: {}", state.name, e));
                         }
                         _ => {}
                     }
@@ -1749,7 +2499,7 @@ pub async fn run_replication(
                         }
                     }
                     Err(e) => {
-                        tracing::error!("{}: WAL sync failed: {}", state.name, e);
+                        return Err(anyhow!("{}: WAL sync failed: {}", state.name, e));
                     }
                 }
             }
@@ -1798,6 +2548,7 @@ pub async fn run_wal_replication(
     );
 
     let mut sync_timer = tokio::time::interval(config.sync_interval);
+    sync_timer.tick().await;
 
     loop {
         tokio::select! {
@@ -1808,7 +2559,7 @@ pub async fn run_wal_replication(
                             tracing::info!("{}: Final sync captured {} frames before shutdown", state.name, frames);
                         }
                         Err(e) => {
-                            tracing::warn!("{}: Final sync failed: {}", state.name, e);
+                            return Err(anyhow!("{}: Final sync failed: {}", state.name, e));
                         }
                         _ => {}
                     }
@@ -1826,7 +2577,7 @@ pub async fn run_wal_replication(
                         }
                     }
                     Err(e) => {
-                        tracing::error!("{}: WAL sync failed: {}", state.name, e);
+                        return Err(anyhow!("{}: WAL sync failed: {}", state.name, e));
                     }
                 }
             }
@@ -2148,7 +2899,10 @@ mod tests {
 
     #[async_trait]
     impl crate::snapshot_source::SnapshotSource for MockSnapshotSource {
-        async fn materialize(&self, output: &Path) -> Result<u64> {
+        async fn materialize(
+            &self,
+            output: &Path,
+        ) -> Result<crate::snapshot_source::SnapshotCheckpoint> {
             if let Some(ref msg) = self.fail {
                 return Err(anyhow!("{}", msg));
             }
@@ -2162,12 +2916,120 @@ mod tests {
                 )
                 .map_err(|e| anyhow!("insert: {}", e))?;
             }
-            Ok(self.version)
+            drop(conn);
+            Ok(crate::snapshot_source::SnapshotCheckpoint {
+                seq: self.version,
+                checksum: ltx::compute_checksum_from_file(output)?,
+            })
         }
 
-        async fn checkpoint_version(&self) -> Result<u64> {
-            Ok(self.version)
+        async fn checkpoint(&self) -> Result<crate::snapshot_source::SnapshotCheckpoint> {
+            Err(anyhow!(
+                "MockSnapshotSource cannot report a checksum without materializing"
+            ))
         }
+    }
+
+    struct CopySnapshotSource {
+        version: u64,
+        path: PathBuf,
+    }
+
+    #[async_trait]
+    impl crate::snapshot_source::SnapshotSource for CopySnapshotSource {
+        async fn materialize(
+            &self,
+            output: &Path,
+        ) -> Result<crate::snapshot_source::SnapshotCheckpoint> {
+            std::fs::copy(&self.path, output)?;
+            Ok(crate::snapshot_source::SnapshotCheckpoint {
+                seq: self.version,
+                checksum: ltx::compute_checksum_from_file(output)?,
+            })
+        }
+
+        async fn checkpoint(&self) -> Result<crate::snapshot_source::SnapshotCheckpoint> {
+            Ok(crate::snapshot_source::SnapshotCheckpoint {
+                seq: self.version,
+                checksum: ltx::compute_checksum_from_file(&self.path)?,
+            })
+        }
+    }
+
+    fn create_sqlite_source(path: &Path) -> Result<u32> {
+        let conn = rusqlite::Connection::open(path)?;
+        conn.execute_batch(
+            "
+            CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT NOT NULL);
+            INSERT INTO data (id, val) VALUES (1, 'base-1');
+            INSERT INTO data (id, val) VALUES (2, 'base-2');
+            ",
+        )?;
+        let page_size = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        drop(conn);
+        Ok(page_size)
+    }
+
+    fn create_marker_db(path: &Path, marker: &str) -> Result<()> {
+        let conn = rusqlite::Connection::open(path)?;
+        conn.execute("CREATE TABLE marker (value TEXT NOT NULL);", [])?;
+        conn.execute(
+            "INSERT INTO marker (value) VALUES (?1)",
+            rusqlite::params![marker],
+        )?;
+        Ok(())
+    }
+
+    fn create_delete_journal_db(path: &Path) -> Result<()> {
+        let conn = rusqlite::Connection::open(path)?;
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=DELETE;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (value) VALUES ('base');
+            ",
+        )?;
+        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+        if mode.to_lowercase() == "wal" {
+            return Err(anyhow!("test database unexpectedly in WAL mode"));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sync_wal_rejects_database_out_of_wal_mode() {
+        let storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("delete-mode.db");
+        create_delete_journal_db(&db_path).unwrap();
+
+        let mut state = SyncState::new(db_path).unwrap();
+        state.current_seq = 1;
+        state.current_txid = 1;
+        state.db_checksum = Some(0);
+
+        let err = sync_wal(&storage, "test/", &mut state)
+            .await
+            .expect_err("sync must fail closed when SQLite is not in WAL mode");
+        let msg = err.to_string();
+        assert!(msg.contains("journal_mode"), "{msg}");
+        assert!(msg.contains("WAL"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn restore_no_snapshot_returns_typed_restore_error() {
+        let storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("restored.db");
+
+        let err = restore(&storage, "test/", "missing", &output, None)
+            .await
+            .expect_err("missing snapshot must be a typed restore error");
+
+        assert_eq!(
+            crate::errors::classify_error(&err),
+            crate::errors::ExitStatus::Restore
+        );
     }
 
     #[tokio::test]
@@ -2247,13 +3109,19 @@ mod tests {
     #[tokio::test]
     async fn test_checkpoint_version_reports_correct_value() {
         use crate::snapshot_source::SnapshotSource;
-        let source = MockSnapshotSource {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.db");
+        create_marker_db(&base, "checkpoint").unwrap();
+        let source = CopySnapshotSource {
             version: 42,
-            row_count: 5,
-            fail: None,
+            path: base.clone(),
         };
-        let version: u64 = source.checkpoint_version().await.unwrap();
-        assert_eq!(version, 42);
+        let checkpoint = source.checkpoint().await.unwrap();
+        assert_eq!(checkpoint.seq, 42);
+        assert_eq!(
+            checkpoint.checksum,
+            ltx::compute_checksum_from_file(&base).unwrap()
+        );
     }
 
     #[tokio::test]
@@ -2279,6 +3147,168 @@ mod tests {
                 .unwrap();
 
         assert_eq!(restored_seq, 5);
+    }
+
+    #[tokio::test]
+    async fn restore_errors_on_noncontiguous_incremental_sequence() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let output = dir.path().join("restored.db");
+        let page_size = 4096u32;
+        std::fs::write(&source, vec![0x11; page_size as usize * 2]).unwrap();
+
+        let snapshot = ltx::encode_snapshot(&source, page_size, 1, 0).unwrap();
+        let snapshot_key = build_changeset_key("test/", "mydb", GENERATION_SNAPSHOT, 1);
+        storage.insert(&snapshot_key, snapshot);
+
+        let snapshot_checksum = ltx::compute_checksum_from_file(&source).unwrap();
+        let pages = vec![(1, vec![0x33; page_size as usize])];
+        let (incremental, _) =
+            ltx::encode_wal_changes(&pages, page_size, 3, snapshot_checksum).unwrap();
+        let incremental_key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 3);
+        storage.insert(&incremental_key, incremental);
+
+        let err = restore(&storage, "test/", "mydb", &output, None)
+            .await
+            .expect_err("restore must reject a gap from seq 1 to seq 3");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gap") || msg.contains("contiguous") || msg.contains("seq"),
+            "expected gap/contiguity error, got: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_point_in_time_uses_latest_snapshot_not_after_target() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let old_db = dir.path().join("old.db");
+        let new_db = dir.path().join("new.db");
+        let output = dir.path().join("restored.db");
+        let page_size = 4096u32;
+
+        create_marker_db(&old_db, "old-snapshot").unwrap();
+        create_marker_db(&new_db, "newer-snapshot").unwrap();
+
+        let old_snapshot = ltx::encode_snapshot(&old_db, page_size, 1, 0).unwrap();
+        let old_key = build_changeset_key("test/", "mydb", GENERATION_SNAPSHOT, 1);
+        storage.insert(&old_key, old_snapshot);
+
+        let new_snapshot = ltx::encode_snapshot(&new_db, page_size, 5, 0).unwrap();
+        let new_key = build_changeset_key("test/", "mydb", GENERATION_SNAPSHOT, 5);
+        storage.insert(&new_key, new_snapshot);
+
+        let restored_seq = restore(&storage, "test/", "mydb", &output, Some("3"))
+            .await
+            .expect("core restore should choose the latest snapshot <= target");
+
+        assert_eq!(restored_seq, 1);
+        let conn = rusqlite::Connection::open(&output).unwrap();
+        let marker: String = conn
+            .query_row("SELECT value FROM marker", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(marker, "old-snapshot");
+    }
+
+    #[tokio::test]
+    async fn restore_failure_preserves_existing_output_database() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source.db");
+        let output = dir.path().join("restored.db");
+        let page_size = create_sqlite_source(&source).unwrap();
+        create_marker_db(&output, "must-survive").unwrap();
+        let original_output = std::fs::read(&output).unwrap();
+
+        let snapshot = ltx::encode_snapshot(&source, page_size, 1, 0).unwrap();
+        let snapshot_key = build_changeset_key("test/", "mydb", GENERATION_SNAPSHOT, 1);
+        storage.insert(&snapshot_key, snapshot);
+
+        let snapshot_checksum = ltx::compute_checksum_from_file(&source).unwrap();
+        let pages = vec![(1, vec![0x66; page_size as usize])];
+        let (incremental, _) =
+            ltx::encode_wal_changes(&pages, page_size, 3, snapshot_checksum).unwrap();
+        let incremental_key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 3);
+        storage.insert(&incremental_key, incremental);
+
+        restore(&storage, "test/", "mydb", &output, None)
+            .await
+            .expect_err("restore must fail before publishing over the existing output");
+
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            original_output,
+            "failed restore must leave the existing output database untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_with_snapshot_source_failure_preserves_existing_output_database() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("restored.db");
+        create_marker_db(&output, "must-survive").unwrap();
+        let original_output = std::fs::read(&output).unwrap();
+
+        let incremental_key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 7);
+        storage.insert(&incremental_key, vec![0xff]);
+        let source = MockSnapshotSource {
+            version: 5,
+            row_count: 2,
+            fail: None,
+        };
+
+        restore_with_snapshot_source(&storage, "test/", "mydb", &output, &source)
+            .await
+            .expect_err("restore must fail before publishing over the existing output");
+
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            original_output,
+            "failed snapshot-source restore must leave the existing output database untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_with_snapshot_source_rejects_first_incremental_with_wrong_anchor_checksum() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base.db");
+        let output = dir.path().join("restored.db");
+        let existing = dir.path().join("existing.db");
+        create_marker_db(&base, "base").unwrap();
+        create_marker_db(&existing, "must-survive").unwrap();
+        std::fs::copy(&existing, &output).unwrap();
+        let original_output = std::fs::read(&output).unwrap();
+
+        let source = CopySnapshotSource {
+            version: 5,
+            path: base.clone(),
+        };
+        let page_size = 4096u32;
+        let base_data = std::fs::read(&base).unwrap();
+        let base_page_1 = base_data[0..page_size as usize].to_vec();
+        let actual_anchor = ltx::compute_checksum_from_file(&base).unwrap();
+        let wrong_anchor = actual_anchor ^ 0xfeed_face_dead_beef;
+        let (incremental, _) =
+            ltx::encode_wal_changes(&[(1, base_page_1)], page_size, 6, wrong_anchor).unwrap();
+        let incremental_key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 6);
+        storage.insert(&incremental_key, incremental);
+
+        restore_with_snapshot_source(&storage, "test/", "mydb", &output, &source)
+            .await
+            .expect_err(
+                "snapshot-source restore must reject a first incremental that does not chain \
+                 from the materialized base checksum",
+            );
+
+        assert_eq!(
+            std::fs::read(&output).unwrap(),
+            original_output,
+            "failed snapshot-source restore must leave existing output untouched"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -2406,18 +3436,18 @@ mod tests {
             SyncState::new_with_paths(dir.path().join("mydb.db"), dir.path().join("mydb.db-wal"))
                 .expect("sync state");
         state.name = "mydb".to_string();
+        let base = ExternalBaseCursor {
+            seq: 3,
+            checksum: checksum_from_current_page_base,
+        };
+        state.external_base = Some(base);
+        state.current_seq = 4;
+        state.db_checksum = Some(checksum4);
+        save_external_base_progress(&state).expect("seed local external progress");
 
-        initialize_external_base_state(
-            &storage,
-            "test/",
-            &mut state,
-            ExternalBaseCursor {
-                seq: 3,
-                checksum: checksum_from_current_page_base,
-            },
-        )
-        .await
-        .expect("external base init should chain from the external page-base checksum");
+        initialize_external_base_state(&storage, "test/", &mut state, base)
+            .await
+            .expect("external base init should chain from the external page-base checksum");
 
         assert_eq!(state.current_seq, 4);
         assert_eq!(
@@ -2455,18 +3485,18 @@ mod tests {
             SyncState::new_with_paths(dir.path().join("mydb.db"), dir.path().join("mydb.db-wal"))
                 .expect("sync state");
         state.name = "mydb".to_string();
+        let base = ExternalBaseCursor {
+            seq: 3,
+            checksum: 0x2222,
+        };
+        state.external_base = Some(base);
+        state.current_seq = 4;
+        state.db_checksum = Some(checksum4);
+        save_external_base_progress(&state).expect("seed local external progress");
 
-        initialize_external_base_state(
-            &storage,
-            "test/",
-            &mut state,
-            ExternalBaseCursor {
-                seq: 3,
-                checksum: 0x2222,
-            },
-        )
-        .await
-        .expect("same-seq checksum should be accepted only when it extends the chain");
+        initialize_external_base_state(&storage, "test/", &mut state, base)
+            .await
+            .expect("same-seq checksum should be accepted only when it extends the chain");
 
         assert_eq!(state.current_seq, 4);
         assert_eq!(state.db_checksum, Some(checksum4));
@@ -2502,11 +3532,24 @@ mod tests {
         let storage = TestStorage::new();
         let mut sink = RecordingSink::new();
 
-        let seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 5)
-            .await
-            .expect("pull");
+        let cursor = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 5,
+                checksum: 0x55,
+            },
+        )
+        .await
+        .expect("pull");
 
-        assert_eq!(seq, 5, "no new changesets, returns current_seq");
+        assert_eq!(cursor.seq, 5, "no new changesets, returns current seq");
+        assert_eq!(
+            cursor.checksum, 0x55,
+            "no new changesets, returns current checksum"
+        );
 
         let ev = sink.snapshot();
         assert_eq!(ev.begin_calls, 1, "begin must be called exactly once");
@@ -2532,10 +3575,19 @@ mod tests {
         );
 
         let mut sink = RecordingSink::new();
-        let seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0)
-            .await
-            .expect("pull");
-        assert_eq!(seq, 1);
+        let cursor = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await
+        .expect("pull");
+        assert_eq!(cursor.seq, 1);
 
         let ev = sink.snapshot();
         assert_eq!(ev.begin_calls, 1);
@@ -2551,6 +3603,139 @@ mod tests {
         assert_eq!(applied[1].0, 2);
         assert_eq!(applied[0].1, p1);
         assert_eq!(applied[1].1, p2);
+    }
+
+    #[tokio::test]
+    async fn pull_incremental_rejects_page_id_zero_without_mutating_database() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("follower.db");
+        let page_size = 4096u32;
+        let original = vec![0x11u8; page_size as usize * 2];
+        std::fs::write(&db_path, &original).unwrap();
+
+        let pre_checksum = ltx::compute_checksum_from_file(&db_path).unwrap();
+        let (bytes, _) = ltx::encode_wal_changes(
+            &[(0, page_payload(page_size as usize, 0xAA))],
+            page_size,
+            1,
+            pre_checksum,
+        )
+        .unwrap();
+        let key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 1);
+        storage.insert(&key, bytes);
+
+        let err = pull_incremental(
+            &storage,
+            "test/",
+            "mydb",
+            &db_path,
+            PullCursor {
+                seq: 0,
+                checksum: pre_checksum,
+            },
+        )
+        .await
+        .expect_err("pull_incremental must reject page_id 0");
+
+        assert!(
+            err.to_string().contains("page number 0"),
+            "expected invalid page id error, got: {err}"
+        );
+        assert_eq!(std::fs::read(&db_path).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn pull_incremental_truncates_database_to_encoded_end_page_count() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("follower.db");
+        let page_size = 4096u32;
+        let mut original = Vec::new();
+        original.extend(vec![0x11; page_size as usize]);
+        original.extend(vec![0x22; page_size as usize]);
+        original.extend(vec![0x33; page_size as usize]);
+        std::fs::write(&db_path, &original).unwrap();
+
+        let pre_checksum = ltx::compute_checksum_from_file(&db_path).unwrap();
+        let mut changeset = ltx::HadbChangeset::new(
+            1,
+            pre_checksum,
+            ltx::SQLITE_PAGE_ID_SIZE,
+            page_size,
+            vec![
+                ltx::HadbPageEntry {
+                    page_id: ltx::HadbPageId::U32(1),
+                    data: vec![0xAA; page_size as usize],
+                },
+                ltx::HadbPageEntry {
+                    page_id: ltx::HadbPageId::U32(2),
+                    data: Vec::new(),
+                },
+            ],
+        );
+        changeset.header.flags = 0x01;
+        let key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 1);
+        storage.insert(&key, hadb_changeset::physical::encode(&changeset));
+
+        let cursor = pull_incremental(
+            &storage,
+            "test/",
+            "mydb",
+            &db_path,
+            PullCursor {
+                seq: 0,
+                checksum: pre_checksum,
+            },
+        )
+        .await
+        .expect("pull should apply shrink marker");
+
+        assert_eq!(cursor.seq, 1);
+        let data = std::fs::read(&db_path).unwrap();
+        assert_eq!(data.len(), page_size as usize);
+        assert_eq!(data, vec![0xAA; page_size as usize]);
+    }
+
+    #[tokio::test]
+    async fn pull_incremental_rejects_first_changeset_with_wrong_anchor_checksum() {
+        let mut storage = TestStorage::new();
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("follower.db");
+        let page_size = 4096u32;
+        let original = vec![0x11u8; page_size as usize];
+        std::fs::write(&db_path, &original).unwrap();
+
+        let actual_anchor = ltx::compute_checksum_from_file(&db_path).unwrap();
+        let wrong_anchor = actual_anchor ^ 0xfeed_face_dead_beef;
+        let (bytes, _) = ltx::encode_wal_changes(
+            &[(1, page_payload(page_size as usize, 0xAA))],
+            page_size,
+            1,
+            wrong_anchor,
+        )
+        .unwrap();
+        let key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 1);
+        storage.insert(&key, bytes);
+
+        pull_incremental(
+            &storage,
+            "test/",
+            "mydb",
+            &db_path,
+            PullCursor {
+                seq: 0,
+                checksum: actual_anchor,
+            },
+        )
+            .await
+            .expect_err("pull_incremental must reject a first changeset that does not chain from the follower checksum");
+
+        assert_eq!(
+            std::fs::read(&db_path).unwrap(),
+            original,
+            "failed pull must not mutate the follower database"
+        );
     }
 
     #[tokio::test]
@@ -2587,10 +3772,19 @@ mod tests {
         );
 
         let mut sink = RecordingSink::new();
-        let final_seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0)
-            .await
-            .expect("pull");
-        assert_eq!(final_seq, 3);
+        let final_cursor = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await
+        .expect("pull");
+        assert_eq!(final_cursor.seq, 3);
 
         let ev = sink.snapshot();
         assert_eq!(ev.begin_calls, 1);
@@ -2606,11 +3800,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pull_into_sink_stops_on_broken_chain() {
-        // F13: a stale changeset from a different lineage sitting at an in-range
-        // seq must NOT be applied. Seq 1 and 2 chain; seq 3 carries a bogus
-        // prev_checksum (a prior leader's lineage). Pull must apply 1 and 2,
-        // then stop at 3.
+    async fn pull_into_sink_errors_on_broken_chain_without_applying_pages() {
+        // A stale changeset from a different lineage sitting at an in-range seq
+        // must NOT be applied. The pull prevalidates the whole discovered chain
+        // before routing any pages into the sink, so a later chain break fails
+        // closed without partially advancing local state.
         let mut storage = TestStorage::new();
         let page_size = 4096u32;
         let ck1 = seed_chained_changeset(
@@ -2643,24 +3837,76 @@ mod tests {
         );
 
         let mut sink = RecordingSink::new();
-        let final_seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0)
-            .await
-            .expect("pull");
-        assert_eq!(final_seq, 2, "must stop before the mis-chained seq 3");
+        let err = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await
+        .expect_err("pull must hard-error on the mis-chained seq 3");
+        assert!(
+            err.to_string().contains("checksum chain broken"),
+            "expected checksum-chain error, got: {err}"
+        );
 
         let ev = sink.snapshot();
-        assert_eq!(ev.committed_seqs, vec![1, 2], "seq 3 rejected");
-        assert_eq!(ev.applied.len(), 2);
-        // The valid prefix still finalizes cleanly (no abort).
-        assert_eq!(ev.finalize_calls, 1);
-        assert_eq!(ev.abort_calls, 0);
+        assert!(ev.committed_seqs.is_empty());
+        assert!(ev.applied.is_empty());
+        assert_eq!(ev.finalize_calls, 0);
+        assert_eq!(ev.abort_calls, 1);
+    }
+
+    #[tokio::test]
+    async fn pull_into_sink_rejects_first_changeset_with_wrong_anchor_checksum() {
+        let mut storage = TestStorage::new();
+        let page_size = 4096u32;
+        seed_chained_changeset(
+            &mut storage,
+            "test/",
+            "mydb",
+            1,
+            0xfeed_face_dead_beef,
+            page_size,
+            &[(1, page_payload(page_size as usize, 0x11))],
+        );
+
+        let mut sink = RecordingSink::new();
+        pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await
+        .expect_err(
+            "sink pull must reject a first changeset that does not chain from the caller checksum",
+        );
+
+        let ev = sink.snapshot();
+        assert_eq!(ev.begin_calls, 1);
+        assert_eq!(ev.finalize_calls, 0);
+        assert_eq!(ev.abort_calls, 1);
+        assert!(
+            ev.applied.is_empty(),
+            "invalid first changeset must be rejected before pages reach the sink"
+        );
+        assert!(ev.committed_seqs.is_empty());
     }
 
     #[tokio::test]
     async fn pull_into_sink_skips_changesets_at_or_below_current_seq() {
         let mut storage = TestStorage::new();
         let page_size = 4096u32;
-        seed_changeset(
+        let ck1 = seed_changeset(
             &mut storage,
             "test/",
             "mydb",
@@ -2668,20 +3914,30 @@ mod tests {
             page_size,
             &[(1, page_payload(page_size as usize, 0x11))],
         );
-        seed_changeset(
+        seed_chained_changeset(
             &mut storage,
             "test/",
             "mydb",
             2,
+            ck1,
             page_size,
             &[(2, page_payload(page_size as usize, 0x22))],
         );
 
         let mut sink = RecordingSink::new();
-        let seq = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 1)
-            .await
-            .expect("pull");
-        assert_eq!(seq, 2, "should advance past current_seq=1 to seq=2");
+        let cursor = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 1,
+                checksum: ck1,
+            },
+        )
+        .await
+        .expect("pull");
+        assert_eq!(cursor.seq, 2, "should advance past current_seq=1 to seq=2");
 
         let ev = sink.snapshot();
         assert_eq!(ev.committed_seqs, vec![2], "only seq>1 applied");
@@ -2710,7 +3966,17 @@ mod tests {
 
         // Inject a failure on the second apply_page call.
         let mut sink = RecordingSink::new().fail_at(1);
-        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+        let result = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await;
 
         assert!(result.is_err(), "primary error must propagate");
         let err = result.unwrap_err().to_string();
@@ -2743,7 +4009,17 @@ mod tests {
         storage.insert(&key, b"not a valid HADBP changeset".to_vec());
 
         let mut sink = RecordingSink::new();
-        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+        let result = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await;
 
         assert!(result.is_err(), "decode failure must propagate");
         let err = result.unwrap_err().to_string();
@@ -2769,7 +4045,17 @@ mod tests {
         let storage = TestStorage::new();
         let mut sink = RecordingSink::new().fail_begin();
 
-        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+        let result = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await;
 
         assert!(result.is_err(), "begin failure must propagate");
         let err = result.unwrap_err().to_string();
@@ -2812,7 +4098,17 @@ mod tests {
         );
 
         let mut sink = RecordingSink::new().fail_finalize();
-        let result = pull_incremental_into_sink(&storage, "test/", "mydb", &mut sink, 0).await;
+        let result = pull_incremental_into_sink(
+            &storage,
+            "test/",
+            "mydb",
+            &mut sink,
+            PullCursor {
+                seq: 0,
+                checksum: 0,
+            },
+        )
+        .await;
 
         assert!(result.is_err(), "finalize failure must propagate");
         let err = result.unwrap_err().to_string();
@@ -2957,6 +4253,237 @@ mod tests {
         assert!(
             err.to_string().contains("equivocation"),
             "error must name equivocation, got: {err}"
+        );
+    }
+
+    struct MutateSourceOnPutStorage {
+        objects: Arc<Mutex<StdHashMap<String, Vec<u8>>>>,
+        db_path: PathBuf,
+        mutated: Arc<Mutex<bool>>,
+    }
+
+    impl MutateSourceOnPutStorage {
+        fn new(db_path: PathBuf) -> Self {
+            Self {
+                objects: Arc::new(Mutex::new(StdHashMap::new())),
+                db_path,
+                mutated: Arc::new(Mutex::new(false)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl StorageBackend for MutateSourceOnPutStorage {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.objects.lock().unwrap().get(key).cloned())
+        }
+
+        async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.objects
+                .lock()
+                .unwrap()
+                .insert(key.to_string(), data.to_vec());
+
+            let mut mutated = self.mutated.lock().unwrap();
+            if !*mutated {
+                let conn = rusqlite::Connection::open(&self.db_path)?;
+                conn.execute_batch(
+                    "
+                    PRAGMA journal_mode=WAL;
+                    INSERT INTO items (id, value) VALUES (2, 'after-upload');
+                    ",
+                )?;
+                *mutated = true;
+            }
+
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.objects.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+            let mut keys: Vec<String> = self
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .filter(|k| after.map(|a| k.as_str() > a).unwrap_or(true))
+                .cloned()
+                .collect();
+            keys.sort();
+            Ok(keys)
+        }
+
+        async fn exists(&self, key: &str) -> Result<bool> {
+            Ok(self.objects.lock().unwrap().contains_key(key))
+        }
+
+        async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+            self.put(key, data).await?;
+            Ok(CasResult {
+                success: true,
+                etag: Some("test".into()),
+            })
+        }
+
+        async fn put_if_match(&self, key: &str, data: &[u8], _etag: &str) -> Result<CasResult> {
+            self.put(key, data).await?;
+            Ok(CasResult {
+                success: true,
+                etag: Some("test".into()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn take_snapshot_state_checksum_matches_uploaded_snapshot_bytes() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("checksum-race.db");
+        let restored_path = dir.path().join("restored.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'uploaded');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = MutateSourceOnPutStorage::new(db_path.clone());
+        let mut state = SyncState::new(db_path.clone()).unwrap();
+        state.name = "checksum_race".to_string();
+        state.init_checksum().unwrap();
+
+        take_snapshot_with_retry(
+            &storage,
+            "prefix/",
+            &mut state,
+            &RetryPolicy::default_policy(),
+        )
+        .await
+        .unwrap();
+
+        let key = build_changeset_key(
+            "prefix/",
+            &state.name,
+            GENERATION_SNAPSHOT,
+            state.current_seq,
+        );
+        let uploaded = storage.get(&key).await.unwrap().expect("snapshot uploaded");
+        let decoded = ltx::decode_to_db(&uploaded, &restored_path).unwrap();
+
+        assert_eq!(
+            state.db_checksum,
+            Some(decoded.checksum),
+            "state checksum must describe the uploaded snapshot bytes, not a later live-file read"
+        );
+    }
+
+    #[tokio::test]
+    async fn walrust_owned_sync_rejects_divergent_existing_changeset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("owned-cas.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            ",
+        )
+        .unwrap();
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path.clone()).unwrap();
+        state.name = "owned_cas".to_string();
+        state.init_checksum().unwrap();
+        take_snapshot_with_retry(
+            &storage,
+            "prefix/",
+            &mut state,
+            &RetryPolicy::default_policy(),
+        )
+        .await
+        .unwrap();
+
+        conn.execute("INSERT INTO items (id, value) VALUES (2, 'delta')", [])
+            .unwrap();
+
+        let next_seq = state.current_seq + 1;
+        let key = build_changeset_key("prefix/", &state.name, GENERATION_LIVE, next_seq);
+        let existing = b"conflicting existing object".to_vec();
+        storage.put(&key, &existing).await.unwrap();
+
+        let err = sync_wal(&storage, "prefix/", &mut state)
+            .await
+            .expect_err("walrust-owned sync must not overwrite a divergent existing object");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate changeset seq") || msg.contains("refusing overwrite"),
+            "expected duplicate overwrite refusal, got: {msg}"
+        );
+        assert_eq!(
+            storage.get(&key).await.unwrap(),
+            Some(existing),
+            "failed CAS publish must leave the existing object intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn walrust_owned_snapshot_rejects_divergent_existing_changeset() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("owned-snapshot-cas.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path).unwrap();
+        state.name = "owned_snapshot_cas".to_string();
+        state.init_checksum().unwrap();
+
+        let next_seq = state.current_seq + 1;
+        let key = build_changeset_key("prefix/", &state.name, GENERATION_SNAPSHOT, next_seq);
+        let existing = b"conflicting existing snapshot object".to_vec();
+        storage.put(&key, &existing).await.unwrap();
+
+        let err = take_snapshot_with_retry(
+            &storage,
+            "prefix/",
+            &mut state,
+            &RetryPolicy::default_policy(),
+        )
+        .await
+        .expect_err("walrust-owned snapshot must not overwrite a divergent existing object");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("duplicate changeset seq") || msg.contains("refusing overwrite"),
+            "expected duplicate overwrite refusal, got: {msg}"
+        );
+        assert_eq!(
+            storage.get(&key).await.unwrap(),
+            Some(existing),
+            "failed snapshot CAS publish must leave the existing object intact"
+        );
+        assert_eq!(
+            state.current_seq, 0,
+            "failed snapshot publish must not advance state"
         );
     }
 

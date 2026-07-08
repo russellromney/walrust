@@ -1,44 +1,86 @@
 use crate::cache::LocalCache;
-use crate::ltx;
+use crate::errors::{classify_or_else, WalrustError};
 use crate::s3::{self, create_client, parse_bucket};
-use anyhow::{anyhow, Result};
+use anyhow::Result;
+use async_trait::async_trait;
+use hadb_storage::{CasResult, StorageBackend};
+use hadb_storage_s3::S3Storage;
 use std::path::Path;
+use walrust_core::legacy_restore;
 
 use super::manifest::{
     discover_state_from_s3, find_latest_snapshot, list_generation_files, GENERATION_LIVE,
 };
+use walrust_core::legacy_manifest::{parse_legacy_flat_ltx_filename, parse_ltx_filename};
 
-/// Decide whether a completed restore actually reached its requested target.
-///
-/// - **Restore-to-latest** (`explicit_pit == false`): `target_txid` is a real
-///   committed boundary discovered from S3, so the restore must reach it
-///   exactly. Falling short means a missing incremental / chain gap and is a
-///   hard error (otherwise we'd report success at a lower TXID — silent data
-///   loss).
-/// - **Explicit point-in-time** (`explicit_pit == true`): the requested TXID
-///   may fall *between* commit boundaries; landing at the latest commit
-///   `<= target` is correct point-in-time behavior, so an exact match is not
-///   required. We only reject an *overshoot* (the only available snapshot/chain
-///   is already past the requested point, so the result includes changes the
-///   caller did not ask for).
-fn restore_reached_target(final_txid: u64, target_txid: u64, explicit_pit: bool) -> Result<()> {
-    if explicit_pit {
-        if final_txid > target_txid {
-            return Err(anyhow!(
-                "restore overshot: reached TXID {final_txid} but point-in-time target is \
-                 {target_txid} (no snapshot/chain at or before the requested point)"
-            ));
+struct CachedLegacyStorage {
+    s3: S3Storage,
+    cache: Option<LocalCache>,
+}
+
+fn key_max_txid(key: &str) -> Option<u64> {
+    let filename = key.rsplit('/').next().unwrap_or(key);
+    parse_ltx_filename(filename)
+        .map(|(_, max_txid)| max_txid)
+        .or_else(|| parse_legacy_flat_ltx_filename(filename))
+}
+
+#[async_trait]
+impl StorageBackend for CachedLegacyStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if let (Some(cache), Some(txid)) = (&self.cache, key_max_txid(key)) {
+            if cache.has_txid(txid) {
+                tracing::debug!("Reading TXID {} from cache", txid);
+                return Ok(Some(cache.read_ltx(txid)?));
+            }
         }
-        return Ok(());
+        self.s3
+            .get(key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
     }
-    if final_txid != target_txid {
-        return Err(anyhow!(
-            "restore incomplete: reached TXID {final_txid} but latest is {target_txid}. \
-             An incremental object is missing or the chain has a gap; the restored \
-             database does not reflect the latest committed state."
-        ));
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.s3
+            .put(key, data)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
     }
-    Ok(())
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.s3
+            .delete(key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.s3
+            .list(prefix, after)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.s3
+            .exists(key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.s3
+            .put_if_absent(key, data)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.s3
+            .put_if_match(key, data, etag)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))
+    }
 }
 
 pub async fn restore(
@@ -51,7 +93,9 @@ pub async fn restore(
     webhook: Option<std::sync::Arc<crate::webhook::WebhookSender>>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint).await?;
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     // Try to open local cache if provided
     let cache = if let Some(dir) = cache_dir {
@@ -72,152 +116,36 @@ pub async fn restore(
         None
     };
 
-    // Discover state from S3 file listings (litestream format - no manifest)
-    let (current_txid, _max_gen, _) =
-        discover_state_from_s3(&client, &bucket_name, &prefix, name).await?;
-
-    if current_txid == 0 {
-        return Err(anyhow!("No LTX files found for database: {}", name));
-    }
-
-    // Find the latest snapshot (min_txid=1 in generation 1+)
-    let snapshot = find_latest_snapshot(&client, &bucket_name, &prefix, name)
-        .await?
-        .ok_or_else(|| anyhow!("No snapshot found for database: {}", name))?;
-
-    let (snapshot_gen, snapshot_key, snapshot_min_txid, snapshot_max_txid) = snapshot;
-
-    // Parse point in time if provided (TXID only for litestream format)
-    let target_txid = if let Some(pit) = point_in_time {
-        pit.parse::<u64>()
-            .map_err(|_| anyhow!("Invalid point_in_time format. Use TXID (number)"))?
+    // Parse point in time if provided (TXID only for litestream format).
+    let parsed_point_in_time = if let Some(pit) = point_in_time {
+        Some(pit.parse::<u64>().map_err(|_| {
+            WalrustError::restore("Invalid point_in_time format. Use TXID (number)")
+        })?)
     } else {
-        current_txid
+        None
     };
 
-    tracing::info!(
-        "Restoring from LTX snapshot: {} (TXID: {}-{}, generation: {})",
-        snapshot_key,
-        snapshot_min_txid,
-        snapshot_max_txid,
-        snapshot_gen
-    );
-
-    // Download and decode LTX snapshot
-    // Try cache first, fall back to S3
-    let ltx_data = if let Some(ref cache) = cache {
-        if cache.has_txid(snapshot_max_txid) {
-            tracing::info!("Reading snapshot TXID {} from cache", snapshot_max_txid);
-            cache.read_ltx(snapshot_max_txid)?
-        } else {
-            tracing::debug!(
-                "Snapshot TXID {} not in cache, fetching from S3",
-                snapshot_max_txid
-            );
-            s3::download_bytes(&client, &bucket_name, &snapshot_key).await?
-        }
-    } else {
-        s3::download_bytes(&client, &bucket_name, &snapshot_key).await?
+    let storage = CachedLegacyStorage {
+        s3: S3Storage::new(client.clone(), bucket_name.clone()),
+        cache,
     };
-
-    let cursor = std::io::Cursor::new(ltx_data);
-    let decode_result = ltx::decode_to_db(cursor, output).map_err(|e| {
-        if let Some(webhook) = webhook {
-            let error_msg = format!("LTX decode failed for snapshot: {}", e);
-            let webhook = webhook.clone();
-            let name = name.to_string();
-            tokio::spawn(async move {
-                webhook.notify_corruption(&name, &error_msg).await;
-            });
+    let result =
+        legacy_restore::restore_legacy_ltx(&storage, &prefix, name, output, parsed_point_in_time)
+            .await;
+    let final_txid = match result {
+        Ok(txid) => txid,
+        Err(e) => {
+            if let Some(webhook) = webhook {
+                let error_msg = format!("legacy LTX restore failed: {e}");
+                let webhook = webhook.clone();
+                let name = name.to_string();
+                tokio::spawn(async move {
+                    webhook.notify_corruption(&name, &error_msg).await;
+                });
+            }
+            return Err(classify_or_else(e, WalrustError::restore));
         }
-        e
-    })?;
-
-    tracing::info!(
-        "Restored {} from LTX (page_size: {}, pages: {}, TXID: {}-{}, checksum: {:016x})",
-        name,
-        decode_result.header.page_size.into_inner(),
-        decode_result.header.commit.into_inner(),
-        decode_result.header.min_txid.into_inner(),
-        decode_result.header.max_txid.into_inner(),
-        decode_result.post_apply_checksum.into_inner()
-    );
-
-    let mut final_txid = snapshot_max_txid;
-
-    // Get incrementals from generation 0 (live folder)
-    let incrementals =
-        list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE).await?;
-
-    // Filter to files we need: min_txid > snapshot_max_txid and max_txid <= target_txid
-    let applicable: Vec<_> = incrementals
-        .iter()
-        .filter(|(_, min, max)| *min > snapshot_max_txid && *max <= target_txid)
-        .collect();
-
-    if !applicable.is_empty() {
-        tracing::info!("Applying {} incremental LTX files", applicable.len());
-
-        // Track cache hits for logging
-        let mut cache_hits = 0;
-        let mut s3_fetches = 0;
-
-        for (key, _min_txid, max_txid) in &applicable {
-            // Try to read from cache first using max_txid as the key
-            let ltx_data = if let Some(ref cache) = cache {
-                if cache.has_txid(*max_txid) {
-                    cache_hits += 1;
-                    tracing::debug!("Reading TXID {} from cache", max_txid);
-                    cache.read_ltx(*max_txid)?
-                } else {
-                    s3_fetches += 1;
-                    tracing::debug!("TXID {} not in cache, fetching from S3", max_txid);
-                    s3::download_bytes(&client, &bucket_name, key).await?
-                }
-            } else {
-                s3_fetches += 1;
-                s3::download_bytes(&client, &bucket_name, key).await?
-            };
-
-            let cursor = std::io::Cursor::new(ltx_data);
-            // apply_ltx_to_db now verifies pre_apply and post_apply checksums
-            let apply_result = ltx::apply_ltx_to_db(cursor, output)?;
-
-            tracing::debug!(
-                "Applied {} (TXID: {}-{}, checksum: {:016x})",
-                key,
-                apply_result.header.min_txid.into_inner(),
-                apply_result.header.max_txid.into_inner(),
-                apply_result.post_apply_checksum.into_inner()
-            );
-
-            final_txid = *max_txid;
-        }
-
-        if cache.is_some() {
-            tracing::info!(
-                "Applied {} incremental LTX files (cache: {}, S3: {}, final TXID: {})",
-                applicable.len(),
-                cache_hits,
-                s3_fetches,
-                final_txid
-            );
-        } else {
-            tracing::info!(
-                "Applied {} incremental LTX files (final TXID: {})",
-                applicable.len(),
-                final_txid
-            );
-        }
-    }
-
-    // The restore must reach the requested target. For "restore to latest"
-    // (no explicit point-in-time) `target_txid` is a real committed boundary
-    // discovered from S3, so falling short means a missing incremental / chain
-    // gap (silent data loss). For an explicit point-in-time the target may fall
-    // *between* commit boundaries, where landing at the latest commit <= target
-    // is correct — so we only reject an overshoot there.
-    restore_reached_target(final_txid, target_txid, point_in_time.is_some())?;
+    };
 
     println!(
         "Restored {} to {} (TXID: {})",
@@ -231,9 +159,13 @@ pub async fn restore(
 /// List databases in bucket
 pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint).await?;
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
-    let objects = s3::list_objects(&client, &bucket_name, &prefix).await?;
+    let objects = s3::list_objects(&client, &bucket_name, &prefix)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     // Extract unique database names (litestream format: db_name/GGGG/file.ltx)
     let mut dbs: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -255,14 +187,20 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
         for db in &dbs {
             // Discover state from S3 (litestream format)
             let (current_txid, _max_gen, _) =
-                discover_state_from_s3(&client, &bucket_name, &prefix, db).await?;
+                discover_state_from_s3(&client, &bucket_name, &prefix, db)
+                    .await
+                    .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
             // Count files in generation 0 (live incrementals)
             let live_files =
-                list_generation_files(&client, &bucket_name, &prefix, db, GENERATION_LIVE).await?;
+                list_generation_files(&client, &bucket_name, &prefix, db, GENERATION_LIVE)
+                    .await
+                    .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
             // Find snapshots (generation 1+)
-            let snapshot = find_latest_snapshot(&client, &bucket_name, &prefix, db).await?;
+            let snapshot = find_latest_snapshot(&client, &bucket_name, &prefix, db)
+                .await
+                .map_err(|e| classify_or_else(e, WalrustError::s3))?;
             let snapshot_info = match snapshot {
                 Some((gen, _, _, max_txid)) => format!("snapshot gen {} (TXID {})", gen, max_txid),
                 None => "no snapshot".to_string(),
@@ -279,36 +217,4 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod restore_target_tests {
-    use super::restore_reached_target;
-
-    #[test]
-    fn latest_restore_must_reach_target_exactly() {
-        // Restore-to-latest: reaching the boundary is OK; falling short is a
-        // hard error (the regression this guards: silently reporting success
-        // at a lower TXID when an incremental is missing).
-        assert!(restore_reached_target(100, 100, false).is_ok());
-        assert!(restore_reached_target(99, 100, false).is_err());
-        assert!(restore_reached_target(0, 1, false).is_err());
-    }
-
-    #[test]
-    fn explicit_pit_between_boundaries_is_ok_not_an_error() {
-        // The regression fix: an explicit point-in-time target that falls
-        // between commit boundaries must land at the latest commit <= target
-        // WITHOUT erroring. Before the fix, the unconditional `final == target`
-        // check wrongly rejected this legitimate PITR.
-        assert!(restore_reached_target(95, 100, true).is_ok()); // landed at 95 for target 100
-        assert!(restore_reached_target(100, 100, true).is_ok()); // exact boundary
-    }
-
-    #[test]
-    fn explicit_pit_overshoot_is_rejected() {
-        // The only available snapshot/chain is past the requested point — the
-        // result would include changes the caller didn't ask for.
-        assert!(restore_reached_target(120, 100, true).is_err());
-    }
 }

@@ -1,16 +1,15 @@
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use chrono::Utc;
+use hadb_storage_s3::S3Storage;
 use std::path::Path;
+use walrust_core::legacy_manifest::plan_legacy_compaction;
+use walrust_core::legacy_wal_sync::snapshot_database_to_storage;
 
-use crate::ltx;
-use crate::retention::{self, RetentionPolicy, SnapshotEntry};
+use crate::errors::{classify_or_else, WalrustError};
+use crate::retention::{RetentionPolicy, SnapshotEntry};
 use crate::s3::{self, create_client, parse_bucket};
 
-use super::manifest::{
-    build_ltx_key, discover_snapshots_from_s3, discover_state_from_s3, list_generation_files,
-    GENERATION_LIVE,
-};
-use super::wal_sync::get_page_size;
+use super::manifest::discover_snapshots_from_s3;
 
 pub async fn compact(
     name: &str,
@@ -20,12 +19,16 @@ pub async fn compact(
     force: bool,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint).await?;
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     // Discover snapshots from the S3 listing — the production watch path never
     // writes a manifest.json, so reading one made compact a silent no-op (F6).
     // The key here is the FULL S3 key (verify/restore use full keys too).
-    let discovered = discover_snapshots_from_s3(&client, &bucket_name, &prefix, name).await?;
+    let discovered = discover_snapshots_from_s3(&client, &bucket_name, &prefix, name)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     if discovered.is_empty() {
         println!("No snapshots found for database '{}'", name);
@@ -35,7 +38,9 @@ pub async fn compact(
     // HEAD each snapshot for size + last-modified to build retention entries.
     let mut snapshot_entries: Vec<SnapshotEntry> = Vec::with_capacity(discovered.len());
     for (key, _gen, _min, max) in &discovered {
-        let meta = s3::head_object_meta(&client, &bucket_name, key).await?;
+        let meta = s3::head_object_meta(&client, &bucket_name, key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))?;
         snapshot_entries.push(SnapshotEntry {
             key: key.clone(),
             created_at: meta.last_modified,
@@ -50,65 +55,18 @@ pub async fn compact(
     }
 
     let now = Utc::now();
-    let mut plan = retention::analyze_retention(&snapshot_entries, policy, now);
-
-    // Chain-reachability guard (F7): a restore replays the latest snapshot whose
-    // coverage is <= the target, then the live incrementals after it. Deleting a
-    // snapshot that a retained incremental chain still depends on would orphan
-    // that chain. Protect any snapshot needed as a base:
-    //   - the highest-TXID snapshot overall (the current restore base), and
-    //   - for the earliest retained live incremental, the latest snapshot at or
-    //     below its start.
-    // Such snapshots are pulled out of the delete set even if the time/size
-    // policy would drop them.
-    let live_incrementals =
-        list_generation_files(&client, &bucket_name, &prefix, name, GENERATION_LIVE).await?;
-    let earliest_live_min = live_incrementals
-        .iter()
-        .filter(|(_, min, max)| !(*min == 1 && *max == 1)) // skip the gen-0 base
-        .map(|(_, min, _)| *min)
-        .min();
-
-    let max_snapshot_txid = snapshot_entries.iter().map(|e| e.sequence).max();
-    // The base needed for the live chain: the latest snapshot whose coverage
-    // ends at or before the earliest retained incremental's start.
-    let base_for_live_chain = earliest_live_min.and_then(|min| {
-        snapshot_entries
-            .iter()
-            .filter(|e| e.sequence < min)
-            .map(|e| e.sequence)
-            .max()
-            .or_else(|| {
-                // No snapshot strictly before the chain start: the lowest
-                // snapshot is the base.
-                snapshot_entries.iter().map(|e| e.sequence).min()
-            })
-    });
-
-    let protected: std::collections::HashSet<u64> = max_snapshot_txid
-        .into_iter()
-        .chain(base_for_live_chain)
-        .collect();
-
+    let storage = S3Storage::new(client.clone(), bucket_name.clone());
+    let plan_before_reachability =
+        crate::retention::analyze_retention(&snapshot_entries, policy, now);
+    let plan = plan_legacy_compaction(&storage, &prefix, name, &snapshot_entries, policy, now)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
     let before = plan.delete.len();
-    let rescued: Vec<_> = plan
-        .delete
-        .iter()
-        .filter(|e| protected.contains(&e.sequence))
-        .cloned()
-        .collect();
-    if !rescued.is_empty() {
-        plan.delete.retain(|e| !protected.contains(&e.sequence));
-        for e in &rescued {
-            if !plan.keep.iter().any(|k| k.sequence == e.sequence) {
-                plan.keep.push(e.clone());
-            }
-            // Don't count rescued snapshots' bytes as freed.
-            plan.bytes_freed = plan.bytes_freed.saturating_sub(e.size);
-        }
+    let rescued = plan_before_reachability.delete.len().saturating_sub(before);
+    if rescued > 0 {
         tracing::info!(
             "Compaction: retained {} snapshot(s) as reachability base for the incremental chain (F7)",
-            before - plan.delete.len()
+            rescued
         );
     }
 
@@ -156,7 +114,9 @@ pub async fn compact(
 
     let keys_to_delete: Vec<String> = plan.delete.iter().map(|e| e.key.clone()).collect();
 
-    let deleted_count = s3::delete_objects(&client, &bucket_name, &keys_to_delete).await?;
+    let deleted_count = s3::delete_objects(&client, &bucket_name, &keys_to_delete)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     tracing::info!("Deleted {} snapshot files", deleted_count);
 
@@ -191,52 +151,27 @@ fn format_age(now: chrono::DateTime<Utc>, created_at: chrono::DateTime<Utc>) -> 
 
 /// Take immediate snapshot as LTX file
 pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> Result<()> {
-    let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint).await?;
-
     if !database.exists() {
-        return Err(anyhow!("Database not found: {}", database.display()));
+        return Err(
+            WalrustError::database(format!("Database not found: {}", database.display())).into(),
+        );
     }
 
     let name = database
         .file_stem()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| anyhow!("Invalid database path"))?;
+        .ok_or_else(|| WalrustError::database("Invalid database path"))?;
 
-    // Get page size from database header
-    let page_size = get_page_size(database).await?;
+    let (bucket_name, prefix) = parse_bucket(bucket);
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+    let storage = S3Storage::new(client, bucket_name.clone());
+    let output = snapshot_database_to_storage(&storage, &prefix, name, database).await?;
 
-    // Discover current state from S3 to get current TXID and generation
-    let (current_txid, current_gen, _) =
-        discover_state_from_s3(&client, &bucket_name, &prefix, name).await?;
-    let new_txid = current_txid + 1;
-    let snapshot_gen = current_gen + 1;
-
-    // Snapshots go to generation 1+ (litestream format)
-    let ltx_key = build_ltx_key(&prefix, name, snapshot_gen, 1, new_txid);
-
-    // Encode database as LTX
-    // Pre-allocate buffer: estimate 2x db size for compression headroom
-    let db_size = std::fs::metadata(database)?.len() as usize;
-    let estimated_size = db_size.saturating_mul(2);
-    let mut ltx_buffer = Vec::with_capacity(estimated_size);
-    ltx::encode_snapshot(&mut ltx_buffer, database, page_size, new_txid)?;
-
-    let ltx_size = ltx_buffer.len() as u64;
-
-    // Upload LTX file
-    s3::upload_bytes(&client, &bucket_name, &ltx_key, ltx_buffer).await?;
-
-    tracing::info!(
-        "LTX snapshot uploaded (gen {}, TXID 1-{}, {} bytes) -> {}",
-        snapshot_gen,
-        new_txid,
-        ltx_size,
-        ltx_key
-    );
     println!(
         "Snapshot uploaded: s3://{}/{} (gen {}, TXID 1-{})",
-        bucket_name, ltx_key, snapshot_gen, new_txid
+        bucket_name, output.key, output.generation, output.max_txid
     );
     Ok(())
 }

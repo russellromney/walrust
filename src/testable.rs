@@ -29,10 +29,10 @@
 //! detected on restore.
 
 use crate::ltx;
+use crate::ltx::Checksum;
 use crate::retry::RetryPolicy;
 use anyhow::{anyhow, Context, Result};
 use hadb_storage::StorageBackend;
-use litepages::Checksum;
 use std::path::{Path, PathBuf};
 
 /// Live generation folder (litestream `0000`).

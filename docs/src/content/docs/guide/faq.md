@@ -129,10 +129,10 @@ Yes, using point-in-time recovery (PITR):
 walrust restore mydb \
   --bucket my-backups \
   -o restored.db \
-  --point-in-time "2024-01-15T10:30:00Z"
+  --point-in-time 42
 ```
 
-Walrust will restore to the closest transaction before that timestamp.
+Walrust will restore through that TXID/sequence number. Timestamp-based PITR is not currently implemented.
 
 ### How do I test my backups?
 

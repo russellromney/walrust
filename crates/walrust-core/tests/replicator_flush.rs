@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 use hadb_storage::{CasResult, StorageBackend};
 use walrust::Replicator;
 use walrust::{ReplicationConfig, SnapshotOwnership};
+use walrust_core as walrust;
 
 // ============================================================================
 // In-memory storage backend for tests
@@ -241,6 +242,23 @@ struct StateJsonForbiddenStorage {
     inner: Arc<MemStorage>,
 }
 
+struct StateJsonGetFailsStorage {
+    inner: Arc<MemStorage>,
+}
+
+struct PutFailsStorage {
+    inner: Arc<MemStorage>,
+}
+
+struct EnospcStorage {
+    inner: Arc<MemStorage>,
+}
+
+struct FailAfterPutsStorage {
+    inner: Arc<MemStorage>,
+    remaining_successful_puts: AtomicUsize,
+}
+
 impl StateJsonForbiddenStorage {
     fn new(inner: Arc<MemStorage>) -> Arc<Self> {
         Arc::new(Self { inner })
@@ -251,6 +269,37 @@ impl StateJsonForbiddenStorage {
             anyhow::bail!("state.json access is forbidden in external-base mode: {key}");
         }
         Ok(())
+    }
+}
+
+impl StateJsonGetFailsStorage {
+    fn new(inner: Arc<MemStorage>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+}
+
+impl PutFailsStorage {
+    fn new(inner: Arc<MemStorage>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+}
+
+impl EnospcStorage {
+    fn new(inner: Arc<MemStorage>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+
+    fn enospc(key: &str) -> anyhow::Error {
+        anyhow::anyhow!("No space left on device while writing {key}")
+    }
+}
+
+impl FailAfterPutsStorage {
+    fn new(inner: Arc<MemStorage>, successful_puts: usize) -> Arc<Self> {
+        Arc::new(Self {
+            inner,
+            remaining_successful_puts: AtomicUsize::new(successful_puts),
+        })
     }
 }
 
@@ -291,6 +340,158 @@ impl StorageBackend for StateJsonForbiddenStorage {
     }
 }
 
+#[async_trait]
+impl StorageBackend for StateJsonGetFailsStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        if key.ends_with("/state.json") {
+            anyhow::bail!("injected state.json read failure: {key}");
+        }
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.inner.put(key, data).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.inner.put_if_absent(key, data).await
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.inner.put_if_match(key, data, etag).await
+    }
+}
+
+#[async_trait]
+impl StorageBackend for PutFailsStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, _data: &[u8]) -> Result<()> {
+        anyhow::bail!("injected put failure: {key}");
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, _data: &[u8]) -> Result<CasResult> {
+        anyhow::bail!("injected put failure: {key}");
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.inner.put_if_match(key, data, etag).await
+    }
+}
+
+#[async_trait]
+impl StorageBackend for EnospcStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, _data: &[u8]) -> Result<()> {
+        Err(Self::enospc(key))
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, _data: &[u8]) -> Result<CasResult> {
+        Err(Self::enospc(key))
+    }
+
+    async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
+        Ok(CasResult {
+            success: false,
+            etag: None,
+        })
+    }
+
+    async fn range_get(&self, key: &str, start: u64, len: u32) -> Result<Option<Vec<u8>>> {
+        self.inner.range_get(key, start, len).await
+    }
+}
+
+#[async_trait]
+impl StorageBackend for FailAfterPutsStorage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        if self
+            .remaining_successful_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return self.inner.put(key, data).await;
+        }
+        anyhow::bail!("injected put failure after allowed successes: {key}");
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.inner.list(prefix, after).await
+    }
+
+    async fn exists(&self, key: &str) -> Result<bool> {
+        self.inner.exists(key).await
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        if self
+            .remaining_successful_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return self.inner.put_if_absent(key, data).await;
+        }
+        anyhow::bail!("injected put failure after allowed successes: {key}");
+    }
+
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.inner.put_if_match(key, data, etag).await
+    }
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -323,6 +524,19 @@ fn write_rows(conn: &rusqlite::Connection, start: u32, count: u32) {
         )
         .unwrap();
     }
+}
+
+fn snapshot_keys(storage: &MemStorage, prefix: &str, db_name: &str) -> Vec<String> {
+    let db_prefix = format!("{prefix}{db_name}/");
+    storage
+        .keys()
+        .into_iter()
+        .filter(|key| {
+            key.starts_with(&db_prefix)
+                && key.ends_with(".hadbp")
+                && (key.starts_with(&format!("{db_prefix}0001/")) || key.contains("/0001/"))
+        })
+        .collect()
 }
 
 fn make_config() -> ReplicationConfig {
@@ -378,6 +592,408 @@ async fn seed_physical_delta(
 // ============================================================================
 // Tests
 // ============================================================================
+
+#[tokio::test]
+async fn test_walrust_owned_reload_restores_saved_wal_checksum_chain() -> Result<()> {
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reload-chain.db");
+    let wal_path = db_path.with_extension("db-wal");
+    let conn = create_wal_db(&db_path, 3);
+    let header = walrust::wal::read_header(&wal_path).await?.unwrap();
+    let saved_offset = std::fs::metadata(&wal_path)?.len();
+
+    let state_json = serde_json::json!({
+        "wal_offset": saved_offset,
+        "wal_generation": 4,
+        "current_seq": 10,
+        "current_txid": 10,
+        "db_checksum": 0u64,
+        "last_snapshot": null,
+        "wal_salt": [header.salt().0, header.salt().1],
+        "wal_checksum_chain": [0x11111111u32, 0x22222222u32],
+    });
+    storage
+        .put(
+            "wal/reload-chain/state.json",
+            &serde_json::to_vec(&state_json)?,
+        )
+        .await?;
+
+    write_rows(&conn, 100, 1);
+
+    let replicator = Replicator::new(storage.clone(), "wal/", make_config());
+    replicator
+        .add_without_snapshot("reload-chain", &db_path)
+        .await?;
+
+    let frames = replicator.flush("reload-chain").await?;
+    assert_eq!(
+        frames, 0,
+        "the saved checksum chain seed must be restored; the intentionally bogus seed makes the next committed frame unverifiable"
+    );
+    assert_ne!(
+        storage.max_hadbp_seq("wal/reload-chain/"),
+        Some(11),
+        "flush must not publish a changeset when the saved chain seed cannot validate the next WAL frame"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_walrust_owned_reload_restores_saved_wal_salt() -> Result<()> {
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reload-salt.db");
+    let wal_path = db_path.with_extension("db-wal");
+    let conn = create_wal_db(&db_path, 3);
+    let header = walrust::wal::read_header(&wal_path).await?.unwrap();
+    let saved_offset = std::fs::metadata(&wal_path)?.len();
+
+    let state_json = serde_json::json!({
+        "wal_offset": saved_offset,
+        "wal_generation": 4,
+        "current_seq": 10,
+        "current_txid": 10,
+        "db_checksum": 0u64,
+        "last_snapshot": null,
+        "wal_salt": [header.salt().0.wrapping_add(1), header.salt().1],
+        "wal_checksum_chain": null,
+    });
+    storage
+        .put(
+            "wal/reload-salt/state.json",
+            &serde_json::to_vec(&state_json)?,
+        )
+        .await?;
+
+    write_rows(&conn, 100, 1);
+
+    let replicator = Replicator::new(storage.clone(), "wal/", make_config());
+    replicator
+        .add_without_snapshot("reload-salt", &db_path)
+        .await?;
+    let frames = replicator.flush("reload-salt").await?;
+    assert!(
+        frames > 0,
+        "salt rollover should reset to the WAL header and resync committed frames"
+    );
+
+    let saved = storage.value("wal/reload-salt/state.json").await;
+    assert_eq!(
+        saved.get("wal_generation").and_then(|v| v.as_u64()),
+        Some(5),
+        "the saved salt must be reloaded so a salt mismatch increments the WAL generation"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_walrust_owned_reload_state_transport_error_is_hard_error() -> Result<()> {
+    let inner = MemStorage::new();
+    let storage = StateJsonGetFailsStorage::new(inner);
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reload-error.db");
+    let _conn = create_wal_db(&db_path, 1);
+
+    let replicator = Replicator::new(storage, "wal/", make_config());
+    let err = replicator
+        .add_without_snapshot("reload-error", &db_path)
+        .await
+        .expect_err("state.json read failures must not be treated as a cold start");
+
+    assert!(
+        err.to_string().contains("state.json"),
+        "error should identify the failed state reload: {err}"
+    );
+    assert!(
+        !replicator.contains("reload-error").await,
+        "database must not be registered after a failed state reload"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_remove_keeps_database_registered_when_final_sync_fails() -> Result<()> {
+    let inner = MemStorage::new();
+    let storage = PutFailsStorage::new(inner);
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("remove-fail.db");
+    let conn = create_wal_db(&db_path, 1);
+
+    let replicator = Replicator::new(storage, "wal/", make_config());
+    replicator
+        .add_without_snapshot("remove-fail", &db_path)
+        .await?;
+    write_rows(&conn, 100, 1);
+
+    let err = replicator
+        .remove("remove-fail")
+        .await
+        .expect_err("failed final sync must be returned to the caller");
+
+    assert!(
+        err.to_string().contains("final sync"),
+        "remove error should identify the failed final sync: {err}"
+    );
+
+    assert!(
+        replicator.contains("remove-fail").await,
+        "a failed final sync must not unregister the database"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_wal_replication_returns_final_sync_error_on_shutdown() -> Result<()> {
+    let storage = PutFailsStorage::new(MemStorage::new());
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("wal-loop-final-fail.db");
+    let conn = create_wal_db(&db_path, 1);
+    write_rows(&conn, 100, 1);
+
+    let mut state = walrust::SyncState::new(db_path.clone())?;
+    state.name = "wal-loop-final-fail".to_string();
+    state.init_checksum()?;
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        let _ = cancel_tx.send(true);
+    });
+
+    let err = walrust::run_wal_replication(
+        storage.as_ref(),
+        "wal/",
+        &mut state,
+        0,
+        make_config(),
+        cancel_rx,
+    )
+    .await
+    .expect_err("shutdown final sync upload failure must be returned");
+
+    assert!(
+        err.to_string().contains("Final sync"),
+        "error should identify the final sync failure: {err}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_replication_returns_final_sync_error_on_shutdown() -> Result<()> {
+    let storage = FailAfterPutsStorage::new(MemStorage::new(), 2);
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("owned-loop-final-fail.db");
+    let conn = create_wal_db(&db_path, 1);
+
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let write_path = db_path.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let conn = rusqlite::Connection::open(&write_path).unwrap();
+        write_rows(&conn, 100, 1);
+        let _ = cancel_tx.send(true);
+    });
+
+    let err = walrust::sync::run_replication(
+        storage.as_ref(),
+        "wal/",
+        &db_path,
+        make_config(),
+        cancel_rx,
+    )
+    .await
+    .expect_err("shutdown final sync upload failure must be returned");
+    drop(conn);
+
+    assert!(
+        err.to_string().contains("Final sync"),
+        "error should identify the final sync failure: {err}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_walrust_owned_flush_resnapshots_after_checkpoint_rollover() -> Result<()> {
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rollover-resnapshot.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let replicator = Replicator::new(storage.clone(), "wal/", make_config());
+    replicator.add("rollover-resnapshot", &db_path).await?;
+
+    write_rows(&conn, 100, 2);
+    let first_frames = replicator.flush("rollover-resnapshot").await?;
+    assert!(
+        first_frames > 0,
+        "initial flush must publish real WAL frames before the forced checkpoint"
+    );
+    let snapshots_before = snapshot_keys(&storage, "wal/", "rollover-resnapshot");
+    assert!(
+        !snapshots_before.is_empty(),
+        "add() must have published the base snapshot; keys={:?}",
+        storage.keys()
+    );
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    let wal_path = db_path.with_extension("db-wal");
+    assert_eq!(
+        std::fs::metadata(&wal_path)?.len(),
+        0,
+        "test setup must force a WAL rollover by truncating the synced WAL"
+    );
+
+    write_rows(&conn, 200, 2);
+    let rollover_frames = replicator.flush("rollover-resnapshot").await?;
+    assert!(
+        rollover_frames > 0,
+        "rollover flush should publish a re-anchor snapshot"
+    );
+
+    let snapshots_after = snapshot_keys(&storage, "wal/", "rollover-resnapshot");
+    assert!(
+        snapshots_after.len() > snapshots_before.len(),
+        "checkpoint rollover must publish a new snapshot instead of a live incremental across the gap; before={snapshots_before:?}, after={snapshots_after:?}, all_keys={:?}",
+        storage.keys()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_external_mode_refuses_checkpoint_rollover_until_reanchored() -> Result<()> {
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-rollover-refusal.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator.add("external-rollover", &db_path).await?;
+
+    write_rows(&conn, 100, 2);
+    let first_frames = replicator.flush("external-rollover").await?;
+    assert!(first_frames > 0, "first flush must publish real WAL frames");
+    let max_seq_before = storage
+        .max_hadbp_seq("wal/external-rollover/")
+        .expect("first external flush should publish a delta");
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_eq!(
+        std::fs::metadata(db_path.with_extension("db-wal"))?.len(),
+        0,
+        "test setup must force a WAL rollover"
+    );
+
+    write_rows(&conn, 200, 2);
+    let err = replicator
+        .flush("external-rollover")
+        .await
+        .expect_err("external-base mode must not publish across a WAL rollover")
+        .to_string();
+    assert!(
+        err.contains("WAL rollover") && err.contains("external base"),
+        "expected rollover re-anchor refusal, got {err}"
+    );
+    assert_eq!(
+        storage.max_hadbp_seq("wal/external-rollover/"),
+        Some(max_seq_before),
+        "rollover refusal must not publish a new external delta"
+    );
+
+    let retry_err = replicator
+        .flush("external-rollover")
+        .await
+        .expect_err("rollover state must stay poisoned until external re-anchor")
+        .to_string();
+    assert!(
+        retry_err.contains("WAL rollover") && retry_err.contains("external base"),
+        "retry must still refuse until re-anchor, got {retry_err}"
+    );
+
+    drop(conn);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_fenced_external_mode_refuses_checkpoint_rollover_until_reanchored() -> Result<()> {
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("fenced-rollover-refusal.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator.add("fenced-rollover", &db_path).await?;
+    assert!(
+        replicator
+            .set_external_delta_base("fenced-rollover", 7, "writer-a", base_seq, [0x42; 32],)
+            .await?,
+        "registered database should accept fenced delta base"
+    );
+
+    write_rows(&conn, 100, 2);
+    let first_frames = replicator.flush("fenced-rollover").await?;
+    assert!(
+        first_frames > 0,
+        "first fenced flush must publish real WAL frames"
+    );
+    let tlmd_before = storage
+        .keys()
+        .into_iter()
+        .filter(|key| key.starts_with("wal/fenced-rollover/") && key.ends_with(".tlmd"))
+        .count();
+    assert!(tlmd_before > 0, "first flush should publish a .tlmd delta");
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    assert_eq!(
+        std::fs::metadata(db_path.with_extension("db-wal"))?.len(),
+        0,
+        "test setup must force a WAL rollover"
+    );
+
+    write_rows(&conn, 200, 2);
+    let err = replicator
+        .flush("fenced-rollover")
+        .await
+        .expect_err("fenced external mode must not publish across a WAL rollover")
+        .to_string();
+    assert!(
+        err.contains("WAL rollover") && err.contains("external mode"),
+        "expected fenced rollover re-anchor refusal, got {err}"
+    );
+    let tlmd_after = storage
+        .keys()
+        .into_iter()
+        .filter(|key| key.starts_with("wal/fenced-rollover/") && key.ends_with(".tlmd"))
+        .count();
+    assert_eq!(
+        tlmd_after, tlmd_before,
+        "rollover refusal must not publish a new fenced delta"
+    );
+
+    let retry_err = replicator
+        .flush("fenced-rollover")
+        .await
+        .expect_err("fenced rollover state must stay poisoned until external re-anchor")
+        .to_string();
+    assert!(
+        retry_err.contains("WAL rollover") && retry_err.contains("external mode"),
+        "retry must still refuse until re-anchor, got {retry_err}"
+    );
+
+    drop(conn);
+    Ok(())
+}
 
 /// flush() after writing WAL frames should upload an LTX file and return frame count > 0.
 #[tokio::test]
@@ -722,6 +1338,82 @@ async fn test_external_mode_ignores_stale_same_seq_delta() {
 }
 
 #[tokio::test]
+async fn test_external_mode_registration_does_not_skip_unpublished_wal_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-unpublished-wal.db");
+    let wal_path = db_path.with_extension("db-wal");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+    let base_checksum = walrust::ltx::compute_checksum_from_file(&db_path).unwrap();
+
+    write_rows(&conn, 100, 1);
+
+    let storage = MemStorage::new();
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    replicator
+        .add_external_base_with_wal_path(
+            "external",
+            &db_path,
+            &wal_path,
+            walrust::ExternalBaseCursor {
+                seq: base_seq,
+                checksum: base_checksum,
+            },
+        )
+        .await
+        .unwrap();
+
+    let frames = replicator.flush("external").await.unwrap();
+    assert!(
+        frames > 0,
+        "registration from an older external base must not skip WAL bytes already present locally"
+    );
+    assert_eq!(
+        storage.max_hadbp_seq("wal/external/"),
+        Some(base_seq + 1),
+        "unpublished WAL bytes must become the next external changeset"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_external_mode_rejects_remote_chain_without_local_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("external-missing-progress.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+    let base_checksum = walrust::ltx::compute_checksum_from_file(&db_path).unwrap();
+
+    let storage = MemStorage::new();
+    seed_physical_delta(&storage, "wal/", "external", base_seq + 1, base_checksum).await;
+
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_external_config())
+        .expect("external config should be valid");
+    let err = replicator
+        .add_external_base_with_wal_path(
+            "external",
+            &db_path,
+            &db_path.with_extension("db-wal"),
+            walrust::ExternalBaseCursor {
+                seq: base_seq,
+                checksum: base_checksum,
+            },
+        )
+        .await
+        .expect_err("remote chain head without local WAL progress proof must fail closed");
+    assert!(
+        err.to_string().contains("local external-base progress"),
+        "expected local progress proof error, got {err}"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
 async fn test_external_mode_does_not_read_or_write_remote_state_json() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("external-no-state-access.db");
@@ -934,6 +1626,209 @@ async fn test_walrust_owned_reopen_uses_legacy_state_json() {
     drop(conn);
 }
 
+#[tokio::test]
+async fn test_walrust_owned_new_stream_writes_lineage_state_and_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("walrust-owned-lineage.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let storage = MemStorage::new();
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    replicator.add("owned-lineage", &db_path).await.unwrap();
+    write_rows(&conn, 100, 2);
+    let frames = replicator.flush("owned-lineage").await.unwrap();
+    assert!(frames > 0, "flush should publish live WAL frames");
+
+    let saved_state = storage.value("wal/owned-lineage/state.json").await;
+    let lineage_id = saved_state
+        .get("lineage_id")
+        .and_then(|value| value.as_str())
+        .expect("walrust-owned mode must persist lineage_id");
+    assert!(
+        !lineage_id.is_empty() && !lineage_id.contains('/'),
+        "lineage_id must be a single path segment, got {lineage_id:?}"
+    );
+
+    let lineage_prefix = format!("wal/owned-lineage/lineages/{lineage_id}/");
+    let keys = storage.keys();
+    assert!(
+        keys.iter().any(
+            |key| key.starts_with(&format!("{lineage_prefix}0001/")) && key.ends_with(".hadbp")
+        ),
+        "initial snapshot must be written under the lineage namespace; keys={keys:?}"
+    );
+    assert!(
+        keys.iter().any(
+            |key| key.starts_with(&format!("{lineage_prefix}0000/")) && key.ends_with(".hadbp")
+        ),
+        "live WAL changeset must be written under the lineage namespace; keys={keys:?}"
+    );
+    assert!(
+        !keys.iter().any(|key| {
+            (key.starts_with("wal/owned-lineage/0000/")
+                || key.starts_with("wal/owned-lineage/0001/"))
+                && key.ends_with(".hadbp")
+        }),
+        "new walrust-owned streams must not write legacy unlineaged HADBP keys; keys={keys:?}"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_walrust_owned_add_refuses_existing_active_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let first_db = dir.path().join("walrust-owned-first.db");
+    let second_db = dir.path().join("walrust-owned-second.db");
+    let first_conn = create_wal_db(&first_db, 3);
+    let second_conn = create_wal_db(&second_db, 5);
+    let storage = MemStorage::new();
+
+    let first = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    first.add("owned-fence", &first_db).await.unwrap();
+
+    let first_state = storage.value("wal/owned-fence/state.json").await;
+    let first_lineage = first_state
+        .get("lineage_id")
+        .and_then(|value| value.as_str())
+        .expect("initial walrust-owned add must persist active lineage")
+        .to_string();
+
+    let second = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    let err = second
+        .add("owned-fence", &second_db)
+        .await
+        .expect_err("competing walrust-owned add must not overwrite active state");
+    assert!(
+        err.to_string().contains("already has replication state"),
+        "expected active-state refusal, got {err}"
+    );
+
+    let state_after = storage.value("wal/owned-fence/state.json").await;
+    assert_eq!(
+        state_after
+            .get("lineage_id")
+            .and_then(|value| value.as_str()),
+        Some(first_lineage.as_str()),
+        "competing add must not replace the active lineage"
+    );
+
+    drop(first_conn);
+    drop(second_conn);
+}
+
+#[tokio::test]
+async fn test_walrust_owned_concurrent_two_watchers_only_one_wins() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("walrust-owned-two-watchers.db");
+    let conn = create_wal_db(&db_path, 3);
+    let storage = MemStorage::new();
+
+    let first = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    let second = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+
+    let (first_result, second_result) = tokio::join!(
+        first.add("owned-two-watchers", &db_path),
+        second.add("owned-two-watchers", &db_path)
+    );
+
+    let successes = usize::from(first_result.is_ok()) + usize::from(second_result.is_ok());
+    let errors: Vec<String> = [first_result.as_ref().err(), second_result.as_ref().err()]
+        .into_iter()
+        .flatten()
+        .map(|err| err.to_string())
+        .collect();
+
+    assert_eq!(
+        successes, 1,
+        "exactly one competing walrust-owned watcher may claim active state"
+    );
+    assert_eq!(
+        errors.len(),
+        1,
+        "losing watcher must fail closed; errors: {errors:?}"
+    );
+
+    let state = storage.value("wal/owned-two-watchers/state.json").await;
+    assert!(
+        state
+            .get("lineage_id")
+            .and_then(|value| value.as_str())
+            .is_some(),
+        "winning watcher must persist the active lineage"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_walrust_owned_enospc_during_add_is_hard_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("walrust-owned-enospc.db");
+    let conn = create_wal_db(&db_path, 3);
+    let inner = MemStorage::new();
+    let storage = EnospcStorage::new(inner);
+    let replicator = Replicator::try_new(storage, "wal/", make_config()).unwrap();
+
+    let err = replicator
+        .add("owned-enospc", &db_path)
+        .await
+        .expect_err("ENOSPC during initial snapshot/state write must fail add");
+    assert!(
+        err.to_string().contains("No space left on device"),
+        "expected ENOSPC to be surfaced, got {err}"
+    );
+    assert_eq!(
+        replicator.current_seq("owned-enospc").await,
+        None,
+        "failed add must not leave the database registered"
+    );
+
+    drop(conn);
+}
+
+#[tokio::test]
+async fn test_walrust_owned_restore_uses_active_lineage_namespace() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("walrust-owned-lineage-restore.db");
+    let restore_path = dir.path().join("restored.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let storage = MemStorage::new();
+    let replicator = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
+    replicator
+        .add("owned-lineage-restore", &db_path)
+        .await
+        .unwrap();
+    write_rows(&conn, 100, 2);
+    replicator.flush("owned-lineage-restore").await.unwrap();
+
+    let restored_seq = walrust::sync::restore(
+        storage.as_ref(),
+        "wal/",
+        "owned-lineage-restore",
+        &restore_path,
+        None,
+    )
+    .await
+    .expect("restore must discover active lineage from state.json");
+    assert_eq!(
+        restored_seq,
+        replicator
+            .current_seq("owned-lineage-restore")
+            .await
+            .unwrap()
+    );
+
+    let restored = rusqlite::Connection::open(&restore_path).unwrap();
+    let count: i64 = restored
+        .query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(count, 5, "restore must include snapshot and lineaged WAL");
+
+    drop(conn);
+}
+
 /// flush() with no pending WAL frames should return 0.
 #[tokio::test]
 async fn test_flush_no_pending_frames_returns_zero() {
@@ -1028,7 +1923,7 @@ async fn test_flush_after_remove_errors() {
     replicator.add("test", &db_path).await.unwrap();
 
     // Remove the database
-    replicator.remove("test").await;
+    replicator.remove("test").await.unwrap();
 
     // flush() should fail
     let result = replicator.flush("test").await;

@@ -15,10 +15,10 @@ mod uploader;
 mod wal;
 mod webhook;
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::{Config, ResolvedDbConfig, RetentionConfig, SyncConfig};
-use errors::{classify_error, ExitStatus};
+use errors::{classify_error, ExitStatus, WalrustError};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
@@ -218,7 +218,7 @@ enum Commands {
         #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
         endpoint: Option<String>,
 
-        /// Restore to specific point in time (ISO 8601)
+        /// Restore to specific TXID/sequence number
         #[arg(long)]
         point_in_time: Option<String>,
 
@@ -403,7 +403,9 @@ fn resolve_watch_config(
                 .bucket
                 .clone()
                 .or(cfg.s3.bucket.clone())
-                .ok_or_else(|| anyhow!("bucket required (via --bucket or config file)"))?;
+                .ok_or_else(|| {
+                    WalrustError::config("bucket required (via --bucket or config file)")
+                })?;
 
             let endpoint = cli.endpoint.clone().or(cfg.s3.endpoint.clone());
 
@@ -430,9 +432,10 @@ fn resolve_watch_config(
                 // Use databases from config file
                 let mut dbs = cfg.resolve_databases()?;
                 if dbs.is_empty() {
-                    return Err(anyhow!(
-                        "No databases specified (provide paths or configure in config file)"
-                    ));
+                    return Err(WalrustError::config(
+                        "No databases specified (provide paths or configure in config file)",
+                    )
+                    .into());
                 }
 
                 // Apply CLI overrides to each database's config
@@ -461,15 +464,15 @@ fn resolve_watch_config(
         }
         None => {
             // No config file - require CLI args
-            let bucket = cli
-                .bucket
-                .clone()
-                .ok_or_else(|| anyhow!("--bucket is required when no config file is present"))?;
+            let bucket = cli.bucket.clone().ok_or_else(|| {
+                WalrustError::config("--bucket is required when no config file is present")
+            })?;
 
             if cli.databases.is_empty() {
-                return Err(anyhow!(
-                    "At least one database path required when no config file is present"
-                ));
+                return Err(WalrustError::config(
+                    "At least one database path required when no config file is present",
+                )
+                .into());
             }
 
             // Build config from CLI with defaults
@@ -599,7 +602,7 @@ fn resolve_cache_config(config: &Option<Config>, cli: &WatchArgs) -> config::Cac
 fn parse_duration(s: &str) -> Result<Duration> {
     let s = s.trim();
     if s.is_empty() {
-        return Err(anyhow!("Empty duration string"));
+        return Err(WalrustError::config("Empty duration string").into());
     }
 
     let (num_str, unit) = if s.ends_with("ms") {
@@ -611,15 +614,16 @@ fn parse_duration(s: &str) -> Result<Duration> {
     } else if s.ends_with('h') {
         (&s[..s.len() - 1], "h")
     } else {
-        return Err(anyhow!(
+        return Err(WalrustError::config(format!(
             "Invalid duration '{}'. Use format like '5s', '1m', '2h'",
             s
-        ));
+        ))
+        .into());
     };
 
     let num: u64 = num_str
         .parse()
-        .map_err(|_| anyhow!("Invalid number in duration: {}", num_str))?;
+        .map_err(|_| WalrustError::config(format!("Invalid number in duration: {}", num_str)))?;
 
     match unit {
         "ms" => Ok(Duration::from_millis(num)),

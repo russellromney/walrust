@@ -246,10 +246,10 @@ walrust verify mydb --bucket my-backups
 # List snapshots
 walrust list --bucket my-backups
 
-# Restore to specific point in time
+# Restore through a specific TXID/sequence number
 walrust restore mydb -o restored.db \
   --bucket my-backups \
-  --point-in-time "2024-01-15T10:00:00Z"
+  --point-in-time 100
 ```
 
 3. Check S3 storage for corruption (rare but possible)
@@ -274,7 +274,7 @@ Use point-in-time restore to the last valid TXID:
 ```bash
 walrust restore mydb -o restored.db \
   --bucket my-backups \
-  --point-in-time "2024-01-15T09:00:00Z"
+  --point-in-time 100
 ```
 
 ## Restore Errors (Exit Code 6)
@@ -309,11 +309,11 @@ walrust restore production -o app.db --bucket my-backups
 
 **Error:**
 ```
-Point-in-time restore unavailable: no LTX files before 2024-01-15T10:00:00Z
+Point-in-time restore unavailable: no snapshot found at or before TXID 100
 ```
 
 **Solution:**
-The requested timestamp is before your first snapshot. List available snapshots:
+The requested TXID/sequence is before your first available snapshot. List available snapshots:
 
 ```bash
 walrust list --bucket my-backups

@@ -130,7 +130,7 @@ Restore a database from S3.
 
 - `name` (str): Database name as stored in S3 (usually the filename without extension)
 - `output` (str): Output path for the restored database
-- `point_in_time` (str, optional): ISO 8601 timestamp for point-in-time recovery (e.g., `"2024-01-15T10:30:00Z"`)
+- `point_in_time` (str, optional): TXID/sequence number for point-in-time recovery (e.g., `"42"`)
 
 **Returns:**
 
@@ -152,7 +152,7 @@ ws.restore("app", "/data/restored.db")
 ws.restore(
     "app",
     "/data/restored.db",
-    point_in_time="2024-01-15T10:30:00Z"
+    point_in_time="42"
 )
 ```
 
@@ -160,7 +160,7 @@ ws.restore(
 
 - Downloads the latest snapshot and applies all incremental LTX files
 - Verifies checksums during restore
-- Point-in-time restore stops at the closest transaction before the specified time
+- Point-in-time restore stops at the requested TXID/sequence number
 - If `point_in_time` is before the first snapshot, raises `RuntimeError`
 
 ---
@@ -272,7 +272,7 @@ Restore a database without creating a Walrust instance.
 - `output` (str): Output path for the restored database
 - `bucket` (str): S3 bucket URL
 - `endpoint` (str, optional): S3 endpoint URL
-- `point_in_time` (str, optional): ISO 8601 timestamp for PITR
+- `point_in_time` (str, optional): TXID/sequence number for PITR
 
 **Returns:**
 
@@ -295,7 +295,7 @@ restore(
     "app",
     "/data/restored.db",
     "s3://my-bucket",
-    point_in_time="2024-01-15T10:30:00Z"
+    point_in_time="42"
 )
 ```
 

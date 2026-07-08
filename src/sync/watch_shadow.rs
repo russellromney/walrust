@@ -1,7 +1,9 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
@@ -10,15 +12,21 @@ use tokio::sync::mpsc;
 use crate::cache::LocalCache;
 use crate::config::{CacheConfig, ResolvedDbConfig, SyncConfig, WebhookConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
+use crate::errors::WalrustError;
 use crate::ltx;
 use crate::retention::RetentionPolicy;
 use crate::retry::{RetryConfig, RetryPolicy};
 use crate::s3::{self, create_client, parse_bucket};
 use crate::shadow::ShadowWal;
-use crate::uploader::{spawn_uploader, UploadMessage, Uploader};
+use crate::uploader::{spawn_uploader, UploadMessage, Uploader, UploaderStats};
 use crate::webhook::WebhookSender;
 use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
+use walrust_core::legacy_shadow_watch::{
+    apply_shadow_sync_result_to_state, apply_shadow_sync_results_strict, load_shadow_progress,
+    save_shadow_watch_progress as save_shadow_progress, shadow_sync_input,
+    wait_for_cache_checkpoint_durability,
+};
 
 use super::shadow::{
     run_compaction, sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry,
@@ -26,6 +34,227 @@ use super::shadow::{
 use super::types::{DbState, Manifest, ShadowDbState, ShadowSyncInput, TriggerState};
 use super::verify::validate_backup_integrity;
 use super::wal_sync::take_snapshot_with_retry;
+
+type ShadowSyncFuture =
+    Pin<Box<dyn Future<Output = Result<super::types::ShadowSyncOutput>> + Send>>;
+
+const CHECKPOINT_UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone)]
+struct DirectShadowSyncTarget {
+    client: Arc<aws_sdk_s3::Client>,
+    bucket_name: String,
+    prefix: String,
+}
+
+async fn run_shadow_syncs(
+    db_states: &HashMap<PathBuf, ShadowDbState>,
+    cache_states: &HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
+    direct_target: Option<DirectShadowSyncTarget>,
+    retry_policy: &RetryPolicy,
+    webhook_sender: Arc<WebhookSender>,
+) -> Vec<Result<super::types::ShadowSyncOutput>> {
+    let sync_inputs: Vec<ShadowSyncInput> = db_states.values().map(shadow_sync_input).collect();
+
+    let sync_futures: Vec<ShadowSyncFuture> = sync_inputs
+        .into_iter()
+        .map(|input| {
+            let policy = retry_policy.clone();
+            let webhooks = Arc::clone(&webhook_sender);
+
+            if let Some((cache, upload_tx)) = cache_states.get(&input.db_path) {
+                let cache = Arc::clone(cache);
+                let upload_tx = upload_tx.clone();
+                Box::pin(sync_shadow_to_cache_with_retry(
+                    cache, upload_tx, input, policy, webhooks,
+                )) as ShadowSyncFuture
+            } else if let Some(target) = direct_target.clone() {
+                Box::pin(sync_shadow_concurrent_with_retry(
+                    Arc::clone(&target.client),
+                    target.bucket_name,
+                    target.prefix,
+                    input,
+                    policy,
+                    webhooks,
+                )) as ShadowSyncFuture
+            } else {
+                let name = input.name;
+                Box::pin(async move {
+                    Err(anyhow!(
+                        "{}: no cache uploader or direct upload target configured",
+                        name
+                    ))
+                }) as ShadowSyncFuture
+            }
+        })
+        .collect();
+
+    join_all(sync_futures).await
+}
+
+async fn copy_final_shadow_frames(db_states: &mut HashMap<PathBuf, ShadowDbState>) -> Result<()> {
+    for state in db_states.values_mut() {
+        if !state.wal_path.exists() {
+            continue;
+        }
+
+        let (frames, new_offset) = state
+            .shadow
+            .copy_frames(state.wal_copy_offset)
+            .await
+            .with_context(|| format!("{}: final shadow copy failed", state.name))?;
+
+        if !frames.is_empty() {
+            tracing::debug!("{}: Final shadow copy: {} frames", state.name, frames.len());
+            state.wal_copy_offset = new_offset;
+        }
+    }
+
+    Ok(())
+}
+
+async fn checkpoint_shadow_after_durable_sync(
+    state: &mut ShadowDbState,
+    cache_state: Option<&(Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
+    direct_target: Option<DirectShadowSyncTarget>,
+    retry_policy: &RetryPolicy,
+    webhook_sender: Arc<WebhookSender>,
+    drain_timeout: Duration,
+) -> Result<()> {
+    let (frames, new_offset) = state
+        .shadow
+        .copy_frames(state.wal_copy_offset)
+        .await
+        .with_context(|| format!("{}: shadow copy before checkpoint failed", state.name))?;
+    if !frames.is_empty() {
+        tracing::debug!(
+            "{}: checkpoint copied {} frames to shadow (offset {} -> {})",
+            state.name,
+            frames.len(),
+            state.wal_copy_offset,
+            new_offset
+        );
+        state.wal_copy_offset = new_offset;
+    }
+
+    let input = shadow_sync_input(state);
+    let output = if let Some((cache, upload_tx)) = cache_state {
+        sync_shadow_to_cache_with_retry(
+            Arc::clone(cache),
+            upload_tx.clone(),
+            input,
+            retry_policy.clone(),
+            Arc::clone(&webhook_sender),
+        )
+        .await?
+    } else if let Some(target) = direct_target {
+        sync_shadow_concurrent_with_retry(
+            Arc::clone(&target.client),
+            target.bucket_name,
+            target.prefix,
+            input,
+            retry_policy.clone(),
+            Arc::clone(&webhook_sender),
+        )
+        .await?
+    } else {
+        anyhow::bail!(
+            "{}: no cache uploader or direct upload target configured for checkpoint drain",
+            state.name
+        );
+    };
+    if let Some((cache, _)) = cache_state {
+        wait_for_cache_checkpoint_durability(
+            cache,
+            &state.name,
+            output.new_current_txid,
+            drain_timeout,
+        )
+        .await?;
+    }
+
+    apply_shadow_sync_result_to_state(state, &output).await?;
+
+    state
+        .shadow
+        .checkpoint()
+        .await
+        .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
+
+    let cleanup_before_gen = state.shadow_sync_generation;
+    if cleanup_before_gen > 0 {
+        state
+            .shadow
+            .cleanup_segments(cleanup_before_gen)
+            .await
+            .with_context(|| format!("{}: shadow cleanup failed", state.name))?;
+    }
+
+    Ok(())
+}
+
+async fn shutdown_shadow_uploaders(
+    cache_states: &HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
+    db_states: &HashMap<PathBuf, ShadowDbState>,
+    uploader_handles: Vec<(PathBuf, tokio::task::JoinHandle<Result<UploaderStats>>)>,
+) -> Result<()> {
+    for (db_path, (_, upload_tx)) in cache_states.iter() {
+        let name = db_states
+            .get(db_path)
+            .map(|s| s.name.as_str())
+            .unwrap_or("unknown");
+        tracing::debug!("{}: Sending shutdown to uploader", name);
+        upload_tx
+            .send(UploadMessage::Shutdown)
+            .await
+            .map_err(|e| anyhow!("{}: failed to send shutdown to uploader: {}", name, e))?;
+    }
+
+    let drain_timeout = Duration::from_secs(10);
+    let mut first_error = None;
+
+    for (db_path, handle) in uploader_handles {
+        let name = db_states
+            .get(&db_path)
+            .map(|s| s.name.as_str())
+            .unwrap_or("unknown");
+        match tokio::time::timeout(drain_timeout, handle).await {
+            Ok(Ok(Ok(stats))) => {
+                tracing::debug!("{}: Uploader drained successfully: {:?}", name, stats);
+            }
+            Ok(Ok(Err(e))) => {
+                let e = e.context(format!("{}: uploader drain failed", name));
+                tracing::error!("{}", e);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+            Ok(Err(e)) => {
+                let e = anyhow!("{}: uploader task panicked: {}", name, e);
+                tracing::error!("{}", e);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+            Err(_) => {
+                let e = anyhow!(
+                    "{}: uploader drain timed out after {:?}",
+                    name,
+                    drain_timeout
+                );
+                tracing::error!("{}", e);
+                if first_error.is_none() {
+                    first_error = Some(e);
+                }
+            }
+        }
+    }
+
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
 
 /// Shadow WAL mode decouples S3 uploads from SQLite's active WAL file:
 /// - Holds a read transaction to prevent SQLite auto-checkpoint
@@ -45,7 +274,11 @@ pub async fn watch_with_shadow(
     cache_config: CacheConfig,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = Arc::new(create_client(endpoint).await?);
+    let client = Arc::new(
+        create_client(endpoint)
+            .await
+            .map_err(|e| WalrustError::s3(e.to_string()))?,
+    );
 
     // Set up retry policy and webhook sender
     let retry_policy = RetryPolicy::new(retry_config.clone());
@@ -75,7 +308,8 @@ pub async fn watch_with_shadow(
     // Initialize cache + uploader per database (if cache enabled)
     let mut cache_states: HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)> =
         HashMap::new();
-    let mut uploader_handles: Vec<(PathBuf, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut uploader_handles: Vec<(PathBuf, tokio::task::JoinHandle<Result<UploaderStats>>)> =
+        Vec::new();
     if cache_config.enabled {
         tracing::info!(
             "Shadow mode cache enabled (concurrency={}, retention={}, max_size={})",
@@ -93,7 +327,11 @@ pub async fn watch_with_shadow(
     for db_config in &databases {
         let db_path = &db_config.path;
         if !db_path.exists() {
-            return Err(anyhow!("Database not found: {}", db_path.display()));
+            return Err(WalrustError::database(format!(
+                "Database not found: {}",
+                db_path.display()
+            ))
+            .into());
         }
 
         let name = db_config.prefix.clone();
@@ -101,7 +339,7 @@ pub async fn watch_with_shadow(
 
         // Check for existing state in S3 (manifest.json)
         let manifest_key = format!("{}{}/manifest.json", prefix, name);
-        let (current_txid, manifest_checksum) =
+        let (mut current_txid, manifest_checksum) =
             match s3::download_bytes(&client, &bucket_name, &manifest_key).await {
                 Ok(data) => {
                     let manifest: Manifest = serde_json::from_slice(&data).unwrap_or_default();
@@ -111,7 +349,7 @@ pub async fn watch_with_shadow(
             };
 
         // Get initial checksum: from manifest if available, otherwise compute from db
-        let db_checksum = match manifest_checksum {
+        let mut db_checksum = match manifest_checksum {
             Some(cs) => {
                 tracing::debug!("{}: Using checksum from manifest: {:#x}", name, cs);
                 Some(cs)
@@ -131,6 +369,9 @@ pub async fn watch_with_shadow(
                 }
             },
         };
+        let mut last_snapshot = None;
+        let mut shadow_sync_generation = 0;
+        let mut shadow_sync_offset = 0;
 
         // Create shadow WAL manager (this holds the checkpoint blocker)
         let shadow = match ShadowWal::new(db_path).await {
@@ -140,6 +381,21 @@ pub async fn watch_with_shadow(
                 return Err(e);
             }
         };
+
+        if let Some(progress) = load_shadow_progress(&shadow, &name)? {
+            tracing::info!(
+                "{}: restored durable shadow progress (TXID: {}, generation: {}, offset: {})",
+                name,
+                progress.current_txid,
+                progress.shadow_sync_generation,
+                progress.shadow_sync_offset
+            );
+            current_txid = progress.current_txid;
+            last_snapshot = progress.last_snapshot;
+            db_checksum = progress.db_checksum;
+            shadow_sync_generation = progress.shadow_sync_generation;
+            shadow_sync_offset = progress.shadow_sync_offset;
+        }
 
         tracing::info!(
             "Shadow WAL: Watching {} as '{}' (TXID: {}, generation: {}, shadow dir: {})",
@@ -155,12 +411,11 @@ pub async fn watch_with_shadow(
             let cache = Arc::new(LocalCache::new(db_path)?);
             let storage: Arc<dyn StorageBackend> =
                 Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
-            let s3_prefix = format!("{}{}", prefix, name);
             let uploader = Arc::new(Uploader::new(
                 name.clone(),
                 Arc::clone(&cache),
                 storage,
-                s3_prefix,
+                prefix.clone(),
                 Arc::new(retry_policy.clone()),
                 Arc::clone(&webhook_sender),
                 cache_config.uploader_concurrency,
@@ -177,10 +432,11 @@ pub async fn watch_with_shadow(
                 db_path: db_path.clone(),
                 wal_path,
                 current_txid,
-                last_snapshot: None,
+                last_snapshot,
                 db_checksum,
                 shadow,
-                shadow_sync_offset: 0,
+                shadow_sync_generation,
+                shadow_sync_offset,
                 wal_copy_offset: 0,
             },
         );
@@ -225,6 +481,8 @@ pub async fn watch_with_shadow(
                 }
                 Err(e) => {
                     tracing::error!("{}: Initial shadow copy failed: {}", state.name, e);
+                    return Err(e)
+                        .with_context(|| format!("{}: initial shadow copy failed", state.name));
                 }
             }
         }
@@ -262,6 +520,10 @@ pub async fn watch_with_shadow(
                 state.current_txid = db_state.current_txid;
                 state.last_snapshot = db_state.last_snapshot;
                 state.db_checksum = db_state.db_checksum;
+                state.shadow_sync_generation = state.shadow.generation();
+                state.shadow_sync_offset = state.shadow.segment_offset();
+                state.wal_copy_offset = 0;
+                save_shadow_progress(state)?;
 
                 if let Some(trigger) = trigger_states.get_mut(db_path) {
                     trigger.frames_since_snapshot = 0;
@@ -279,10 +541,11 @@ pub async fn watch_with_shadow(
     let mut wal_sync_timer = tokio::time::interval(wal_sync_interval);
     wal_sync_timer.tick().await;
 
+    let disabled_timer_duration = Duration::from_secs(86400 * 365);
     let compact_interval_duration = if global_sync.compact_interval > 0 {
         Duration::from_secs(global_sync.compact_interval)
     } else {
-        Duration::from_secs(u64::MAX)
+        disabled_timer_duration
     };
     let mut compact_timer = tokio::time::interval(compact_interval_duration);
     compact_timer.tick().await;
@@ -291,7 +554,7 @@ pub async fn watch_with_shadow(
     let checkpoint_interval_duration = if global_sync.checkpoint_interval > 0 {
         Duration::from_secs(global_sync.checkpoint_interval)
     } else {
-        Duration::from_secs(u64::MAX)
+        disabled_timer_duration
     };
     let mut checkpoint_timer = tokio::time::interval(checkpoint_interval_duration);
     checkpoint_timer.tick().await;
@@ -302,7 +565,7 @@ pub async fn watch_with_shadow(
     let validation_interval_duration = if global_sync.validation_interval > 0 {
         Duration::from_secs(global_sync.validation_interval)
     } else {
-        Duration::from_secs(u64::MAX)
+        disabled_timer_duration
     };
     let mut validation_timer = tokio::time::interval(validation_interval_duration);
     validation_timer.tick().await;
@@ -362,82 +625,53 @@ pub async fn watch_with_shadow(
             _ = wal_sync_timer.tick() => {
                 // Copy any new WAL frames to shadow for all databases
                 for state in db_states.values_mut() {
-                    if state.wal_path.exists() {
-                        match state.shadow.copy_frames(state.wal_copy_offset).await {
-                            Ok((frames, new_offset)) => {
-                                if !frames.is_empty() {
-                                    tracing::debug!(
-                                        "{}: Copied {} frames to shadow (offset {} -> {})",
-                                        state.name,
-                                        frames.len(),
-                                        state.wal_copy_offset,
-                                        new_offset
-                                    );
-                                    state.wal_copy_offset = new_offset;
-                                }
+                    match state.shadow.copy_frames(state.wal_copy_offset).await {
+                        Ok((frames, new_offset)) => {
+                            if !frames.is_empty() {
+                                tracing::debug!(
+                                    "{}: Copied {} frames to shadow (offset {} -> {})",
+                                    state.name,
+                                    frames.len(),
+                                    state.wal_copy_offset,
+                                    new_offset
+                                );
+                                state.wal_copy_offset = new_offset;
                             }
-                            Err(e) => {
-                                tracing::error!("{}: Shadow copy failed: {}", state.name, e);
-                            }
+                        }
+                        Err(e) => {
+                            tracing::error!("{}: Shadow copy failed: {}", state.name, e);
+                            webhook_sender
+                                .notify_upload_failed(&state.name, &e.to_string(), 1)
+                                .await;
+                            return Err(e.context(format!("{}: shadow copy failed", state.name)));
                         }
                     }
                 }
 
-                // Phase 1: Collect inputs for ALL databases with shadow segments
-                let sync_inputs: Vec<ShadowSyncInput> = db_states
-                    .values()
-                    .map(|state| ShadowSyncInput {
-                        db_path: state.db_path.clone(),
-                        name: state.name.clone(),
-                        current_txid: state.current_txid,
-                        db_checksum: state.db_checksum,
-                        generation: state.shadow.generation(),
-                        shadow_sync_offset: state.shadow_sync_offset,
-                        page_size: state.shadow.page_size(),
-                        shadow_dir: state.shadow.shadow_dir().to_path_buf(),
-                    })
-                    .collect();
-
-                if sync_inputs.is_empty() {
-                    continue;
-                }
-
-                // Phase 2: Run all syncs concurrently (cache path or direct S3)
-                let sync_futures: Vec<_> = sync_inputs
-                    .into_iter()
-                    .map(|input| {
-                        let policy = retry_policy.clone();
-                        let webhooks = Arc::clone(&webhook_sender);
-
-                        if let Some((cache, upload_tx)) = cache_states.get(&input.db_path) {
-                            // Cache path: write to disk cache, uploader handles S3
-                            let cache = Arc::clone(cache);
-                            let upload_tx = upload_tx.clone();
-                            Box::pin(sync_shadow_to_cache_with_retry(
-                                cache, upload_tx, input, policy, webhooks,
-                            )) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<_>> + Send>>
-                        } else {
-                            // Direct S3 path (no cache)
-                            let client = Arc::clone(&client);
-                            let bucket = bucket_name.clone();
-                            let pfx = prefix.clone();
-                            Box::pin(sync_shadow_concurrent_with_retry(
-                                client, bucket, pfx, input, policy, webhooks,
-                            ))
-                        }
-                    })
-                    .collect();
-
-                let results = join_all(sync_futures).await;
+                let results = run_shadow_syncs(
+                    &db_states,
+                    &cache_states,
+                    Some(DirectShadowSyncTarget {
+                        client: Arc::clone(&client),
+                        bucket_name: bucket_name.clone(),
+                        prefix: prefix.clone(),
+                    }),
+                    &retry_policy,
+                    Arc::clone(&webhook_sender),
+                ).await;
 
                 // Phase 3: Apply results sequentially
                 for result in results {
                     match result {
-                        Ok(output) if output.frame_count > 0 => {
+                        Ok(output) => {
+                            let frame_count = output.frame_count;
+
                             if let Some(state) = db_states.get_mut(&output.db_path) {
-                                state.shadow_sync_offset = output.new_shadow_sync_offset;
-                                state.current_txid = output.new_current_txid;
-                                state.db_checksum = output.new_db_checksum;
+                                apply_shadow_sync_result_to_state(state, &output).await?;
+
+                                if frame_count == 0 {
+                                    continue;
+                                }
 
                                 // Update dashboard
                                 let shadow_size = walkdir::WalkDir::new(state.shadow.shadow_dir())
@@ -462,7 +696,7 @@ pub async fn watch_with_shadow(
 
                                 // Update trigger state
                                 if let Some(trigger) = trigger_states.get_mut(&output.db_path) {
-                                    trigger.frames_since_snapshot += output.frame_count;
+                                    trigger.frames_since_snapshot += frame_count;
                                     trigger.last_wal_activity = Some(std::time::Instant::now());
                                     if trigger.first_change_time.is_none() {
                                         trigger.first_change_time = Some(std::time::Instant::now());
@@ -498,6 +732,7 @@ pub async fn watch_with_shadow(
                                             state.current_txid = db_state.current_txid;
                                             state.last_snapshot = db_state.last_snapshot;
                                             state.db_checksum = db_state.db_checksum;
+                                            save_shadow_progress(state)?;
                                             metrics_state.record_snapshot(&state.name);
                                             trigger.frames_since_snapshot = 0;
                                             trigger.first_change_time = None;
@@ -506,9 +741,9 @@ pub async fn watch_with_shadow(
                                 }
                             }
                         }
-                        Ok(_) => {} // No frames synced
                         Err(e) => {
                             tracing::error!("Shadow sync failed: {}", e);
+                            return Err(e).context("shadow sync failed");
                         }
                     }
                 }
@@ -581,6 +816,7 @@ pub async fn watch_with_shadow(
                             state.current_txid = db_state.current_txid;
                             state.last_snapshot = db_state.last_snapshot;
                             state.db_checksum = db_state.db_checksum;
+                            save_shadow_progress(state)?;
                             metrics_state.record_snapshot(&state.name);
                             trigger.frames_since_snapshot = 0;
                             trigger.first_change_time = None;
@@ -612,6 +848,7 @@ pub async fn watch_with_shadow(
                         state.current_txid = db_state.current_txid;
                         state.last_snapshot = db_state.last_snapshot;
                         state.db_checksum = db_state.db_checksum;
+                        save_shadow_progress(state)?;
                         metrics_state.record_snapshot(&state.name);
 
                         if let Some(trigger) = trigger_states.get_mut(db_path) {
@@ -644,9 +881,9 @@ pub async fn watch_with_shadow(
                 }
             }
 
-            // Checkpoint timer - use shadow.checkpoint() for manual control
+            // Checkpoint timer - copy, sync, verify durability, then checkpoint.
             _ = checkpoint_timer.tick(), if global_sync.checkpoint_interval > 0 => {
-                for (_db_path, state) in db_states.iter_mut() {
+                for (db_path, state) in db_states.iter_mut() {
                     // Check if shadow has accumulated enough data
                     let segments = match state.shadow.list_segments(state.shadow.generation()).await {
                         Ok(s) => s,
@@ -667,20 +904,29 @@ pub async fn watch_with_shadow(
                             estimated_frames
                         );
 
-                        // First, ensure all shadow data is uploaded
-                        // Then trigger checkpoint via shadow
-                        if let Err(e) = state.shadow.checkpoint().await {
+                        if let Err(e) = checkpoint_shadow_after_durable_sync(
+                            state,
+                            cache_states.get(db_path),
+                            Some(DirectShadowSyncTarget {
+                                client: Arc::clone(&client),
+                                bucket_name: bucket_name.clone(),
+                                prefix: prefix.clone(),
+                            }),
+                            &retry_policy,
+                            Arc::clone(&webhook_sender),
+                            CHECKPOINT_UPLOAD_DRAIN_TIMEOUT,
+                        ).await {
                             tracing::error!("{}: Shadow checkpoint failed: {}", state.name, e);
-                        } else {
-                            tracing::debug!("{}: Shadow checkpoint completed", state.name);
-                            // Clean up old generation segments
-                            let current_gen = state.shadow.generation();
-                            if current_gen > 0 {
-                                if let Err(e) = state.shadow.cleanup_segments(current_gen).await {
-                                    tracing::warn!("{}: Shadow cleanup failed: {}", state.name, e);
-                                }
-                            }
+                            webhook_sender
+                                .notify_upload_failed(&state.name, &e.to_string(), 1)
+                                .await;
+                            return Err(e.context(format!(
+                                "{}: shadow checkpoint failed",
+                                state.name
+                            )));
                         }
+
+                        tracing::debug!("{}: Shadow checkpoint completed", state.name);
                     } else {
                         tracing::debug!(
                             "{}: Skipping checkpoint (only ~{} frames, need {})",
@@ -759,45 +1005,379 @@ pub async fn watch_with_shadow(
     // Graceful shutdown - sync remaining shadow data
     tracing::info!("Shadow mode shutdown: syncing remaining data...");
 
-    for (_db_path, state) in db_states.iter_mut() {
-        // Copy any remaining WAL frames
-        if let Ok((frames, _)) = state.shadow.copy_frames(state.wal_copy_offset).await {
-            if !frames.is_empty() {
-                tracing::debug!("{}: Final shadow copy: {} frames", state.name, frames.len());
-            }
-        }
-    }
+    copy_final_shadow_frames(&mut db_states).await?;
+    let final_results = run_shadow_syncs(
+        &db_states,
+        &cache_states,
+        Some(DirectShadowSyncTarget {
+            client: Arc::clone(&client),
+            bucket_name: bucket_name.clone(),
+            prefix: prefix.clone(),
+        }),
+        &retry_policy,
+        Arc::clone(&webhook_sender),
+    )
+    .await;
+    apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
 
-    // Shutdown uploaders (drain in-flight uploads)
-    for (db_path, (_, upload_tx)) in cache_states.iter() {
-        let name = db_states
-            .get(db_path)
-            .map(|s| s.name.as_str())
-            .unwrap_or("unknown");
-        tracing::debug!("{}: Sending shutdown to uploader", name);
-        if let Err(e) = upload_tx.send(UploadMessage::Shutdown).await {
-            tracing::error!("{}: Failed to send shutdown to uploader: {}", name, e);
-        }
-    }
-
-    // Wait for uploaders to finish draining (with timeout)
-    let drain_timeout = Duration::from_secs(10);
-    for (db_path, handle) in uploader_handles {
-        let name = db_states
-            .get(&db_path)
-            .map(|s| s.name.as_str())
-            .unwrap_or("unknown");
-        match tokio::time::timeout(drain_timeout, handle).await {
-            Ok(Ok(())) => tracing::debug!("{}: Uploader drained successfully", name),
-            Ok(Err(e)) => tracing::error!("{}: Uploader task panicked: {}", name, e),
-            Err(_) => tracing::warn!(
-                "{}: Uploader drain timed out after {:?}",
-                name,
-                drain_timeout
-            ),
-        }
-    }
+    shutdown_shadow_uploaders(&cache_states, &db_states, uploader_handles).await?;
 
     tracing::info!("walrust shadow mode shutdown complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::shadow::format_segment_name;
+    use rusqlite::Connection;
+    use std::io::{Read, Write};
+    use tempfile::TempDir;
+
+    fn create_real_wal_db() -> (TempDir, PathBuf, Connection) {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("shutdown-shadow.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (value) VALUES ('alpha'), ('beta'), ('gamma');
+            ",
+        )
+        .unwrap();
+
+        assert!(
+            db_path.with_extension("db-wal").exists(),
+            "test must exercise a live SQLite WAL"
+        );
+
+        (temp, db_path, conn)
+    }
+
+    fn write_shadow_segment(
+        shadow_dir: &std::path::Path,
+        generation: u64,
+        page_size: usize,
+        page_data: &[u8],
+    ) {
+        std::fs::create_dir_all(shadow_dir).unwrap();
+        let path = shadow_dir.join(format_segment_name(generation, 0));
+        let mut file = std::fs::File::create(path).unwrap();
+        let mut header = [0u8; 24];
+        header[0..4].copy_from_slice(&1u32.to_be_bytes());
+        header[4..8].copy_from_slice(&1u32.to_be_bytes());
+        file.write_all(&header).unwrap();
+        file.write_all(&page_data[..page_size]).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_shadow_shutdown_syncs_final_real_wal_frames_to_cache() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let wal_path = db_path.with_extension("db-wal");
+
+        let mut db_states = HashMap::new();
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name: "shutdown_shadow".to_string(),
+                db_path: db_path.clone(),
+                wal_path,
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                shadow,
+                shadow_sync_generation: 0,
+                shadow_sync_offset: 0,
+                wal_copy_offset: 0,
+            },
+        );
+
+        copy_final_shadow_frames(&mut db_states).await.unwrap();
+        assert!(
+            db_states.get(&db_path).unwrap().wal_copy_offset > 0,
+            "final shutdown copy must consume real WAL frames"
+        );
+
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+        let (upload_tx, mut upload_rx) = mpsc::channel(10);
+        let mut cache_states = HashMap::new();
+        cache_states.insert(db_path.clone(), (Arc::clone(&cache), upload_tx));
+
+        let results = run_shadow_syncs(
+            &db_states,
+            &cache_states,
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+        )
+        .await;
+        apply_shadow_sync_results_strict(&mut db_states, results)
+            .await
+            .unwrap();
+
+        let pending = cache.pending_uploads();
+        assert_eq!(
+            pending.len(),
+            1,
+            "final shutdown sync must queue an LTX upload"
+        );
+
+        let ltx = cache.read_ltx(pending[0]).unwrap();
+        crate::ltx::verify_ltx(std::io::Cursor::new(ltx)).unwrap();
+
+        let msg = upload_rx.try_recv().unwrap();
+        assert!(
+            matches!(msg, UploadMessage::Upload(txid) if txid == pending[0]),
+            "cache sync must notify uploader for queued LTX"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shadow_sync_persists_restart_progress_after_durable_cache_write() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let progress_path = shadow.shadow_dir().join("progress.json");
+        let wal_path = db_path.with_extension("db-wal");
+
+        let mut db_states = HashMap::new();
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name: "restart_progress".to_string(),
+                db_path: db_path.clone(),
+                wal_path,
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                shadow,
+                shadow_sync_generation: 0,
+                shadow_sync_offset: 0,
+                wal_copy_offset: 0,
+            },
+        );
+
+        copy_final_shadow_frames(&mut db_states).await.unwrap();
+
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+        let (upload_tx, _upload_rx) = mpsc::channel(10);
+        let mut cache_states = HashMap::new();
+        cache_states.insert(db_path.clone(), (Arc::clone(&cache), upload_tx));
+
+        let results = run_shadow_syncs(
+            &db_states,
+            &cache_states,
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+        )
+        .await;
+        apply_shadow_sync_results_strict(&mut db_states, results)
+            .await
+            .unwrap();
+
+        assert!(
+            progress_path.exists(),
+            "shadow sync must persist a restart progress record after durable cache write"
+        );
+        let state = db_states.get(&db_path).unwrap();
+        let reloaded = load_shadow_progress(&state.shadow, &state.name)
+            .unwrap()
+            .expect("progress record must reload");
+        assert_eq!(reloaded.current_txid, state.current_txid);
+        assert_eq!(
+            reloaded.shadow_sync_generation,
+            state.shadow_sync_generation
+        );
+        assert_eq!(reloaded.shadow_sync_offset, state.shadow_sync_offset);
+    }
+
+    #[tokio::test]
+    async fn test_shadow_sync_cursor_resets_offset_when_advancing_generation() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow_dir = ShadowWal::shadow_dir_for(&db_path);
+        let page_size = 4096usize;
+        let mut page = vec![0u8; page_size];
+        std::fs::File::open(&db_path)
+            .unwrap()
+            .read_exact(&mut page)
+            .unwrap();
+
+        write_shadow_segment(&shadow_dir, 0, page_size, &page);
+        write_shadow_segment(&shadow_dir, 1, page_size, &page);
+
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        assert_eq!(
+            shadow.generation(),
+            1,
+            "test setup must start with a newer live shadow generation"
+        );
+        let frame_size = 24 + page_size as u64;
+        let wal_path = db_path.with_extension("db-wal");
+        let mut db_states = HashMap::new();
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name: "generation_cursor".to_string(),
+                db_path: db_path.clone(),
+                wal_path,
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                shadow,
+                shadow_sync_generation: 0,
+                shadow_sync_offset: frame_size,
+                wal_copy_offset: 0,
+            },
+        );
+
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+        let (upload_tx, _upload_rx) = mpsc::channel(10);
+        let mut cache_states = HashMap::new();
+        cache_states.insert(db_path.clone(), (Arc::clone(&cache), upload_tx));
+
+        let drained_old_generation = run_shadow_syncs(
+            &db_states,
+            &cache_states,
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+        )
+        .await;
+        apply_shadow_sync_results_strict(&mut db_states, drained_old_generation)
+            .await
+            .unwrap();
+        let state = db_states.get(&db_path).unwrap();
+        assert_eq!(state.shadow_sync_generation, 1);
+        assert_eq!(
+            state.shadow_sync_offset, 0,
+            "offset must reset when advancing to the new shadow generation"
+        );
+        assert!(
+            cache.pending_uploads().is_empty(),
+            "draining the old generation at EOF should not upload anything"
+        );
+
+        let synced_new_generation = run_shadow_syncs(
+            &db_states,
+            &cache_states,
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+        )
+        .await;
+        apply_shadow_sync_results_strict(&mut db_states, synced_new_generation)
+            .await
+            .unwrap();
+        assert_eq!(
+            cache.pending_uploads().len(),
+            1,
+            "new generation frames must be read from offset 0, not skipped by the prior generation offset"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shadow_checkpoint_copies_syncs_and_waits_for_cache_upload() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let wal_path = db_path.with_extension("db-wal");
+        let mut state = ShadowDbState {
+            name: "checkpoint_shadow".to_string(),
+            db_path: db_path.clone(),
+            wal_path,
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+        let (upload_tx, mut upload_rx) = mpsc::channel(10);
+        let ack_cache = Arc::clone(&cache);
+        let ack_handle = tokio::spawn(async move {
+            match upload_rx.recv().await {
+                Some(UploadMessage::Upload(txid)) => ack_cache.mark_uploaded(txid).unwrap(),
+                other => panic!("expected upload notification, got {other:?}"),
+            }
+        });
+        let cache_state = (Arc::clone(&cache), upload_tx);
+
+        checkpoint_shadow_after_durable_sync(
+            &mut state,
+            Some(&cache_state),
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+            Duration::from_secs(2),
+        )
+        .await
+        .unwrap();
+        ack_handle.await.unwrap();
+
+        assert!(
+            state.wal_copy_offset > 0,
+            "checkpoint path must copy real active WAL frames before checkpointing"
+        );
+        assert!(
+            state.shadow_sync_offset > 0,
+            "checkpoint path must sync copied shadow frames before checkpointing"
+        );
+        assert!(
+            cache.pending_uploads().is_empty(),
+            "checkpoint must wait until cache uploads are confirmed durable"
+        );
+        assert!(
+            cache.last_uploaded_txid() >= state.current_txid,
+            "confirmed uploaded LTX must cover the checkpointed shadow state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_shadow_checkpoint_refuses_pending_cache_upload() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let wal_path = db_path.with_extension("db-wal");
+        let mut state = ShadowDbState {
+            name: "checkpoint_shadow_pending".to_string(),
+            db_path: db_path.clone(),
+            wal_path,
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+        let (upload_tx, _upload_rx) = mpsc::channel(10);
+        let cache_state = (Arc::clone(&cache), upload_tx);
+
+        let err = checkpoint_shadow_after_durable_sync(
+            &mut state,
+            Some(&cache_state),
+            None,
+            &RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+            Duration::from_millis(100),
+        )
+        .await
+        .expect_err("checkpoint must fail closed while cache uploads are pending")
+        .to_string();
+
+        assert!(
+            err.contains("durable upload confirmation timed out"),
+            "expected durability timeout, got {err}"
+        );
+        assert!(
+            !cache.pending_uploads().is_empty(),
+            "test must leave an unconfirmed cache upload pending"
+        );
+    }
 }

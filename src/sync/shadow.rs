@@ -1,187 +1,31 @@
 use anyhow::Result;
 use chrono::Utc;
+use hadb_storage_s3::S3Storage;
 use std::sync::Arc;
+use walrust_core::legacy_manifest::plan_legacy_compaction;
+use walrust_core::legacy_shadow;
+#[cfg(test)]
+use walrust_core::legacy_shadow::ShadowEncodeResult;
 
 use crate::cache::LocalCache;
-use crate::ltx;
-use crate::retention::{analyze_retention, RetentionPolicy, SnapshotEntry};
+use crate::errors::{classify_or_else, WalrustError};
+use crate::retention::{RetentionPolicy, SnapshotEntry};
 use crate::retry::{classify_error, ErrorKind, RetryPolicy};
 use crate::s3;
 use crate::uploader::UploadMessage;
 use crate::webhook::WebhookSender;
 
-use super::manifest::{build_ltx_key, load_manifest, save_manifest, GENERATION_LIVE};
-use super::types::{LtxEntry, Manifest, ShadowSyncInput, ShadowSyncOutput};
+use super::manifest::discover_snapshots_from_s3;
+use super::types::{ShadowSyncInput, ShadowSyncOutput};
 
-/// Result of encoding shadow WAL segments into LTX
-struct ShadowEncodeResult {
-    ltx_buffer: Vec<u8>,
-    post_checksum: litepages::Checksum,
-    frame_count: usize,
-    unique_pages: usize,
-    min_txid: u64,
-    max_txid: u64,
-}
-
-/// Read shadow WAL segments and encode into LTX buffer.
-/// Returns None if no new frames to sync.
+#[cfg(test)]
 fn encode_shadow_to_ltx(input: &ShadowSyncInput) -> Result<Option<(ShadowEncodeResult, u64)>> {
-    use litepages::Checksum;
-
-    let shadow_dir = &input.shadow_dir;
-    let mut page_map: std::collections::HashMap<u32, Vec<u8>> = std::collections::HashMap::new();
-    let mut pending_page_map: std::collections::HashMap<u32, Vec<u8>> =
-        std::collections::HashMap::new();
-    let mut final_db_size = 0u32;
-    let mut frame_count = 0usize;
-    let mut pending_frame_count = 0usize;
-    let mut committed_frame_count = 0usize;
-    let mut total_offset = 0u64;
-    let frame_size = 24u64 + input.page_size as u64;
-
-    let mut entries: Vec<_> = std::fs::read_dir(shadow_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().ends_with(".wal"))
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-
-        let parts: Vec<&str> = name_str.trim_end_matches(".wal").split('-').collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let gen = u64::from_str_radix(parts[0], 16).unwrap_or(u64::MAX);
-        if gen != input.generation {
-            continue;
-        }
-
-        let path = entry.path();
-        let metadata = std::fs::metadata(&path)?;
-        let segment_size = metadata.len();
-        let segment_start = total_offset;
-        let segment_end = segment_start + segment_size;
-
-        if segment_end <= input.shadow_sync_offset {
-            total_offset = segment_end;
-            continue;
-        }
-
-        let mut file = std::fs::File::open(&path)?;
-        use std::io::{Read, Seek, SeekFrom};
-
-        let relative_offset = if input.shadow_sync_offset > segment_start {
-            input.shadow_sync_offset - segment_start
-        } else {
-            0
-        };
-
-        file.seek(SeekFrom::Start(relative_offset))?;
-
-        let bytes_to_read = segment_size - relative_offset;
-        let segment_frames = bytes_to_read / frame_size;
-
-        let mut page_data = vec![0u8; input.page_size as usize];
-        for _ in 0..segment_frames {
-            let mut header = [0u8; 24];
-            file.read_exact(&mut header)?;
-
-            let page_number = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
-            let db_size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
-
-            file.read_exact(&mut page_data)?;
-
-            pending_page_map.insert(page_number, page_data.clone());
-            pending_frame_count += 1;
-
-            if db_size > 0 {
-                final_db_size = db_size;
-                page_map.extend(pending_page_map.drain());
-                frame_count += pending_frame_count;
-                committed_frame_count += pending_frame_count;
-                pending_frame_count = 0;
-            }
-        }
-
-        total_offset = segment_end;
-    }
-
-    if page_map.is_empty() {
-        return Ok(None);
-    }
-
-    let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
-    let pre_checksum = input.db_checksum.map(|cs| Checksum::new(cs));
-
-    let min_txid = input.current_txid + 1;
-    let max_txid = min_txid + pages.len() as u64 - 1;
-    let commit_page = if final_db_size > 0 { final_db_size } else { 1 };
-
-    let unique_pages = pages.len();
-    let estimated_size = unique_pages
-        .saturating_mul(input.page_size as usize)
-        .saturating_mul(2);
-    let page_size = input.page_size;
-
-    let expected_post = if let Some(pre) = pre_checksum {
-        ltx::chain_checksum(pre, &pages)
-    } else {
-        ltx::compute_checksum_from_file(&input.db_path)?
-    };
-
-    let mut ltx_buffer = Vec::with_capacity(estimated_size);
-    let post_checksum = ltx::encode_wal_changes(
-        &mut ltx_buffer,
-        &pages,
-        page_size,
-        min_txid,
-        max_txid,
-        commit_page,
-        pre_checksum,
-        expected_post,
-    )?;
-
-    let new_offset = input.shadow_sync_offset + (committed_frame_count as u64 * frame_size);
-
-    Ok(Some((
-        ShadowEncodeResult {
-            ltx_buffer,
-            post_checksum,
-            frame_count,
-            unique_pages,
-            min_txid,
-            max_txid,
-        },
-        new_offset,
-    )))
+    legacy_shadow::encode_shadow_to_ltx(input)
 }
 
-/// Build ShadowSyncOutput from encode result
-fn build_output(
-    input: &ShadowSyncInput,
-    encoded: &ShadowEncodeResult,
-    new_offset: u64,
-) -> ShadowSyncOutput {
-    ShadowSyncOutput {
-        db_path: input.db_path.clone(),
-        frame_count: encoded.unique_pages as u64,
-        new_shadow_sync_offset: new_offset,
-        new_current_txid: encoded.max_txid,
-        new_db_checksum: Some(encoded.post_checksum.into_inner()),
-    }
-}
-
-/// Build empty ShadowSyncOutput (no frames to sync)
+#[cfg(test)]
 fn build_empty_output(input: &ShadowSyncInput) -> ShadowSyncOutput {
-    ShadowSyncOutput {
-        db_path: input.db_path.clone(),
-        frame_count: 0,
-        new_shadow_sync_offset: input.shadow_sync_offset,
-        new_current_txid: input.current_txid,
-        new_db_checksum: input.db_checksum,
-    }
+    legacy_shadow::build_empty_shadow_output(input)
 }
 
 /// Sync shadow WAL segments to S3 (direct upload, no cache)
@@ -191,39 +35,8 @@ pub(crate) async fn sync_shadow_concurrent(
     prefix: &str,
     input: ShadowSyncInput,
 ) -> Result<ShadowSyncOutput> {
-    // Encoding is CPU-bound, run in blocking thread pool
-    let input_clone = input.clone();
-    let result = tokio::task::spawn_blocking(move || encode_shadow_to_ltx(&input_clone)).await??;
-
-    let (encoded, new_offset) = match result {
-        Some(r) => r,
-        None => return Ok(build_empty_output(&input)),
-    };
-
-    let ltx_key = build_ltx_key(
-        prefix,
-        &input.name,
-        GENERATION_LIVE,
-        encoded.min_txid,
-        encoded.max_txid,
-    );
-    let ltx_size = encoded.ltx_buffer.len() as u64;
-    let output = build_output(&input, &encoded, new_offset);
-
-    s3::upload_bytes(client, bucket, &ltx_key, encoded.ltx_buffer).await?;
-
-    tracing::info!(
-        "{}: Shadow sync uploaded {} frames ({} bytes, {} unique pages, TXID {}-{}) -> {}",
-        input.name,
-        encoded.frame_count,
-        ltx_size,
-        encoded.unique_pages,
-        encoded.min_txid,
-        encoded.max_txid,
-        ltx_key
-    );
-
-    Ok(output)
+    let storage = S3Storage::new(client.clone(), bucket.to_string());
+    legacy_shadow::sync_shadow_to_storage(&storage, prefix, input).await
 }
 
 /// Sync shadow WAL segments to disk cache (cache + uploader)
@@ -235,36 +48,7 @@ pub(crate) async fn sync_shadow_to_cache(
     upload_tx: &tokio::sync::mpsc::Sender<UploadMessage>,
     input: ShadowSyncInput,
 ) -> Result<ShadowSyncOutput> {
-    let input_clone = input.clone();
-    let result = tokio::task::spawn_blocking(move || encode_shadow_to_ltx(&input_clone)).await??;
-
-    let (encoded, new_offset) = match result {
-        Some(r) => r,
-        None => return Ok(build_empty_output(&input)),
-    };
-
-    let ltx_size = encoded.ltx_buffer.len() as u64;
-
-    // Write to disk cache (atomic: temp file + rename)
-    cache.write_ltx(encoded.max_txid, &encoded.ltx_buffer)?;
-
-    // Notify uploader task
-    upload_tx
-        .send(UploadMessage::Upload(encoded.max_txid))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to notify uploader: {}", e))?;
-
-    tracing::info!(
-        "{}: Shadow sync cached {} frames ({} bytes, {} unique pages, TXID {}-{})",
-        input.name,
-        encoded.frame_count,
-        ltx_size,
-        encoded.unique_pages,
-        encoded.min_txid,
-        encoded.max_txid,
-    );
-
-    Ok(build_output(&input, &encoded, new_offset))
+    legacy_shadow::sync_shadow_to_cache(cache, upload_tx, input).await
 }
 
 /// Sync shadow WAL to cache with retry logic
@@ -386,36 +170,43 @@ pub(crate) async fn run_compaction(
     name: &str,
     policy: &RetentionPolicy,
 ) -> Result<()> {
-    // Load manifest to get snapshot info
-    let manifest = load_manifest(client, bucket, prefix, name).await?;
+    let discovered = discover_snapshots_from_s3(client, bucket, prefix, name)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
-    if manifest.files.is_empty() {
+    if discovered.is_empty() {
         return Ok(());
     }
 
-    // Filter to only snapshots (not incremental files)
-    let snapshot_entries: Vec<SnapshotEntry> = manifest
-        .files
-        .iter()
-        .filter(|f| f.is_snapshot)
-        .filter_map(|f| {
-            chrono::DateTime::parse_from_rfc3339(&f.created_at)
-                .ok()
-                .map(|dt| SnapshotEntry {
-                    key: f.filename.clone(),
-                    created_at: dt.with_timezone(&Utc),
-                    sequence: f.max_txid,
-                    size: f.size,
-                })
-        })
-        .collect();
-
-    if snapshot_entries.is_empty() {
-        return Ok(());
+    let mut snapshot_entries: Vec<SnapshotEntry> = Vec::with_capacity(discovered.len());
+    for (key, _gen, _min, max) in &discovered {
+        let meta = s3::head_object_meta(client, bucket, key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+        snapshot_entries.push(SnapshotEntry {
+            key: key.clone(),
+            created_at: meta.last_modified,
+            sequence: *max,
+            size: meta.size,
+        });
     }
 
     let now = Utc::now();
-    let plan = analyze_retention(&snapshot_entries, policy, now);
+    let storage = S3Storage::new(client.clone(), bucket.to_string());
+    let plan_before_reachability =
+        crate::retention::analyze_retention(&snapshot_entries, policy, now);
+    let plan = plan_legacy_compaction(&storage, prefix, name, &snapshot_entries, policy, now)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+    let before = plan.delete.len();
+    let rescued = plan_before_reachability.delete.len().saturating_sub(before);
+    if rescued > 0 {
+        tracing::info!(
+            "{}: compaction retained {} snapshot(s) as reachability base for the incremental chain",
+            name,
+            rescued
+        );
+    }
 
     if !plan.has_deletions() {
         tracing::debug!("Compaction for {}: nothing to delete", name);
@@ -429,31 +220,11 @@ pub(crate) async fn run_compaction(
         plan.keep.len()
     );
 
-    // Delete files
-    let keys_to_delete: Vec<String> = plan
-        .delete
-        .iter()
-        .map(|e| format!("{}{}/{}", prefix, name, e.key))
-        .collect();
+    let keys_to_delete: Vec<String> = plan.delete.iter().map(|entry| entry.key.clone()).collect();
 
-    let deleted_count = s3::delete_objects(client, bucket, &keys_to_delete).await?;
-
-    // Update manifest to remove deleted entries
-    let kept_keys: std::collections::HashSet<_> =
-        plan.keep.iter().map(|e| e.key.as_str()).collect();
-
-    let updated_files: Vec<LtxEntry> = manifest
-        .files
-        .into_iter()
-        .filter(|f| !f.is_snapshot || kept_keys.contains(f.filename.as_str()))
-        .collect();
-
-    let updated_manifest = Manifest {
-        files: updated_files,
-        ..manifest
-    };
-
-    save_manifest(client, bucket, prefix, &updated_manifest).await?;
+    let deleted_count = s3::delete_objects(client, bucket, &keys_to_delete)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     tracing::info!(
         "Compaction complete for {}: deleted {} snapshots, freed {:.2} MB",
@@ -469,12 +240,72 @@ pub(crate) async fn run_compaction(
 mod tests {
     use super::*;
     use crate::cache::LocalCache;
+    use crate::ltx;
+    use crate::sync::manifest::build_ltx_key;
     use crate::uploader::UploadMessage;
     use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::TempDir;
     use tokio::sync::mpsc;
 
     const PAGE_SIZE: u32 = 4096;
+
+    fn unique_s3_name(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{prefix}-{nanos}")
+    }
+
+    fn test_bucket_config() -> (String, Option<String>) {
+        let bucket = std::env::var("WALRUST_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026/verify-test".to_string());
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        (bucket, endpoint)
+    }
+
+    #[tokio::test]
+    async fn test_watch_auto_compaction_uses_listing_without_manifest() {
+        if std::env::var("AWS_ENDPOINT_URL_S3").is_err()
+            && std::env::var("AWS_ENDPOINT_URL").is_err()
+            && std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        {
+            eprintln!("SKIP test_watch_auto_compaction_uses_listing_without_manifest: no S3 endpoint/credentials configured");
+            return;
+        }
+        let (bucket_arg, endpoint) = test_bucket_config();
+        let (bucket, prefix) = s3::parse_bucket(&bucket_arg);
+        let client = s3::create_client(endpoint.as_deref()).await.unwrap();
+        let name = unique_s3_name("watch-compact-no-manifest");
+
+        let keep_old = build_ltx_key(&prefix, &name, 1, 1, 1);
+        let delete_middle = build_ltx_key(&prefix, &name, 2, 1, 2);
+        let keep_latest = build_ltx_key(&prefix, &name, 3, 1, 3);
+        let keys = vec![keep_old.clone(), delete_middle.clone(), keep_latest.clone()];
+
+        for key in &keys {
+            s3::upload_bytes(&client, &bucket, key, b"snapshot".to_vec())
+                .await
+                .unwrap();
+        }
+
+        let policy = RetentionPolicy::new(0, 0, 0, 0);
+        run_compaction(&client, &bucket, &prefix, &name, &policy)
+            .await
+            .unwrap();
+
+        assert!(
+            !s3::exists(&client, &bucket, &delete_middle).await.unwrap(),
+            "watch auto-compaction must delete eligible listing-discovered snapshots even without manifest.json"
+        );
+        assert!(s3::exists(&client, &bucket, &keep_old).await.unwrap());
+        assert!(s3::exists(&client, &bucket, &keep_latest).await.unwrap());
+
+        let _ = s3::delete_objects(&client, &bucket, &keys).await;
+    }
 
     /// Create a shadow WAL segment file with the given frames.
     /// Each frame is (page_number, db_size, page_data).

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Result};
+use std::fmt;
 use std::path::Path;
 use tokio::fs::File;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
@@ -45,17 +46,47 @@ pub struct FrameHeader {
 pub const WAL_HEADER_SIZE: u64 = 32;
 pub const FRAME_HEADER_SIZE: u64 = 24;
 
-/// WAL magic for the big-endian checksum variant.
-pub const WAL_MAGIC_BE: u32 = 0x377F_0682;
 /// WAL magic for the little-endian checksum variant.
-pub const WAL_MAGIC_LE: u32 = 0x377F_0683;
+pub const WAL_MAGIC_LE: u32 = 0x377F_0682;
+/// WAL magic for the big-endian checksum variant.
+pub const WAL_MAGIC_BE: u32 = 0x377F_0683;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WalValidationError {
+    InvalidHeaderChecksum,
+    FrameSaltMismatch {
+        frame: u64,
+        expected: (u32, u32),
+        actual: (u32, u32),
+    },
+}
+
+impl fmt::Display for WalValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WalValidationError::InvalidHeaderChecksum => {
+                write!(f, "WAL header checksum is invalid")
+            }
+            WalValidationError::FrameSaltMismatch {
+                frame,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "WAL frame salt mismatch at frame {frame}: expected {expected:?}, got {actual:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for WalValidationError {}
 
 /// SQLite WAL cumulative checksum (the s0/s1 Fibonacci-weighted sum).
 ///
 /// `data` must be a whole number of 32-bit words (length a multiple of 8 bytes,
 /// per the SQLite spec which feeds an even count of 32-bit ints). `big_endian`
 /// selects how each 4-byte word is interpreted, chosen by the WAL magic
-/// (`0x377f0682` => big-endian, `0x377f0683` => little-endian). The running
+/// (`0x377f0682` => little-endian, `0x377f0683` => big-endian). The running
 /// `(s0, s1)` seed is the previous checksum: `(0, 0)` for the header, the
 /// header checksum for frame 1, then the prior frame's checksum thereafter.
 ///
@@ -89,8 +120,8 @@ fn read_u32(b: &[u8], big_endian: bool) -> u32 {
 
 /// True if the WAL magic selects big-endian checksum word interpretation.
 fn magic_is_big_endian(magic: u32) -> bool {
-    // 0x377f0682 => big-endian, 0x377f0683 => little-endian.
-    magic & 1 == 0
+    // 0x377f0682 => little-endian, 0x377f0683 => big-endian.
+    magic & 1 == 1
 }
 
 /// Validate the 32-byte WAL header's own checksum.
@@ -100,10 +131,10 @@ fn magic_is_big_endian(magic: u32) -> bool {
 /// the magic-selected body endianness. Returns the header's `(checksum1,
 /// checksum2)` seed for the frame chain when valid.
 ///
-/// A synthetic header whose stored checksum is `(0, 0)` (e.g. hand-built test
-/// WALs) does not validate; callers treat that as "no checksum chain to verify"
-/// rather than an error.
-pub fn validate_header_checksum(header_bytes: &[u8; 32], big_endian: bool) -> Option<(u32, u32)> {
+pub fn validate_header_checksum(
+    header_bytes: &[u8; 32],
+    big_endian: bool,
+) -> std::result::Result<(u32, u32), WalValidationError> {
     let stored = (
         u32::from_be_bytes([
             header_bytes[24],
@@ -119,13 +150,13 @@ pub fn validate_header_checksum(header_bytes: &[u8; 32], big_endian: bool) -> Op
         ]),
     );
     if stored == (0, 0) {
-        return None;
+        return Err(WalValidationError::InvalidHeaderChecksum);
     }
     let computed = wal_checksum((0, 0), &header_bytes[0..24], big_endian);
     if computed == stored {
-        Some(stored)
+        Ok(stored)
     } else {
-        None
+        Err(WalValidationError::InvalidHeaderChecksum)
     }
 }
 
@@ -212,7 +243,7 @@ pub async fn read_frames_from(
     let frame_size = FRAME_HEADER_SIZE + page_size as u64;
 
     // Calculate start position
-    let start_pos = if start_offset == 0 {
+    let start_pos = if start_offset == 0 || start_offset > file_size {
         WAL_HEADER_SIZE
     } else {
         start_offset
@@ -318,10 +349,9 @@ pub async fn read_frames_as_page_map(
 /// as a torn / partial tail — reading stops at the last good *committed* frame,
 /// exactly as if the bad frame and everything after it were not yet written.
 ///
-/// Validation is skipped only when the WAL header carries no checksum
-/// (`(0, 0)`), which is the case for hand-built synthetic WALs but never for a
-/// real SQLite WAL. The returned final chain value lets the caller seed the
-/// next incremental read.
+/// A frame whose salt does not match the header is treated as a stale tail.
+/// Invalid header checksums are hard errors. The returned final chain value
+/// lets the caller seed the next incremental read.
 pub async fn read_frames_as_page_map_checked(
     path: &Path,
     page_size: u32,
@@ -360,7 +390,22 @@ pub async fn read_frames_as_page_map_checked(
         ]);
         if magic == WAL_MAGIC_BE || magic == WAL_MAGIC_LE {
             let be = magic_is_big_endian(magic);
-            validate_header_checksum(&header_bytes, be).map(|seed| (seed, be))
+            let seed = validate_header_checksum(&header_bytes, be)?;
+            let salt = (
+                u32::from_be_bytes([
+                    header_bytes[16],
+                    header_bytes[17],
+                    header_bytes[18],
+                    header_bytes[19],
+                ]),
+                u32::from_be_bytes([
+                    header_bytes[20],
+                    header_bytes[21],
+                    header_bytes[22],
+                    header_bytes[23],
+                ]),
+            );
+            Some((seed, be, salt))
         } else {
             None
         }
@@ -398,23 +443,20 @@ pub async fn read_frames_as_page_map_checked(
     // Checksum chain. We can only validate when the header carries a checksum.
     // The seed at `start_pos` is the caller-supplied chain (mid-WAL) or the
     // header checksum (start_pos == header).
-    let (mut running, big_endian, validate) = match header_seed {
-        Some((hdr_seed, be)) => {
+    let (mut running, big_endian, validate, header_salt) = match header_seed {
+        Some((hdr_seed, be, salt)) => {
             let seed = if start_pos == WAL_HEADER_SIZE {
                 hdr_seed
             } else {
                 // Mid-WAL incremental read: caller must supply the running chain.
                 // If absent we cannot validate this slice; skip rather than
                 // false-reject.
-                match chain_seed {
-                    Some(c) => c,
-                    None => (0, 0),
-                }
+                chain_seed.unwrap_or_default()
             };
             let validate = start_pos == WAL_HEADER_SIZE || chain_seed.is_some();
-            (seed, be, validate)
+            (seed, be, validate, salt)
         }
-        None => ((0, 0), true, false),
+        None => ((0, 0), true, false, (0, 0)),
     };
 
     let mut frame_headers = Vec::with_capacity(full_frames as usize);
@@ -427,6 +469,27 @@ pub async fn read_frames_as_page_map_checked(
         file.read_exact(&mut page_data).await?;
 
         if validate {
+            let frame_salt = (
+                u32::from_be_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]),
+                u32::from_be_bytes([
+                    header_buf[12],
+                    header_buf[13],
+                    header_buf[14],
+                    header_buf[15],
+                ]),
+            );
+            if frame_salt != header_salt {
+                tracing::warn!(
+                    "{}; treating as stale tail",
+                    WalValidationError::FrameSaltMismatch {
+                        frame: frame_index + 1,
+                        expected: header_salt,
+                        actual: frame_salt,
+                    }
+                );
+                break;
+            }
+
             match verify_frame_checksum(running, &header_buf, &page_data, big_endian) {
                 Some(next) => running = next,
                 None => {
@@ -482,7 +545,7 @@ pub async fn read_frames_as_page_map_checked(
     // Recompute the chain over exactly the committed prefix so the returned
     // chain value matches the last consumed frame.
     let mut out_chain = match header_seed {
-        Some((hdr_seed, _)) if start_pos == WAL_HEADER_SIZE => Some(hdr_seed),
+        Some((hdr_seed, _, _)) if start_pos == WAL_HEADER_SIZE => Some(hdr_seed),
         _ => chain_seed,
     };
 
@@ -814,6 +877,37 @@ pub async fn read_frames_with_metadata(
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use tempfile::TempDir;
+
+    struct RealWalFixture {
+        _dir: TempDir,
+        _conn: rusqlite::Connection,
+        db_path: PathBuf,
+        wal_path: PathBuf,
+    }
+
+    fn build_real_sqlite_wal() -> RealWalFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("real-wal.db");
+        let wal_path = db_path.with_extension("db-wal");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT);
+            INSERT INTO items (value) VALUES ('alpha'), ('beta'), ('gamma');
+            ",
+        )
+        .unwrap();
+        assert!(wal_path.exists(), "SQLite should leave a live WAL file");
+        RealWalFixture {
+            _dir: dir,
+            _conn: conn,
+            db_path,
+            wal_path,
+        }
+    }
 
     /// Build a real SQLite-format WAL with a correctly checksummed header and
     /// frame chain. `frames` is `(page_number, db_size_after_commit, fill)`.
@@ -869,6 +963,50 @@ mod tests {
         // Little-endian interpretation of the same bytes differs.
         let le = wal_checksum((0, 0), &data2, false);
         assert_ne!(le, (7, 14));
+    }
+
+    #[tokio::test]
+    async fn test_real_sqlite_wal_helper_produces_live_wal() {
+        let fixture = build_real_sqlite_wal();
+        assert!(fixture.db_path.exists());
+
+        let header = read_header(&fixture.wal_path).await.unwrap().unwrap();
+        assert!(matches!(header.magic, WAL_MAGIC_BE | WAL_MAGIC_LE));
+        #[cfg(target_endian = "little")]
+        assert_eq!(header.magic, 0x377F_0682);
+        assert!(header.page_size > 0);
+        assert_ne!(
+            (header.checksum1, header.checksum2),
+            (0, 0),
+            "real SQLite WAL headers carry checksums"
+        );
+
+        let size = get_wal_size(&fixture.wal_path).await.unwrap();
+        assert!(size > WAL_HEADER_SIZE);
+    }
+
+    #[tokio::test]
+    async fn test_real_sqlite_wal_checked_reader_validates_checksum_chain() {
+        let fixture = build_real_sqlite_wal();
+        let header = read_header(&fixture.wal_path).await.unwrap().unwrap();
+
+        let (pages, frame_count, offset, db_size, commit_count, chain) =
+            read_frames_as_page_map_checked(&fixture.wal_path, header.page_size, 0, None)
+                .await
+                .unwrap();
+
+        assert!(!pages.is_empty(), "real SQLite WAL should yield pages");
+        assert!(frame_count > 0, "real SQLite WAL should yield frames");
+        assert!(
+            offset > WAL_HEADER_SIZE,
+            "reader should consume committed frames"
+        );
+        assert!(db_size > 0, "real SQLite WAL should include a commit frame");
+        assert!(commit_count > 0, "real SQLite WAL should count commits");
+        assert!(
+            chain.is_some(),
+            "real SQLite WAL checksum chain must validate"
+        );
     }
 
     #[tokio::test]
@@ -980,33 +1118,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_checked_reader_skips_validation_for_synthetic_wal() {
-        // Hand-built WALs with a zero header checksum (used elsewhere in the
-        // suite) must still parse: validation only engages for real WALs.
+    async fn test_checked_reader_rejects_frame_salt_mismatch() {
         let path = PathBuf::from(format!(
-            "/tmp/walrust-test-chk-synth-{}.db-wal",
+            "/tmp/walrust-test-chk-salt-{}.db-wal",
             uuid::Uuid::new_v4()
         ));
         let page_size = 1024u32;
         let frame_size = FRAME_HEADER_SIZE as usize + page_size as usize;
-        let mut data = vec![0u8; 32 + frame_size];
-        data[0..4].copy_from_slice(&WAL_MAGIC_BE.to_be_bytes());
-        data[8..12].copy_from_slice(&page_size.to_be_bytes());
-        // frame: page 1, db_size 1 (commit), zero checksum
-        data[32..36].copy_from_slice(&1u32.to_be_bytes());
-        data[36..40].copy_from_slice(&1u32.to_be_bytes());
-        tokio::fs::write(&path, &data).await.unwrap();
+        let mut wal = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(1, 1, 0xAA), (2, 2, 0xBB)],
+        );
+        let second_frame_header = WAL_HEADER_SIZE as usize + frame_size;
+        wal[second_frame_header + 8..second_frame_header + 12]
+            .copy_from_slice(&0x3333_3333u32.to_be_bytes());
+        tokio::fs::write(&path, &wal).await.unwrap();
 
-        let (pages, frame_count, _offset, db_size, _commit, chain) =
+        let (pages, frame_count, _offset, db_size, commit_count, _chain) =
             read_frames_as_page_map_checked(&path, page_size, 0, None)
                 .await
                 .unwrap();
 
-        assert_eq!(frame_count, 1);
+        assert_eq!(frame_count, 1, "stale frame salt must stop the reader");
         assert_eq!(db_size, 1);
-        assert_eq!(pages.len(), 1);
-        assert!(chain.is_none(), "no header checksum => no chain to track");
+        assert_eq!(commit_count, 1);
+        assert!(pages.contains_key(&1));
+        assert!(!pages.contains_key(&2));
 
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_checked_reader_rejects_zero_header_checksum() {
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-chk-zero-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let page_size = 1024u32;
+        let frame_size = FRAME_HEADER_SIZE as usize + page_size as usize;
+        let mut data = vec![0u8; WAL_HEADER_SIZE as usize + frame_size];
+        data[0..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
+        data[8..12].copy_from_slice(&page_size.to_be_bytes());
+        data[32..36].copy_from_slice(&1u32.to_be_bytes());
+        data[36..40].copy_from_slice(&1u32.to_be_bytes());
+        tokio::fs::write(&path, &data).await.unwrap();
+
+        let err = read_frames_as_page_map_checked(&path, page_size, 0, None)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            err.downcast_ref::<WalValidationError>(),
+            Some(WalValidationError::InvalidHeaderChecksum)
+        ));
+        assert!(err.to_string().contains("WAL header checksum"));
         tokio::fs::remove_file(&path).await.ok();
     }
 
@@ -1098,10 +1264,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_header_valid_magic_big_endian() {
+    async fn test_read_header_valid_magic_little_endian() {
         let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
 
-        // Create valid WAL header with magic 0x377F0682 (big-endian checksum)
+        // Create valid WAL header with magic 0x377F0682 (little-endian checksum)
         let mut header = [0u8; 32];
         header[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes()); // magic
         header[4..8].copy_from_slice(&3007000u32.to_be_bytes()); // format version
@@ -1118,10 +1284,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_read_header_valid_magic_little_endian() {
+    async fn test_read_header_valid_magic_big_endian() {
         let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
 
-        // Create valid WAL header with magic 0x377F0683 (little-endian checksum)
+        // Create valid WAL header with magic 0x377F0683 (big-endian checksum)
         let mut header = [0u8; 32];
         header[0..4].copy_from_slice(&0x377F0683u32.to_be_bytes()); // magic
         header[4..8].copy_from_slice(&3007000u32.to_be_bytes()); // format version
@@ -1403,12 +1569,8 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
 
-        // Create valid WAL header only (no frames)
-        let mut header = [0u8; 32];
-        header[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
-        header[8..12].copy_from_slice(&4096u32.to_be_bytes());
-
-        tokio::fs::write(&path, &header).await.unwrap();
+        let data = build_valid_wal(4096, (0x1111_1111, 0x2222_2222), &[]);
+        tokio::fs::write(&path, &data).await.unwrap();
 
         let (page_map, frame_count, offset, max_db_size, commit_count) =
             read_frames_as_page_map(&path, 4096, 0).await.unwrap();
@@ -1433,46 +1595,13 @@ mod tests {
         ));
 
         let page_size: u32 = 4096;
-        let frame_header_size = 24usize;
-        let frame_size = frame_header_size + page_size as usize;
-
         // Create WAL with 4 frames: page 1 (v1), page 2, page 1 (v2), page 3
         // Result should have 3 unique pages, with page 1 being v2
-        let mut data = vec![0u8; 32 + frame_size * 4];
-        data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
-        data[8..12].copy_from_slice(&page_size.to_be_bytes());
-
-        // Frame 0: page 1, v1 (will be overwritten)
-        let f0 = 32;
-        data[f0..f0 + 4].copy_from_slice(&1u32.to_be_bytes()); // page_number=1
-        data[f0 + 4..f0 + 8].copy_from_slice(&3u32.to_be_bytes()); // db_size=3
-        for b in &mut data[f0 + frame_header_size..f0 + frame_size] {
-            *b = 0x11;
-        } // v1 data
-
-        // Frame 1: page 2
-        let f1 = 32 + frame_size;
-        data[f1..f1 + 4].copy_from_slice(&2u32.to_be_bytes()); // page_number=2
-        data[f1 + 4..f1 + 8].copy_from_slice(&0u32.to_be_bytes()); // db_size=0
-        for b in &mut data[f1 + frame_header_size..f1 + frame_size] {
-            *b = 0x22;
-        }
-
-        // Frame 2: page 1, v2 (overwrites v1)
-        let f2 = 32 + frame_size * 2;
-        data[f2..f2 + 4].copy_from_slice(&1u32.to_be_bytes()); // page_number=1
-        data[f2 + 4..f2 + 8].copy_from_slice(&0u32.to_be_bytes()); // db_size=0
-        for b in &mut data[f2 + frame_header_size..f2 + frame_size] {
-            *b = 0xAA;
-        } // v2 data
-
-        // Frame 3: page 3
-        let f3 = 32 + frame_size * 3;
-        data[f3..f3 + 4].copy_from_slice(&3u32.to_be_bytes()); // page_number=3
-        data[f3 + 4..f3 + 8].copy_from_slice(&3u32.to_be_bytes()); // db_size=3 (commit)
-        for b in &mut data[f3 + frame_header_size..f3 + frame_size] {
-            *b = 0x33;
-        }
+        let data = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(1, 3, 0x11), (2, 0, 0x22), (1, 0, 0xAA), (3, 3, 0x33)],
+        );
 
         tokio::fs::write(&path, &data).await.unwrap();
 
@@ -1511,33 +1640,12 @@ mod tests {
         ));
 
         let page_size: u32 = 4096;
-        let frame_header_size = 24usize;
-        let frame_size = frame_header_size + page_size as usize;
-
         // Create WAL with 3 frames: page 5, page 5 (overwrite), page 10
-        let mut data = vec![0u8; 32 + frame_size * 3];
-        data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
-        data[8..12].copy_from_slice(&page_size.to_be_bytes());
-
-        let f0 = 32;
-        data[f0..f0 + 4].copy_from_slice(&5u32.to_be_bytes());
-        data[f0 + 4..f0 + 8].copy_from_slice(&10u32.to_be_bytes());
-        for b in &mut data[f0 + frame_header_size..f0 + frame_size] {
-            *b = 0x55;
-        }
-
-        let f1 = 32 + frame_size;
-        data[f1..f1 + 4].copy_from_slice(&5u32.to_be_bytes());
-        for b in &mut data[f1 + frame_header_size..f1 + frame_size] {
-            *b = 0x66;
-        } // overwrite
-
-        let f2 = 32 + frame_size * 2;
-        data[f2..f2 + 4].copy_from_slice(&10u32.to_be_bytes());
-        data[f2 + 4..f2 + 8].copy_from_slice(&10u32.to_be_bytes());
-        for b in &mut data[f2 + frame_header_size..f2 + frame_size] {
-            *b = 0xAA;
-        }
+        let data = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(5, 10, 0x55), (5, 0, 0x66), (10, 10, 0xAA)],
+        );
 
         tokio::fs::write(&path, &data).await.unwrap();
 
@@ -1572,25 +1680,11 @@ mod tests {
             uuid::Uuid::new_v4()
         ));
         let page_size: u32 = 4096;
-        let frame_header_size = 24usize;
-        let frame_size = frame_header_size + page_size as usize;
-        let mut data = vec![0u8; 32 + frame_size * 2];
-        data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
-        data[8..12].copy_from_slice(&page_size.to_be_bytes());
-
-        let f0 = 32;
-        data[f0..f0 + 4].copy_from_slice(&5u32.to_be_bytes());
-        data[f0 + 4..f0 + 8].copy_from_slice(&5u32.to_be_bytes());
-        for b in &mut data[f0 + frame_header_size..f0 + frame_size] {
-            *b = 0x55;
-        }
-
-        let f1 = 32 + frame_size;
-        data[f1..f1 + 4].copy_from_slice(&3u32.to_be_bytes());
-        data[f1 + 4..f1 + 8].copy_from_slice(&3u32.to_be_bytes());
-        for b in &mut data[f1 + frame_header_size..f1 + frame_size] {
-            *b = 0x33;
-        }
+        let data = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(5, 5, 0x55), (3, 3, 0x33)],
+        );
 
         tokio::fs::write(&path, &data).await.unwrap();
 
@@ -1681,25 +1775,12 @@ mod tests {
         ));
 
         let page_size: u32 = 4096;
-        let frame_header_size = 24usize;
-        let frame_size = frame_header_size + page_size as usize;
-
         // 3 frames: commits at frame 0 and 2
-        let mut data = vec![0u8; 32 + frame_size * 3];
-        data[0..4].copy_from_slice(&0x377F0682u32.to_be_bytes());
-        data[8..12].copy_from_slice(&page_size.to_be_bytes());
-
-        let f0 = 32;
-        data[f0..f0 + 4].copy_from_slice(&1u32.to_be_bytes());
-        data[f0 + 4..f0 + 8].copy_from_slice(&1u32.to_be_bytes()); // commit
-
-        let f1 = 32 + frame_size;
-        data[f1..f1 + 4].copy_from_slice(&2u32.to_be_bytes());
-        // db_size=0 (no commit)
-
-        let f2 = 32 + frame_size * 2;
-        data[f2..f2 + 4].copy_from_slice(&3u32.to_be_bytes());
-        data[f2 + 4..f2 + 8].copy_from_slice(&3u32.to_be_bytes()); // commit
+        let data = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(1, 1, 0x11), (2, 0, 0x22), (3, 3, 0x33)],
+        );
 
         tokio::fs::write(&path, &data).await.unwrap();
 

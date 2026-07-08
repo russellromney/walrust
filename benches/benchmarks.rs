@@ -3,7 +3,6 @@
 //! Run with: cargo bench
 
 use brunch::{benches, Bench};
-use litepages::Checksum;
 use sha2::{Digest, Sha256};
 use std::hint::black_box;
 

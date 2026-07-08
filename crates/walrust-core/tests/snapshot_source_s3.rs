@@ -6,7 +6,7 @@
 //!
 //! ```bash
 //! set -a && source ../../.env && set +a
-//! WALRUST_S3_TEST_BUCKET=sqlces-test cargo test --test snapshot_source_s3 -- --ignored
+//! WALRUST_S3_TEST_BUCKET=sqlces-test cargo test --test snapshot_source_s3
 //! ```
 
 use anyhow::Result;
@@ -14,9 +14,10 @@ use async_trait::async_trait;
 use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
 use std::path::Path;
-use walrust::snapshot_source::SnapshotSource;
+use walrust::snapshot_source::{SnapshotCheckpoint, SnapshotSource};
 use walrust::sync::restore_with_snapshot_source;
 use walrust::SyncState;
+use walrust_core as walrust;
 
 fn test_bucket() -> String {
     std::env::var("WALRUST_S3_TEST_BUCKET").unwrap_or_else(|_| "sqlces-test".to_string())
@@ -51,7 +52,7 @@ struct TestSnapshotSource {
 
 #[async_trait]
 impl SnapshotSource for TestSnapshotSource {
-    async fn materialize(&self, output: &Path) -> Result<u64> {
+    async fn materialize(&self, output: &Path) -> Result<SnapshotCheckpoint> {
         let conn =
             rusqlite::Connection::open(output).map_err(|e| anyhow::anyhow!("open: {}", e))?;
         conn.execute_batch("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);")
@@ -63,11 +64,17 @@ impl SnapshotSource for TestSnapshotSource {
             )
             .map_err(|e| anyhow::anyhow!("insert: {}", e))?;
         }
-        Ok(self.version)
+        drop(conn);
+        Ok(SnapshotCheckpoint {
+            seq: self.version,
+            checksum: walrust::ltx::compute_checksum_from_file(output)?,
+        })
     }
 
-    async fn checkpoint_version(&self) -> Result<u64> {
-        Ok(self.version)
+    async fn checkpoint(&self) -> Result<SnapshotCheckpoint> {
+        Err(anyhow::anyhow!(
+            "TestSnapshotSource cannot report a checksum without materializing"
+        ))
     }
 }
 
@@ -75,24 +82,45 @@ impl SnapshotSource for TestSnapshotSource {
 struct FileSnapshotSource {
     source: std::path::PathBuf,
     version: u64,
+    checksum: u64,
 }
 
 #[async_trait]
 impl SnapshotSource for FileSnapshotSource {
-    async fn materialize(&self, output: &Path) -> Result<u64> {
+    async fn materialize(&self, output: &Path) -> Result<SnapshotCheckpoint> {
         std::fs::copy(&self.source, output)?;
-        Ok(self.version)
+        Ok(SnapshotCheckpoint {
+            seq: self.version,
+            checksum: self.checksum,
+        })
     }
-    async fn checkpoint_version(&self) -> Result<u64> {
-        Ok(self.version)
+
+    async fn checkpoint(&self) -> Result<SnapshotCheckpoint> {
+        Ok(SnapshotCheckpoint {
+            seq: self.version,
+            checksum: self.checksum,
+        })
     }
 }
 
 /// Happy path: materialize via snapshot source, no incrementals in S3.
 /// All S3 operations hit real Tigris.
+/// S3-backed tests run only when S3 credentials/an endpoint are configured.
+/// CI provisions MinIO and sets AWS_* env; local dev injects Tigris creds via
+/// Soup. On a clean machine with no S3 configured these tests skip so that a
+/// plain `cargo test --workspace` stays green (Phase 0.5).
+fn s3_test_enabled() -> bool {
+    std::env::var("AWS_ENDPOINT_URL_S3").is_ok()
+        || std::env::var("AWS_ENDPOINT_URL").is_ok()
+        || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+}
+
 #[tokio::test]
-#[ignore = "real S3 proof; run with soup credentials and --ignored"]
 async fn test_s3_restore_snapshot_source_no_incrementals() {
+    if !s3_test_enabled() {
+        eprintln!("SKIP test_s3_restore_snapshot_source_no_incrementals: no S3 endpoint/credentials configured");
+        return;
+    }
     let bucket = test_bucket();
     let endpoint = test_endpoint();
     let prefix = unique_prefix();
@@ -124,8 +152,11 @@ async fn test_s3_restore_snapshot_source_no_incrementals() {
 
 /// E2E: create base DB, sync WAL to real Tigris, then restore via snapshot source.
 #[tokio::test]
-#[ignore = "real S3 proof; run with soup credentials and --ignored"]
 async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
+    if !s3_test_enabled() {
+        eprintln!("SKIP test_s3_restore_snapshot_source_with_real_wal_sync: no S3 endpoint/credentials configured");
+        return;
+    }
     let bucket = test_bucket();
     let endpoint = test_endpoint();
     let prefix = unique_prefix();
@@ -160,7 +191,13 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
     walrust::sync::take_snapshot(&storage, &prefix, &mut state)
         .await
         .unwrap();
-    let snapshot_txid = state.current_txid;
+    let snapshot_seq = state.current_seq;
+    let snapshot_checksum = state
+        .db_checksum
+        .expect("snapshot must record chain checksum");
+    let clean_base = dir.path().join("clean_base.db");
+    std::fs::copy(&base_db, &clean_base)
+        .expect("snapshot-source base must match the byte checksum that anchors WAL deltas");
 
     // Step 3: write more rows and keep the writer connection open while
     // walrust reads the live WAL. If the last SQLite connection closes first,
@@ -182,34 +219,17 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
         .unwrap();
     assert!(synced > 0, "real WAL sync proof must capture frames");
     eprintln!(
-        "[test] synced {} WAL frames, snapshot_txid={}, current_txid={}",
-        synced, snapshot_txid, state.current_txid
+        "[test] synced {} WAL frames, snapshot_seq={}, current_txid={}",
+        synced, snapshot_seq, state.current_txid
     );
     drop(conn);
 
-    // Step 5: make a clean copy of the base DB (before WAL changes) for snapshot source
-    let clean_base = dir.path().join("clean_base.db");
-    {
-        let conn = rusqlite::Connection::open(&clean_base).unwrap();
-        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
-        conn.execute_batch("CREATE TABLE data (id INTEGER PRIMARY KEY, val TEXT);")
-            .unwrap();
-        for i in 0..50 {
-            conn.execute(
-                "INSERT INTO data VALUES (?1, ?2)",
-                rusqlite::params![i, format!("base_{}", i)],
-            )
-            .unwrap();
-        }
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-            .unwrap();
-    }
-
-    // Step 6: restore using snapshot source + S3 incrementals
+    // Step 5: restore using snapshot source + S3 incrementals
     let output = dir.path().join("restored.db");
     let source = FileSnapshotSource {
         source: clean_base,
-        version: snapshot_txid,
+        version: snapshot_seq,
+        checksum: snapshot_checksum,
     };
 
     let restored_txid = restore_with_snapshot_source(&storage, &prefix, "base", &output, &source)
@@ -237,7 +257,6 @@ async fn test_s3_restore_snapshot_source_with_real_wal_sync() {
 
 /// Negative: snapshot source fails, error propagates through real S3 path.
 #[tokio::test]
-#[ignore = "real S3 proof; run with soup credentials and --ignored"]
 async fn test_s3_restore_snapshot_source_materialize_fails() {
     let bucket = test_bucket();
     let endpoint = test_endpoint();
@@ -251,13 +270,16 @@ async fn test_s3_restore_snapshot_source_materialize_fails() {
 
     #[async_trait]
     impl SnapshotSource for FailingSource {
-        async fn materialize(&self, _output: &Path) -> Result<u64> {
+        async fn materialize(&self, _output: &Path) -> Result<SnapshotCheckpoint> {
             Err(anyhow::anyhow!(
                 "page group download failed: connection reset"
             ))
         }
-        async fn checkpoint_version(&self) -> Result<u64> {
-            Ok(0)
+        async fn checkpoint(&self) -> Result<SnapshotCheckpoint> {
+            Ok(SnapshotCheckpoint {
+                seq: 0,
+                checksum: 0,
+            })
         }
     }
 

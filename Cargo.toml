@@ -16,6 +16,14 @@ exclude = [
     ".github/",
 ]
 
+[workspace]
+members = [
+    ".",
+    "crates/walrust-core",
+    "walrust-dst",
+]
+resolver = "2"
+
 [lib]
 name = "walrust"
 crate-type = ["cdylib", "rlib"]
@@ -69,22 +77,23 @@ hmac = "0.12"
 hex = "0.4"
 
 # Core library (embeddable sync primitives)
-walrust-core = { version = "0.3.0", path = "crates/walrust-core", package = "walrust" }
+walrust-core = { version = "0.3.1", path = "crates/walrust-core" }
 
 # Storage substrate (trait is always available; concrete S3 impl is feature-gated).
-hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", branch = "hoist-prereq-internal-lease-store" }
-hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", branch = "hoist-prereq-internal-lease-store", optional = true }
+# hadb-* are pinned to an explicit rev on branch `hoist-prereq-internal-lease-store`
+# for a reproducible clean-clone build (Cargo permits only one of branch/rev, so
+# the rev is the pin and the branch is documented here). A gitignored
+# `.cargo/config.toml` `[patch]` -> `../hadb` overrides this for local dev.
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "c3eab301aa680bc647641d78f0aa3d640589ef9b" }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", rev = "c3eab301aa680bc647641d78f0aa3d640589ef9b", optional = true }
 
 # Legacy config/webhook/retention/s3 helpers. Default-features = false so
 # `walrust --no-default-features` can build without aws-sdk; the `s3` feature
 # above re-enables hadb-io's `s3` (and pulls in aws-sdk-s3 transitively).
-hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", branch = "hoist-prereq-internal-lease-store", default-features = false }
+hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", rev = "c3eab301aa680bc647641d78f0aa3d640589ef9b", default-features = false }
 
 # S3 client type (shared with hadb-io, needed for function signatures).
 aws-sdk-s3 = { version = "1", optional = true }
-
-# LTX format (Litestream-compatible) - see https://github.com/russellromney/litepages
-litepages = "0.1.0"
 
 # SQLite for checkpointing
 rusqlite = { version = "0.35", features = ["bundled"] }
@@ -106,12 +115,6 @@ mimalloc = { version = "0.1", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 brunch = "0.5"
 tower = "0.5"
-
-[patch."https://github.com/russellromney/hadb.git"]
-hadb-changeset = { path = "../hadb/hadb-changeset" }
-hadb-io = { path = "../hadb/hadb-io" }
-hadb-storage = { path = "../hadb/hadb-storage" }
-hadb-storage-s3 = { path = "../hadb/hadb-storage-s3" }
 
 [[example]]
 name = "profile_rss"

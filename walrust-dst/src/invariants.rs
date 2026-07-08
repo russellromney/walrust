@@ -13,6 +13,7 @@
 
 use crate::mock_storage::{MockStorageBackend, MockStorageConfig, StorageFault};
 use anyhow::Result;
+use hadb_storage::StorageBackend;
 use proptest::prelude::*;
 use rusqlite::Connection;
 use std::collections::HashSet;
@@ -30,6 +31,59 @@ fn get_config() -> proptest::test_runner::Config {
             .unwrap_or(100),
         ..Default::default()
     }
+}
+
+fn get_production_config() -> proptest::test_runner::Config {
+    proptest::test_runner::Config {
+        cases: std::env::var("PROPTEST_CASES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(20),
+        ..Default::default()
+    }
+}
+
+fn insert_item_batch(conn: &Connection, start_id: i64, count: usize, label: &str) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE;")?;
+    let result = (|| -> Result<()> {
+        for offset in 0..count {
+            let id = start_id + offset as i64;
+            conn.execute(
+                "INSERT INTO items (id, value) VALUES (?1, ?2)",
+                rusqlite::params![id, format!("{label}-{id}")],
+            )?;
+        }
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT;")?;
+            Ok(())
+        }
+        Err(err) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(err)
+        }
+    }
+}
+
+fn item_rows(path: &std::path::Path) -> Result<Vec<(i64, String)>> {
+    let conn = Connection::open(path)?;
+    let mut stmt = conn.prepare("SELECT id, value FROM items ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(rows)
+}
+
+fn assert_integrity_ok(path: &std::path::Path) -> Result<()> {
+    let conn = Connection::open(path)?;
+    let integrity: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+    anyhow::ensure!(integrity == "ok", "integrity_check failed: {integrity}");
+    Ok(())
 }
 
 // ============================================================================
@@ -313,7 +367,114 @@ pub fn prop_wal_batching_no_loss() -> Result<()> {
 }
 
 // ============================================================================
-// Invariant 4: Snapshot Atomicity
+// Invariant 4: Production Published Delta Restore
+// ============================================================================
+
+/// Property: core production sync publishes restorable snapshots + deltas.
+///
+/// This intentionally does not use `src/testable.rs`: it drives
+/// `walrust-core` production `take_snapshot`, `sync_wal`, object discovery,
+/// and `restore` against the DST mock storage backend.
+pub fn prop_production_published_delta_restore() -> Result<()> {
+    let mut runner = proptest::test_runner::TestRunner::new(get_production_config());
+    let rt = tokio::runtime::Runtime::new()?;
+
+    let result = runner.run(
+        &(1usize..8, 1usize..5, 1usize..8, 42u64..1000000u64),
+        |(base_rows, batches, rows_per_batch, seed)| {
+            rt.block_on(async {
+                let tmpdir = TempDir::new().unwrap();
+                let db_path = tmpdir.path().join("production.db");
+                let restored_path = tmpdir.path().join("restored.db");
+                let prefix = format!("dst/{seed}/");
+
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute_batch(
+                    "PRAGMA journal_mode=WAL;
+                     PRAGMA wal_autocheckpoint=0;
+                     PRAGMA page_size=4096;
+                     CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+                )
+                .unwrap();
+                insert_item_batch(&conn, 1, base_rows, "base").unwrap();
+
+                let storage = MockStorageBackend::new(
+                    MockStorageConfig::new("production-published-deltas").with_seed(seed),
+                );
+                let mut state = walrust::walrust_core::sync::SyncState::new(db_path.clone())
+                    .expect("core sync state");
+
+                walrust::walrust_core::sync::take_snapshot(&storage, &prefix, &mut state)
+                    .await
+                    .expect("production snapshot should publish");
+
+                let mut next_id = base_rows as i64 + 1;
+                for batch in 0..batches {
+                    insert_item_batch(&conn, next_id, rows_per_batch, &format!("batch{batch}"))
+                        .unwrap();
+                    next_id += rows_per_batch as i64;
+
+                    let frames =
+                        walrust::walrust_core::sync::sync_wal(&storage, &prefix, &mut state)
+                            .await
+                            .expect("production WAL sync should publish");
+                    prop_assert!(
+                        frames > 0,
+                        "production sync_wal should publish frames for batch {batch}"
+                    );
+                }
+                drop(conn);
+
+                let snapshot_keys = storage
+                    .list(&format!("{prefix}{}/0001/", state.name), None)
+                    .await
+                    .unwrap();
+                let incremental_keys = storage
+                    .list(&format!("{prefix}{}/0000/", state.name), None)
+                    .await
+                    .unwrap();
+                prop_assert!(
+                    !snapshot_keys.is_empty(),
+                    "production snapshot was not published"
+                );
+                prop_assert_eq!(
+                    incremental_keys.len(),
+                    batches,
+                    "each production sync batch should publish one delta"
+                );
+
+                let restored_seq = walrust::walrust_core::sync::restore(
+                    &storage,
+                    &prefix,
+                    &state.name,
+                    &restored_path,
+                    None::<&str>,
+                )
+                .await
+                .expect("production restore should consume published deltas");
+                prop_assert_eq!(
+                    restored_seq,
+                    state.current_seq,
+                    "restore should reach the production stream head"
+                );
+
+                assert_integrity_ok(&restored_path).unwrap();
+                prop_assert_eq!(
+                    item_rows(&restored_path).unwrap(),
+                    item_rows(&db_path).unwrap(),
+                    "production restore must match source rows"
+                );
+
+                Ok(())
+            })
+        },
+    );
+
+    result.map_err(|e| anyhow::anyhow!("Property test failed: {:?}", e))
+}
+
+// ============================================================================
+// Invariant 5: Snapshot Atomicity
 // ============================================================================
 
 /// Property: Snapshot is atomic (no partial state)
@@ -403,7 +564,7 @@ pub fn prop_snapshot_atomicity() -> Result<()> {
 }
 
 // ============================================================================
-// Invariant 5: TXID Monotonicity
+// Invariant 6: TXID Monotonicity
 // ============================================================================
 
 /// Property: TXIDs are monotonically increasing with no gaps in sequence
@@ -482,7 +643,7 @@ pub fn prop_txid_monotonicity() -> Result<()> {
 }
 
 // ============================================================================
-// Invariant 6: Binary Preservation
+// Invariant 7: Binary Preservation
 // ============================================================================
 
 /// Property: Restored database is byte-identical to source (for snapshots)
@@ -537,7 +698,7 @@ pub fn prop_binary_preservation() -> Result<()> {
 }
 
 // ============================================================================
-// Invariant 7: Recovery Under Failure
+// Invariant 8: Recovery Under Failure
 // ============================================================================
 
 /// Property: Recovery succeeds even when some S3 operations fail
@@ -650,6 +811,12 @@ mod tests {
     fn test_prop_wal_batching_no_loss() {
         std::env::set_var("PROPTEST_CASES", "5");
         prop_wal_batching_no_loss().unwrap();
+    }
+
+    #[test]
+    fn test_prop_production_published_delta_restore() {
+        std::env::set_var("PROPTEST_CASES", "5");
+        prop_production_published_delta_restore().unwrap();
     }
 
     #[test]

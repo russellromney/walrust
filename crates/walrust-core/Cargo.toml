@@ -1,5 +1,5 @@
 [package]
-name = "walrust"
+name = "walrust-core"
 version = "0.3.1"
 edition = "2021"
 description = "SQLite WAL sync to S3-compatible storage — continuous replication, point-in-time restore"
@@ -23,15 +23,18 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # Storage substrate (trait)
-hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", branch = "hoist-prereq-internal-lease-store" }
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "c3eab301aa680bc647641d78f0aa3d640589ef9b" }
 
 # Legacy retry/checksum helpers; replaced in step i.
 # default-features off so consumers can build walrust-core with no AWS deps;
 # the outer walrust crate's `s3` feature re-enables hadb-io/s3.
-hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", branch = "hoist-prereq-internal-lease-store", default-features = false }
+hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", rev = "c3eab301aa680bc647641d78f0aa3d640589ef9b", default-features = false }
 
 # HADBP changeset format
-hadb-changeset = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-changeset", branch = "hoist-prereq-internal-lease-store" }
+hadb-changeset = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-changeset", rev = "c3eab301aa680bc647641d78f0aa3d640589ef9b" }
+
+# Legacy Litestream-derived LTX format used by the root CLI migration path.
+litepages = "0.1.0"
 
 # SQLite for checkpointing (shadow WAL)
 rusqlite = { version = "0.35", features = ["bundled"] }
@@ -46,6 +49,7 @@ chrono = { version = "0.4", features = ["serde"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+uuid = { version = "1", features = ["v4"] }
 
 # Directory traversal (shadow WAL size)
 walkdir = "2"
@@ -60,13 +64,6 @@ serde_bytes = "0.11"
 thiserror = "1"
 
 [dev-dependencies]
-uuid = { version = "1", features = ["v4"] }
 tempfile = "3"
 # Integration tests use the S3 impl directly for compile-time usability checks.
-hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", branch = "hoist-prereq-internal-lease-store" }
-
-[patch."https://github.com/russellromney/hadb.git"]
-hadb-changeset = { path = "../../../hadb/hadb-changeset" }
-hadb-io = { path = "../../../hadb/hadb-io" }
-hadb-storage = { path = "../../../hadb/hadb-storage" }
-hadb-storage-s3 = { path = "../../../hadb/hadb-storage-s3" }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", rev = "c3eab301aa680bc647641d78f0aa3d640589ef9b" }

@@ -9,15 +9,44 @@
 //! 3. Preserved history - shadow keeps frames even after checkpoint
 //! 4. Decoupled I/O - upload doesn't block write path
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::Mutex;
 
 use crate::wal::{self, ParsedFrame, FRAME_HEADER_SIZE};
+
+/// Hex width for both the generation and index components of a shadow segment
+/// filename. Both are `u64`, so 16 hex digits keeps lexical order == numeric
+/// order across the full range.
+pub(crate) const SEGMENT_HEX_WIDTH: usize = 16;
+
+/// Format a shadow segment filename: `{generation:016x}-{index:016x}.wal`.
+fn format_segment_name(generation: u64, index: u64) -> String {
+    format!(
+        "{:0width$x}-{:0width$x}.wal",
+        generation,
+        index,
+        width = SEGMENT_HEX_WIDTH
+    )
+}
+
+fn ensure_connection_in_wal_mode(conn: &Connection, db_path: &Path) -> Result<()> {
+    let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{}: SQLite journal_mode is '{}', expected WAL; shadow replication cannot continue",
+            db_path.display(),
+            mode
+        ))
+    }
+}
 
 /// Shadow WAL manager for a single database
 pub struct ShadowWal {
@@ -99,22 +128,42 @@ impl ShadowWal {
     fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
         let conn = Connection::open(db_path)?;
 
-        // Set WAL mode and disable auto-checkpoint on this connection
+        ensure_connection_in_wal_mode(&conn, db_path)?;
+
+        // Disable auto-checkpoint on this connection without changing journal_mode.
         conn.execute_batch(
-            "PRAGMA journal_mode=WAL;
-             PRAGMA wal_autocheckpoint=0;",
+            "
+            PRAGMA busy_timeout=5000;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE IF NOT EXISTS _walrust_seq (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                value INTEGER NOT NULL
+            );
+            INSERT INTO _walrust_seq (id, value)
+            VALUES (1, 1)
+            ON CONFLICT(id) DO UPDATE SET value = value + 1;
+            ",
         )?;
 
-        // Start a read transaction that will block checkpointing
-        // We use a simple query that keeps the transaction open
+        // Pin a real WAL frame. Reading sqlite_master can leave the blocker at
+        // read-mark 0, which does not prevent walRestartLog on later frames.
         conn.execute_batch("BEGIN DEFERRED;")?;
-
-        // Read from sqlite_master to establish the read transaction
-        let _: i64 = conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))?;
+        let _: i64 = conn.query_row("SELECT value FROM _walrust_seq WHERE id = 1", [], |row| {
+            row.get(0)
+        })?;
 
         tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
 
         Ok(conn)
+    }
+
+    async fn ensure_database_in_wal_mode(db_path: &Path) -> Result<()> {
+        let db_path = db_path.to_path_buf();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let conn = Connection::open(&db_path)?;
+            ensure_connection_in_wal_mode(&conn, &db_path)
+        })
+        .await?
     }
 
     /// Find the latest generation number in the shadow directory
@@ -151,13 +200,17 @@ impl ShadowWal {
 
         // Check if WAL exists
         if !wal_path.exists() {
+            Self::ensure_database_in_wal_mode(&self.db_path).await?;
             return Ok((Vec::new(), offset));
         }
 
         // Read WAL header to check for checkpoint (salt change)
         let header = match wal::read_header(&wal_path).await? {
             Some(h) => h,
-            None => return Ok((Vec::new(), offset)),
+            None => {
+                Self::ensure_database_in_wal_mode(&self.db_path).await?;
+                return Ok((Vec::new(), offset));
+            }
         };
 
         // Detect checkpoint by salt change
@@ -232,15 +285,21 @@ impl ShadowWal {
         }
 
         file.flush().await?;
+        file.sync_all().await?;
+        Self::fsync_dir(&self.shadow_dir).await?;
+        Ok(())
+    }
+
+    async fn fsync_dir(path: &Path) -> Result<()> {
+        let dir = File::open(path).await?;
+        dir.sync_all().await?;
         Ok(())
     }
 
     /// Get path to current shadow segment file
     fn current_segment_path(&self) -> PathBuf {
-        self.shadow_dir.join(format!(
-            "{:08x}-{:08x}.wal",
-            self.generation, self.segment_index
-        ))
+        self.shadow_dir
+            .join(format_segment_name(self.generation, self.segment_index))
     }
 
     /// List all shadow segments for a generation
@@ -350,15 +409,45 @@ impl ShadowWal {
             drop(conn);
         }
 
-        // Run PASSIVE checkpoint (non-blocking)
-        {
+        let checkpoint_result = {
             let conn = Connection::open(&self.db_path)?;
-            conn.execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
-        }
+            conn.busy_timeout(Duration::from_secs(5))?;
+            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+                conn.query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            if busy != 0 || checkpointed_frames < log_frames {
+                Err(anyhow!(
+                    "{}: shadow checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
+                    self.db_path.display(),
+                    busy,
+                    log_frames,
+                    checkpointed_frames
+                ))
+            } else {
+                Ok(())
+            }
+        };
 
         // Re-establish checkpoint blocker
-        let new_blocker = Self::open_checkpoint_blocker(&self.db_path)?;
-        self.checkpoint_blocker = Some(Arc::new(Mutex::new(new_blocker)));
+        let reopen_result = Self::open_checkpoint_blocker(&self.db_path);
+        match (checkpoint_result, reopen_result) {
+            (Ok(()), Ok(new_blocker)) => {
+                self.checkpoint_blocker = Some(Arc::new(Mutex::new(new_blocker)));
+            }
+            (Err(checkpoint_err), Ok(new_blocker)) => {
+                self.checkpoint_blocker = Some(Arc::new(Mutex::new(new_blocker)));
+                return Err(checkpoint_err);
+            }
+            (Ok(()), Err(reopen_err)) => return Err(reopen_err),
+            (Err(checkpoint_err), Err(reopen_err)) => {
+                return Err(anyhow!(
+                    "{}; additionally failed to re-open shadow checkpoint blocker: {}",
+                    checkpoint_err,
+                    reopen_err
+                ));
+            }
+        }
 
         tracing::debug!(
             "Shadow WAL: checkpoint complete for {}",
@@ -405,6 +494,11 @@ impl ShadowWal {
         self.generation
     }
 
+    /// Current byte offset within the active shadow segment generation.
+    pub fn segment_offset(&self) -> u64 {
+        self.segment_offset
+    }
+
     /// Get page size
     pub fn page_size(&self) -> u32 {
         self.page_size
@@ -440,6 +534,36 @@ mod tests {
         assert_eq!(shadow_dir, PathBuf::from("/data/.walrust-myapp"));
     }
 
+    #[test]
+    fn test_segment_name_width_keeps_lexical_order_past_u32() {
+        fn segment_name(generation: u64) -> String {
+            let shadow = ShadowWal {
+                db_path: PathBuf::from("test.db"),
+                shadow_dir: PathBuf::from(".walrust-test"),
+                generation,
+                segment_index: 0,
+                segment_offset: 0,
+                page_size: 4096,
+                checkpoint_blocker: None,
+                wal_salt: (0, 0),
+            };
+            shadow
+                .current_segment_path()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .into_owned()
+        }
+
+        let before_wrap = segment_name(0xffff_ffff);
+        let after_wrap = segment_name(0x1_0000_0000);
+        assert!(
+            before_wrap < after_wrap,
+            "lexical order must follow numeric order: {before_wrap} vs {after_wrap}"
+        );
+        assert_eq!(before_wrap.len(), after_wrap.len(), "fixed width");
+    }
+
     #[tokio::test]
     async fn test_shadow_wal_creation() {
         let dir = tempdir().unwrap();
@@ -459,5 +583,36 @@ mod tests {
         let shadow = ShadowWal::new(&db_path).await.unwrap();
         assert!(shadow.shadow_dir().exists());
         assert_eq!(shadow.generation(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_shadow_wal_new_rejects_delete_mode_without_converting() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("delete-mode.db");
+
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=DELETE;
+            CREATE TABLE test (id INTEGER PRIMARY KEY);
+            INSERT INTO test VALUES (1);
+            ",
+        )
+        .unwrap();
+        drop(conn);
+
+        let err = match ShadowWal::new(&db_path).await {
+            Ok(_) => panic!("shadow mode must fail closed instead of converting DELETE to WAL"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("journal_mode"), "{msg}");
+        assert!(msg.contains("WAL"), "{msg}");
+
+        let conn = Connection::open(&db_path).unwrap();
+        let mode: String = conn
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "delete");
     }
 }
