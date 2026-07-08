@@ -23,7 +23,7 @@ use hadb_storage_s3::S3Storage;
 use super::manifest::discover_state_from_s3;
 use super::types::{CacheState, DbState, DbTaskState, SyncInput, TriggerState};
 use super::verify::validate_backup_integrity;
-use super::wal_sync::{do_sync, sync_wal_concurrent_with_retry};
+use super::wal_sync::{do_sync, sync_wal_concurrent_with_retry, take_snapshot_with_retry};
 
 /// Watch databases using independent per-DB tasks for maximum concurrency
 ///
@@ -449,6 +449,19 @@ async fn run_db_task(
     let mut cleanup_timer = tokio::time::interval(Duration::from_secs(300));
     cleanup_timer.tick().await; // Skip first immediate tick
 
+    // Periodic full-snapshot timer (disabled when interval is 0). Without this,
+    // a low-write DB whose WAL is checkpointed/reset between syncs would have an
+    // unbounded RPO in this mode: the sync path folds the base only opportunis-
+    // tically, so nothing re-anchors the remote base on a time cadence (B6).
+    let snapshot_interval_secs = state.sync_config.snapshot_interval;
+    let snapshot_duration = if snapshot_interval_secs > 0 {
+        Duration::from_secs(snapshot_interval_secs)
+    } else {
+        Duration::from_secs(86400 * 365) // effectively never
+    };
+    let mut snapshot_timer = tokio::time::interval(snapshot_duration);
+    snapshot_timer.tick().await; // Skip first immediate tick
+
     tracing::debug!(
         "{}: Task started, polling every {}s (WAL: {})",
         db_name,
@@ -498,6 +511,24 @@ async fn run_db_task(
                             .await;
                         return Err(e.context(format!("{}: sync failed", db_name)));
                     }
+                }
+            }
+
+            // Periodic full-snapshot timer
+            _ = snapshot_timer.tick(), if snapshot_interval_secs > 0 => {
+                tracing::debug!("{}: Taking periodic snapshot", db_name);
+                if let Err(e) = take_snapshot_with_retry(
+                    &client,
+                    &bucket,
+                    &prefix,
+                    &mut state.db_state,
+                    &retry_policy,
+                    &webhook_sender,
+                )
+                .await
+                {
+                    tracing::error!("{}: Periodic snapshot failed: {}", db_name, e);
+                    return Err(e.context(format!("{}: periodic snapshot failed", db_name)));
                 }
             }
 
