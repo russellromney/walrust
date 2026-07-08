@@ -67,6 +67,15 @@ pub struct ShadowWal {
     checkpoint_blocker: Option<Arc<Mutex<Connection>>>,
     /// Salt values from current WAL header (used to detect checkpoint)
     wal_salt: (u32, u32),
+    /// Running WAL checksum chain of the last frame copied into the shadow. Used
+    /// to validate incremental reads (torn-tail / stale-frame rejection, B4).
+    /// `None` means "seed from the WAL header on the next read" — a fresh start
+    /// or immediately after a generation rollover.
+    wal_chain: Option<(u32, u32)>,
+    /// Whether a real WAL header has been observed yet. Until then `page_size`
+    /// and `wal_salt` hold defaults; the first real header seeds them without
+    /// being mistaken for a checkpoint rollover (B5).
+    header_seeded: bool,
 }
 
 /// A segment file in the shadow WAL
@@ -92,9 +101,9 @@ impl ShadowWal {
 
         // Read current WAL header to get page size and salt
         let wal_path = db_path.with_extension("db-wal");
-        let (page_size, salt1, salt2) = match wal::read_header(&wal_path).await? {
-            Some(header) => (header.page_size, header.salt1, header.salt2),
-            None => (4096, 0, 0), // Default if no WAL exists yet
+        let (page_size, salt1, salt2, header_seeded) = match wal::read_header(&wal_path).await? {
+            Some(header) => (header.page_size, header.salt1, header.salt2, true),
+            None => (4096, 0, 0, false), // Defaults until a WAL header appears (B5)
         };
 
         // Find highest existing generation
@@ -114,6 +123,8 @@ impl ShadowWal {
             page_size,
             checkpoint_blocker: Some(Arc::new(Mutex::new(checkpoint_blocker))),
             wal_salt: (salt1, salt2),
+            wal_chain: None,
+            header_seeded,
         })
     }
 
@@ -217,7 +228,17 @@ impl ShadowWal {
         let current_salt = (header.salt1, header.salt2);
         let mut effective_offset = offset;
 
-        if current_salt != self.wal_salt && self.wal_salt != (0, 0) {
+        if !self.header_seeded {
+            // First real WAL header after a fresh start (DB created with no WAL):
+            // seed salt + page_size from the actual header instead of the
+            // (0,0)/4096 defaults. This is initialization, NOT a rollover, so we
+            // do not bump the generation. Without this, wal_salt stays (0,0)
+            // forever and later genuine checkpoints are never detected (B5).
+            self.wal_salt = current_salt;
+            self.page_size = header.page_size;
+            self.header_seeded = true;
+            self.wal_chain = None;
+        } else if current_salt != self.wal_salt {
             // Checkpoint occurred - start new generation
             tracing::info!(
                 "Shadow WAL: checkpoint detected (salt changed), starting generation {}",
@@ -227,12 +248,25 @@ impl ShadowWal {
             self.segment_index = 0;
             self.segment_offset = 0;
             self.wal_salt = current_salt;
+            // A new generation may in principle use a different page size; refresh
+            // so the readback/upload path frames segments correctly (B5).
+            self.page_size = header.page_size;
             effective_offset = 0;
+            // New generation: re-seed the checksum chain from the WAL header.
+            self.wal_chain = None;
         }
 
-        // Read new frames from active WAL
-        let (frames, new_offset, _max_db_size) =
-            wal::read_frames_as_pages(&wal_path, header.page_size, effective_offset).await?;
+        // Read new frames from the active WAL through the CHECKED reader so torn
+        // or stale (salt-mismatched) frames never enter the shadow (B4). The
+        // running chain is carried across incremental reads within this process.
+        let (frames, new_offset, _max_db_size, out_chain) = wal::read_frames_as_pages_checked(
+            &wal_path,
+            header.page_size,
+            effective_offset,
+            self.wal_chain,
+        )
+        .await?;
+        self.wal_chain = out_chain;
 
         if frames.is_empty() {
             return Ok((Vec::new(), new_offset));
@@ -508,6 +542,12 @@ impl ShadowWal {
     pub fn shadow_dir(&self) -> &Path {
         &self.shadow_dir
     }
+
+    /// Test-only: whether the WAL salt has been seeded off the `(0,0)` sentinel.
+    #[cfg(test)]
+    pub(crate) fn wal_salt_seeded(&self) -> bool {
+        self.header_seeded && self.wal_salt != (0, 0)
+    }
 }
 
 impl Drop for ShadowWal {
@@ -546,6 +586,8 @@ mod tests {
                 page_size: 4096,
                 checkpoint_blocker: None,
                 wal_salt: (0, 0),
+                wal_chain: None,
+                header_seeded: false,
             };
             shadow
                 .current_segment_path()
@@ -614,5 +656,58 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mode.to_lowercase(), "delete");
+    }
+
+    #[tokio::test]
+    async fn test_shadow_reseeds_salt_and_page_size_when_wal_appears_after_startup() {
+        // B5: a DB whose WAL is absent/empty at ShadowWal construction (e.g. just
+        // after a TRUNCATE checkpoint) must re-read the real page_size and salt
+        // from the header when the WAL reappears — instead of being stuck at the
+        // 4096 / (0,0) defaults, which would (a) mis-frame the readback path and
+        // (b) make every later genuine checkpoint invisible.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("reseed.db");
+
+        // Non-default page size so the 4096 default is detectably wrong.
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA page_size=8192;
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+            INSERT INTO t VALUES (1, 'a');
+            ",
+        )
+        .unwrap();
+        // Truncate the WAL so no header exists at construction time.
+        let _: (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        drop(conn);
+
+        // WAL is now empty (< 32 bytes) -> ShadowWal seeds defaults.
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        assert_eq!(shadow.generation(), 0);
+
+        // Write new frames so a real WAL header appears.
+        let writer = Connection::open(&db_path).unwrap();
+        writer
+            .execute_batch("PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        writer.execute("INSERT INTO t VALUES (2, 'b')", []).unwrap();
+
+        let (frames, _offset) = shadow.copy_frames(0).await.unwrap();
+        assert!(!frames.is_empty(), "new WAL frames should be copied");
+        // B5: page_size re-seeded from the real header, not stuck at 4096. Because
+        // the `!header_seeded` seeding branch sets page_size AND wal_salt together
+        // from the same header, a correct page_size proves the salt was also
+        // seeded off the (0,0) sentinel (so later checkpoints are now detectable).
+        assert_eq!(shadow.page_size(), 8192, "page_size must be re-seeded");
+        assert!(shadow.wal_salt_seeded(), "salt must be seeded off (0,0)");
+        // First appearance is initialization, not a rollover.
+        assert_eq!(shadow.generation(), 0, "seeding must not bump generation");
     }
 }
