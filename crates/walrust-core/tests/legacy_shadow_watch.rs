@@ -30,6 +30,9 @@ async fn legacy_shadow_progress_persistence_is_owned_by_core() -> Result<()> {
         db_checksum: Some(0xfeed_beef),
         shadow_sync_generation: shadow.generation(),
         shadow_sync_offset: 4096,
+        wal_copy_offset: 8192,
+        wal_salt: Some((0x1111_2222, 0x3333_4444)),
+        wal_checksum_chain: Some((0xaaaa_bbbb, 0xcccc_dddd)),
     };
 
     save_shadow_progress(shadow.shadow_dir(), "shadow-progress", &progress)?;
@@ -42,6 +45,11 @@ async fn legacy_shadow_progress_persistence_is_owned_by_core() -> Result<()> {
         progress.shadow_sync_generation
     );
     assert_eq!(loaded.shadow_sync_offset, progress.shadow_sync_offset);
+    // B4 restart-window: the live-WAL read cursor, salt, and running checksum
+    // chain must round-trip so the first post-restart read resumes validated.
+    assert_eq!(loaded.wal_copy_offset, progress.wal_copy_offset);
+    assert_eq!(loaded.wal_salt, progress.wal_salt);
+    assert_eq!(loaded.wal_checksum_chain, progress.wal_checksum_chain);
     Ok(())
 }
 

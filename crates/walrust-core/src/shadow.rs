@@ -543,6 +543,36 @@ impl ShadowWal {
         &self.shadow_dir
     }
 
+    /// The WAL header salt of the generation the live-WAL read cursor indexes
+    /// into, once a real header has been observed. `None` before the first
+    /// header appears (mirrors the seeding logic in `copy_frames`). Persisted
+    /// in the shadow progress record so a restart can detect a checkpoint that
+    /// happened while the process was down.
+    pub fn wal_read_salt(&self) -> Option<(u32, u32)> {
+        self.header_seeded.then_some(self.wal_salt)
+    }
+
+    /// The running SQLite WAL checksum `(s0, s1)` at the live-WAL read cursor,
+    /// or `None` at a generation boundary. Persisted so the first post-restart
+    /// read validates the checksum chain per-frame from the resumed offset.
+    pub fn wal_read_chain(&self) -> Option<(u32, u32)> {
+        self.wal_chain
+    }
+
+    /// Restore the live-WAL read cursor after a process restart (B4). Seeding
+    /// the persisted salt + running chain lets the next `copy_frames` resume
+    /// from the persisted offset with full per-frame checksum validation and
+    /// detect a checkpoint that occurred during downtime (salt mismatch), in
+    /// place of re-reading the entire live WAL from offset 0. `salt == None`
+    /// means no header was ever observed durably, so nothing is restored.
+    pub fn restore_read_cursor(&mut self, salt: Option<(u32, u32)>, chain: Option<(u32, u32)>) {
+        if let Some(salt) = salt {
+            self.wal_salt = salt;
+            self.header_seeded = true;
+            self.wal_chain = chain;
+        }
+    }
+
     /// Test-only: whether the WAL salt has been seeded off the `(0,0)` sentinel.
     #[cfg(test)]
     pub(crate) fn wal_salt_seeded(&self) -> bool {
@@ -656,6 +686,118 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |row| row.get(0))
             .unwrap();
         assert_eq!(mode.to_lowercase(), "delete");
+    }
+
+    #[tokio::test]
+    async fn test_restore_read_cursor_resumes_without_re_reading_wal() {
+        // B4 restart-window: after a restart, seeding the persisted read cursor
+        // (offset + salt + running chain) must resume the live-WAL read from the
+        // persisted offset — reading only NEW frames — instead of re-reading
+        // (and re-appending) the whole live WAL from offset 0.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("resume.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+            ",
+        )
+        .unwrap();
+        // Many separate commits so the live WAL holds a large, countable set of
+        // frames to (not) re-read.
+        for i in 0..30 {
+            conn.execute("INSERT INTO t (v) VALUES (?1)", [format!("row-{i}")])
+                .unwrap();
+        }
+
+        // Pre-restart process copies the current WAL frames.
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
+        assert!(frames.len() >= 10, "initial copy must read the committed frames");
+        let saved_salt = shadow.wal_read_salt();
+        let saved_chain = shadow.wal_read_chain();
+        assert!(saved_salt.is_some(), "a real header must have been observed");
+        drop(shadow);
+
+        // Baseline restart WITHOUT the persisted cursor: reading from offset 0
+        // re-reads the whole live WAL (the pre-B4 behavior).
+        let mut fresh = ShadowWal::new(&db_path).await.unwrap();
+        let (reread, _) = fresh.copy_frames(0).await.unwrap();
+        drop(fresh);
+
+        // Restart WITH the persisted cursor: resume from `offset`, reading only
+        // frames committed since (here just the checkpoint-blocker's own frame),
+        // never the already-copied data frames.
+        let mut restarted = ShadowWal::new(&db_path).await.unwrap();
+        restarted.restore_read_cursor(saved_salt, saved_chain);
+        let (resumed_frames, resumed_offset) = restarted.copy_frames(offset).await.unwrap();
+        assert!(
+            resumed_frames.len() < reread.len(),
+            "resume ({}) must read far fewer frames than a from-0 re-read ({})",
+            resumed_frames.len(),
+            reread.len()
+        );
+        assert!(
+            resumed_offset >= offset,
+            "the resumed cursor must never rewind below the persisted offset"
+        );
+
+        // A new commit after restart is picked up from the resumed cursor.
+        conn.execute("INSERT INTO t (v) VALUES ('after-restart')", [])
+            .unwrap();
+        let (new_frames, _) = restarted.copy_frames(resumed_offset).await.unwrap();
+        assert!(
+            !new_frames.is_empty(),
+            "frames committed after restart must be copied from the resumed cursor"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_restore_read_cursor_detects_downtime_checkpoint() {
+        // B4 restart-window: if an external checkpoint reset the WAL while the
+        // process was down, the persisted salt no longer matches the live WAL.
+        // Seeding the persisted salt via restore_read_cursor lets the first
+        // post-restart copy_frames detect the rollover (generation bump) instead
+        // of silently continuing on the wrong generation.
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("downtime-ckpt.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+            INSERT INTO t (v) VALUES ('a');
+            INSERT INTO t (v) VALUES ('b');
+            ",
+        )
+        .unwrap();
+
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let (_frames, offset) = shadow.copy_frames(0).await.unwrap();
+        let saved_salt = shadow.wal_read_salt();
+        let saved_chain = shadow.wal_read_chain();
+        drop(shadow);
+
+        // Simulate a checkpoint during downtime: TRUNCATE resets the WAL and the
+        // next writes take a fresh salt.
+        let _: (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        conn.execute("INSERT INTO t (v) VALUES ('c')", []).unwrap();
+
+        let mut restarted = ShadowWal::new(&db_path).await.unwrap();
+        let base_generation = restarted.generation();
+        restarted.restore_read_cursor(saved_salt, saved_chain);
+        restarted.copy_frames(offset).await.unwrap();
+        assert!(
+            restarted.generation() > base_generation,
+            "seeding the persisted salt must let the restart detect the downtime checkpoint (generation must advance from {base_generation})"
+        );
     }
 
     #[tokio::test]

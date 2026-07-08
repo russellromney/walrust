@@ -22,6 +22,21 @@ pub struct ShadowProgress {
     pub db_checksum: Option<u64>,
     pub shadow_sync_generation: u64,
     pub shadow_sync_offset: u64,
+    /// Live-WAL read cursor (byte offset into the active WAL) at the last
+    /// durable sync. Restored on restart so the shadow resumes reading from
+    /// here instead of re-reading (and re-appending) the whole live WAL from
+    /// offset 0. `serde(default)` keeps pre-B4 progress records loadable.
+    #[serde(default)]
+    pub wal_copy_offset: u64,
+    /// WAL header salt at `wal_copy_offset`. Lets a restart detect a checkpoint
+    /// that occurred while the process was down (salt mismatch => rollover).
+    #[serde(default)]
+    pub wal_salt: Option<(u32, u32)>,
+    /// Running SQLite WAL checksum `(s0, s1)` at `wal_copy_offset`, so the
+    /// first post-restart read validates the frame checksum chain per-frame
+    /// from the resumed offset instead of skipping validation (B4).
+    #[serde(default)]
+    pub wal_checksum_chain: Option<(u32, u32)>,
 }
 
 pub struct ShadowWatchState {
@@ -213,7 +228,22 @@ fn progress_from_state(state: &ShadowWatchState) -> ShadowProgress {
         db_checksum: state.db_checksum,
         shadow_sync_generation: state.shadow_sync_generation,
         shadow_sync_offset: state.shadow_sync_offset,
+        wal_copy_offset: state.wal_copy_offset,
+        wal_salt: state.shadow.wal_read_salt(),
+        wal_checksum_chain: state.shadow.wal_read_chain(),
     }
+}
+
+/// Restore the live-WAL read cursor from a durable progress record so the first
+/// post-restart `copy_frames` resumes from the persisted offset with per-frame
+/// checksum validation (B4), instead of re-reading and re-appending the whole
+/// live WAL from offset 0. Call after `load_shadow_progress`, before the first
+/// sync tick.
+pub fn restore_read_cursor_from_progress(state: &mut ShadowWatchState, progress: &ShadowProgress) {
+    state.wal_copy_offset = progress.wal_copy_offset;
+    state
+        .shadow
+        .restore_read_cursor(progress.wal_salt, progress.wal_checksum_chain);
 }
 
 pub fn save_shadow_watch_progress(state: &ShadowWatchState) -> Result<()> {
