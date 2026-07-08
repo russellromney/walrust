@@ -5,7 +5,7 @@
 **Simple, reliable SQLite backups to S3 with integrity verification.**
 
 Core differentiators:
-- LTX format with SHA256 verification
+- HADBP changeset format (formerly "LTX") with integrity verification
 - Lower memory footprint than Litestream
 - Built for production: verify, explain, webhook alerting
 - Honest about what works (no vaporware)
@@ -13,6 +13,17 @@ Core differentiators:
 ---
 
 ## Current Capabilities (v0.6.0)
+
+> **Review history.** After the first adversarial review (F1–F15,
+> ADVERSARIAL_REVIEW.md), a second review (ADVERSARIAL_REVIEW_2.md) found
+> additional silent-data-loss and silent-restore-corruption paths. Those were
+> worked through in phased fix waves (Phase 0 foundations through Phase 4
+> single-engine convergence), each gated by revert-proven tests and CI E2E
+> round-trips with an external autocheckpointing writer. The dual src/ and
+> walrust-core trees are now one engine (the source of half the original
+> findings). A set of residuals remains open and is tracked, per item with
+> risk/trigger/suggested fix, in the DEFERRED register at the bottom of
+> ADVERSARIAL_REVIEW_2.md. The "Experimental" warning stands.
 
 **Core features that work:**
 - `walrust watch` - Watch and sync multiple databases
@@ -23,9 +34,10 @@ Core differentiators:
 - `walrust replicate` - Poll-based read replica
 - `walrust explain` - Configuration preview with cost estimation
 - `walrust verify` - Backup integrity verification with exit codes
-- LTX format with SHA256 verification
+- HADBP changeset format (formerly "LTX") with per-object integrity verification
 - Chained page checksums (O(changed pages) not O(entire DB))
-- Point-in-time restore (by TXID or timestamp)
+- Point-in-time restore by TXID/sequence number (timestamp PITR is not
+  implemented — object keys carry only TXID range, not commit wall-clock time)
 - Multi-database support
 - Prometheus metrics + dashboard
 - Webhook notifications (corruption, circuit breaker)

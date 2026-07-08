@@ -1695,6 +1695,18 @@ pub async fn list_delta_envelopes_after(
         };
         let payload =
             external_delta::decode(&bytes).map_err(|e| anyhow!("decode delta at {key}: {e}"))?;
+        // B14: bind the decoded payload seq to the key-derived seq. The key
+        // carries the ordering authority (zero-padded hex sorts numerically),
+        // so a mislabeled envelope whose inner `payload.seq` disagrees with its
+        // key would be applied out of order — or silently substituted for a
+        // different seq — by a follower that trusts either field. Fail closed.
+        if payload.seq != seq {
+            return Err(WalrustError::integrity(format!(
+                "delta envelope seq mismatch at {key}: key seq {seq} but payload seq {}",
+                payload.seq
+            ))
+            .into());
+        }
         let envelope_checksum = external_delta::checksum(&bytes);
         out.push(DiscoveredDelta {
             key,
@@ -1727,6 +1739,156 @@ pub async fn fetch_delta_envelope(
         payload,
         envelope_checksum,
     }))
+}
+
+/// The externally-owned base state a fenced-delta follower anchors on.
+///
+/// A follower already holds the base database image and knows, from the
+/// external base manifest, the epoch and writer identity that own the fenced
+/// chain, the seq the base was published at, and the BLAKE3 checksum of the
+/// base object's envelope (the anchor the first delta's `prev_checksum` must
+/// equal).
+#[derive(Debug, Clone)]
+pub struct FencedFollowerCursor {
+    /// Seq of the published external base. Fenced deltas after it are
+    /// contiguous: `base_seq + 1`, `base_seq + 2`, ...
+    pub base_seq: u64,
+    /// Lease epoch that owns the chain. Deltas whose `epoch` differs are
+    /// rejected (stale-writer fence), even if the chain link verifies.
+    pub epoch: u64,
+    /// Lease-holder identity that owns the chain. Deltas from a different
+    /// `writer_id` are rejected (writer fence).
+    pub writer_id: String,
+    /// BLAKE3 of the base object's envelope bytes — the chain anchor. The
+    /// first delta's `prev_checksum` must equal this.
+    pub base_envelope_checksum: [u8; 32],
+}
+
+/// Result of a fenced follower reconstruction.
+#[derive(Debug, Clone)]
+pub struct FencedFollowerResult {
+    /// Number of fenced deltas applied on top of the base.
+    pub applied: u64,
+    /// Seq of the last applied delta (`base_seq` if none were applied).
+    pub head_seq: u64,
+    /// BLAKE3 of the last applied delta's envelope — the anchor a resuming
+    /// follower threads back in as its next `base_envelope_checksum`.
+    pub head_envelope_checksum: [u8; 32],
+    /// HADBP running checksum of the reconstructed database.
+    pub db_checksum: u64,
+}
+
+/// Reconstruct a database on a follower from the published fenced-delta
+/// envelope sequence, enforcing every fence before applying anything.
+///
+/// This is the production follower/restore path for external-base fenced
+/// (TLM_DELTA) mode — the counterpart of the writer's
+/// [`sync_wal_fenced_delta`]. It copies the caller's base image to
+/// `output_path`, discovers the published envelopes after `cursor.base_seq`
+/// with [`list_delta_envelopes_after`], and for each one enforces, in order:
+///
+/// 1. **Seq contiguity** — the delta must be exactly the next seq after the
+///    running head; a gap is a hard error (never a silent short reconstruct).
+/// 2. **Epoch fence** — `payload.epoch == cursor.epoch`, else reject. This is
+///    how stale-writer leftover is fenced even if a chain link happens to
+///    verify.
+/// 3. **Writer fence** — `payload.writer_id == cursor.writer_id`, else reject.
+/// 4. **Envelope chain** — `payload.prev_checksum` must equal the running
+///    envelope anchor (BLAKE3 of the prior object). A break is a hard error.
+/// 5. **Byte-identity chain** — the recomputed BLAKE3 of the re-encoded
+///    payload must equal the checksum discovery reported for the stored bytes.
+///
+/// Only then is the LTX payload applied with the running DB checksum threaded
+/// through [`ltx::apply_changeset_to_db`], whose own chain verify catches any
+/// base/page divergence. Every fence rejection is a typed
+/// [`WalrustError::Integrity`] whose message names the fence, and the function
+/// returns `Err` **before** any apply on the first offending envelope — a
+/// forged delta never reaches the database.
+///
+/// `output_path` is treated as staging owned by the caller; on success it
+/// holds the reconstructed database. On error its contents are unspecified
+/// (partially applied) — callers restoring a live database should stage to a
+/// temp path and publish atomically only on `Ok`.
+pub async fn reconstruct_fenced_follower(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    db_name: &str,
+    cursor: &FencedFollowerCursor,
+    base_db_path: &Path,
+    output_path: &Path,
+) -> Result<FencedFollowerResult> {
+    tokio::fs::copy(base_db_path, output_path)
+        .await
+        .map_err(|e| {
+            anyhow!(
+                "copy fenced base {} -> {}: {e}",
+                base_db_path.display(),
+                output_path.display()
+            )
+        })?;
+
+    let mut running_db = ltx::compute_checksum_from_file(output_path)?;
+    let mut running_env = cursor.base_envelope_checksum;
+
+    let deltas = list_delta_envelopes_after(storage, prefix, db_name, cursor.base_seq).await?;
+    let mut applied: u64 = 0;
+    for (i, d) in deltas.iter().enumerate() {
+        let expected_seq = cursor.base_seq + (i as u64) + 1;
+        if d.seq != expected_seq {
+            return Err(WalrustError::integrity(format!(
+                "{db_name}: fenced envelope seq gap: expected {expected_seq}, got {} at position {i}",
+                d.seq
+            ))
+            .into());
+        }
+        if d.payload.epoch != cursor.epoch {
+            return Err(WalrustError::integrity(format!(
+                "{db_name}: epoch fence rejected envelope seq {} (epoch {} != cursor epoch {})",
+                d.seq, d.payload.epoch, cursor.epoch
+            ))
+            .into());
+        }
+        if d.payload.writer_id != cursor.writer_id {
+            return Err(WalrustError::integrity(format!(
+                "{db_name}: writer fence rejected envelope seq {} (writer {:?} != {:?})",
+                d.seq, d.payload.writer_id, cursor.writer_id
+            ))
+            .into());
+        }
+        if d.payload.prev_checksum.as_slice() != running_env.as_slice() {
+            return Err(WalrustError::integrity(format!(
+                "{db_name}: envelope chain break at seq {}",
+                d.seq
+            ))
+            .into());
+        }
+        // Byte-identity chain: the checksum discovery reported for the STORED
+        // bytes must equal a fresh BLAKE3 of the re-encoded payload. This
+        // pins the discovered checksum to the payload we are about to apply.
+        let recomputed = external_delta::checksum(
+            &external_delta::encode(&d.payload)
+                .map_err(|e| anyhow!("re-encode fenced envelope seq {}: {e}", d.seq))?,
+        );
+        if recomputed != d.envelope_checksum {
+            return Err(WalrustError::integrity(format!(
+                "{db_name}: envelope checksum mismatch at seq {} (recomputed != discovered)",
+                d.seq
+            ))
+            .into());
+        }
+
+        let step = ltx::apply_changeset_to_db(&d.payload.ltx_payload, output_path, running_db)?;
+        running_db = step.checksum;
+        running_env = d.envelope_checksum;
+        applied += 1;
+    }
+
+    Ok(FencedFollowerResult {
+        applied,
+        head_seq: cursor.base_seq + applied,
+        head_envelope_checksum: running_env,
+        db_checksum: running_db,
+    })
 }
 
 /// Read pending WAL frames, encode them as an LTX changeset, wrap in a
@@ -5128,6 +5290,369 @@ mod tests {
         assert_eq!(
             found[1].payload.prev_checksum,
             found[0].envelope_checksum.to_vec()
+        );
+    }
+
+    /// B14: a mislabeled envelope (stored at the key for one seq but carrying a
+    /// different inner `payload.seq`) is a hard, typed integrity error — not
+    /// silently returned for a follower to apply out of order.
+    #[tokio::test]
+    async fn list_delta_envelopes_after_rejects_seq_key_mismatch() {
+        let storage = MutStorage::new();
+        // payload claims seq 99 but is planted at the key for seq 5.
+        let payload = delta_payload(99, 5, "w", vec![1, 2, 3]);
+        let bytes = external_delta::encode(&payload).unwrap();
+        let key = delta_envelope_key("wal/", "db", 5);
+        storage.put(&key, &bytes).await.unwrap();
+
+        let err = list_delta_envelopes_after(&storage, "wal/", "db", 0)
+            .await
+            .expect_err("seq/key mismatch must be rejected");
+        assert!(
+            err.to_string().contains("seq mismatch"),
+            "expected seq mismatch rejection, got: {err}"
+        );
+        assert_eq!(
+            crate::errors::classify_error(&err),
+            crate::errors::ExitStatus::Integrity
+        );
+    }
+
+    /// Real-WAL helper: create a fresh WAL-mode DB, fold `base` rows into the
+    /// main file via a TRUNCATE checkpoint, and copy that stable image as the
+    /// follower's base. Returns the live connection (WAL still owned) plus the
+    /// db path and the base-copy path.
+    fn setup_fenced_source(
+        dir: &Path,
+    ) -> (rusqlite::Connection, std::path::PathBuf, std::path::PathBuf) {
+        let db_path = dir.join("fenced.db");
+        let base_copy = dir.join("base.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             PRAGMA page_size=4096;
+             CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO items (id, value) VALUES (1, 'base-1'), (2, 'base-2');",
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
+        std::fs::copy(&db_path, &base_copy).unwrap();
+        (conn, db_path, base_copy)
+    }
+
+    fn read_items(path: &Path) -> Vec<(i64, String)> {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT id, value FROM items ORDER BY id")
+            .unwrap();
+        let rows: Vec<(i64, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        rows
+    }
+
+    /// Publish `batches` real fenced deltas from `conn`'s WAL into `storage`,
+    /// threading the envelope chain. Returns the last envelope checksum and the
+    /// applied count so the follower can anchor.
+    async fn publish_fenced_deltas(
+        storage: &dyn StorageBackend,
+        prefix: &str,
+        state: &mut SyncState,
+        conn: &rusqlite::Connection,
+        epoch: u64,
+        writer: &str,
+        anchor: [u8; 32],
+        batches: u64,
+    ) -> [u8; 32] {
+        let mut prev_env = anchor;
+        for batch in 0..batches {
+            conn.execute(
+                "INSERT INTO items (id, value) VALUES (?1, ?2)",
+                rusqlite::params![10 + batch as i64, format!("d{batch}")],
+            )
+            .unwrap();
+            let params = FencedDeltaSyncParams {
+                epoch,
+                writer_id: writer.to_string(),
+                prev_envelope_checksum: prev_env,
+            };
+            if let Some(res) = sync_wal_fenced_delta(storage, prefix, state, &params)
+                .await
+                .unwrap()
+            {
+                prev_env = res.envelope_checksum;
+            }
+        }
+        prev_env
+    }
+
+    /// Production-path proof: a follower reconstructs the EXACT database from
+    /// the published fenced-delta sequence via the production
+    /// `reconstruct_fenced_follower` API. Drives the real `sync_wal_fenced_delta`
+    /// writer over a real rusqlite WAL — not a fixture.
+    #[tokio::test]
+    async fn reconstruct_fenced_follower_replays_published_deltas() {
+        const EPOCH: u64 = 7;
+        const WRITER: &str = "leader-A";
+        const ANCHOR: [u8; 32] = [0x11; 32];
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (conn, db_path, base_copy) = setup_fenced_source(dir.path());
+        let follower = dir.path().join("follower.db");
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path.clone()).unwrap();
+        state.name = "fenced".to_string();
+        state.init_checksum().unwrap();
+        let base_seq = state.current_seq;
+
+        publish_fenced_deltas(
+            &storage, "fenced/", &mut state, &conn, EPOCH, WRITER, ANCHOR, 3,
+        )
+        .await;
+        drop(conn);
+
+        let cursor = FencedFollowerCursor {
+            base_seq,
+            epoch: EPOCH,
+            writer_id: WRITER.to_string(),
+            base_envelope_checksum: ANCHOR,
+        };
+        let result = reconstruct_fenced_follower(
+            &storage, "fenced/", "fenced", &cursor, &base_copy, &follower,
+        )
+        .await
+        .expect("honest fenced follower reconstruct");
+        assert!(result.applied >= 1, "at least one delta must be published");
+        assert_eq!(result.head_seq, base_seq + result.applied);
+
+        // integrity_check + exact row equality against the source DB.
+        let conn = rusqlite::Connection::open(&follower).unwrap();
+        let integ: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            integ, "ok",
+            "reconstructed follower must pass integrity_check"
+        );
+        drop(conn);
+        assert_eq!(
+            read_items(&follower),
+            read_items(&db_path),
+            "fenced follower must match source rows exactly"
+        );
+    }
+
+    /// The production follower API enforces every fence: a forged head+1
+    /// envelope (wrong epoch / wrong writer / broken chain — each otherwise
+    /// valid) is rejected with a typed integrity error BEFORE any apply.
+    #[tokio::test]
+    async fn reconstruct_fenced_follower_rejects_forged_envelopes() {
+        const EPOCH: u64 = 7;
+        const WRITER: &str = "leader-A";
+        const ANCHOR: [u8; 32] = [0x11; 32];
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (conn, _db_path, base_copy) = setup_fenced_source(dir.path());
+        let follower = dir.path().join("follower.db");
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(_db_path.clone()).unwrap();
+        state.name = "fenced".to_string();
+        state.init_checksum().unwrap();
+        let base_seq = state.current_seq;
+
+        publish_fenced_deltas(
+            &storage, "fenced/", &mut state, &conn, EPOCH, WRITER, ANCHOR, 2,
+        )
+        .await;
+        drop(conn);
+
+        let cursor = FencedFollowerCursor {
+            base_seq,
+            epoch: EPOCH,
+            writer_id: WRITER.to_string(),
+            base_envelope_checksum: ANCHOR,
+        };
+        let honest = reconstruct_fenced_follower(
+            &storage, "fenced/", "fenced", &cursor, &base_copy, &follower,
+        )
+        .await
+        .expect("honest reconstruct");
+        let head_seq = base_seq + honest.applied;
+        let head = fetch_delta_envelope(&storage, "fenced/", "fenced", head_seq)
+            .await
+            .expect("fetch head")
+            .expect("head exists");
+        let forged_seq = head_seq + 1;
+        let forged_key = delta_envelope_key("fenced/", "fenced", forged_seq);
+        let forge = |epoch: u64, writer: &str, prev: Vec<u8>| DeltaPayloadV1 {
+            seq: forged_seq,
+            epoch,
+            writer_id: writer.to_string(),
+            prev_checksum: prev,
+            end_page_count: head.payload.end_page_count,
+            ltx_payload: head.payload.ltx_payload.clone(),
+        };
+        let cases = [
+            (
+                "epoch fence",
+                forge(EPOCH + 1, WRITER, honest.head_envelope_checksum.to_vec()),
+            ),
+            (
+                "writer fence",
+                forge(EPOCH, "stale-B", honest.head_envelope_checksum.to_vec()),
+            ),
+            ("envelope chain break", forge(EPOCH, WRITER, vec![0xEE; 32])),
+        ];
+        for (label, payload) in cases {
+            let bytes = external_delta::encode(&payload).unwrap();
+            storage.put(&forged_key, &bytes).await.unwrap();
+            let poisoned = dir
+                .path()
+                .join(format!("poisoned-{}.db", label.replace(' ', "-")));
+            let err = reconstruct_fenced_follower(
+                &storage, "fenced/", "fenced", &cursor, &base_copy, &poisoned,
+            )
+            .await
+            .expect_err("forged envelope must be rejected");
+            assert!(
+                err.to_string().contains(label),
+                "expected rejection by {label}, got: {err}"
+            );
+            assert_eq!(
+                crate::errors::classify_error(&err),
+                crate::errors::ExitStatus::Integrity,
+                "fence violation must be a typed integrity error ({label})"
+            );
+            storage.delete(&forged_key).await.unwrap();
+        }
+    }
+
+    /// Atomicity of rejection, MID-STREAM: a forged envelope planted at a seq in
+    /// the MIDDLE of an otherwise-valid chain must leave the follower DB exactly
+    /// at the state produced by the deltas BEFORE it — no page from the forged
+    /// envelope (nor any later one) is applied — and, once the bad envelope is
+    /// replaced with the honest one, a fresh reconstruct resumes cleanly to the
+    /// full head. This guards the "fences enforced before any apply" claim
+    /// against the harder case than head+1: the forge is not at the end.
+    #[tokio::test]
+    async fn reconstruct_fenced_follower_rejects_midstream_forge_atomically() {
+        const EPOCH: u64 = 7;
+        const WRITER: &str = "leader-A";
+        const ANCHOR: [u8; 32] = [0x11; 32];
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (conn, _db_path, base_copy) = setup_fenced_source(dir.path());
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(_db_path.clone()).unwrap();
+        state.name = "fenced".to_string();
+        state.init_checksum().unwrap();
+        let base_seq = state.current_seq;
+
+        // Four real deltas: batch b inserts row (10 + b, "d{b}") at seq base+b+1.
+        publish_fenced_deltas(
+            &storage, "fenced/", &mut state, &conn, EPOCH, WRITER, ANCHOR, 4,
+        )
+        .await;
+        drop(conn);
+
+        let cursor = FencedFollowerCursor {
+            base_seq,
+            epoch: EPOCH,
+            writer_id: WRITER.to_string(),
+            base_envelope_checksum: ANCHOR,
+        };
+
+        // Honest full reconstruct: the target the resume must reach.
+        let full_follower = dir.path().join("full.db");
+        let full = reconstruct_fenced_follower(
+            &storage,
+            "fenced/",
+            "fenced",
+            &cursor,
+            &base_copy,
+            &full_follower,
+        )
+        .await
+        .expect("honest full reconstruct");
+        assert!(full.applied >= 4, "expected 4 published deltas");
+        let full_rows = read_items(&full_follower);
+
+        // Forge the MIDDLE envelope (seq base+2, position 1 = the delta that
+        // inserts row (11, "d1")). Keep its chain link (prev_checksum) honest so
+        // ONLY the epoch fence trips — proving the fence, not the chain hash,
+        // stops a delta buried inside an otherwise-valid stream.
+        let mid_seq = base_seq + 2;
+        let real_mid = fetch_delta_envelope(&storage, "fenced/", "fenced", mid_seq)
+            .await
+            .expect("fetch mid")
+            .expect("mid exists");
+        let real_mid_bytes = external_delta::encode(&real_mid.payload).unwrap();
+        let mid_key = delta_envelope_key("fenced/", "fenced", mid_seq);
+        let forged = DeltaPayloadV1 {
+            epoch: EPOCH + 1,
+            ..real_mid.payload.clone()
+        };
+        storage
+            .put(&mid_key, &external_delta::encode(&forged).unwrap())
+            .await
+            .unwrap();
+
+        let poisoned = dir.path().join("poisoned-mid.db");
+        let err = reconstruct_fenced_follower(
+            &storage, "fenced/", "fenced", &cursor, &base_copy, &poisoned,
+        )
+        .await
+        .expect_err("mid-stream forged envelope must be rejected");
+        assert!(
+            err.to_string().contains("epoch fence"),
+            "expected epoch fence rejection at mid seq, got: {err}"
+        );
+        assert_eq!(
+            crate::errors::classify_error(&err),
+            crate::errors::ExitStatus::Integrity
+        );
+
+        // Atomicity: the follower DB holds ONLY the deltas before the forge
+        // (base + row (10,"d0")). The forged seq's row (11,"d1") and every later
+        // row (12,"d2"), (13,"d3") must be absent — the forged envelope's pages
+        // never reached the file, and no later delta was applied past the break.
+        let expected_before_forge = vec![
+            (1_i64, "base-1".to_string()),
+            (2, "base-2".to_string()),
+            (10, "d0".to_string()),
+        ];
+        assert_eq!(
+            read_items(&poisoned),
+            expected_before_forge,
+            "mid-stream rejection must leave the DB at the pre-forge (seq N-1) state exactly"
+        );
+
+        // Clean resume: replace the forged envelope with the honest bytes and
+        // reconstruct fresh — the follower reaches the full head.
+        storage.put(&mid_key, &real_mid_bytes).await.unwrap();
+        let resumed_follower = dir.path().join("resumed.db");
+        let resumed = reconstruct_fenced_follower(
+            &storage,
+            "fenced/",
+            "fenced",
+            &cursor,
+            &base_copy,
+            &resumed_follower,
+        )
+        .await
+        .expect("resume after replacing the bad envelope");
+        assert_eq!(resumed.head_seq, full.head_seq, "resume reaches full head");
+        assert_eq!(
+            read_items(&resumed_follower),
+            full_rows,
+            "resumed follower must match the honest full reconstruct exactly"
         );
     }
 }

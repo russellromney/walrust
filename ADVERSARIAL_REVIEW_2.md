@@ -1178,6 +1178,20 @@ locally (sandbox MinIO clock skew, see A6).
 - B14 — `list_delta_envelopes_after` never asserts payload.seq == key-derived
   seq (`sync.rs:748-767`); genesis sentinel ambiguity (empty vs 32 zero
   bytes) in `external_delta.rs`.
+  Status: Fixed (Wave 3b, Phase-4 remainder). `list_delta_envelopes_after`
+  (`crates/walrust-core/src/sync.rs`) now hard-errors with a typed
+  `WalrustError::Integrity` when a decoded `payload.seq` disagrees with the
+  key-derived seq — the key carries the ordering authority (zero-padded hex
+  sorts numerically), so a mislabeled envelope can no longer be returned for a
+  follower to apply out of order. This protects every consumer, including the
+  new production follower API (see Phase 4.1 below). Proven by
+  `sync::tests::list_delta_envelopes_after_rejects_seq_key_mismatch`
+  (revert-verified: dropping the check returns the mislabeled envelope). The
+  genesis-sentinel half is a non-issue on the production fenced-follower path:
+  `reconstruct_fenced_follower` anchors on an explicit 32-byte
+  `base_envelope_checksum` and requires each `prev_checksum` to equal the
+  running anchor exactly, so an empty (genesis) `prev_checksum` never matches a
+  real anchor and fails closed — no empty-vs-32-zeros conflation is reachable.
 
 ## MEDIUM / LOW (abbreviated)
 
@@ -1188,11 +1202,33 @@ locally (sandbox MinIO clock skew, see A6).
 - Stringly-typed error classification everywhere
   (`e.to_string().contains(...)` in `sync.rs:1015`, `replicator.rs:432`,
   `errors.rs:114-183`); printed exit codes wrong (`verify.rs:375-386`).
+  Status: Fixed (Phase 4.2 + confirmed Wave 3b). `errors.rs` classifies only
+  typed `WalrustError` values found in the `anyhow` chain
+  (`classify_error`/`classify_or_else` downcast; no substring match), and
+  `replicator.rs` restore uses a `downcast_ref::<WalrustError>` on
+  `RestoreNotFound` instead of a "No snapshot found" string test. A Wave-3b
+  grep of `crates/walrust-core/src/{sync.rs,replicator.rs,errors.rs}` and
+  `src/` for `.contains(` on error strings finds only test assertions and
+  non-error string ops — no production control-flow classification remains. The
+  new fenced-follower fence rejections are typed `WalrustError::Integrity`
+  (exit 5), keeping the end-to-end typing invariant. Exit-code contract held
+  by the `cli_exit_codes` tests.
 - Corruption webhook fired via tokio::spawn on the exit path — usually lost
   (`restore.rs:129`).
 - Legacy `sync_wal_and_manifest` grows manifest unboundedly (`sync.rs:1275`).
 - Naming: `ltx.rs` in core is HADBP, not LTX; `external_delta.rs` calls HADBP
   payloads "raw LTX bytes"; `WAL_MAGIC_BE/LE` names encode the A1 inversion.
+  Status: Fixed (Wave 3b). `WAL_MAGIC_LE/BE` were already corrected in Phase 1
+  (`WAL_MAGIC_LE=0x377F_0682`, `WAL_MAGIC_BE=0x377F_0683` — the real SQLite
+  convention). `external_delta.rs` no longer calls the payload "raw LTX bytes":
+  the module doc, `DeltaPayloadV1::ltx_payload` doc, and `MagicMismatch` doc now
+  say "raw HADBP changeset bytes" and note the `ltx_payload` field name is a
+  back-compat alias. Core `ltx.rs`'s header documents that the `walrust_core::ltx`
+  module name is a LEGACY ALIAS for the HADBP codec (not byte-compatible with
+  litepages LTX). Decision: doc fix, not rename — the `ltx` module and
+  `ltx_payload` field are public API used across the root crate, the DST
+  harness, and embedders, so a rename is pure churn in multiple trees for zero
+  behavior change (the Session-8 override explicitly permits the doc fix here).
 
 ---
 
@@ -1684,3 +1720,139 @@ Phase 0+1 — independent audit (2026-07-08, fresh reviewer, review/phase-0-1-au
     startup failures to typed errors, and replaces the core replica
     no-snapshot string guard with a typed `WalrustError` downcast. The
     second-pass tests now pass.
+
+### Phase 4 — Wave 3b (convergence remainder, 2026-07-08)
+
+The Session-8 module convergence (4.1 above) had already landed; Wave 3b
+executed the recorded remainder.
+
+- **4.1 (fenced follower → production API).** The fence-enforcing follower
+  reconstruction previously lived only as `fenced_follower_reconstruct`, an
+  executable spec inside `walrust-dst/src/invariants.rs`. It is now the public,
+  documented `walrust_core::reconstruct_fenced_follower` +
+  `FencedFollowerCursor`/`FencedFollowerResult` in `crates/walrust-core/src/sync.rs`,
+  alongside `list_delta_envelopes_after`. It copies the external base, discovers
+  published envelopes, and enforces seq contiguity, epoch fence, writer fence,
+  BLAKE3 envelope chain, and byte-identity chain BEFORE applying each payload
+  with the running DB checksum threaded through. Every fence rejection is a
+  typed `WalrustError::Integrity` (exit 5) whose message still names the fence.
+  The DST `prop_fenced_delta_restore` follower now CALLS this production API, so
+  spec and implementation have converged. Proven by the non-gated
+  `sync::tests::reconstruct_fenced_follower_replays_published_deltas` (drives
+  the real `sync_wal_fenced_delta` writer over a real rusqlite WAL and asserts
+  integrity + exact row equality) and
+  `sync::tests::reconstruct_fenced_follower_rejects_forged_envelopes` (a forged
+  head+1 envelope — wrong epoch / wrong writer / broken chain — is rejected with
+  a typed integrity error before any apply). The fence is not weakened.
+- **4.2 (typed errors end-to-end).** Confirmed already complete from the earlier
+  Phase-4.2 wave; the new fence rejections are typed. See the MEDIUM/LOW
+  stringly-typed classification Status above.
+- **Naming/doc honesty.** See the MEDIUM/LOW naming Status above.
+- **WAN flake.** The `production_e2e` poll deadlines are now WAN-tunable via
+  `WALRUST_E2E_DEADLINE_SECS` (`e2e_poll_deadline`), removing the fixed 30s/20s/10s
+  magic numbers that made the core SIGKILL restart E2E flaky under load. Proven
+  by `e2e_poll_deadline_override_parses`.
+- **B14.** Closed this wave (see the B14 Status above).
+
+---
+
+## DEFERRED (final register)
+
+Everything still open after the fix waves, so nothing vanishes. Each item:
+**risk**, **trigger scenario**, **suggested future fix**. None is a silent
+data-loss path in steady-state operation; all are shouldn't-happen edges bounded
+by an existing safety net (periodic snapshot, pinned-reader blocker, fail-closed
+chain verify), or observability/ergonomics gaps.
+
+### D1 — Writer-lease / split-brain immunity token (from B11)
+- **Risk:** the walrust-owned crash-window recovery is gated on a local, fsynced
+  `PublishIntent` authorship proof, not a distributed fence. It correctly refuses
+  a second writer's same-seq object, but it is a state-durability proof, not a
+  lease. Two nodes that both believe they hold the writer role can still each make
+  local progress until their CAS puts collide.
+- **Trigger:** HA failover where the promoted node and a revived original node
+  both publish under the same lineage/base before either observes the other's
+  objects.
+- **Suggested fix:** a real lease/epoch token from an external store (the hadb
+  internal-lease-store the pinned `hadb-*` branch is named for), checked at
+  publish time so a stale epoch cannot CAS at all. Larger than a fix wave.
+
+### D2 — Core walrust-owned first-checkpoint window (from A3)
+- **Risk:** rollover DETECTION needs a previously-recorded WAL salt, which is
+  `None` immediately after a snapshot (the WAL is empty). An external checkpoint
+  that folds un-read frames in that brief first-read window is not detected as a
+  rollover; its un-re-imaged pages can be lost.
+- **Trigger:** an external process checkpoints a walrust-OWNED WAL (which walrust
+  sets `autocheckpoint=0` on) in the gap between a snapshot and walrust's first
+  incremental read.
+- **Suggested fix:** record the first post-snapshot WAL salt as SQLite writes it,
+  without a full read, so the window has a reset signal. Phase 2B tried the
+  offset-24 counter and a DB-file hash; both were rejected (false-positive on
+  benign PASSIVE folds, would weaken the honest pinned-reader E2Es). Exposure is
+  bounded by `snapshot_interval` (the next snapshot re-images the DB file).
+
+### D3 — Shadow downtime-checkpoint completeness (from B4)
+- **Risk:** on restart, the shadow reader detects a downtime checkpoint (salt
+  mismatch) and bumps the generation + re-seeds per-frame validation, but does
+  NOT eagerly re-snapshot. Frames an external checkpoint folded away during
+  downtime live in the main DB file, not re-imaged until the next periodic
+  snapshot.
+- **Trigger:** process is down while an external checkpoint TRUNCATEs the shadow's
+  source WAL, then walrust restarts.
+- **Suggested fix:** an eager re-snapshot on a downtime generation bump — deferred
+  because a generation bump in shadow mode is normally BENIGN (walrust's own
+  copy-then-checkpoint bumps it too) and the PASSIVE-fold-vs-destructive-reset
+  distinction is not cheaply available (same residual class as D2). Bounded by
+  `snapshot_interval`; the generation-boundary chain re-seed keeps restore
+  fail-closed on any gap (short restore errors, never silent).
+
+### D4 — Rollover CheckpointDetected webhook variant (from A3)
+- **Risk:** rollover events ride the `upload_failed` webhook channel with a
+  distinct message rather than a dedicated `CheckpointDetected` variant, so an
+  external consumer cannot filter rollovers by event type. Library embedders have
+  the typed `RolloverObserver`; the webhook half is binary-only.
+- **Trigger:** an operator wiring alerting who wants to route rollover events
+  separately from upload failures.
+- **Suggested fix:** add a `CheckpointDetected` variant. Deferred: the `hadb-io`
+  webhook enum is a pinned external dependency (Phase-0 decision); changing it is
+  cross-repo. Also, shadow mode treats a salt change as a routine generation roll
+  (walrust's own checkpoints change the salt), so a blocker-failure external
+  rollover in shadow mode is not distinctly alerted — same observability gap.
+
+### D5 — A5 drain-at-commit-boundary invariant (from A5)
+- **Risk:** the generation-aware shadow sync cursor's drain condition relies on
+  the invariant that a generation ends at a commit boundary. Uncommitted trailing
+  frames would stall the cursor.
+- **Trigger:** a generation whose tail is uncommitted frames (should not occur —
+  the checked reader stops at the last committed frame).
+- **Suggested fix:** the stall is the intended fail-safe (it never advances past
+  an incomplete generation), but it is an unenforced invariant rather than an
+  asserted one. A defensive assertion + loud error would make the assumption
+  explicit.
+
+### D6 — B13 cross-generation same-(min,max) cache collision (from B13)
+- **Risk:** restore cache substitution binds a cached object to the requested
+  key's `(min,max)` TXID range, closing the bare-TXID hole. A same-`(min,max)`
+  collision across generations after a TXID-rewinding reset would still pass the
+  binding.
+- **Trigger:** a TXID-rewinding reset that produces two objects sharing an exact
+  `(min,max)` interval in different generations, with the wrong one cached.
+- **Suggested fix:** bind the substitution to lineage/etag as well as the TXID
+  range. Backstopped today by the DB-anchored restore-chain `pre/post_apply`
+  checksums (`apply_ltx_to_db_checked`), which are computed from actual DB bytes
+  and catch a wrong-lineage substitution downstream.
+
+### D7 — MEDIUM/LOW ergonomics (not on a durability path)
+- **Config glob matching nothing is a warn+skip, not an error** (`config.rs`):
+  risk is a silent typo'd glob backing up nothing; trigger is a mistyped path
+  pattern; fix is warn→error, deferred because it changes semantics for existing
+  configs and is not a durability path.
+- **CLI clap defaults silently override walrust.toml values** (`main.rs`): risk
+  is a surprising precedence; trigger is setting a value in the toml that a clap
+  default shadows; fix is a presence check on the CLI arg before override.
+- **Corruption webhook fired via `tokio::spawn` on the exit path** (`restore.rs`):
+  risk is the webhook is lost when the process exits before the task runs; trigger
+  is a corruption-triggered exit; fix is to await the notification before exit.
+- **Legacy `sync_wal_and_manifest` grows the manifest unboundedly** (`sync.rs`):
+  risk is manifest bloat over long uptime; trigger is a very long-lived stream on
+  the legacy manifest path; fix is periodic compaction of the manifest.

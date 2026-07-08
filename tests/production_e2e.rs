@@ -198,13 +198,64 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+/// Env override name for E2E poll deadlines.
+const E2E_DEADLINE_ENV: &str = "WALRUST_E2E_DEADLINE_SECS";
+
+/// Parse a poll-deadline override. A positive integer wins; anything else
+/// (unset, empty, non-numeric, zero) falls back to `default_secs`.
+fn parse_deadline_override(raw: Option<&str>, default_secs: u64) -> Duration {
+    let secs = raw
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(default_secs);
+    Duration::from_secs(secs)
+}
+
+/// Poll deadline for the E2E harness. WAN-sensitive: on a slow/remote S3
+/// endpoint the fixed caps below can trip even though the operation would have
+/// succeeded (this is the source of the known `flush_until_frames` flake under
+/// load). Set `WALRUST_E2E_DEADLINE_SECS` to a larger positive integer on a
+/// high-RTT link to widen every poll loop at once; unset keeps the defaults.
+fn e2e_poll_deadline(default_secs: u64) -> Duration {
+    parse_deadline_override(
+        std::env::var(E2E_DEADLINE_ENV).ok().as_deref(),
+        default_secs,
+    )
+}
+
+#[test]
+fn e2e_poll_deadline_override_parses() {
+    assert_eq!(parse_deadline_override(None, 30), Duration::from_secs(30));
+    assert_eq!(
+        parse_deadline_override(Some("120"), 30),
+        Duration::from_secs(120)
+    );
+    // Empty / non-numeric / zero fall back to the default.
+    assert_eq!(
+        parse_deadline_override(Some(""), 30),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        parse_deadline_override(Some("abc"), 30),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        parse_deadline_override(Some("0"), 30),
+        Duration::from_secs(30)
+    );
+    assert_eq!(
+        parse_deadline_override(Some("  45 "), 30),
+        Duration::from_secs(45)
+    );
+}
+
 /// Wait until the shadow watcher has attached its checkpoint blocker (which
 /// creates and pins the `_walrust_seq` table). A fixed sleep races the watcher's
 /// S3 discovery + initial snapshot, so on a slow endpoint the blocker is not yet
 /// up and any "racing checkpoint" would be racing nothing. Poll for readiness so
 /// the race actually happens against a live pin.
 fn wait_for_shadow_blocker(db_path: &Path, child: &mut Child) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(30);
+    let deadline = Instant::now() + e2e_poll_deadline(30);
     loop {
         let conn = Connection::open(db_path)?;
         let exists: i64 = conn
@@ -228,7 +279,7 @@ fn wait_for_shadow_blocker(db_path: &Path, child: &mut Child) -> Result<()> {
 }
 
 fn wait_for_file_or_child_exit(child: &mut Child, path: &Path, context: &str) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + e2e_poll_deadline(20);
     loop {
         if path.exists() {
             return Ok(());
@@ -259,11 +310,12 @@ async fn flush_until_frames(
     name: &str,
     context: &str,
 ) -> Result<u64> {
-    // 30s (not 10s): this polls until the first WAL frame is published and returns
-    // immediately once it is, so a generous deadline only matters under heavy
-    // sequential-test load where S3 latency previously tripped a 10s cap and made
-    // the core SIGKILL restart E2E flaky. No cost on the happy path.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Polls until the first WAL frame is published and returns immediately once
+    // it is, so a generous deadline only matters under heavy sequential-test
+    // load where S3 latency previously tripped a 10s cap and made the core
+    // SIGKILL restart E2E flaky. Default 30s; WAN-tunable via
+    // WALRUST_E2E_DEADLINE_SECS (see e2e_poll_deadline). No cost on the happy path.
+    let deadline = Instant::now() + e2e_poll_deadline(30);
     loop {
         let frames = replicator.flush(name).await?;
         if frames > 0 {
@@ -376,7 +428,7 @@ fn wait_for_cli_restore_rows(
     restored_path: &Path,
     expected_rows: &[(i64, String)],
 ) -> Result<()> {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + e2e_poll_deadline(10);
 
     loop {
         let _ = std::fs::remove_file(restored_path);
@@ -1020,7 +1072,7 @@ fn e2e_core_replicator_sigkill_child() -> Result<()> {
             "first" => {
                 replicator.add(&name, &db_path).await?;
                 std::fs::write(&ready_path, b"ready")?;
-                let deadline = Instant::now() + Duration::from_secs(20);
+                let deadline = Instant::now() + e2e_poll_deadline(20);
                 while !go_path.exists() {
                     if Instant::now() >= deadline {
                         anyhow::bail!("first helper timed out waiting for go signal");

@@ -11,6 +11,17 @@ Status: F1–F15 are **Fixed**. The DST harness (F14) now builds and runs its
 property/chaos/invariant tests against the current crate API, exercising real
 storage faults.
 
+> **Superseded in part by a second review.** After this pass, a deeper second
+> adversarial review (see ADVERSARIAL_REVIEW_2.md) found that several F1–F15
+> fixes had landed in only one of the two parallel trees (src/ vs
+> walrust-core/) and rotted in the other, plus new silent-data-loss and
+> silent-restore-corruption paths (A1–A14, B1–B14). Those were addressed in
+> phased fix waves (Phase 0 foundations → Phase 4 single-engine convergence),
+> which also collapsed the dual trees into one engine so a fix can no longer
+> rot in a shadow copy. Treat ADVERSARIAL_REVIEW_2.md (and its final DEFERRED
+> register) as the current state of record; this document is the first-pass
+> history.
+
 ---
 
 ## Fixed in this PR

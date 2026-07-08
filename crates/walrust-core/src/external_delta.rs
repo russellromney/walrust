@@ -15,7 +15,9 @@
 //!   subsequent ones). This is the chain link.
 //! - `end_page_count` — page count at the end of this delta. Handles
 //!   shrink / grow / VACUUM / truncate.
-//! - `ltx_payload` — the raw LTX bytes (the actual page changes).
+//! - `ltx_payload` — the raw HADBP changeset bytes (the actual page
+//!   changes). Named `ltx_payload` for public-API back-compat; the codec
+//!   is HADBP (hadb-changeset physical), not the former litepages LTX.
 //!
 //! Envelope layout (v1):
 //!
@@ -63,7 +65,8 @@ pub enum DeltaPayloadError {
     #[error("delta payload too short to be a TLMD envelope ({0} bytes)")]
     Truncated(usize),
 
-    /// Magic bytes did not match. Likely a raw LTX or different format.
+    /// Magic bytes did not match. Likely a raw HADBP changeset or a
+    /// different format.
     #[error("delta magic mismatch: expected TLMD, got {got:?}")]
     MagicMismatch { got: [u8; 4] },
 
@@ -126,9 +129,11 @@ pub struct DeltaPayloadV1 {
     /// db file's page count to this value after applying.
     pub end_page_count: u64,
 
-    /// Raw LTX bytes (hadb-changeset physical encoding). The actual
-    /// page-level changes the follower applies after chain
-    /// verification + epoch/writer filtering succeed.
+    /// Raw HADBP changeset bytes (hadb-changeset physical encoding). The
+    /// actual page-level changes the follower applies after chain
+    /// verification + epoch/writer filtering succeed. The field is named
+    /// `ltx_payload` for public-API/wire back-compat; the codec is HADBP,
+    /// not the former litepages LTX (whose magic was `LTX2`).
     #[serde(with = "serde_bytes")]
     pub ltx_payload: Vec<u8>,
 }
