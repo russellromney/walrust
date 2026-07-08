@@ -7,6 +7,15 @@
 //! Replaces the former litepages/LTX format. The on-disk format is .hadbp,
 //! but all replication semantics (WAL parsing, checksum chaining, snapshot +
 //! incremental restore) remain identical.
+//!
+//! Naming: the module path `walrust_core::ltx` (and the `ltx_*`/`Ltx*`
+//! symbols it exposes) is a LEGACY ALIAS retained for public-API stability
+//! across the root crate, the DST harness, and downstream embedders. It does
+//! NOT implement the litepages LTX wire format — the checksum is computed
+//! differently (HADBP folds `data_len` into the hash) and the two are not
+//! byte-compatible. Renaming the module/types would be pure churn touching the
+//! public crate API in multiple trees, so the name stays and this note removes
+//! the ambiguity: read "ltx" here as "the HADBP changeset codec".
 
 use anyhow::{anyhow, Result};
 use hadb_changeset::physical::{
