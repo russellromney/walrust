@@ -231,12 +231,18 @@ fn e2e_poll_deadline_override_parses() {
         Duration::from_secs(120)
     );
     // Empty / non-numeric / zero fall back to the default.
-    assert_eq!(parse_deadline_override(Some(""), 30), Duration::from_secs(30));
+    assert_eq!(
+        parse_deadline_override(Some(""), 30),
+        Duration::from_secs(30)
+    );
     assert_eq!(
         parse_deadline_override(Some("abc"), 30),
         Duration::from_secs(30)
     );
-    assert_eq!(parse_deadline_override(Some("0"), 30), Duration::from_secs(30));
+    assert_eq!(
+        parse_deadline_override(Some("0"), 30),
+        Duration::from_secs(30)
+    );
     assert_eq!(
         parse_deadline_override(Some("  45 "), 30),
         Duration::from_secs(45)

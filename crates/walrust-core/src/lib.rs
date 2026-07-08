@@ -49,8 +49,8 @@ pub use replicator::Replicator;
 pub use snapshot_source::{SnapshotCheckpoint, SnapshotSource};
 pub use sync::{
     fetch_delta_envelope, list_delta_envelopes_after, publish_delta_envelope,
-    pull_incremental_into_sink, restore_with_snapshot_source, run_wal_replication,
-    reconstruct_fenced_follower, sync_wal_fenced_delta, DeltaPublishResult, DiscoveredDelta,
+    pull_incremental_into_sink, reconstruct_fenced_follower, restore_with_snapshot_source,
+    run_wal_replication, sync_wal_fenced_delta, DeltaPublishResult, DiscoveredDelta,
     ExternalBaseCursor, FencedDeltaSyncParams, FencedFollowerCursor, FencedFollowerResult,
     LtxEntry, Manifest, PullCursor, ReplicationConfig, RolloverEvent, RolloverObserver,
     SnapshotOwnership, SyncState,

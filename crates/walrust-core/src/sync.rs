@@ -1877,8 +1877,7 @@ pub async fn reconstruct_fenced_follower(
             .into());
         }
 
-        let step =
-            ltx::apply_changeset_to_db(&d.payload.ltx_payload, output_path, running_db)?;
+        let step = ltx::apply_changeset_to_db(&d.payload.ltx_payload, output_path, running_db)?;
         running_db = step.checksum;
         running_env = d.envelope_checksum;
         applied += 1;
@@ -5337,7 +5336,8 @@ mod tests {
              INSERT INTO items (id, value) VALUES (1, 'base-1'), (2, 'base-2');",
         )
         .unwrap();
-        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .unwrap();
         std::fs::copy(&db_path, &base_copy).unwrap();
         (conn, db_path, base_copy)
     }
@@ -5422,10 +5422,11 @@ mod tests {
             writer_id: WRITER.to_string(),
             base_envelope_checksum: ANCHOR,
         };
-        let result =
-            reconstruct_fenced_follower(&storage, "fenced/", "fenced", &cursor, &base_copy, &follower)
-                .await
-                .expect("honest fenced follower reconstruct");
+        let result = reconstruct_fenced_follower(
+            &storage, "fenced/", "fenced", &cursor, &base_copy, &follower,
+        )
+        .await
+        .expect("honest fenced follower reconstruct");
         assert!(result.applied >= 1, "at least one delta must be published");
         assert_eq!(result.head_seq, base_seq + result.applied);
 
@@ -5434,7 +5435,10 @@ mod tests {
         let integ: String = conn
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(integ, "ok", "reconstructed follower must pass integrity_check");
+        assert_eq!(
+            integ, "ok",
+            "reconstructed follower must pass integrity_check"
+        );
         drop(conn);
         assert_eq!(
             read_items(&follower),
@@ -5474,10 +5478,11 @@ mod tests {
             writer_id: WRITER.to_string(),
             base_envelope_checksum: ANCHOR,
         };
-        let honest =
-            reconstruct_fenced_follower(&storage, "fenced/", "fenced", &cursor, &base_copy, &follower)
-                .await
-                .expect("honest reconstruct");
+        let honest = reconstruct_fenced_follower(
+            &storage, "fenced/", "fenced", &cursor, &base_copy, &follower,
+        )
+        .await
+        .expect("honest reconstruct");
         let head_seq = base_seq + honest.applied;
         let head = fetch_delta_envelope(&storage, "fenced/", "fenced", head_seq)
             .await
@@ -5502,19 +5507,19 @@ mod tests {
                 "writer fence",
                 forge(EPOCH, "stale-B", honest.head_envelope_checksum.to_vec()),
             ),
-            (
-                "envelope chain break",
-                forge(EPOCH, WRITER, vec![0xEE; 32]),
-            ),
+            ("envelope chain break", forge(EPOCH, WRITER, vec![0xEE; 32])),
         ];
         for (label, payload) in cases {
             let bytes = external_delta::encode(&payload).unwrap();
             storage.put(&forged_key, &bytes).await.unwrap();
-            let poisoned = dir.path().join(format!("poisoned-{}.db", label.replace(' ', "-")));
-            let err =
-                reconstruct_fenced_follower(&storage, "fenced/", "fenced", &cursor, &base_copy, &poisoned)
-                    .await
-                    .expect_err("forged envelope must be rejected");
+            let poisoned = dir
+                .path()
+                .join(format!("poisoned-{}.db", label.replace(' ', "-")));
+            let err = reconstruct_fenced_follower(
+                &storage, "fenced/", "fenced", &cursor, &base_copy, &poisoned,
+            )
+            .await
+            .expect_err("forged envelope must be rejected");
             assert!(
                 err.to_string().contains(label),
                 "expected rejection by {label}, got: {err}"
