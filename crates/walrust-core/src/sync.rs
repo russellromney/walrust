@@ -834,13 +834,11 @@ async fn put_changeset_if_absent(
             )
         })?;
     if existing != bytes {
-        anyhow::bail!(
+        return Err(WalrustError::equivocation(format!(
             "{}: {} duplicate changeset seq {}; refusing overwrite at {}",
-            db_name,
-            mode,
-            seq,
-            key
-        );
+            db_name, mode, seq, key
+        ))
+        .into());
     }
 
     tracing::info!(
@@ -850,6 +848,34 @@ async fn put_changeset_if_absent(
         seq
     );
     Ok(())
+}
+
+/// B11 crash-window discriminator. Returns `Some(post_checksum)` when the
+/// object already at `key` is *our own* changeset for `seq` — it decodes as a
+/// physical changeset at `seq` whose `prev_checksum` equals our current
+/// pre-apply checksum. That is the signature of a publish that succeeded
+/// durably but whose `save_state` never ran before a crash: on restart we
+/// re-read the WAL from the stale cursor and, if new commits landed, encode
+/// *different* bytes at the same seq. Returns `None` for undecodable bytes or
+/// a changeset built from a different base (a genuine foreign equivocation).
+async fn existing_changeset_is_our_prefix(
+    storage: &dyn StorageBackend,
+    key: &str,
+    seq: u64,
+    our_pre_checksum: u64,
+) -> Result<Option<u64>> {
+    let Some(existing) = storage.get(key).await? else {
+        return Ok(None);
+    };
+    let decoded = match ltx::decode_sqlite_changeset(&existing) {
+        Ok(d) => d,
+        Err(_) => return Ok(None),
+    };
+    if decoded.header.seq == seq && decoded.header.prev_checksum == our_pre_checksum {
+        Ok(Some(decoded.checksum))
+    } else {
+        Ok(None)
+    }
 }
 
 /// Result of reading the next batch of WAL frames for a sync site.
@@ -1056,7 +1082,7 @@ async fn sync_wal_with_sequence(
             .await?;
         }
         DeltaSequence::WalrustOwned => {
-            put_changeset_if_absent(
+            if let Err(e) = put_changeset_if_absent(
                 storage,
                 &changeset_key,
                 &changeset_bytes,
@@ -1064,7 +1090,39 @@ async fn sync_wal_with_sequence(
                 new_seq,
                 "walrust-owned",
             )
-            .await?;
+            .await
+            {
+                // B11 recovery: close the put-then-save_state crash window.
+                // If the conflicting object is our own prior publish at this
+                // seq (see existing_changeset_is_our_prefix), adopt it as
+                // committed and re-anchor with a fresh snapshot so any frames
+                // written after the crash are folded in. A foreign/garbage
+                // conflict still propagates as a hard equivocation error.
+                if WalrustError::is_equivocation(&e) {
+                    if let Some(adopted_post) = existing_changeset_is_our_prefix(
+                        storage,
+                        &changeset_key,
+                        new_seq,
+                        pre_checksum,
+                    )
+                    .await?
+                    {
+                        tracing::error!(
+                            "{}: same-seq changeset conflict at seq {} from a prior crashed publish; \
+                             adopting it and re-anchoring with a fresh snapshot",
+                            state.name,
+                            new_seq
+                        );
+                        state.current_seq = new_seq;
+                        state.current_txid = max_txid;
+                        state.db_checksum = Some(adopted_post);
+                        take_snapshot(storage, prefix, state).await?;
+                        save_state(storage, prefix, state).await?;
+                        return Ok(1);
+                    }
+                }
+                return Err(e);
+            }
         }
     }
 
@@ -1344,11 +1402,12 @@ pub async fn publish_delta_envelope(
                 )
             })?;
         if existing != envelope {
-            anyhow::bail!(
+            return Err(WalrustError::equivocation(format!(
                 "{db_name}: delta envelope seq {} already exists with different bytes at {key}; \
                  refusing overwrite (writer equivocation at the same seq)",
                 payload.seq
-            );
+            ))
+            .into());
         }
         tracing::info!(
             "{db_name}: delta envelope seq {} already present with identical bytes; idempotent re-publish",
@@ -4441,6 +4500,139 @@ mod tests {
             storage.get(&key).await.unwrap(),
             Some(existing),
             "failed CAS publish must leave the existing object intact"
+        );
+    }
+
+    #[tokio::test]
+    async fn walrust_owned_reanchors_after_crash_window_same_seq_conflict() {
+        // B11: a crash between a durable changeset put and its save_state
+        // leaves our own object at seq N. On restart we reload the stale
+        // cursor; if more commits landed we re-encode *different* bytes at
+        // seq N. Recovery must adopt the durable object and re-anchor with a
+        // fresh snapshot (no wedge, no data loss), not hard-fail.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("owned-crash.db");
+        let restored_path = dir.path().join("restored.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            ",
+        )
+        .unwrap();
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path.clone()).unwrap();
+        state.name = "owned_crash".to_string();
+        state.init_checksum().unwrap();
+        take_snapshot_with_retry(&storage, "p/", &mut state, &RetryPolicy::default_policy())
+            .await
+            .unwrap();
+
+        // Snapshot of the reload cursor as it would be persisted BEFORE the
+        // seq-2 incremental publishes (i.e. what a crashed process reloads).
+        let crashed_seq = state.current_seq;
+        let crashed_txid = state.current_txid;
+        let crashed_checksum = state.db_checksum;
+        let crashed_offset = state.wal_offset;
+        let crashed_gen = state.wal_generation;
+        let crashed_salt = state.wal_salt;
+        let crashed_chain = state.wal_checksum_chain;
+
+        // Durable publish of seq 2 (this is the write that survives the crash).
+        conn.execute("INSERT INTO items (id, value) VALUES (2, 'delta')", [])
+            .unwrap();
+        sync_wal(&storage, "p/", &mut state).await.unwrap();
+        let seq2_key = build_changeset_key("p/", &state.name, GENERATION_LIVE, 2);
+        assert!(
+            storage.get(&seq2_key).await.unwrap().is_some(),
+            "seq 2 incremental must be durably published pre-crash"
+        );
+
+        // Simulate the crash: save_state never ran, so reload the stale cursor.
+        state.current_seq = crashed_seq;
+        state.current_txid = crashed_txid;
+        state.db_checksum = crashed_checksum;
+        state.wal_offset = crashed_offset;
+        state.wal_generation = crashed_gen;
+        state.wal_salt = crashed_salt;
+        state.wal_checksum_chain = crashed_chain;
+
+        // A new commit lands after the crash, before the next sync.
+        conn.execute("INSERT INTO items (id, value) VALUES (3, 'after-crash')", [])
+            .unwrap();
+
+        // The next sync re-encodes different bytes at seq 2 -> CAS conflict ->
+        // recovery re-anchors with a snapshot at seq 3.
+        sync_wal(&storage, "p/", &mut state)
+            .await
+            .expect("crash-window conflict must recover, not wedge");
+        assert_eq!(state.current_seq, 3, "re-anchor must land a snapshot at seq 3");
+        let snap3_key = build_changeset_key("p/", &state.name, GENERATION_SNAPSHOT, 3);
+        assert!(
+            storage.get(&snap3_key).await.unwrap().is_some(),
+            "recovery must publish a fresh snapshot at seq 3"
+        );
+
+        // Restore must round-trip all three committed rows.
+        restore(&storage, "p/", &state.name, &restored_path, None)
+            .await
+            .expect("restore after re-anchor");
+        let rconn = rusqlite::Connection::open(&restored_path).unwrap();
+        let count: i64 = rconn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "all rows including the post-crash commit must restore");
+        let integrity: String = rconn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn walrust_owned_sync_rejects_foreign_same_seq_changeset() {
+        // B11 discriminator: a same-seq object that is NOT our own prefix
+        // (undecodable/foreign bytes) must remain a hard equivocation error,
+        // never silently re-anchored.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("owned-foreign.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            ",
+        )
+        .unwrap();
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path.clone()).unwrap();
+        state.name = "owned_foreign".to_string();
+        state.init_checksum().unwrap();
+        take_snapshot_with_retry(&storage, "p/", &mut state, &RetryPolicy::default_policy())
+            .await
+            .unwrap();
+
+        conn.execute("INSERT INTO items (id, value) VALUES (2, 'delta')", [])
+            .unwrap();
+        let next_seq = state.current_seq + 1;
+        let key = build_changeset_key("p/", &state.name, GENERATION_LIVE, next_seq);
+        storage
+            .put(&key, b"foreign non-changeset bytes")
+            .await
+            .unwrap();
+
+        let err = sync_wal(&storage, "p/", &mut state)
+            .await
+            .expect_err("foreign same-seq object must hard-fail");
+        assert!(
+            WalrustError::is_equivocation(&err),
+            "must be a typed equivocation error, got: {err}"
         );
     }
 
