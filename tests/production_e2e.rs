@@ -978,8 +978,25 @@ fn spawn_core_sigkill_helper(args: CoreSigkillHelperArgs<'_>) -> Result<Child> {
     cmd.spawn().context("spawn core replicator SIGKILL helper")
 }
 
+/// Coordination-driven spawn target for the core SIGKILL E2E — NOT a
+/// standalone test.
+///
+/// Why it stays `#[ignore]`d (and must not be un-ignored into the default set):
+/// it is not a self-contained test. It reads its bucket/prefix/db/coordination
+/// paths from `WALRUST_CORE_SIGKILL_*` env vars and blocks on `go`/`ready`/
+/// `flushed` file handshakes; run standalone with no parent it errors on the
+/// missing env (or, in the `first` phase, loops forever waiting for `go`). The
+/// parent `e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows` re-execs
+/// *this same test binary* with `--exact e2e_core_replicator_sigkill_child
+/// --ignored`, so the helper is compiled and shipped as part of the ordinary
+/// test build — nothing extra to build in CI — and it *does* execute in CI:
+/// the parent is `require_s3!`-gated, MinIO satisfies that gate, and the CI log
+/// shows `e2e_core_replicator_sigkill_child ... ok` for each spawned phase. So
+/// the SIGKILL path runs end to end in CI; the `#[ignore]` only keeps the helper
+/// out of the unparameterized default run where it has no parent to drive it.
 #[test]
-#[ignore = "spawned by e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows"]
+#[ignore = "spawn target of e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows; \
+            runs in CI when the parent re-execs it with --ignored (see doc comment)"]
 fn e2e_core_replicator_sigkill_child() -> Result<()> {
     let phase = std::env::var("WALRUST_CORE_SIGKILL_PHASE")?;
     let name = std::env::var("WALRUST_CORE_SIGKILL_NAME")?;

@@ -1211,10 +1211,31 @@ locally (sandbox MinIO clock skew, see A6).
   paths — which is why A1/A3/A5/A8 survived a "fixed and tested" review.
 - Crash consistency is simulated, never real (no SIGKILL tests; chaos
   "crashes" fault prints `[TODO]`; stress/soak cannot fail).
+  CLOSED (Phase 3): real process-SIGKILL E2Es run in CI on both stacks
+  (`e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows`,
+  `e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows` + its spawned
+  `e2e_core_replicator_sigkill_child`); the chaos `crashes` fault is now a real
+  child-process kill (`chaos::chaos_process_crash_recovery`, CI-covered by
+  `walrust-dst/tests/crash_recovery.rs`); stress/soak now hard-fail on a
+  threshold breach (`evaluate_stress_result`/`evaluate_soak_result`,
+  `threshold_tests`).
 - Phase-4 external-delta mode: publish semantics well tested; NO
   restore-from-published-deltas test.
+  CLOSED (Phase 3): `walrust-dst` `prop_fenced_delta_restore`
+  (`test_prop_fenced_delta_restore`) drives the real fenced writer path
+  (`Replicator` external mode + `set_external_delta_base` +
+  `sync_wal_fenced_delta`) and reconstructs the exact DB in a follower from the
+  published `.tlmd` envelope sequence (epoch/writer fence + BLAKE3 chain +
+  `apply_changeset_to_db`), asserting `integrity_check` + row equality.
 - Untested: compaction-vs-restore races, two watchers on one DB, ENOSPC,
   DBs > ~2MB, 64KB pages, timestamp PITR.
+  CLOSED (Phase 3, except timestamp PITR — see A9 doc-fix decision):
+  `e2e_compaction_during_restore_keeps_backup_restorable`,
+  `test_walrust_owned_concurrent_two_watchers_only_one_wins`,
+  `test_walrust_owned_enospc_during_add_is_hard_error`,
+  `e2e_cli_watch_restore_round_trips_64kb_pages`,
+  `ltx::tests::test_sqlite_snapshot_over_100mb_smoke`, and
+  `ltx::tests::test_snapshot_various_page_sizes` (both trees).
 
 ---
 
@@ -1384,6 +1405,28 @@ Phase 0+1 — independent audit (2026-07-08, fresh reviewer, review/phase-0-1-au
     and on re-run). `flush_until_frames` now uses a 30s deadline — it returns the
     instant a frame is published, so this only affects the under-load path and has
     no happy-path cost.
+    Phase 3 (2026-07-08): VERIFIED CI-runnable, both stacks. Read the latest green
+    run's log (CI run 28938797148, `production_e2e` binary): 10 passed / 0 failed /
+    1 ignored in 35.9s, and every E2E in both stacks executes —
+    CLI: `e2e_cli_watch_restore_round_trips_sqlite_rows`,
+    `e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows`,
+    `e2e_cli_watch_racing_checkpoint_no_data_loss`,
+    `e2e_cli_watch_independent_snapshot_timer_round_trips_through_reset`,
+    `e2e_cli_watch_restore_round_trips_64kb_pages`,
+    `e2e_compaction_during_restore_keeps_backup_restorable`; core:
+    `e2e_core_replicator_restore_round_trips_sqlite_rows`,
+    `e2e_core_replicator_restart_reopens_state_and_restores_cleanly`,
+    `e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss`,
+    `e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows`. The one
+    `ignored` line is the SIGKILL child spawn target — and the SAME log shows it
+    running twice as `e2e_core_replicator_sigkill_child ... ok` (once per phase the
+    parent spawns). Decision: the child STAYS `#[ignore]`d — it is a
+    coordination-driven spawn target (blocks on `WALRUST_CORE_SIGKILL_*` env +
+    go/ready/flushed file handshakes; hangs/errors run standalone). It is compiled
+    into the ordinary test binary (nothing extra to build in CI), the parent
+    re-execs it with `--ignored`, and it executes in CI. The `#[ignore]` doc
+    comment now states this precisely. No CI gating hole found: nothing is skipped
+    in CI, both stacks' E2Es (including both SIGKILL parents) run against MinIO.
 3.2 DST drives the production pipeline (not testable.rs) for at least one
     property; restore-from-published-deltas test for phase-4 mode.
     Status: Fixed — `walrust-dst` now has
@@ -1395,6 +1438,29 @@ Phase 0+1 — independent audit (2026-07-08, fresh reviewer, review/phase-0-1-au
     source. Proven by
     `invariants::tests::test_prop_production_published_delta_restore` and
     `walrust-dst invariants --invariant production_published_deltas`.
+    Phase 3 (2026-07-08): the three remaining 3.2 obligations closed.
+    (a) Chaos "crashes" [TODO] REPLACED with a real child-process kill:
+    `walrust-dst` re-execs itself as a durable on-disk cache writer, SIGKILLs it
+    mid-write, then reopens the cache and proves the committed prefix survived
+    byte-for-byte and the manifest is not torn (regression for A12 fsync +
+    atomic-rename). Wired into `chaos --faults crashes` / `--faults all`;
+    CI-covered by `walrust-dst/tests/crash_recovery.rs`. Spot-checked: neutering
+    the cache manifest atomic-rename makes it FAIL (torn JSON on reopen).
+    (b) Stress/soak can now FAIL: threshold decisions are typed evaluators
+    (`evaluate_stress_result`, `evaluate_soak_result`) that hard-error (non-zero
+    exit) on an error-rate / memory-growth / memory-trend / fd-growth breach
+    instead of printing `[WARN]` and returning Ok. Unit-proven by
+    `threshold_tests::{stress_breach_is_hard_failure, soak_breach_is_hard_failure}`.
+    (c) Fenced external (TLM_DELTA) restore-from-published-deltas ADDED:
+    `prop_fenced_delta_restore` (`test_prop_fenced_delta_restore`) drives the real
+    fenced writer path (`Replicator` external mode + `set_external_delta_base` +
+    `sync_wal_fenced_delta` shipping `.tlmd` envelopes) against the deterministic
+    `MockStorageBackend`, then plays the follower: `list_delta_envelopes_after` +
+    epoch/writer fence + BLAKE3 envelope chain + `apply_changeset_to_db` with the
+    running DB checksum threaded from the external base, asserting `integrity_check`
+    + exact source-row equality. Self-validating (a base-checksum/chain divergence
+    trips the HADBP chain verify). Spot-checked: neutering the dispatch's
+    envelope-chain advance makes it FAIL ("envelope chain break at seq N").
 3.3 Compaction-vs-restore race test; two-watchers test; ENOSPC test;
     64KB pages; >100MB DB smoke test.
     Status: Fixed — production and dual-tree coverage now exercises these
