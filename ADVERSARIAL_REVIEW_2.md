@@ -1418,9 +1418,15 @@ Phase 0+1 — independent audit (2026-07-08, fresh reviewer, review/phase-0-1-au
     `e2e_core_replicator_restart_reopens_state_and_restores_cleanly`,
     `e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss`,
     `e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows`. The one
-    `ignored` line is the SIGKILL child spawn target — and the SAME log shows it
-    running twice as `e2e_core_replicator_sigkill_child ... ok` (once per phase the
-    parent spawns). Decision: the child STAYS `#[ignore]`d — it is a
+    `ignored` line is the SIGKILL child spawn target — and the SAME log shows both
+    spawned phases start (`running 1 test` twice); only the `second` phase prints
+    `e2e_core_replicator_sigkill_child ... ok`, because the `first` phase is
+    SIGKILLed mid-run by the parent and never reports — exactly the crash under
+    test. (Phase-3 review 2026-07-08: re-verified on the branch's own green run
+    28941451610 — same 10 passed / 1 ignored, same one-ok/one-killed child shape;
+    the earlier wording "running twice as ... ok" overstated the log and was
+    corrected, since a first-phase "ok" would mean the SIGKILL missed.)
+    Decision: the child STAYS `#[ignore]`d — it is a
     coordination-driven spawn target (blocks on `WALRUST_CORE_SIGKILL_*` env +
     go/ready/flushed file handshakes; hangs/errors run standalone). It is compiled
     into the ordinary test binary (nothing extra to build in CI), the parent
@@ -1461,6 +1467,23 @@ Phase 0+1 — independent audit (2026-07-08, fresh reviewer, review/phase-0-1-au
     + exact source-row equality. Self-validating (a base-checksum/chain divergence
     trips the HADBP chain verify). Spot-checked: neutering the dispatch's
     envelope-chain advance makes it FAIL ("envelope chain break at seq N").
+    Phase-3 review (2026-07-08): finding — the property only checked the fence
+    POSITIVELY (all honest envelopes carry the right epoch/writer); it never
+    proved a follower rejects a hostile envelope. FIXED: the follower loop is now
+    a fallible `fenced_follower_reconstruct` helper, and after the honest
+    reconstruction the property forges an envelope at head+1 (wrong epoch, wrong
+    writer, broken chain — each otherwise valid, carrying real LTX bytes and, for
+    the epoch/writer cases, the CORRECT chain link) and asserts each is rejected
+    by the named fence before apply. Neuter-verified: disabling the epoch fence
+    makes the property FAIL (forgery reaches apply and dies with the wrong error).
+    Also independently re-verified the author's neuters: chain-advance removal →
+    "envelope chain break at seq 4" FAIL; cache manifest atomic-rename removal →
+    crash_recovery FAIL. Stress exit path verified end-to-end: forcing the stress
+    threshold to breach makes `walrust-dst stress` exit 1 (soak shares the same
+    `?`-propagated evaluator tail). 3.3 spot-check: neutering the CAS lineage
+    fence + snapshot/state error propagation in `Replicator::add` makes BOTH
+    `test_walrust_owned_concurrent_two_watchers_only_one_wins` (2 winners) and
+    `test_walrust_owned_enospc_during_add_is_hard_error` FAIL — both are real.
 3.3 Compaction-vs-restore race test; two-watchers test; ENOSPC test;
     64KB pages; >100MB DB smoke test.
     Status: Fixed — production and dual-tree coverage now exercises these

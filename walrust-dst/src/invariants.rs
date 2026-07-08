@@ -477,6 +477,81 @@ pub fn prop_production_published_delta_restore() -> Result<()> {
 // Invariant 4b: Fenced external (TLM_DELTA) restore-from-published-deltas
 // ============================================================================
 
+/// Follower-side fenced reconstruction: copy the external base, discover the
+/// published envelopes after `base_seq`, enforce the seq/epoch/writer fences
+/// and the BLAKE3 envelope chain, and apply each LTX payload with the running
+/// DB checksum threaded through. Fallible ON PURPOSE — the negative cases in
+/// [`prop_fenced_delta_restore`] assert that a forged envelope (wrong epoch,
+/// wrong writer, broken chain) makes this return Err *before* any apply, not
+/// get silently applied.
+///
+/// Returns `(applied_count, head_envelope_checksum)`.
+#[allow(clippy::too_many_arguments)]
+async fn fenced_follower_reconstruct(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    name: &str,
+    base_seq: u64,
+    epoch: u64,
+    writer_id: &str,
+    base_anchor: [u8; 32],
+    base_copy: &std::path::Path,
+    follower_path: &std::path::Path,
+) -> Result<(u64, [u8; 32])> {
+    use walrust::walrust_core::external_delta;
+    use walrust::walrust_core::list_delta_envelopes_after;
+    use walrust::walrust_core::ltx as core_ltx;
+
+    std::fs::copy(base_copy, follower_path)?;
+    let mut running_db = core_ltx::compute_checksum_from_file(follower_path)?;
+    let mut running_env = base_anchor;
+
+    let deltas = list_delta_envelopes_after(storage, prefix, name, base_seq).await?;
+    let mut applied: u64 = 0;
+    for (i, d) in deltas.iter().enumerate() {
+        anyhow::ensure!(
+            d.seq == base_seq + (i as u64) + 1,
+            "envelope seq must be contiguous from base: got {} at position {i}",
+            d.seq
+        );
+        anyhow::ensure!(
+            d.payload.epoch == epoch,
+            "epoch fence: rejected envelope seq {} with epoch {} != cursor epoch {epoch}",
+            d.seq,
+            d.payload.epoch
+        );
+        anyhow::ensure!(
+            d.payload.writer_id == writer_id,
+            "writer fence: rejected envelope seq {} from writer {:?} != {writer_id:?}",
+            d.seq,
+            d.payload.writer_id
+        );
+        anyhow::ensure!(
+            d.payload.prev_checksum.as_slice() == running_env.as_slice(),
+            "envelope chain break at seq {}",
+            d.seq
+        );
+        // Recompute the stored-envelope checksum from the decoded payload and
+        // confirm discovery agrees (byte-identity chain).
+        let recomputed = external_delta::checksum(
+            &external_delta::encode(&d.payload)
+                .map_err(|e| anyhow::anyhow!("re-encode envelope: {e}"))?,
+        );
+        anyhow::ensure!(
+            recomputed == d.envelope_checksum,
+            "envelope checksum must be BLAKE3 of the stored bytes (seq {})",
+            d.seq
+        );
+
+        let step =
+            core_ltx::apply_changeset_to_db(&d.payload.ltx_payload, follower_path, running_db)?;
+        running_db = step.checksum;
+        running_env = d.envelope_checksum;
+        applied += 1;
+    }
+    Ok((applied, running_env))
+}
+
 /// Property: a follower reconstructs the EXACT database from the published
 /// fenced-delta envelope sequence alone — the reason the TLM_DELTA mode exists.
 ///
@@ -493,12 +568,16 @@ pub fn prop_production_published_delta_restore() -> Result<()> {
 /// If the follower's base checksum or the applied chain ever diverges from the
 /// writer's, `apply_changeset_to_db`'s chain verify fails loudly — so this
 /// property is self-validating, not a rubber stamp.
+///
+/// The property also exercises the FENCE negatively: after the honest
+/// reconstruction it forges an envelope at the head+1 seq (wrong epoch, wrong
+/// writer, broken chain — each otherwise valid) and asserts the follower
+/// rejects each one instead of applying it.
 pub fn prop_fenced_delta_restore() -> Result<()> {
     use std::sync::Arc;
     use walrust::walrust_core::external_delta;
-    use walrust::walrust_core::ltx as core_ltx;
     use walrust::walrust_core::{
-        list_delta_envelopes_after, ReplicationConfig, Replicator, SnapshotOwnership,
+        fetch_delta_envelope, DeltaPayloadV1, ReplicationConfig, Replicator, SnapshotOwnership,
     };
 
     let mut runner = proptest::test_runner::TestRunner::new(get_production_config());
@@ -579,54 +658,22 @@ pub fn prop_fenced_delta_restore() -> Result<()> {
                 replicator.flush(name).await.expect("final fenced flush");
                 drop(replicator);
 
-                // Follower: reconstruct from the base file + published envelopes.
-                std::fs::copy(&base_copy, &follower_path).unwrap();
-                let mut running_db = core_ltx::compute_checksum_from_file(&follower_path).unwrap();
-                let mut running_env = BASE_ANCHOR;
-
-                let deltas =
-                    list_delta_envelopes_after(arc_storage.as_ref(), &prefix, name, base_seq)
-                        .await
-                        .expect("list fenced deltas");
-                prop_assert!(
-                    !deltas.is_empty(),
-                    "at least one fenced delta must be published"
-                );
-
-                for (i, d) in deltas.iter().enumerate() {
-                    prop_assert_eq!(
-                        d.seq,
-                        base_seq + (i as u64) + 1,
-                        "envelope seq must be contiguous from base"
-                    );
-                    prop_assert_eq!(d.payload.epoch, EPOCH, "epoch fence");
-                    prop_assert_eq!(d.payload.writer_id.as_str(), WRITER_ID, "writer fence");
-                    prop_assert_eq!(
-                        d.payload.prev_checksum.as_slice(),
-                        running_env.as_slice(),
-                        "envelope chain break at seq {}",
-                        d.seq
-                    );
-                    // Recompute the stored-envelope checksum from the decoded
-                    // payload and confirm discovery agrees (byte-identity chain).
-                    let recomputed = external_delta::checksum(
-                        &external_delta::encode(&d.payload).expect("re-encode envelope"),
-                    );
-                    prop_assert_eq!(
-                        recomputed,
-                        d.envelope_checksum,
-                        "envelope checksum must be BLAKE3 of the stored bytes"
-                    );
-
-                    let applied = core_ltx::apply_changeset_to_db(
-                        &d.payload.ltx_payload,
-                        &follower_path,
-                        running_db,
-                    )
-                    .expect("apply fenced delta to follower");
-                    running_db = applied.checksum;
-                    running_env = d.envelope_checksum;
-                }
+                // Follower: reconstruct from the base file + published envelopes,
+                // enforcing the seq/epoch/writer/chain fences on every envelope.
+                let (applied, head_env) = fenced_follower_reconstruct(
+                    arc_storage.as_ref(),
+                    &prefix,
+                    name,
+                    base_seq,
+                    EPOCH,
+                    WRITER_ID,
+                    BASE_ANCHOR,
+                    &base_copy,
+                    &follower_path,
+                )
+                .await
+                .expect("honest fenced follower reconstruct");
+                prop_assert!(applied >= 1, "at least one fenced delta must be published");
 
                 assert_integrity_ok(&follower_path).unwrap();
                 prop_assert_eq!(
@@ -634,6 +681,73 @@ pub fn prop_fenced_delta_restore() -> Result<()> {
                     item_rows(&db_path).unwrap(),
                     "fenced follower must match source rows exactly"
                 );
+
+                // FENCE REJECTION: forge an envelope at the head+1 seq and prove
+                // the follower rejects it instead of applying it. Each forgery is
+                // valid EXCEPT for the one fence under test — the epoch/writer
+                // forgeries carry the CORRECT chain link and real LTX bytes, so
+                // only that fence can catch them.
+                let head_seq = base_seq + applied;
+                let head = fetch_delta_envelope(arc_storage.as_ref(), &prefix, name, head_seq)
+                    .await
+                    .expect("fetch head envelope")
+                    .expect("head envelope exists");
+                let dir = head.key.rsplit_once('/').expect("delta key has a dir").0;
+                let forged_seq = head_seq + 1;
+                let forged_key = format!("{dir}/{forged_seq:016x}.tlmd");
+                let forged = |epoch: u64, writer_id: &str, prev: Vec<u8>| DeltaPayloadV1 {
+                    seq: forged_seq,
+                    epoch,
+                    writer_id: writer_id.to_string(),
+                    prev_checksum: prev,
+                    end_page_count: head.payload.end_page_count,
+                    ltx_payload: head.payload.ltx_payload.clone(),
+                };
+                let cases = [
+                    (
+                        "epoch fence",
+                        forged(EPOCH + 1, WRITER_ID, head_env.to_vec()),
+                    ),
+                    (
+                        "writer fence",
+                        forged(EPOCH, "stale-writer-B", head_env.to_vec()),
+                    ),
+                    (
+                        "envelope chain break",
+                        forged(EPOCH, WRITER_ID, vec![0xEE; 32]),
+                    ),
+                ];
+                for (expect_msg, payload) in cases {
+                    let bytes = external_delta::encode(&payload).expect("encode forged envelope");
+                    arc_storage
+                        .put(&forged_key, &bytes)
+                        .await
+                        .expect("plant forged envelope");
+                    let poisoned_follower = tmpdir.path().join("follower-poisoned.db");
+                    let err = fenced_follower_reconstruct(
+                        arc_storage.as_ref(),
+                        &prefix,
+                        name,
+                        base_seq,
+                        EPOCH,
+                        WRITER_ID,
+                        BASE_ANCHOR,
+                        &base_copy,
+                        &poisoned_follower,
+                    )
+                    .await
+                    .expect_err("forged envelope must be rejected, not applied");
+                    prop_assert!(
+                        err.to_string().contains(expect_msg),
+                        "expected rejection by {}, got: {}",
+                        expect_msg,
+                        err
+                    );
+                    arc_storage
+                        .delete(&forged_key)
+                        .await
+                        .expect("remove forged envelope");
+                }
 
                 Ok(())
             })

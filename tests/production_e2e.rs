@@ -991,9 +991,12 @@ fn spawn_core_sigkill_helper(args: CoreSigkillHelperArgs<'_>) -> Result<Child> {
 /// --ignored`, so the helper is compiled and shipped as part of the ordinary
 /// test build — nothing extra to build in CI — and it *does* execute in CI:
 /// the parent is `require_s3!`-gated, MinIO satisfies that gate, and the CI log
-/// shows `e2e_core_replicator_sigkill_child ... ok` for each spawned phase. So
-/// the SIGKILL path runs end to end in CI; the `#[ignore]` only keeps the helper
-/// out of the unparameterized default run where it has no parent to drive it.
+/// shows both spawned phases start (`running 1 test` twice). Only the `second`
+/// phase prints `e2e_core_replicator_sigkill_child ... ok`; the `first` phase
+/// is SIGKILLed mid-run by the parent, so it never reports — which is exactly
+/// the crash being tested. So the SIGKILL path runs end to end in CI; the
+/// `#[ignore]` only keeps the helper out of the unparameterized default run
+/// where it has no parent to drive it.
 #[test]
 #[ignore = "spawn target of e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows; \
             runs in CI when the parent re-execs it with --ignored (see doc comment)"]
