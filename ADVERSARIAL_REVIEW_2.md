@@ -215,6 +215,22 @@ production restart E2E now asserts fail-closed behavior with
 `e2e_core_replicator_restart_rejects_divergent_chain` until A10's state reload
 fix removes that divergent lineage.
 
+Verify (Wave 1b, 2026-07-07): VERIFIED already-fixed. Non-gated core proof
+`sync::tests::restore_errors_on_noncontiguous_incremental_sequence` passes and
+FAILS on revert: neutering the contiguity gate in `restore` at
+`crates/walrust-core/src/sync.rs:1710` (`if false && inc.seq != expected_seq`)
+makes it FAIL. That path also threads the running DB checksum through
+`apply_changeset_to_db(.., current_checksum)` and runs
+`verify_sqlite_integrity` before publish. The root proof
+`restore_rejects_incremental_without_prior_chain_link` and the S3-gated e2e
+could not be run locally: the sandbox Docker/MinIO clock is skewed vs the AWS
+request signer (`RequestTimeTooSkewed`) and an external MinIO binary download
+was policy-denied, so all ~22 S3-gated tests skip locally (they run in CI/Soup).
+Scope note: `e2e_core_replicator_restart_rejects_divergent_chain` no longer
+exists under that name — the divergent-chain e2e assertion was folded into the
+Phase-4 convergence; the surviving named restart e2e is
+`e2e_core_replicator_restart_reopens_state_and_restores_cleanly` (S3-gated).
+
 - `src/ltx.rs:177-250` `apply_ltx_to_db`: chain hasher is seeded from the LTX
   file's OWN `pre_apply_checksum`, hashes the file's OWN pages, compares to
   the file's OWN trailer. `pre_apply_checksum` is logged, never compared to
@@ -340,6 +356,17 @@ proof. Proven by
 `test_external_mode_rejects_remote_chain_without_local_progress` and
 `test_external_mode_reopen_derives_head_without_remote_state`.
 
+Verify (Wave 1b, 2026-07-07): VERIFIED already-fixed (reload-half). All three
+named non-gated proofs pass and FAIL on revert. Dropping the salt/chain reload
+at `crates/walrust-core/src/replicator.rs:355-356` (`state.wal_salt = ...` /
+`state.wal_checksum_chain = ...`) breaks
+`test_walrust_owned_reload_restores_saved_wal_salt` and
+`test_walrust_owned_reload_restores_saved_wal_checksum_chain`; reverting the
+transport-error guard at `replicator.rs:328` from
+`get(..).with_context(..)?` back to `if let Ok(Some(data)) = get(..)` (swallow)
+breaks `test_walrust_owned_reload_state_transport_error_is_hard_error`. (Both
+reverts applied together in one build; all three FAILED, then restored.)
+
 - `state.json` save/load asymmetry: `save_state` persists `wal_salt` +
   `wal_checksum_chain` (`crates/walrust-core/src/sync.rs:258-267`) but reload
   (`replicator.rs:300-327`) never reads them back => after every restart,
@@ -445,6 +472,15 @@ the disabled-timer regression is covered by
 `src/sync/watch_shadow.rs:475-502`. `walrust-core` has no verify command,
 daemon validation path, or watch-mode auto-compaction path for this finding.
 
+Verify (Wave 1b, 2026-07-07): VERIFIED already-fixed (honesty-half). Non-gated
+proof `sync::verify::tests::test_verify_chain_rejects_snapshot_to_incremental_checksum_mismatch`
+passes and FAILS on revert: gating the cross-file linkage check at
+`src/sync/verify.rs:81` (`if false && file.pre_apply_checksum != Some(..)`)
+makes it FAIL — with the check off, a snapshot->incremental checksum break is
+no longer flagged. `sync::shadow::tests::test_watch_auto_compaction_uses_listing_without_manifest`
+also passes non-gated (not revert-checked). `test_verify_no_backup_found` is
+S3-gated and skipped locally (sandbox MinIO clock skew, see A6).
+
 - `walrust verify` (`src/sync/verify.rs:233-322`): per-file internal
   checksums + TXID continuity among gen-0 files only, starting from whichever
   file is first. Never checks snapshot->first-incremental linkage, never
@@ -481,6 +517,18 @@ and
 `sync::replicate::tests::replica_gap_without_future_snapshot_errors_and_preserves_existing_database`.
 `walrust-core` has no read-replica loop corresponding to root
 `src/sync/replicate.rs`; its restore-half coverage is the relevant tree.
+
+Verify (Wave 1b, 2026-07-07): VERIFIED already-fixed (restore-half). Non-gated
+core proofs `sync::tests::restore_failure_preserves_existing_output_database`
+and `..._with_snapshot_source_failure_preserves_existing_output_database` pass
+and BOTH FAIL on revert: making `AtomicRestore::new`
+(`crates/walrust-core/src/sync.rs:32`) stage directly on the output path
+instead of a temp `.restore-*.tmp` (so a failed apply mutates the live output
+in place) breaks both — the existing DB is no longer preserved. The restore
+path stages to the temp file, runs `verify_sqlite_integrity`, then
+`staged_restore.publish(output)` (atomic rename) only on success. Root proof
+`failed_restore_preserves_existing_output_database` is S3-gated and skipped
+locally (sandbox MinIO clock skew, see A6).
 
 - `src/ltx.rs:127` writes the full DB image THEN checks the trailer; every
   incremental applies in place to the output. A failed restore leaves the
@@ -556,6 +604,20 @@ and
   `src/uploader.rs:280-338, 346-379, 392-400`;
   `src/sync/watch_independent.rs:286-292, 369-397, 456-480`;
   `src/sync/watch_shadow.rs:138-194, 919-934`).
+  Verify (Wave 1b, 2026-07-07): VERIFIED already-fixed. Four non-gated proofs
+  pass and FAIL on revert. Making the final sync in `Replicator::remove`
+  swallow errors (`crates/walrust-core/src/replicator.rs:445`,
+  `.with_context(..)?` -> `.unwrap_or(0)`, which also lets the db be
+  de-registered) breaks `test_remove_keeps_database_registered_when_final_sync_fails`;
+  turning the two shutdown final-sync `return Err(..)` arms at
+  `crates/walrust-core/src/sync.rs:2484` and `:2562` into `warn!` breaks
+  `test_run_replication_returns_final_sync_error_on_shutdown` and
+  `test_run_wal_replication_returns_final_sync_error_on_shutdown`; gating the
+  drain error at `crates/walrust-core/src/legacy_uploader.rs:321`
+  (`if false && !failed.is_empty()`) breaks
+  `test_uploader_shutdown_returns_error_after_failed_upload`. The fifth proof
+  `test_shadow_shutdown_syncs_final_real_wal_frames_to_cache` (root) passes
+  non-gated (not revert-checked; the cluster is already proven active).
 - B8 — `apply_changeset_to_db` / `pull_incremental` accept `page_id = 0` =>
   u64 underflow offset (`crates/walrust-core/src/ltx.rs:170`,
   `sync.rs:1121, 1381`) — F4 guard landed only in decode_to_db. Also no file
@@ -620,6 +682,16 @@ and
   `shadow::tests::test_shadow_wal_new_rejects_delete_mode_without_converting`,
   `sync::tests::sync_wal_rejects_database_out_of_wal_mode`, and core
   `shadow::tests::test_shadow_wal_new_rejects_delete_mode_without_converting`.
+  Verify (Wave 1b, 2026-07-07): VERIFIED already-fixed. Non-gated core proof
+  `sync::tests::sync_wal_rejects_database_out_of_wal_mode` passes and FAILS on
+  revert: relaxing the WAL-mode gate at `crates/walrust-core/src/sync.rs:939`
+  (`if mode.eq_ignore_ascii_case("wal") || true`) makes it FAIL — a non-WAL DB
+  is no longer a hard error. The core delete-mode shadow guard
+  `shadow::tests::test_shadow_wal_new_rejects_delete_mode_without_converting`
+  also passes non-gated (not revert-checked). The root
+  `test_sync_wal_concurrent_rejects_database_out_of_wal_mode` and
+  `test_sync_wal_retry_notifies_webhook_when_database_leaves_wal_mode` pass
+  non-gated as well.
 - B13 — Restore cache substitution keyed by bare TXID, no lineage/etag binding
   (`restore.rs:108-118`); NO_CHECKSUM litestream files skip even internal
   checks.
