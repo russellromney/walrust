@@ -108,8 +108,12 @@ impl WalrustError {
 
     /// True if any cause in an `anyhow` chain is a same-seq equivocation.
     pub fn is_equivocation(err: &anyhow::Error) -> bool {
-        err.chain()
-            .any(|cause| matches!(cause.downcast_ref::<WalrustError>(), Some(WalrustError::Equivocation(_))))
+        err.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<WalrustError>(),
+                Some(WalrustError::Equivocation(_))
+            )
+        })
     }
 
     /// Create a general error

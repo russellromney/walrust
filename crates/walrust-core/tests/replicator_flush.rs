@@ -726,7 +726,8 @@ async fn test_walrust_owned_reopen_does_not_seed_seq_from_change_counter() -> Re
     let db_path = dir.path().join("no-seed.db");
     let conn = create_wal_db(&db_path, 5);
     // Fold the WAL so the file change counter is written into the main DB.
-    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .unwrap();
     let cc = walrust::sync::change_counter_from_file(&db_path).expect("change counter");
     assert!(cc > 0, "precondition: file change counter must be non-zero");
 

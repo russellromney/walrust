@@ -232,18 +232,26 @@ un-re-imaged pages can be lost. Steady-state operation (walrust reads the WAL ev
 sync interval) is covered; this is the same class as the B4 restart-window
 residual and is recorded for Phase 2B state-durability.
 
-Phase 2B (2026-07-08): CLOSED. `take_snapshot`/`take_snapshot_with_retry` now
-record the raw DB *file* hash (post-checkpoint) as `SyncState.snapshot_file_checksum`.
-`read_next_wal_batch` compares the current file hash against that baseline ONLY in
-the first-read window (`wal_salt == None`) and treats a difference as a rollover
-(re-anchor). A walrust-owned WAL-resident write never mutates the main DB file, so
-there are no false positives and the full-file hash is paid at most once per
-snapshot. (SQLite's offset-24 change counter was tried first and rejected: in WAL
-mode it only advances when the DB grows, so a same-size external fold is invisible
-to it.) Proven by
-`sync::tests::walrust_owned_reanchors_on_external_checkpoint_in_first_read_window`
-(revert-verified: disabling the content check drops the in-window folded row and
-`integrity_check`/row-count fail).
+Phase 2B (2026-07-08): ATTEMPTED, REVERTED — remains a documented residual. Two
+detection signals were tried and both rejected:
+- SQLite's offset-24 file change counter: unreliable in WAL mode — it only
+  advances when the DB *grows*, so a same-size external fold is invisible.
+- Raw DB-file hash baselined at snapshot, compared in the first-read window
+  (`wal_salt == None`): this correctly detects that the main file changed, but it
+  cannot distinguish a benign external PASSIVE checkpoint (which folds frames into
+  the file yet LEAVES them readable in the WAL — no loss) from a destructive
+  TRUNCATE/RESTART (frames gone from the WAL — loss). It therefore false-positives
+  on PASSIVE folds and fired a spurious re-anchor whose `checkpoint_wal(TRUNCATE)`
+  is blocked by the pinned-reader S3 E2Es (`e2e_core_replicator_*`,
+  `busy=1`). Since the goal is not to weaken those honest E2Es and the
+  PASSIVE-vs-reset distinction is not cheaply available in the first-read window
+  (there is no recorded salt for the folded-away generation), the change was
+  reverted. The residual stands: walrust-owned mode sets `autocheckpoint=0` so an
+  external checkpoint in this window is a shouldn't-happen edge, and the periodic
+  snapshot timer bounds the exposure (the next snapshot re-images the DB file,
+  which contains any externally-folded pages). A correct fix needs a cheap
+  WAL-reset signal in the window (e.g. recording the first post-snapshot WAL salt
+  as SQLite writes it, without a full read) and is left for a later phase.
 
 Phase 2B rollover-webhook plumbing (2026-07-08): CLOSED (the "core library has NO
 webhook channel" residual). Added `RolloverObserver` — a cloneable, `Debug`,

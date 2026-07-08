@@ -715,10 +715,16 @@ mod tests {
         // Pre-restart process copies the current WAL frames.
         let mut shadow = ShadowWal::new(&db_path).await.unwrap();
         let (frames, offset) = shadow.copy_frames(0).await.unwrap();
-        assert!(frames.len() >= 10, "initial copy must read the committed frames");
+        assert!(
+            frames.len() >= 10,
+            "initial copy must read the committed frames"
+        );
         let saved_salt = shadow.wal_read_salt();
         let saved_chain = shadow.wal_read_chain();
-        assert!(saved_salt.is_some(), "a real header must have been observed");
+        assert!(
+            saved_salt.is_some(),
+            "a real header must have been observed"
+        );
         drop(shadow);
 
         // Baseline restart WITHOUT the persisted cursor: reading from offset 0
