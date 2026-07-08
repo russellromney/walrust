@@ -27,7 +27,9 @@ sync::restore(&*storage, "prefix/", "my-db", &output_path, None).await?;
 ## Features
 
 - WAL frame extraction and deduplication
-- LTX encoding with checksum chaining (litestream-compatible)
+- HADBP changeset encoding with checksum chaining (formerly "LTX"; NOT
+  Litestream-compatible — walrust folds `data_len` into the checksum, which
+  Litestream does not expect)
 - Concurrent S3 downloads for fast follower catch-up
 - Shadow WAL for decoupled uploads
 - Retry with exponential backoff and circuit breaker

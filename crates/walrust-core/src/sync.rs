@@ -5532,4 +5532,127 @@ mod tests {
             storage.delete(&forged_key).await.unwrap();
         }
     }
+
+    /// Atomicity of rejection, MID-STREAM: a forged envelope planted at a seq in
+    /// the MIDDLE of an otherwise-valid chain must leave the follower DB exactly
+    /// at the state produced by the deltas BEFORE it — no page from the forged
+    /// envelope (nor any later one) is applied — and, once the bad envelope is
+    /// replaced with the honest one, a fresh reconstruct resumes cleanly to the
+    /// full head. This guards the "fences enforced before any apply" claim
+    /// against the harder case than head+1: the forge is not at the end.
+    #[tokio::test]
+    async fn reconstruct_fenced_follower_rejects_midstream_forge_atomically() {
+        const EPOCH: u64 = 7;
+        const WRITER: &str = "leader-A";
+        const ANCHOR: [u8; 32] = [0x11; 32];
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let (conn, _db_path, base_copy) = setup_fenced_source(dir.path());
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(_db_path.clone()).unwrap();
+        state.name = "fenced".to_string();
+        state.init_checksum().unwrap();
+        let base_seq = state.current_seq;
+
+        // Four real deltas: batch b inserts row (10 + b, "d{b}") at seq base+b+1.
+        publish_fenced_deltas(
+            &storage, "fenced/", &mut state, &conn, EPOCH, WRITER, ANCHOR, 4,
+        )
+        .await;
+        drop(conn);
+
+        let cursor = FencedFollowerCursor {
+            base_seq,
+            epoch: EPOCH,
+            writer_id: WRITER.to_string(),
+            base_envelope_checksum: ANCHOR,
+        };
+
+        // Honest full reconstruct: the target the resume must reach.
+        let full_follower = dir.path().join("full.db");
+        let full = reconstruct_fenced_follower(
+            &storage,
+            "fenced/",
+            "fenced",
+            &cursor,
+            &base_copy,
+            &full_follower,
+        )
+        .await
+        .expect("honest full reconstruct");
+        assert!(full.applied >= 4, "expected 4 published deltas");
+        let full_rows = read_items(&full_follower);
+
+        // Forge the MIDDLE envelope (seq base+2, position 1 = the delta that
+        // inserts row (11, "d1")). Keep its chain link (prev_checksum) honest so
+        // ONLY the epoch fence trips — proving the fence, not the chain hash,
+        // stops a delta buried inside an otherwise-valid stream.
+        let mid_seq = base_seq + 2;
+        let real_mid = fetch_delta_envelope(&storage, "fenced/", "fenced", mid_seq)
+            .await
+            .expect("fetch mid")
+            .expect("mid exists");
+        let real_mid_bytes = external_delta::encode(&real_mid.payload).unwrap();
+        let mid_key = delta_envelope_key("fenced/", "fenced", mid_seq);
+        let forged = DeltaPayloadV1 {
+            epoch: EPOCH + 1,
+            ..real_mid.payload.clone()
+        };
+        storage
+            .put(&mid_key, &external_delta::encode(&forged).unwrap())
+            .await
+            .unwrap();
+
+        let poisoned = dir.path().join("poisoned-mid.db");
+        let err = reconstruct_fenced_follower(
+            &storage, "fenced/", "fenced", &cursor, &base_copy, &poisoned,
+        )
+        .await
+        .expect_err("mid-stream forged envelope must be rejected");
+        assert!(
+            err.to_string().contains("epoch fence"),
+            "expected epoch fence rejection at mid seq, got: {err}"
+        );
+        assert_eq!(
+            crate::errors::classify_error(&err),
+            crate::errors::ExitStatus::Integrity
+        );
+
+        // Atomicity: the follower DB holds ONLY the deltas before the forge
+        // (base + row (10,"d0")). The forged seq's row (11,"d1") and every later
+        // row (12,"d2"), (13,"d3") must be absent — the forged envelope's pages
+        // never reached the file, and no later delta was applied past the break.
+        let expected_before_forge = vec![
+            (1_i64, "base-1".to_string()),
+            (2, "base-2".to_string()),
+            (10, "d0".to_string()),
+        ];
+        assert_eq!(
+            read_items(&poisoned),
+            expected_before_forge,
+            "mid-stream rejection must leave the DB at the pre-forge (seq N-1) state exactly"
+        );
+
+        // Clean resume: replace the forged envelope with the honest bytes and
+        // reconstruct fresh — the follower reaches the full head.
+        storage.put(&mid_key, &real_mid_bytes).await.unwrap();
+        let resumed_follower = dir.path().join("resumed.db");
+        let resumed = reconstruct_fenced_follower(
+            &storage,
+            "fenced/",
+            "fenced",
+            &cursor,
+            &base_copy,
+            &resumed_follower,
+        )
+        .await
+        .expect("resume after replacing the bad envelope");
+        assert_eq!(resumed.head_seq, full.head_seq, "resume reaches full head");
+        assert_eq!(
+            read_items(&resumed_follower),
+            full_rows,
+            "resumed follower must match the honest full reconstruct exactly"
+        );
+    }
 }
