@@ -717,6 +717,31 @@ async fn test_walrust_owned_reload_state_transport_error_is_hard_error() -> Resu
 }
 
 #[tokio::test]
+async fn test_walrust_owned_reopen_does_not_seed_seq_from_change_counter() -> Result<()> {
+    // A10: on a walrust-owned reopen with no durable state.json, the publish
+    // sequence must NOT be seeded from SQLite's internal file change counter
+    // (which is unrelated to our seq and would silently fork the chain).
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("no-seed.db");
+    let conn = create_wal_db(&db_path, 5);
+    // Fold the WAL so the file change counter is written into the main DB.
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    let cc = walrust::sync::change_counter_from_file(&db_path).expect("change counter");
+    assert!(cc > 0, "precondition: file change counter must be non-zero");
+
+    let replicator = Replicator::new(storage, "wal/", make_config());
+    replicator.add_without_snapshot("no-seed", &db_path).await?;
+    assert_eq!(
+        replicator.current_seq("no-seed").await,
+        Some(0),
+        "reopen without saved state must leave seq at 0, not the change counter ({cc})"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_remove_keeps_database_registered_when_final_sync_fails() -> Result<()> {
     let inner = MemStorage::new();
     let storage = PutFailsStorage::new(inner);

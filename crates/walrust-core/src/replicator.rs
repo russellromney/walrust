@@ -316,12 +316,16 @@ impl Replicator {
 
         if db_path.exists() {
             state.init_checksum()?;
-            let base_change_counter = sync::change_counter_from_file(db_path).unwrap_or(0);
-            state.current_seq = base_change_counter;
-            state.current_txid = base_change_counter;
+            // current_txid is change-detection only; a change-counter hint is
+            // harmless. current_seq is deliberately NOT seeded here: on a
+            // walrust-owned reopen the publish sequence must come from the
+            // durable state.json, never from SQLite's internal file change
+            // counter (A10). Seeding seq from the change counter after a lost
+            // state.json silently forks the object chain at an unrelated seq.
+            state.current_txid = sync::change_counter_from_file(db_path).unwrap_or(0);
         }
 
-        // Walrust-owned mode still uses remote state.json as its reopen cursor.
+        // Walrust-owned mode uses remote state.json as its reopen cursor.
         // External-base mode returned above and derives its cursor from the
         // caller's base plus the physical changeset chain.
         let state_key = format!("{}{}/state.json", prefix, name);
