@@ -24,6 +24,17 @@ Status: Fixed — proven by
 `wal::tests::test_real_sqlite_wal_checked_reader_validates_checksum_chain`
 in both `src/` and `crates/walrust-core/`.
 
+Verify (Wave 1, 2026-07-07): VERIFIED. Fix present in
+`crates/walrust-core/src/wal.rs:124` (`magic_is_big_endian` = `magic & 1 == 1`)
+with constants corrected (`WAL_MAGIC_LE=0x377F_0682`, `WAL_MAGIC_BE=0x377F_0683`).
+Reverting the predicate to `magic & 1 == 0` makes the named test FAIL
+(`chain.is_some()` unwrap panics because the checked reader picks BE on a real
+LE WAL). The test drives the production reader `read_frames_as_page_map_checked`
+against `build_real_sqlite_wal()` (a live rusqlite WAL, `journal_mode=WAL`).
+"Both trees": Phase-4 converged the WAL layer into `walrust-core`; `src/wal.rs`
+is now a 6-line shim (`pub use walrust_core::wal::*;`), so there is one
+implementation and the second tree cannot rot. No adjacent uncovered path found.
+
 - `crates/walrust-core/src/wal.rs:91-94`, `src/wal.rs:76-78`
 - `magic_is_big_endian` returns true for `0x377f0682`. SQLite writes
   `WAL_MAGIC | SQLITE_BIGENDIAN`: `0x377f0682` = little-endian checksums (all
@@ -44,6 +55,18 @@ Status: Fixed — proven by
 `wal::tests::test_checked_reader_rejects_frame_salt_mismatch` and
 `wal::tests::test_checked_reader_rejects_zero_header_checksum` in both `src/`
 and `crates/walrust-core/`.
+
+Verify (Wave 1, 2026-07-07): VERIFIED. Frame-salt check present at
+`crates/walrust-core/src/wal.rs:481` (`if frame_salt != header_salt { break }`);
+disabling it (`if false && ...`) makes `test_checked_reader_rejects_frame_salt_mismatch`
+FAIL. Zero/invalid header checksum is a hard, typed error at
+`wal.rs:152-154` (`validate_header_checksum` returns
+`Err(InvalidHeaderChecksum)`, propagated via `?` at the reader's header parse);
+reverting it to `Ok((0,0))` (the old carve-out) makes
+`test_checked_reader_rejects_zero_header_checksum` FAIL. The validate path these
+crafted-WAL tests exercise is the same one A1 proved active on a real SQLite
+WAL; the crafted fixtures use real (not zero) checksums per the fix. Single
+converged tree (see A1). No adjacent uncovered path found.
 
 - `crates/walrust-core/src/wal.rs:424-453` (frame salt bytes 8..16 never
   compared to header salt), `wal.rs:106-130, 398-418` (`None` from
@@ -107,6 +130,24 @@ Soup-backed production-path
 `e2e_cli_watch_restore_round_trips_sqlite_rows` and the full
 `production_e2e` test binary.
 
+Verify (Wave 1, 2026-07-07): VERIFIED (with scope note). All three named
+unit tests pass and FAIL on revert: disabling the WalrustOwned re-anchor
+(`take_snapshot` on rollover, `crates/walrust-core/src/sync.rs:985`) breaks
+`test_walrust_owned_flush_resnapshots_after_checkpoint_rollover`; turning the
+external/fenced `anyhow::bail!` into a warn (`sync.rs:994`, `sync.rs:1481`)
+breaks `test_external_mode_refuses_checkpoint_rollover_until_reanchored` and
+`test_fenced_external_mode_refuses_checkpoint_rollover_until_reanchored`. These
+drive the real core `Replicator` (`add`/`flush`) against a live rusqlite WAL and
+force a real rollover via `PRAGMA wal_checkpoint(TRUNCATE)`. The `_walrust_seq`
+pinned-frame blocker exists in `crates/walrust-core/src/shadow.rs:138-151`;
+poll-mode's WAL-growth gate is gone from `src/sync/watch_independent.rs`.
+Scope note: the unit tests force the rollover synchronously between flushes and
+assert re-anchor/refusal (a new snapshot key appears / a hard error is
+returned); they do NOT run a concurrent external autocheckpointer racing an
+in-flight flush, nor do they assert end-to-end restore row-equality. That
+end-to-end/no-loss proof is `e2e_cli_watch_restore_round_trips_sqlite_rows` +
+`production_e2e`, which are credential-gated (skip without S3; run in CI/Soup).
+
 ### A4 — walrust's own checkpoint timer destroys unshipped frames
 - `src/sync/watch_shadow.rs:663-681`: comment says "First, ensure all shadow
   data is uploaded" — no such code exists. `ShadowWal::checkpoint()`
@@ -128,6 +169,21 @@ re-opening the blocker before returning. Proven by
 `sync::watch_shadow::tests::test_shadow_checkpoint_copies_syncs_and_waits_for_cache_upload`
 and
 `sync::watch_shadow::tests::test_shadow_checkpoint_refuses_pending_cache_upload`.
+
+Verify (Wave 1, 2026-07-07): VERIFIED (with scope note). The orchestration
+`checkpoint_shadow_after_durable_sync` (`src/sync/watch_shadow.rs:116`) does
+copy_frames -> shadow sync -> `wait_for_cache_checkpoint_durability` ->
+`ShadowWal::checkpoint()`. Disabling the copy-offset advance breaks
+`test_shadow_checkpoint_copies_syncs_and_waits_for_cache_upload`; removing the
+durability wait breaks `test_shadow_checkpoint_refuses_pending_cache_upload`.
+The tests drive the real path against a live rusqlite WAL + real `LocalCache`.
+"Both trees": shadow is Phase-4 converged — `src/shadow.rs` is a shim; the
+`ShadowWal::checkpoint()` busy_timeout + `wal_checkpoint(PASSIVE)` result-row
+check live in `crates/walrust-core/src/shadow.rs:404-416`. The copy/sync/wait
+orchestration is root-only (the watch loop). Scope note: the unit test calls
+`checkpoint_shadow_after_durable_sync` directly rather than exercising the live
+watch checkpoint timer racing an external autocheckpointer; that end-to-end
+path is the credential-gated `e2e_cli_watch_*` in `production_e2e`.
 
 ### A5 — Shadow generation rollover drops data: sync offset never reset, un-uploaded segments deleted
 - `src/sync/watch_shadow.rs:438` is the only assignment of
@@ -641,6 +697,43 @@ and
     `e2e_core_replicator_restore_round_trips_sqlite_rows`,
     `e2e_core_replicator_restart_reopens_state_and_restores_cleanly`, and
     `e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows`.
+
+Phase 0 — Wave 1 verification (2026-07-07):
+- 0.1 Confirmed: `[workspace]` members are `.`, `crates/walrust-core`,
+  `walrust-dst`; `make test` runs `cargo test --workspace`.
+- 0.2 Confirmed a clean clone builds from the pinned rev with NO local patch:
+  `cargo build --workspace` and `cargo test --workspace` pass with no
+  `.cargo/config.toml` present. The `[patch."…hadb.git"]` blocks are already
+  deleted from `Cargo.toml` and `walrust-dst/Cargo.toml`. `.gitignore` ignores
+  `.cargo/`, and a gitignored `.cargo/config.toml` `[patch]` -> `../hadb` is
+  the local-dev override (not committed). Decision/deviation: the hadb pin was
+  KEPT at `rev = c3eab301…` (proven-good, CI-fetchable) rather than bumped to
+  the current branch head of `hoist-prereq-internal-lease-store`
+  (remote `6d8ae0c…`); Cargo cannot carry both `branch` and `rev`, so the
+  branch is named in a comment on each `hadb-*` dependency. Rationale: the
+  paramount Phase-0 requirement is a green clean build; bumping to an
+  actively-developed branch head risks an API break with no benefit here.
+- 0.3 Confirmed the real-WAL helper exists (`build_real_sqlite_wal` in
+  `crates/walrust-core/src/wal.rs`; `create_real_wal_db` in the root shadow
+  tests; `create_source_db` + `open_external_autocheckpoint_connection` in
+  `tests/production_e2e.rs`). WAL is Phase-4 converged to one tree, so the
+  "share across both trees" clause is moot (root re-exports core).
+- 0.4 Confirmed the E2E + SIGKILL harness exists (CLI watch, CLI SIGKILL,
+  core Replicator, core restart, core SIGKILL) and uses a real external
+  autocheckpointing connection (`wal_autocheckpoint=1`). These are
+  credential-gated, not "known-failing pending a finding," so they use env
+  gating rather than `#[ignore]`.
+- 0.5 Gap found and fixed in Wave 1: ~22 S3-dependent tests (in
+  `production_e2e.rs`, `restore_chain.rs`, `test_verify.rs`, `cli_exit_codes.rs`,
+  `snapshot_source_s3.rs`, and the `sync::replicate`/`sync::shadow` unit tests)
+  were neither `#[ignore]` nor env-gated, so a clean-machine `cargo test
+  --workspace` failed on S3 service errors. Added a `s3_test_enabled()` guard
+  (skips when neither `AWS_ENDPOINT_URL_S3`/`AWS_ENDPOINT_URL` nor
+  `AWS_ACCESS_KEY_ID` is set). CI (MinIO) and local Soup set these, so the
+  tests still run there; a clean machine skips them. `cargo test --workspace`
+  now exits 0 with no `.cargo/config.toml`. CI workflow is `ci.yml`
+  (fmt + clippy + `make test USE_SOUP=0` against a MinIO service), which
+  satisfies the 0.5 `test.yml` intent.
 
 ### Phase 1 — Stop lying (small diffs, loud errors)
 1.1 A1: flip endianness predicate (both crates), rename constants, golden
