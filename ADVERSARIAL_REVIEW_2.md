@@ -148,6 +148,17 @@ in-flight flush, nor do they assert end-to-end restore row-equality. That
 end-to-end/no-loss proof is `e2e_cli_watch_restore_round_trips_sqlite_rows` +
 `production_e2e`, which are credential-gated (skip without S3; run in CI/Soup).
 
+Audit (Phase 0+1, 2026-07-08): the credential-gated `production_e2e` cases
+stabilize the round-trip by holding a `pin_read_transaction` reader on the
+watched DB, which pins the WAL so the co-resident `wal_autocheckpoint=1`
+connection cannot RESTART/TRUNCATE mid-stream. The autocheckpointer is present
+but its destructive rollover is suppressed, so no E2E case exercises a
+checkpoint race that actually drops frames. DEFERRED to Phase 2A (session 4):
+add a racing variant with the reader pin removed and decide whether the current
+re-anchor/refuse behavior holds end-to-end, per the session-4 "un-ignore the
+harness's known-failing cases as you fix them" model (there is currently no
+such ignored case to un-ignore — this note is the placeholder for it).
+
 ### A4 — walrust's own checkpoint timer destroys unshipped frames
 - `src/sync/watch_shadow.rs:663-681`: comment says "First, ensure all shadow
   data is uploaded" — no such code exists. `ShadowWal::checkpoint()`
@@ -183,7 +194,10 @@ check live in `crates/walrust-core/src/shadow.rs:404-416`. The copy/sync/wait
 orchestration is root-only (the watch loop). Scope note: the unit test calls
 `checkpoint_shadow_after_durable_sync` directly rather than exercising the live
 watch checkpoint timer racing an external autocheckpointer; that end-to-end
-path is the credential-gated `e2e_cli_watch_*` in `production_e2e`.
+path is the credential-gated `e2e_cli_watch_*` in `production_e2e`. DEFERRED to
+Phase 2A: the `e2e_cli_watch_*` cases pin a reader (see the A3 audit note), so
+the live checkpoint timer never actually destroys unshipped frames under
+test — the racing case is Phase 2A's to add and un-ignore.
 
 ### A5 — Shadow generation rollover drops data: sync offset never reset, un-uploaded segments deleted
 - `src/sync/watch_shadow.rs:438` is the only assignment of
@@ -806,6 +820,40 @@ Phase 0 — Wave 1 verification (2026-07-07):
   now exits 0 with no `.cargo/config.toml`. CI workflow is `ci.yml`
   (fmt + clippy + `make test USE_SOUP=0` against a MinIO service), which
   satisfies the 0.5 `test.yml` intent.
+
+Phase 0+1 — independent audit (2026-07-08, fresh reviewer, review/phase-0-1-audit):
+- Verdict: Phase 0 (0.1-0.5) and Phase 1 (1.3-1.7) are SATISFIED. No code
+  defects found; no dodged Phase-1 obligations. The only residuals are the
+  A3/A4 racing-checkpoint E2E cases, which are correctly Phase-2A scope (see
+  the DEFERRED notes on A3/A4).
+- Revert-proofs re-run and re-confirmed (fix reverted -> named test FAILS ->
+  restored): A1 (`magic_is_big_endian` predicate, core `wal.rs`) ->
+  `test_real_sqlite_wal_checked_reader_validates_checksum_chain`; A6
+  (restore contiguity gate, core `sync.rs`) ->
+  `restore_errors_on_noncontiguous_incremental_sequence`; A10 (state-reload
+  transport-error guard, core `replicator.rs`) ->
+  `test_walrust_owned_reload_state_transport_error_is_hard_error`; A13
+  (cross-file linkage, root `verify.rs`) ->
+  `test_verify_chain_rejects_snapshot_to_incremental_checksum_mismatch`. All
+  four drive production paths (real rusqlite WAL / core restore / core
+  Replicator reload / root verify chain), not fixtures.
+- 0.5 CI holes checked against the real run (PR #10 CI run 28921404005): the
+  ~22 S3-gated tests RUN and PASS in CI against MinIO, not skip. Evidence:
+  `production_e2e` = 7 passed / 0 failed / 1 ignored (the ignored one is the
+  SIGKILL child helper); `snapshot_source_s3` = 9 passed; the
+  `restore_chain` / `test_verify` / `cli_exit_codes` gated tests all `... ok`;
+  zero "SKIP"/"no S3 endpoint" lines anywhere in the log; zero FAILED. No
+  env-var-name mismatch: `s3_test_enabled()` keys off `AWS_ACCESS_KEY_ID` /
+  `AWS_ENDPOINT_URL*`, all set by the CI env block.
+- Clean-machine green re-confirmed locally: `cargo test --workspace` with all
+  S3 env unset exits 0 (27 test-result summaries, 0 failed; S3 cases skip).
+- Shims audited: `src/wal.rs` (6-line `pub use`), `src/ltx.rs`, and
+  `src/shadow.rs` are pure re-exports of `walrust-core` (the shadow shim adds
+  only a tested `format_segment_name` helper); no semantic drift, so the
+  dual-tree rot that spawned half these findings cannot recur for WAL/LTX/
+  shadow. No new TODO/unimplemented/`#[ignore]` half-work introduced by the
+  Phase 0/1 work (the sole `#[ignore]` is the legitimate SIGKILL child helper;
+  the walrust-dst chaos `[TODO]` is pre-existing Phase-3.2 scope).
 
 ### Phase 1 — Stop lying (small diffs, loud errors)
 1.1 A1: flip endianness predicate (both crates), rename constants, golden
