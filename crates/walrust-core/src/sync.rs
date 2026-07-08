@@ -256,6 +256,14 @@ pub struct SyncState {
     /// validation for the next incremental read so a torn tail frame is rejected
     /// rather than shipped.
     pub wal_checksum_chain: Option<(u32, u32)>,
+    /// Raw hash of the DB *file* captured at the last snapshot (post-checkpoint).
+    /// A walrust-owned DB (autocheckpoint=0) never mutates its main file except
+    /// through `take_snapshot`, so if the file hash differs before walrust's
+    /// first incremental read, an external checkpoint folded frames into the
+    /// file that walrust never read — a rollover in the first-read-after-snapshot
+    /// window (obligation 1). Checked only in that window (`wal_salt == None`),
+    /// so the full-file hash cost is paid at most once per snapshot.
+    pub snapshot_file_checksum: Option<u64>,
     /// Runtime-only sink for loud rollover events. Not persisted; the embedder
     /// installs it (e.g. wired to the CLI's webhook sender).
     pub rollover_observer: RolloverObserver,
@@ -290,6 +298,7 @@ impl SyncState {
             db_checksum: None,
             wal_salt: None,
             wal_checksum_chain: None,
+            snapshot_file_checksum: None,
             rollover_observer: RolloverObserver::default(),
         })
     }
@@ -543,6 +552,20 @@ async fn reset_wal_cursor_after_snapshot(state: &mut SyncState) {
         .flatten()
         .map(|h| h.salt());
     state.wal_checksum_chain = None;
+    // Baseline for the first-checkpoint-window guard (obligation 1). The WAL was
+    // just checkpoint-folded, so the DB file is the complete committed state; a
+    // differing file hash before the first read means an external checkpoint
+    // folded frames walrust never read.
+    state.snapshot_file_checksum = db_file_checksum(&state.db_path).await;
+}
+
+/// Raw hash of the current DB file, off the async runtime (a full-file read).
+async fn db_file_checksum(db_path: &Path) -> Option<u64> {
+    let path = db_path.to_path_buf();
+    tokio::task::spawn_blocking(move || ltx::compute_checksum_from_file(&path).ok())
+        .await
+        .ok()
+        .flatten()
 }
 
 // ============================================================================
@@ -953,19 +976,39 @@ struct WalBatch {
 async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> Result<WalBatch> {
     let current_salt = header.salt();
 
-    // Two-pronged rollover detection: size shrink OR salt change.
+    // Three-pronged rollover detection: size shrink, salt change, OR the DB
+    // file content changing in the first-read-after-snapshot window. The last
+    // prong closes the first-checkpoint window (obligation 1): right after a
+    // snapshot the WAL is empty and `wal_salt` is `None`, so a size/salt reset
+    // from an external checkpoint that folds un-read frames in that window is
+    // invisible — but such a checkpoint mutates the DB *file*, which a
+    // walrust-owned WAL-resident write never does. The full-file hash is only
+    // computed in that window (`wal_salt == None`), so it costs at most once per
+    // snapshot; steady-state rollovers are caught by the salt check.
     let size = wal::get_wal_size(&state.wal_path).await?;
     let size_rollover = size < state.wal_offset;
     let salt_rollover = matches!(state.wal_salt, Some(prev) if prev != current_salt);
+    let content_rollover = if state.wal_salt.is_none() {
+        match state.snapshot_file_checksum {
+            Some(baseline) => db_file_checksum(&state.db_path)
+                .await
+                .map(|cs| cs != baseline)
+                .unwrap_or(false),
+            None => false,
+        }
+    } else {
+        false
+    };
 
-    let rollover_detected = size_rollover || salt_rollover;
+    let rollover_detected = size_rollover || salt_rollover || content_rollover;
 
     if rollover_detected {
         tracing::info!(
-            "{}: WAL rollover detected (size_rollover={}, salt_rollover={}); resetting offset",
+            "{}: WAL rollover detected (size_rollover={}, salt_rollover={}, content_rollover={}); resetting offset",
             state.name,
             size_rollover,
-            salt_rollover
+            salt_rollover,
+            content_rollover
         );
         state.wal_offset = 0;
         // New generation: chain must re-seed from the new header.
@@ -4670,6 +4713,85 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 3, "all rows including the post-crash commit must restore");
+        let integrity: String = rconn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn walrust_owned_reanchors_on_external_checkpoint_in_first_read_window() {
+        // Obligation 1: right after a snapshot the WAL is empty and wal_salt is
+        // None, so an external checkpoint that folds un-read frames in the window
+        // before walrust's first incremental read is invisible to size/salt
+        // rollover detection. It IS visible via the DB file change counter, which
+        // a walrust-owned WAL-resident write never advances. The next sync must
+        // re-anchor (snapshot) rather than ship an incremental across the gap.
+        let dir = tempfile::TempDir::new().unwrap();
+        let db_path = dir.path().join("first-window.db");
+        let restored_path = dir.path().join("restored.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "
+            PRAGMA journal_mode=WAL;
+            PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO items (id, value) VALUES (1, 'base');
+            ",
+        )
+        .unwrap();
+
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path.clone()).unwrap();
+        state.name = "first_window".to_string();
+        state.init_checksum().unwrap();
+        take_snapshot_with_retry(&storage, "p/", &mut state, &RetryPolicy::default_policy())
+            .await
+            .unwrap();
+        assert!(
+            state.snapshot_file_checksum.is_some(),
+            "snapshot must record the DB file-hash baseline"
+        );
+
+        // Frames written but NOT yet read by walrust (the first-read window).
+        conn.execute("INSERT INTO items (id, value) VALUES (2, 'in-window')", [])
+            .unwrap();
+
+        // An external actor checkpoint-folds those frames into the DB file and
+        // resets the WAL, all before walrust's first incremental read.
+        let external = rusqlite::Connection::open(&db_path).unwrap();
+        external
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let (busy, _log, _ckpt): (i64, i64, i64) = external
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
+        assert_eq!(busy, 0, "external checkpoint must actually fold the frames");
+
+        // A later commit reopens the WAL (new salt); walrust's first read is now.
+        conn.execute("INSERT INTO items (id, value) VALUES (3, 'after-window')", [])
+            .unwrap();
+
+        sync_wal(&storage, "p/", &mut state)
+            .await
+            .expect("first-window external checkpoint must re-anchor");
+        let snap_key =
+            build_changeset_key("p/", &state.name, GENERATION_SNAPSHOT, state.current_seq);
+        assert!(
+            storage.get(&snap_key).await.unwrap().is_some(),
+            "detecting the first-window rollover must publish a re-anchor snapshot"
+        );
+
+        restore(&storage, "p/", &state.name, &restored_path, None)
+            .await
+            .expect("restore after re-anchor");
+        let rconn = rusqlite::Connection::open(&restored_path).unwrap();
+        let count: i64 = rconn
+            .query_row("SELECT COUNT(*) FROM items", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 3, "the in-window folded row must not be lost");
         let integrity: String = rconn
             .query_row("PRAGMA integrity_check", [], |r| r.get(0))
             .unwrap();
