@@ -556,9 +556,22 @@ pub async fn read_frames_as_page_map_checked(
 
         if validate {
             if let Some(seed) = out_chain {
-                if let Some(next) = verify_frame_checksum(seed, &header_buf, &page_data, big_endian)
-                {
-                    out_chain = Some(next);
+                match verify_frame_checksum(seed, &header_buf, &page_data, big_endian) {
+                    Some(next) => out_chain = Some(next),
+                    None => {
+                        // Pass 1 already validated this frame's checksum chain, so a
+                        // pass-2 mismatch means the bytes changed between the two reads:
+                        // a concurrent checkpoint/reset raced this read (TOCTOU). Fail
+                        // closed — do NOT insert the (possibly stale / mixed-generation)
+                        // page and do NOT silently stop advancing the chain (B1).
+                        return Err(anyhow::anyhow!(
+                            "WAL frame {} failed checksum re-verification during read of \
+                             {:?}; concurrent checkpoint/reset suspected — refusing to \
+                             emit a partially validated page map",
+                            idx + 1,
+                            path
+                        ));
+                    }
                 }
             }
         }
@@ -569,7 +582,17 @@ pub async fn read_frames_as_page_map_checked(
         page_map.insert(page_number, page_data.clone());
     }
 
+    // Post-read stability check: if the WAL was reset (shrunk below the frames we
+    // just returned, or its header salt changed) while we were reading, the parsed
+    // frames may be a torn mix of two generations. Fail closed (B1).
     let new_offset = start_pos + committed_frames as u64 * frame_size;
+    detect_reset_during_read(
+        path,
+        file_size,
+        new_offset,
+        header_seed.map(|(_, _, salt)| salt),
+    )
+    .await?;
 
     Ok((
         page_map,
@@ -886,7 +909,62 @@ pub async fn read_frames_as_pages_checked(
     frames.truncate(committed_count);
     let new_offset = start_pos + committed_count as u64 * frame_size;
 
+    // Post-read stability check: reject frames read across a concurrent WAL
+    // reset (size shrank below what we returned, or the salt changed) (B1).
+    detect_reset_during_read(
+        path,
+        file_size,
+        new_offset,
+        header_seed.map(|(_, _, salt)| salt),
+    )
+    .await?;
+
     Ok((frames, new_offset, final_db_size, committed_chain))
+}
+
+/// Detect a concurrent WAL checkpoint/reset that raced a checked read.
+///
+/// A checked reader stats the file size and reads the header salt at the START
+/// of its read. If, by the time the read completes, the file has shrunk below
+/// the frames it is about to return (`committed_end`) or the header salt has
+/// changed, the WAL was reset underneath the reader and the parsed frames may
+/// be a torn mix of two generations. Callers MUST fail closed rather than emit
+/// pages they can no longer prove are backed by the current WAL (B1).
+///
+/// A file that merely GREW (new frames appended after the snapshot) is benign
+/// and does not trip this check.
+async fn detect_reset_during_read(
+    path: &Path,
+    size_before: u64,
+    committed_end: u64,
+    salt_before: Option<(u32, u32)>,
+) -> Result<()> {
+    let size_after = get_wal_size(path).await?;
+    if size_after < committed_end {
+        return Err(anyhow::anyhow!(
+            "WAL {:?} shrank during read ({} bytes at start, {} now, {} bytes returned); \
+             concurrent checkpoint/reset — refusing to trust the parsed frames",
+            path,
+            size_before,
+            size_after,
+            committed_end
+        ));
+    }
+    if let Some(before) = salt_before {
+        if let Some(header) = read_header(path).await? {
+            let after = header.salt();
+            if after != before {
+                return Err(anyhow::anyhow!(
+                    "WAL {:?} header salt changed during read ({:?} -> {:?}); concurrent \
+                     checkpoint/reset — refusing to trust the parsed frames",
+                    path,
+                    before,
+                    after
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Read WAL frames with full metadata for robust checkpoint detection
@@ -1211,6 +1289,91 @@ mod tests {
         assert_eq!(commit_count, 1);
         assert_eq!(pages.len(), 2);
         assert!(chain.is_some(), "valid chain returns a running checksum");
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_detect_reset_during_read_rejects_truncated_wal() {
+        // B1: a WAL that shrank below the frames the reader is returning was reset
+        // (checkpoint TRUNCATE) mid-read; the parsed frames are no longer backed.
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-reset-trunc-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let page_size = 1024u32;
+        let salt = (0x1111_1111u32, 0x2222_2222u32);
+        let wal = build_valid_wal(page_size, salt, &[(1, 1, 0xAA), (2, 2, 0xBB)]);
+        tokio::fs::write(&path, &wal).await.unwrap();
+        let size_before = wal.len() as u64;
+
+        // Simulate a concurrent checkpoint that truncated the WAL after we stat'd it.
+        tokio::fs::write(&path, &wal[..64]).await.unwrap();
+
+        let err = detect_reset_during_read(&path, size_before, size_before, Some(salt))
+            .await
+            .expect_err("shrunk WAL must be a hard error");
+        assert!(err.to_string().contains("shrank during read"), "{err}");
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_detect_reset_during_read_rejects_salt_change() {
+        // B1: the WAL header salt changed during the read (RESTART reset), so the
+        // frames we parsed belong to a stale generation.
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-reset-salt-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let page_size = 1024u32;
+        let salt_before = (0x1111_1111u32, 0x2222_2222u32);
+        let wal = build_valid_wal(page_size, salt_before, &[(1, 1, 0xAA), (2, 2, 0xBB)]);
+        tokio::fs::write(&path, &wal).await.unwrap();
+        let size_before = wal.len() as u64;
+
+        // Rewrite the WAL with a new generation's salt (same length, no shrink).
+        let reset = build_valid_wal(
+            page_size,
+            (0x3333_3333, 0x4444_4444),
+            &[(1, 1, 0xCC), (2, 2, 0xDD)],
+        );
+        tokio::fs::write(&path, &reset).await.unwrap();
+
+        let err = detect_reset_during_read(&path, size_before, size_before, Some(salt_before))
+            .await
+            .expect_err("salt change during read must be a hard error");
+        assert!(
+            err.to_string().contains("salt changed during read"),
+            "{err}"
+        );
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_detect_reset_during_read_accepts_stable_or_grown_wal() {
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-reset-stable-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let page_size = 1024u32;
+        let salt = (0x1111_1111u32, 0x2222_2222u32);
+        let wal = build_valid_wal(page_size, salt, &[(1, 1, 0xAA), (2, 2, 0xBB)]);
+        tokio::fs::write(&path, &wal).await.unwrap();
+        let size_before = wal.len() as u64;
+
+        // Unchanged file is fine.
+        detect_reset_during_read(&path, size_before, size_before, Some(salt))
+            .await
+            .expect("stable WAL must pass");
+
+        // A WAL that only GREW (new frames appended, same salt) is benign.
+        let grown = build_valid_wal(page_size, salt, &[(1, 1, 0xAA), (2, 2, 0xBB), (3, 3, 0xEE)]);
+        tokio::fs::write(&path, &grown).await.unwrap();
+        detect_reset_during_read(&path, size_before, size_before, Some(salt))
+            .await
+            .expect("grown WAL must pass");
 
         tokio::fs::remove_file(&path).await.ok();
     }
