@@ -15,7 +15,8 @@ path = "src/main.rs"
 walrust = { path = ".." }
 
 # Storage trait — DST mock + tests implement it directly. Pinned to the same
-# hadb commit walrust uses so it resolves to exactly one copy.
+# hadb commit walrust uses so it resolves to exactly one copy. Rev is on branch
+# `hoist-prereq-internal-lease-store` (Cargo allows only one of branch/rev).
 hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "c3eab301aa680bc647641d78f0aa3d640589ef9b" }
 
 # Property-based testing
