@@ -67,7 +67,9 @@ impl Walrust {
     /// Args:
     ///     name: Database name (as stored in S3)
     ///     output: Output path for the restored database
-    ///     point_in_time: Optional ISO 8601 timestamp for point-in-time recovery
+    ///     point_in_time: Optional TXID/sequence number (as a string, e.g. "42")
+    ///         to restore through. Timestamp-based PITR is not implemented;
+    ///         object keys carry only TXID/sequence range, not wall-clock time.
     #[pyo3(signature = (name, output, point_in_time=None))]
     fn restore(&self, name: &str, output: &str, point_in_time: Option<&str>) -> PyResult<()> {
         let bucket = self.bucket.clone();

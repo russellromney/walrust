@@ -487,6 +487,29 @@ TXID/sequence-based PITR instead of ISO 8601 timestamps. Proven by
 `point_in_time_restore_uses_latest_snapshot_not_after_target` and
 `sync::tests::restore_point_in_time_uses_latest_snapshot_not_after_target`.
 
+Verify (Phase 2C, 2026-07-08): VERIFIED. Timestamp-PITR-vs-doc-fix decision
+(2.7) re-affirmed: the doc fix stands — object keys carry only TXID/sequence
+range, not commit wall-clock time, so ISO-8601 PITR is not implementable
+without new commit-time metadata; every `--point-in-time` help/doc string
+documents a TXID/sequence target and the parser rejects non-numeric input
+(`WalrustError::restore("... Use TXID (number)")`). Selection re-revert-verified:
+relaxing the core snapshot filter `snapshots.retain(|c| c.seq <= target_seq)` to
+keep-all makes `sync::tests::restore_point_in_time_uses_latest_snapshot_not_after_target`
+FAIL (restore picks the newest snapshot past the target instead of the latest
+snapshot at-or-before it). The core-only non-gated proof passes; the root
+`point_in_time_restore_uses_latest_snapshot_not_after_target` is S3-gated
+(runs in CI/Soup).
+
+Verify (Phase 2C review, 2026-07-08): swept every user-facing PIT string
+(`grep -ri "8601|point.in.time|PITR|timestamp"` across src, docs, README).
+CLI help (`main.rs`: "Restore to specific TXID/sequence number"), the parser
+error (`restore.rs`: "Use TXID (number)"), the docs site, and README are all
+correct. FOUND ONE MISSED false promise: the Python binding docstring
+(`src/python.rs`) still read "point_in_time: Optional ISO 8601 timestamp" —
+corrected to document a TXID/sequence number and that timestamp PITR is not
+implemented. `src/sync/types.rs` "Upload timestamp (ISO 8601)" is an internal
+`created_at` field description (accurate), not the restore param.
+
 - `src/sync/restore.rs:84` hard-codes `find_latest_snapshot` (no target
   param). If `target_txid < snapshot_max_txid`, restore always fails
   ("overshot") even when an older retained snapshot + incrementals cover the
@@ -602,6 +625,18 @@ by `test_contiguous_cursor_advances_over_uploaded_ltx_intervals`,
 `walrust-dst` uses this root cache/uploader pipeline; `walrust-core` has no
 corresponding local-cache uploader tree.
 
+Verify (Phase 2C, 2026-07-08): VERIFIED. All four named proofs (now owned by
+`walrust_core::legacy_cache`/`legacy_uploader` after convergence) pass on this
+branch. Revert-verified the central 2.6 regression: replacing the interval walk
+in `legacy_cache::recompute_contiguous` (`if min_txid <= next && next <=
+max_txid`) with the old bare-max keying (`if next == max_txid`) makes
+`test_contiguous_cursor_advances_over_uploaded_ltx_intervals` FAIL (a multi-page
+LTX interval stalls the cursor). Halt-vs-block decision (2.6): walrust HALTS the
+uploader on a permanent failure (`handle_join_result_nonfatal` returns the error;
+`test_uploader_halts_after_permanent_failure_without_shipping_later_txids`) rather
+than shipping later TXIDs around the hole — the pipeline stops loudly and the
+failed TXID re-enqueues on restart (`test_failed_uploads_reenqueue_on_restart`).
+
 - `src/uploader.rs:164-185` + `src/cache.rs:305-314`: permanently-failed TXID
   is removed from pending; restart resume reads only `pending_uploads()` —
   failed TXIDs are never re-enqueued by anyone (`failed_uploads()` has zero
@@ -632,6 +667,14 @@ were converted to production-valid LTX fixtures so uploader/cache integration
 continues through the real LTX path. Power-loss fsync behavior is not directly
 simulated in unit tests, but the production ack paths now issue the required
 file and directory fsyncs.
+
+Verify (Phase 2C, 2026-07-08): VERIFIED. `test_uploader_rejects_corrupt_cached_ltx_before_put`
+passes and FAILS on revert: gating the `verify_ltx(Cursor::new(&data))`
+pre-PUT decode in `legacy_uploader::upload_txid` (behind `if false`) makes a
+corrupt cached LTX ship to storage, failing the test's "corrupt cached bytes
+must not be PUT" assertion. The fsync file+parent-dir ack paths in
+`legacy_cache` (temp-write + `sync_all` + rename + dir fsync) and the shadow
+segment / `decode_to_db` fsync paths remain in the converged core.
 - `src/cache.rs:236-246` (`write_ltx_inner`) and `:211-222` (`save_manifest`):
   `fs::write` + `rename`, no `File::sync_all`, no directory fsync. Shadow
   segments only `flush()` (`src/shadow.rs:251`). Core shadow same
@@ -711,6 +754,18 @@ and
 `walrust-core` has no read-replica loop corresponding to root
 `src/sync/replicate.rs`; its restore-half coverage is the relevant tree.
 
+Verify (Phase 2C, 2026-07-08): VERIFIED (replica half). Both named root
+proofs pass on this branch:
+`sync::replicate::tests::replica_failed_incremental_apply_preserves_existing_database`
+(incremental apply runs on a staged copy that is atomically renamed only after
+LTX apply + integrity check succeed — a bad incremental preserves the live DB)
+and
+`sync::replicate::tests::replica_gap_without_future_snapshot_errors_and_preserves_existing_database`
+(a mid-chain gap with no snapshot past it hard-errors and preserves local
+data/state — no unbounded re-bootstrap loop, no backwards time travel). The
+atomic staged-apply/bootstrap engine is owned by
+`walrust_core::legacy_replica`; the root loop keeps the gap decision + backoff.
+
 Verify (Wave 1b, 2026-07-07): VERIFIED already-fixed (restore-half). Non-gated
 core proofs `sync::tests::restore_failure_preserves_existing_output_database`
 and `..._with_snapshot_source_failure_preserves_existing_output_database` pass
@@ -743,6 +798,41 @@ locally (sandbox MinIO clock skew, see A6).
   inserted anyway, chain silently stops advancing
   (`crates/walrust-core/src/wal.rs:489-507`; same in `src/wal.rs`). No
   post-read size/salt re-check (TOCTOU with concurrent reset).
+  Status: Fixed (Phase 2C, 2026-07-08). Two halves in
+  `crates/walrust-core/src/wal.rs` (WAL is Phase-4 converged, so `src/wal.rs`
+  is a shim and this lands once):
+  (1) Pass-2 hard stop. In `read_frames_as_page_map_checked`, a pass-2
+  `verify_frame_checksum` returning `None` (the frame's bytes changed between
+  the pass-1 validate and the pass-2 re-read — a concurrent checkpoint/reset)
+  is now a hard error that refuses to emit a partially-validated page map,
+  instead of silently inserting the page while the chain stops advancing.
+  (2) Post-read stability guard. Both checked readers
+  (`read_frames_as_page_map_checked`, `read_frames_as_pages_checked`) now call
+  `detect_reset_during_read` before returning success: if the WAL shrank below
+  the frames being returned, or the header salt changed since the read began,
+  the frames may be a torn mix of two generations, so the reader hard-errors.
+  A WAL that merely grew (new frames appended, same salt) stays benign. Proven
+  by `wal::tests::test_detect_reset_during_read_rejects_truncated_wal`,
+  `..._rejects_salt_change`, and `..._accepts_stable_or_grown_wal`
+  (revert-verified: neutering `detect_reset_during_read` to `Ok(())` makes the
+  two rejection tests FAIL). Root uses these core readers via the shim.
+  Verify (Phase 2C review, 2026-07-08): the three original proofs exercised the
+  guard HELPER directly, not the reader CALL SITE — neutering both call-site
+  invocations (`if false { detect_reset_during_read(..) }`) left the ENTIRE
+  walrust-core suite green (vacuous-guard soft spot confirmed). Added two
+  call-site integration tests
+  (`wal::tests::test_checked_reader_call_site_rejects_reset_shrink_during_read`,
+  `..._rejects_salt_change_during_read`) that drive the guard through the real
+  `read_frames_as_pages_checked`: the reader opens its fd on generation A, a
+  concurrent task atomically renames a smaller/different-salt generation over
+  the path mid-read (Unix open-fd semantics keep the read on gen A), and the
+  post-read guard re-opens the path and hard-errors. Both FAIL with the call
+  site neutered and PASS restored (revert-verified). Pass-2 hard-error path:
+  reached only under in-place mid-call frame rewrite (SQLite RESTART reuse);
+  the early `Err` return mutates no caller state (chain seed / page_map are
+  locals returned only on `Ok`), and the sole production caller
+  (`legacy_wal_sync.rs:234` via `?`) does not advance offset/chain/txid on
+  `Err`, so a retry re-reads consistently.
 - B2 — `pull_incremental` / `pull_incremental_into_sink` re-anchor the chain
   from `None` every call (`sync.rs:1346, 1510`): a steady-state follower
   pulling 1 changeset/poll never verifies anything (F13 holds only
@@ -757,6 +847,12 @@ locally (sandbox MinIO clock skew, see A6).
   `sync::tests::pull_into_sink_errors_on_broken_chain_without_applying_pages`.
   Root is unaffected: these pull APIs and `PageReplaySink` exist only in
   `crates/walrust-core/`.
+  Verify (Phase 2C, 2026-07-08): VERIFIED. All three B2 proofs plus the B3
+  proof `restore_with_snapshot_source_rejects_first_incremental_with_wrong_anchor_checksum`
+  pass on this branch. The pull APIs take/return a `PullCursor { seq, checksum }`
+  and `SnapshotSource` returns a `SnapshotCheckpoint { seq, checksum }`, so a
+  steady-state 1-changeset poll and a snapshot-anchored restore both verify the
+  first changeset against the caller's running chain (not `None`).
 - B3 — `restore_with_snapshot_source` applies the first incremental unverified
   (trait provides no anchor checksum, `snapshot_source.rs:40`,
   `sync.rs:1087-1135`) and returns Ok on a later chain break. Use
@@ -899,6 +995,13 @@ locally (sandbox MinIO clock skew, see A6).
   Root uses the separate `litepages` LTX path; page IDs/page sizes are
   constructed through `PageNum::new`/`PageSize::new` and this HADBP
   `apply_changeset_to_db`/`pull_incremental` bug does not exist there.
+  Verify (Phase 2C, 2026-07-08): VERIFIED. `test_apply_rejects_page_id_zero_without_mutating_database`,
+  `pull_incremental_rejects_page_id_zero_without_mutating_database`, and
+  `pull_incremental_truncates_database_to_encoded_end_page_count` pass on this
+  branch: page_id >= 1 is guarded before offset math in all core apply paths
+  and a shrink/VACUUM truncates the follower to the encoded end-page count.
+  Also confirmed the root legacy decode path guards `pn < 1 || pn > num_pages`
+  and bounds `num_pages * page_size` before allocating (`legacy_ltx::decode_to_db`).
 - B9 — Untrusted-size allocations: `page_size`/`max_page` magnitude unchecked
   (`crates/walrust-core/src/ltx.rs:87-91`; page_size never checked for
   0/pow2/<=65536); `hadb-changeset` `Vec::with_capacity(page_count)` with
@@ -910,6 +1013,11 @@ locally (sandbox MinIO clock skew, see A6).
   decoded DB sizes beyond a 1 TiB safety cap. Proven by
   `ltx::tests::test_apply_rejects_invalid_sqlite_page_size_without_mutating_database`
   and `ltx::tests::test_decode_rejects_invalid_sqlite_page_size`.
+  Verify (Phase 2C, 2026-07-08): VERIFIED. Both named proofs pass on this
+  branch: HADBP headers are preflighted (page_size a power of two in
+  512..=65536, decoded DB size capped) before `hadb-changeset::decode` can
+  allocate a page vector, so a crafted/corrupt object cannot force a giant
+  allocation.
 - B10 — Snapshot TXID cursor claims WAL-resident commits the raw file copy
   doesn't contain (`sync.rs:913-919` counts WAL commits; binary path PASSIVE
   may not backfill) => transactions in neither snapshot nor any post-snapshot
@@ -1030,6 +1138,43 @@ locally (sandbox MinIO clock skew, see A6).
 - B13 — Restore cache substitution keyed by bare TXID, no lineage/etag binding
   (`restore.rs:108-118`); NO_CHECKSUM litestream files skip even internal
   checks.
+  Status: Fixed (Phase 2C, 2026-07-08). Root `CachedLegacyStorage::get`
+  (`src/sync/restore.rs`) no longer substitutes a cached LTX on a bare max-TXID
+  match. `cache_substitute_for_key` now (a) parses the FULL `(min, max)` TXID
+  interval the requested object KEY names (`key_txid_range`, canonical
+  `db/GEN/min-max.ltx` and legacy-flat shapes), (b) decodes and verifies the
+  cached bytes with `walrust_core::legacy_ltx::verify_ltx`, and (c) substitutes
+  ONLY when the cached LTX's encoded `(min, max)` range equals the key range;
+  any mismatch or verification failure falls back to authoritative S3. This
+  closes the bare-TXID hole (two objects from different generations/lineages
+  can share a max TXID; the cache dir is already per-DB-path scoped, so the
+  cross-object confusion that remained was the TXID-interval collision). The
+  NO_CHECKSUM half is covered on two fronts: `verify_ltx` runs the internal LTX
+  trailer/decode check regardless of the litestream NO_CHECKSUM per-page flag,
+  and the restore chain (`legacy_restore`) links files via walrust-computed
+  DB-anchored `pre/post_apply` checksums (`apply_ltx_to_db_checked`), which are
+  computed from actual DB bytes even for NO_CHECKSUM files — so a NO_CHECKSUM
+  object cannot silently break the chain. Proven by
+  `sync::restore::tests::cache_substitution_binds_to_key_txid_range_not_bare_txid`
+  (revert-verified: restoring the bare-`has_txid` substitution makes it FAIL —
+  a same-max/different-min key wrongly returns the cached bytes). Core is
+  unaffected: this cache-over-S3 substitution is a root-only restore adapter.
+  Verify (Phase 2C review, 2026-07-08): revert-verified independently
+  (`if true || cached == (min,max)` → test FAILS). Attack edges checked:
+  (a) NO_CHECKSUM litestream files — `verify_ltx` parses the header + decodes
+  every page regardless of the NO_CHECKSUM flag (that flag only skips the
+  per-page checksum COMPARE, not the header/range decode), so the decoded
+  `(min,max)` used for the binding is authoritative even for those files; the
+  restore chain separately re-checks DB-anchored pre/post checksums.
+  (b) Interval parse failures — `key_txid_range` returns `None` and
+  `cache_substitute_for_key` short-circuits to S3 (no panic); added assertions
+  for an unparseable key and an empty key to the proof.
+  (c) SNAPSHOT vs INCREMENTAL at the same key — the cache holds one file per
+  max-TXID; the binding compares the DECODED `(min,max)` to the key range, so a
+  cached snapshot (min=1) never satisfies an incremental key (min>1) and vice
+  versa. Residual: a same-`(min,max)` collision across generations after a
+  TXID-rewinding reset would pass the binding, but is backstopped by the
+  DB-anchored restore chain checksums (documented, later-phase).
 - B14 — `list_delta_envelopes_after` never asserts payload.seq == key-derived
   seq (`sync.rs:748-767`); genesis sentinel ambiguity (empty vs 32 zero
   bytes) in `external_delta.rs`.
