@@ -12,7 +12,11 @@ use crate::mock_storage::{MockStorageBackend, MockStorageConfig, StorageFault};
 use anyhow::Result;
 use rusqlite::Connection;
 use std::io::Cursor;
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use walrust::cache::LocalCache;
 use walrust::ltx;
 use walrust::testable::{self, SyncState};
 
@@ -763,6 +767,188 @@ pub async fn chaos_disk_queue_concurrent_isolation(
 // ============================================================================
 // Tests
 // ============================================================================
+
+// ============================================================================
+// Chaos Test: Real Child-Process Crash (SIGKILL) Recovery
+// ============================================================================
+
+/// Env var: when set, the process runs as the crash-test child instead of the
+/// normal CLI. Dispatched at the very top of `main()` before clap parsing.
+pub const CRASH_CHILD_ENV: &str = "WALRUST_DST_CRASH_CHILD";
+const CRASH_CACHE_DIR_ENV: &str = "WALRUST_DST_CRASH_CACHE_DIR";
+const CRASH_READY_ENV: &str = "WALRUST_DST_CRASH_READY";
+const CRASH_COUNT_ENV: &str = "WALRUST_DST_CRASH_COUNT";
+
+/// Deterministic cache payload for a given txid so the parent can re-derive and
+/// byte-compare exactly what a committed child wrote. Padded to a fixed size so
+/// a torn (truncated) write surfaces as a size mismatch, not a silent short read.
+fn crash_ltx_content(txid: u64) -> Vec<u8> {
+    let mut data = Vec::with_capacity(256);
+    data.extend_from_slice(b"WALRUST_DST_CRASH_LTX");
+    data.extend_from_slice(&txid.to_le_bytes());
+    data.resize(256, (txid & 0xff) as u8);
+    data
+}
+
+/// Child routine (separate process): open a real on-disk cache, durably write
+/// `count` LTX files, signal readiness, then keep writing forever until the
+/// parent SIGKILLs it. Because it runs in its own process, the parent can hard-
+/// kill it and observe that the fsync + atomic-rename cache write path leaves a
+/// reopenable, non-torn cache across a real process death (regression for A12).
+pub fn run_crash_child() -> Result<()> {
+    let cache_dir = PathBuf::from(std::env::var(CRASH_CACHE_DIR_ENV)?);
+    let ready_path = PathBuf::from(std::env::var(CRASH_READY_ENV)?);
+    let count: u64 = std::env::var(CRASH_COUNT_ENV)?.parse()?;
+
+    let cache = LocalCache::new_at(&cache_dir)?;
+
+    // Durably commit the first `count` LTX before signaling ready.
+    for txid in 1..=count {
+        cache.write_ltx(txid, &crash_ltx_content(txid))?;
+    }
+    std::fs::write(&ready_path, b"ready")?;
+
+    // Keep churning the manifest + LTX write path so the parent's SIGKILL lands
+    // mid-write. An interrupted temp+rename must never leave a torn manifest or
+    // a truncated committed file.
+    // No pacing sleep: churn the manifest + LTX write path as fast as possible
+    // so the parent's SIGKILL has the widest chance of landing mid-write.
+    let mut txid = count + 1;
+    loop {
+        cache.write_ltx(txid, &crash_ltx_content(txid))?;
+        txid += 1;
+    }
+}
+
+/// Real child-process crash recovery: spawn the walrust-dst binary as a child
+/// that durably writes to an on-disk cache, SIGKILL it mid-write, then reopen
+/// the cache in this process and prove the committed prefix survived intact and
+/// the manifest is not torn. `binary` is the walrust-dst executable to re-exec
+/// (its `main()` dispatches to [`run_crash_child`] when `CRASH_CHILD_ENV` is set).
+pub fn chaos_process_crash_recovery(
+    binary: &Path,
+    seed: u64,
+    iterations: u32,
+) -> Result<ChaosTestResult> {
+    use rand::prelude::*;
+
+    let mut rng = StdRng::seed_from_u64(seed);
+    let committed = 8u64; // durable prefix committed before "ready"
+    let mut successes = 0u32;
+    let mut failures = 0u32;
+    let mut messages: Vec<String> = Vec::new();
+
+    for _ in 0..iterations {
+        let tmpdir = TempDir::new()?;
+        let cache_dir = tmpdir.path().join("cache");
+        let ready_path = tmpdir.path().join("ready");
+
+        let mut child = Command::new(binary)
+            .env(CRASH_CHILD_ENV, "1")
+            .env(CRASH_CACHE_DIR_ENV, &cache_dir)
+            .env(CRASH_READY_ENV, &ready_path)
+            .env(CRASH_COUNT_ENV, committed.to_string())
+            .spawn()?;
+
+        // Wait for the durable prefix, or bail if the child died early.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if ready_path.exists() {
+                break;
+            }
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("crash child exited before ready: {status}");
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                anyhow::bail!("crash child never signaled ready");
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // Let the child get mid-loop, then hard-kill (SIGKILL on Unix).
+        std::thread::sleep(Duration::from_millis(rng.gen_range(2..20)));
+        child.kill()?;
+        let _ = child.wait();
+
+        // Reopen the cache the killed process was writing. A torn manifest makes
+        // this Err; a missing manifest makes it Ok(None) — both are failures.
+        let reopened = match LocalCache::open(&cache_dir) {
+            Ok(Some(cache)) => cache,
+            Ok(None) => {
+                failures += 1;
+                messages.push("cache manifest missing after kill".to_string());
+                continue;
+            }
+            Err(e) => {
+                failures += 1;
+                messages.push(format!("cache manifest torn/unreadable after kill: {e}"));
+                continue;
+            }
+        };
+
+        // The committed prefix must survive intact: present, correct size, and
+        // byte-for-byte the content the child wrote before signaling ready.
+        let mut ok = true;
+        for txid in 1..=committed {
+            match reopened.read_ltx(txid) {
+                Ok(bytes) if bytes == crash_ltx_content(txid) => {}
+                Ok(bytes) => {
+                    ok = false;
+                    messages.push(format!(
+                        "committed txid {txid} corrupt after kill (len {})",
+                        bytes.len()
+                    ));
+                    break;
+                }
+                Err(e) => {
+                    ok = false;
+                    messages.push(format!("committed txid {txid} unreadable after kill: {e}"));
+                    break;
+                }
+            }
+        }
+
+        // No manifest-listed LTX may be truncated (temp+rename atomicity). An
+        // orphan .ltx (renamed but manifest not yet updated when killed) is a
+        // benign crash artifact, so only size/missing mismatches count.
+        if ok {
+            let issues = reopened.verify()?;
+            let torn: Vec<&String> = issues
+                .iter()
+                .filter(|i| i.contains("size mismatch") || i.contains("file missing"))
+                .collect();
+            if !torn.is_empty() {
+                ok = false;
+                messages.push(format!("torn cache entries after kill: {torn:?}"));
+            }
+        }
+
+        if ok {
+            successes += 1;
+        } else {
+            failures += 1;
+        }
+    }
+
+    let passed = failures == 0;
+    let mut message = format!(
+        "Real SIGKILL crash recovery: successes={successes}, failures={failures} over {iterations} process kills"
+    );
+    if !messages.is_empty() {
+        let shown = &messages[..messages.len().min(3)];
+        message.push_str(&format!("; first issues: {shown:?}"));
+    }
+
+    Ok(ChaosTestResult {
+        name: "chaos_process_crash_recovery".to_string(),
+        passed,
+        iterations,
+        errors_injected: iterations,
+        errors_recovered: successes,
+        message,
+    })
+}
 
 #[cfg(test)]
 mod tests {

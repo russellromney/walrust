@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod mock_storage;
 mod properties;
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use metrics::{format_report, get_memory_usage, get_open_fds, IterationResult, MetricsCollector};
 use rand::Rng;
@@ -121,6 +122,13 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Crash-test child mode: when spawned by chaos_process_crash_recovery, this
+    // process is a durable-writer that gets SIGKILLed mid-write. Dispatch before
+    // clap so the child never touches the CLI surface.
+    if std::env::var(chaos::CRASH_CHILD_ENV).is_ok() {
+        return chaos::run_crash_child();
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
@@ -327,6 +335,16 @@ fn run_chaos_tests(fault_types: &[&str], seed: u64, iterations: u32) -> anyhow::
                     }
                 }
                 results.extend(all_results);
+
+                // Real child-process SIGKILL crash recovery (not MadSim-gated).
+                let binary =
+                    std::env::current_exe().context("locate walrust-dst binary for crash child")?;
+                let crash = chaos::chaos_process_crash_recovery(&binary, seed, iterations.max(5))?;
+                print_chaos_result(&crash);
+                if !crash.passed {
+                    all_passed = false;
+                }
+                results.push(crash);
             }
             "corruption" if !run_all => {
                 println!("  Testing fault: corruption");
@@ -337,7 +355,18 @@ fn run_chaos_tests(fault_types: &[&str], seed: u64, iterations: u32) -> anyhow::
                 }
                 results.push(result);
             }
-            "s3_errors" | "crashes" | "eventual_consistency" | "stress" if !run_all => {
+            "crashes" if !run_all => {
+                println!("  Testing fault: crashes (real child-process SIGKILL)");
+                let binary =
+                    std::env::current_exe().context("locate walrust-dst binary for crash child")?;
+                let result = chaos::chaos_process_crash_recovery(&binary, seed, iterations.max(5))?;
+                print_chaos_result(&result);
+                if !result.passed {
+                    all_passed = false;
+                }
+                results.push(result);
+            }
+            "s3_errors" | "eventual_consistency" | "stress" if !run_all => {
                 println!("  [TODO] {} - requires MadSim integration", fault);
                 println!("         See BATTLE_TESTING.md for roadmap");
             }
@@ -371,6 +400,50 @@ fn print_chaos_result(result: &chaos::ChaosTestResult) {
         status, result.name, result.iterations, result.errors_injected, result.errors_recovered
     );
     println!("         {}", result.message);
+}
+
+/// Threshold decision for a stress run. A breach is a hard failure so CI and
+/// automation see a non-zero exit instead of a buried `[WARN]` line.
+pub fn evaluate_stress_result(error_rate_pct: f64, max_error_rate_pct: f64) -> anyhow::Result<()> {
+    if error_rate_pct >= max_error_rate_pct {
+        anyhow::bail!(
+            "stress error rate {error_rate_pct:.1}% breached the {max_error_rate_pct:.1}% threshold"
+        );
+    }
+    Ok(())
+}
+
+/// Threshold decision for a soak run. Any breach — sustained memory growth, an
+/// upward memory trend, or file-descriptor growth — is a hard failure so a leak
+/// surfaces as a non-zero exit rather than a `[WARN]` nobody reads.
+pub fn evaluate_soak_result(
+    memory_growth_pct: f64,
+    memory_trend_pct: Option<f64>,
+    fd_growth: i32,
+    max_memory_growth_pct: f64,
+    max_memory_trend_pct: f64,
+    max_fd_growth: i32,
+) -> anyhow::Result<()> {
+    let mut breaches = Vec::new();
+    if memory_growth_pct.abs() >= max_memory_growth_pct {
+        breaches.push(format!(
+            "memory growth {memory_growth_pct:.1}% >= {max_memory_growth_pct:.1}%"
+        ));
+    }
+    if let Some(trend) = memory_trend_pct {
+        if trend >= max_memory_trend_pct {
+            breaches.push(format!(
+                "memory trend {trend:.1}% >= {max_memory_trend_pct:.1}%"
+            ));
+        }
+    }
+    if fd_growth >= max_fd_growth {
+        breaches.push(format!("fd growth {fd_growth} >= {max_fd_growth}"));
+    }
+    if !breaches.is_empty() {
+        anyhow::bail!("soak thresholds breached: {}", breaches.join("; "));
+    }
+    Ok(())
 }
 
 fn run_stress_test(
@@ -552,17 +625,22 @@ fn run_stress_test(
         final_fds as i32 - baseline_fds as i32
     );
 
-    // Success criteria: <10% error rate under 20% fault injection
-    if error_rate < 10.0 {
-        println!("\n  [PASS] Error rate {:.1}% < 10% threshold", error_rate);
+    // Success criteria: <10% error rate under 20% fault injection. A breach is
+    // a hard failure (non-zero exit), not a buried [WARN].
+    const STRESS_MAX_ERROR_RATE_PCT: f64 = 10.0;
+    if error_rate < STRESS_MAX_ERROR_RATE_PCT {
+        println!(
+            "\n  [PASS] Error rate {:.1}% < {:.1}% threshold",
+            error_rate, STRESS_MAX_ERROR_RATE_PCT
+        );
     } else {
         println!(
-            "\n  [WARN] Error rate {:.1}% exceeds 10% threshold",
-            error_rate
+            "\n  [FAIL] Error rate {:.1}% exceeds {:.1}% threshold",
+            error_rate, STRESS_MAX_ERROR_RATE_PCT
         );
     }
 
-    Ok(())
+    evaluate_stress_result(error_rate, STRESS_MAX_ERROR_RATE_PCT)
 }
 
 fn run_soak_test(duration: Duration) -> anyhow::Result<()> {
@@ -750,8 +828,8 @@ fn run_soak_test(duration: Duration) -> anyhow::Result<()> {
         baseline_fds, final_fds, fd_growth
     );
 
-    // Memory trend analysis
-    if memory_samples.len() >= 3 {
+    // Memory trend analysis (only meaningful with enough samples).
+    let memory_trend_pct: Option<f64> = if memory_samples.len() >= 3 {
         let first_half_avg: f64 = memory_samples[..memory_samples.len() / 2]
             .iter()
             .map(|(_, m)| *m as f64)
@@ -768,31 +846,33 @@ fn run_soak_test(duration: Duration) -> anyhow::Result<()> {
             "    Memory Trend:  {:+.1}% (first half avg vs second half avg)",
             trend
         );
-
-        if trend > 10.0 {
-            println!(
-                "\n  [WARN] Memory trending upward by {:.1}% - possible leak",
-                trend
-            );
-        } else {
-            println!("\n  [PASS] Memory stable (trend: {:+.1}%)", trend);
-        }
-    }
-
-    // Success criteria: <10% memory growth overall
-    if memory_growth.abs() < 10.0 {
-        println!(
-            "  [PASS] Memory growth {:.1}% within 10% threshold",
-            memory_growth
-        );
+        Some(trend)
     } else {
+        None
+    };
+
+    // Hard thresholds — a breach exits non-zero so a leak surfaces in CI. The
+    // thresholds are set well above healthy warmup noise (which the [WARN] lines
+    // above still surface) so only a genuine leak / fd exhaustion fails the run.
+    const SOAK_MAX_MEMORY_GROWTH_PCT: f64 = 50.0;
+    const SOAK_MAX_MEMORY_TREND_PCT: f64 = 25.0;
+    const SOAK_MAX_FD_GROWTH: i32 = 64;
+
+    if memory_growth.abs() >= 10.0 {
         println!(
-            "  [WARN] Memory growth {:.1}% exceeds 10% threshold",
+            "  [WARN] Memory growth {:.1}% exceeds soft 10% threshold",
             memory_growth
         );
     }
 
-    Ok(())
+    evaluate_soak_result(
+        memory_growth,
+        memory_trend_pct,
+        fd_growth,
+        SOAK_MAX_MEMORY_GROWTH_PCT,
+        SOAK_MAX_MEMORY_TREND_PCT,
+        SOAK_MAX_FD_GROWTH,
+    )
 }
 
 fn parse_duration(s: &str) -> anyhow::Result<Duration> {
@@ -981,14 +1061,16 @@ fn run_single_invariant(name: &str) -> anyhow::Result<()> {
         "production_published_deltas" | "production_deltas" => {
             invariants::prop_production_published_delta_restore()?
         }
+        "fenced_delta_restore" | "fenced_deltas" => invariants::prop_fenced_delta_restore()?,
         "snapshot_atomicity" => invariants::prop_snapshot_atomicity()?,
         "txid_monotonicity" => invariants::prop_txid_monotonicity()?,
         "binary_preservation" => invariants::prop_binary_preservation()?,
         "recovery_under_failure" => invariants::prop_recovery_under_failure()?,
         _ => anyhow::bail!(
             "Unknown invariant: {}. Available: transaction_recovery, point_in_time, \
-             wal_batching, production_published_deltas, snapshot_atomicity, \
-             txid_monotonicity, binary_preservation, recovery_under_failure",
+             wal_batching, production_published_deltas, fenced_delta_restore, \
+             snapshot_atomicity, txid_monotonicity, binary_preservation, \
+             recovery_under_failure",
             name
         ),
     }
@@ -1006,6 +1088,10 @@ fn run_all_invariants() -> anyhow::Result<()> {
         (
             "production_published_deltas",
             "Production core published deltas restore cleanly",
+        ),
+        (
+            "fenced_delta_restore",
+            "Fenced TLM_DELTA followers reconstruct the exact DB",
         ),
         ("snapshot_atomicity", "Snapshots are atomic"),
         ("txid_monotonicity", "TXIDs are monotonic"),
@@ -1025,4 +1111,32 @@ fn run_all_invariants() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod threshold_tests {
+    use super::{evaluate_soak_result, evaluate_stress_result};
+
+    #[test]
+    fn stress_breach_is_hard_failure() {
+        // Under threshold: pass.
+        assert!(evaluate_stress_result(5.0, 10.0).is_ok());
+        // At/over threshold: non-zero exit.
+        assert!(evaluate_stress_result(10.0, 10.0).is_err());
+        assert!(evaluate_stress_result(42.0, 10.0).is_err());
+    }
+
+    #[test]
+    fn soak_breach_is_hard_failure() {
+        // Healthy run: pass.
+        assert!(evaluate_soak_result(3.0, Some(1.0), 4, 50.0, 25.0, 64).is_ok());
+        // Sustained memory growth: fail.
+        assert!(evaluate_soak_result(80.0, Some(1.0), 4, 50.0, 25.0, 64).is_err());
+        // Upward memory trend: fail.
+        assert!(evaluate_soak_result(3.0, Some(40.0), 4, 50.0, 25.0, 64).is_err());
+        // File-descriptor leak: fail.
+        assert!(evaluate_soak_result(3.0, Some(1.0), 128, 50.0, 25.0, 64).is_err());
+        // No trend sample must not spuriously fail on the trend axis.
+        assert!(evaluate_soak_result(3.0, None, 4, 50.0, 25.0, 64).is_ok());
+    }
 }
