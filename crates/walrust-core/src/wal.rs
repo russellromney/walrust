@@ -712,6 +712,183 @@ pub async fn read_frames_as_pages(
     Ok((frames, new_offset, final_db_size))
 }
 
+/// Checksum + salt validating variant of [`read_frames_as_pages`].
+///
+/// Returns ordered committed frames (like `read_frames_as_pages`) but rejects
+/// torn tails (frame checksum mismatch) and stale frames (frame salt mismatch),
+/// stopping at the last good *committed* frame — exactly as if the bad frame and
+/// everything after it were not yet written. This is the reader the shadow-WAL
+/// copy path must use so torn/stale frames never enter the shadow (finding B4).
+///
+/// `chain_seed` is the running WAL checksum `(s0, s1)` of the last frame already
+/// consumed at `start_offset`. Pass `None` to seed from the validated header
+/// checksum (only meaningful when `start_offset == 0`); a non-zero
+/// `start_offset` with no `chain_seed` cannot be validated and is read without
+/// per-frame verification. Invalid header checksums are hard errors.
+///
+/// Returns `(frames, new_offset, final_db_size, out_chain)` where `out_chain` is
+/// the running checksum at the last committed frame, suitable for seeding the
+/// next incremental read.
+pub async fn read_frames_as_pages_checked(
+    path: &Path,
+    page_size: u32,
+    start_offset: u64,
+    chain_seed: Option<(u32, u32)>,
+) -> Result<(Vec<ParsedFrame>, u64, u32, Option<(u32, u32)>)> {
+    let mut file = File::open(path).await?;
+    let file_size = file.metadata().await?.len();
+
+    let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+
+    let start_pos = if start_offset == 0 {
+        WAL_HEADER_SIZE
+    } else {
+        start_offset
+    };
+
+    // Read the 32-byte header to decide checksum endianness and obtain the
+    // header chain seed / salt.
+    let mut header_bytes = [0u8; WAL_HEADER_SIZE as usize];
+    let header_seed = if file_size >= WAL_HEADER_SIZE {
+        file.seek(SeekFrom::Start(0)).await?;
+        file.read_exact(&mut header_bytes).await?;
+        let magic = u32::from_be_bytes([
+            header_bytes[0],
+            header_bytes[1],
+            header_bytes[2],
+            header_bytes[3],
+        ]);
+        if magic == WAL_MAGIC_BE || magic == WAL_MAGIC_LE {
+            let be = magic_is_big_endian(magic);
+            let seed = validate_header_checksum(&header_bytes, be)?;
+            let salt = (
+                u32::from_be_bytes([
+                    header_bytes[16],
+                    header_bytes[17],
+                    header_bytes[18],
+                    header_bytes[19],
+                ]),
+                u32::from_be_bytes([
+                    header_bytes[20],
+                    header_bytes[21],
+                    header_bytes[22],
+                    header_bytes[23],
+                ]),
+            );
+            Some((seed, be, salt))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if start_pos >= file_size {
+        return Ok((Vec::new(), start_pos, 0, chain_seed));
+    }
+
+    file.seek(SeekFrom::Start(start_pos)).await?;
+
+    let available = file_size - start_pos;
+    let full_frames = available / frame_size;
+
+    if full_frames == 0 {
+        return Ok((Vec::new(), start_pos, 0, chain_seed));
+    }
+
+    let (mut running, big_endian, validate, header_salt) = match header_seed {
+        Some((hdr_seed, be, salt)) => {
+            let seed = if start_pos == WAL_HEADER_SIZE {
+                hdr_seed
+            } else {
+                chain_seed.unwrap_or_default()
+            };
+            let validate = start_pos == WAL_HEADER_SIZE || chain_seed.is_some();
+            (seed, be, validate, salt)
+        }
+        None => ((0, 0), true, false, (0, 0)),
+    };
+
+    let mut frames: Vec<ParsedFrame> = Vec::with_capacity(full_frames as usize);
+    let mut page_data = vec![0u8; page_size as usize];
+    // Chain / commit boundary tracked as we go so the returned offset and chain
+    // correspond to exactly the last committed frame.
+    let seed_chain = match header_seed {
+        Some((hdr_seed, _, _)) if start_pos == WAL_HEADER_SIZE => Some(hdr_seed),
+        _ => chain_seed,
+    };
+    let mut committed_count: usize = 0;
+    let mut committed_chain = seed_chain;
+    let mut final_db_size = 0u32;
+
+    for frame_index in 0..full_frames {
+        let mut header_buf = [0u8; 24];
+        file.read_exact(&mut header_buf).await?;
+        file.read_exact(&mut page_data).await?;
+
+        if validate {
+            let frame_salt = (
+                u32::from_be_bytes([header_buf[8], header_buf[9], header_buf[10], header_buf[11]]),
+                u32::from_be_bytes([
+                    header_buf[12],
+                    header_buf[13],
+                    header_buf[14],
+                    header_buf[15],
+                ]),
+            );
+            if frame_salt != header_salt {
+                tracing::warn!(
+                    "{}; treating as stale tail",
+                    WalValidationError::FrameSaltMismatch {
+                        frame: frame_index + 1,
+                        expected: header_salt,
+                        actual: frame_salt,
+                    }
+                );
+                break;
+            }
+
+            match verify_frame_checksum(running, &header_buf, &page_data, big_endian) {
+                Some(next) => running = next,
+                None => {
+                    tracing::warn!(
+                        "WAL checksum mismatch at frame {} ({:?}); treating as torn tail",
+                        frame_index + 1,
+                        path
+                    );
+                    break;
+                }
+            }
+        }
+
+        let page_number =
+            u32::from_be_bytes([header_buf[0], header_buf[1], header_buf[2], header_buf[3]]);
+        let db_size =
+            u32::from_be_bytes([header_buf[4], header_buf[5], header_buf[6], header_buf[7]]);
+
+        frames.push(ParsedFrame {
+            page_number,
+            db_size,
+            data: page_data.clone(),
+        });
+
+        if db_size > 0 {
+            committed_count = frames.len();
+            committed_chain = if validate { Some(running) } else { seed_chain };
+            final_db_size = db_size;
+        }
+    }
+
+    if committed_count == 0 {
+        return Ok((Vec::new(), start_pos, 0, chain_seed));
+    }
+
+    frames.truncate(committed_count);
+    let new_offset = start_pos + committed_count as u64 * frame_size;
+
+    Ok((frames, new_offset, final_db_size, committed_chain))
+}
+
 /// Read WAL frames with full metadata for robust checkpoint detection
 ///
 /// This function provides:
@@ -1790,6 +1967,110 @@ mod tests {
 
         assert_eq!(standalone, from_page_map);
         assert_eq!(standalone, 2);
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_as_pages_checked_accepts_ordered_valid_chain() {
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-pages-chk-valid-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let page_size = 1024u32;
+        // Three frames: page 1, then page 1 again (newer), commit on the 3rd.
+        let wal = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(1, 0, 0xAA), (1, 0, 0xBB), (2, 2, 0xCC)],
+        );
+        tokio::fs::write(&path, &wal).await.unwrap();
+
+        let (frames, offset, db_size, chain) =
+            read_frames_as_pages_checked(&path, page_size, 0, None)
+                .await
+                .unwrap();
+
+        // Ordered frames preserved (unlike the deduped page-map reader).
+        assert_eq!(frames.len(), 3, "all committed frames preserved in order");
+        assert_eq!(frames[0].page_number, 1);
+        assert_eq!(frames[1].page_number, 1);
+        assert_eq!(frames[2].page_number, 2);
+        assert_eq!(db_size, 2);
+        assert_eq!(
+            offset,
+            WAL_HEADER_SIZE + 3 * (FRAME_HEADER_SIZE + page_size as u64)
+        );
+        assert!(chain.is_some(), "valid chain returns a running checksum");
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_as_pages_checked_rejects_torn_tail() {
+        // A torn tail frame (corrupt body, non-zero db_size) appended after a
+        // valid commit must NOT be shipped: the ordered checked reader stops at
+        // the last good commit (B4 — shadow copy must not ship torn frames).
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-pages-chk-torn-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let page_size = 1024u32;
+        let mut wal = build_valid_wal(
+            page_size,
+            (0x1111_1111, 0x2222_2222),
+            &[(1, 1, 0xAA), (2, 2, 0xBB)],
+        );
+        // Corrupt the second frame's page body without fixing its checksum.
+        let second_frame_body = WAL_HEADER_SIZE as usize
+            + (FRAME_HEADER_SIZE as usize + page_size as usize)
+            + FRAME_HEADER_SIZE as usize;
+        wal[second_frame_body] ^= 0xFF;
+        tokio::fs::write(&path, &wal).await.unwrap();
+
+        let (frames, offset, db_size, _chain) =
+            read_frames_as_pages_checked(&path, page_size, 0, None)
+                .await
+                .unwrap();
+
+        assert_eq!(frames.len(), 1, "only the first good frame survives");
+        assert_eq!(frames[0].page_number, 1);
+        assert_eq!(db_size, 1, "commit boundary is the last good frame");
+        assert_eq!(
+            offset,
+            WAL_HEADER_SIZE + (FRAME_HEADER_SIZE + page_size as u64),
+            "offset stops at the last good commit, not the torn frame"
+        );
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    #[tokio::test]
+    async fn test_read_frames_as_pages_checked_rejects_stale_salt_tail() {
+        // A frame carrying a stale (mismatched) salt is a leftover from a prior
+        // WAL generation and must be treated as a stale tail, not shipped.
+        let path = PathBuf::from(format!(
+            "/tmp/walrust-test-pages-chk-salt-{}.db-wal",
+            uuid::Uuid::new_v4()
+        ));
+        let page_size = 1024u32;
+        let salt = (0x1111_1111u32, 0x2222_2222u32);
+        let mut wal = build_valid_wal(page_size, salt, &[(1, 1, 0xAA), (2, 2, 0xBB)]);
+        // Rewrite the second frame's salt bytes (offset 8..16 within its header)
+        // to a different value: a stale prior-generation frame.
+        let second_frame =
+            WAL_HEADER_SIZE as usize + (FRAME_HEADER_SIZE as usize + page_size as usize);
+        wal[second_frame + 8..second_frame + 12].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        tokio::fs::write(&path, &wal).await.unwrap();
+
+        let (frames, _offset, db_size, _chain) =
+            read_frames_as_pages_checked(&path, page_size, 0, None)
+                .await
+                .unwrap();
+
+        assert_eq!(frames.len(), 1, "stale-salt frame must be rejected");
+        assert_eq!(frames[0].page_number, 1);
+        assert_eq!(db_size, 1);
 
         tokio::fs::remove_file(&path).await.ok();
     }

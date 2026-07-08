@@ -3,7 +3,7 @@ use chrono::Utc;
 use hadb_storage_s3::S3Storage;
 use std::path::Path;
 use walrust_core::legacy_manifest::plan_legacy_compaction;
-use walrust_core::legacy_wal_sync::snapshot_database_to_storage;
+use walrust_core::legacy_wal_sync::{checkpoint_wal_truncate, snapshot_database_to_storage};
 
 use crate::errors::{classify_or_else, WalrustError};
 use crate::retention::{RetentionPolicy, SnapshotEntry};
@@ -167,6 +167,13 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
     let storage = S3Storage::new(client, bucket_name.clone());
+    // The one-shot `walrust snapshot` command has no shadow WAL to carry
+    // un-folded frames as incrementals, so fully fold the WAL into the base image
+    // with a completeness-checked TRUNCATE (busy_timeout + result-row check)
+    // before encoding. This hard-fails if another process (e.g. a running
+    // watcher) pins the WAL — correct fail-closed behavior for a manual snapshot,
+    // rather than silently producing a base missing recent commits (B10).
+    checkpoint_wal_truncate(database).await?;
     let output = snapshot_database_to_storage(&storage, &prefix, name, database).await?;
 
     println!(

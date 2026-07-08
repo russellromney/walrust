@@ -129,11 +129,17 @@ pub(crate) async fn do_sync(
 
     state.db_state.apply_watched_state(&watched_state);
     if result.checkpoint_detected {
+        // A WAL rollover in the direct/independent sync path is a durability-
+        // relevant event (the WAL was reset out from under the incremental
+        // cursor). Emit it loudly (error log + webhook) even though the safety
+        // path already re-anchored, so operators can see the re-anchor happened
+        // (A3/A4). Shadow mode handles generation rolls routinely and does not
+        // route through here.
         let event = format!(
-            "{}: WAL rollover/checkpoint detected; backup safety path handled it before continuing",
+            "{}: WAL rollover/checkpoint detected; backup safety path re-anchored before continuing",
             state.db_state.name
         );
-        tracing::warn!("{}", event);
+        tracing::error!("{}", event);
         webhook_sender
             .notify_upload_failed(&state.db_state.name, &event, 1)
             .await;
