@@ -51,8 +51,8 @@ pub use sync::{
     fetch_delta_envelope, list_delta_envelopes_after, publish_delta_envelope,
     pull_incremental_into_sink, restore_with_snapshot_source, run_wal_replication,
     sync_wal_fenced_delta, DeltaPublishResult, DiscoveredDelta, ExternalBaseCursor,
-    FencedDeltaSyncParams, LtxEntry, Manifest, PullCursor, ReplicationConfig, SnapshotOwnership,
-    SyncState,
+    FencedDeltaSyncParams, LtxEntry, Manifest, PullCursor, ReplicationConfig, RolloverEvent,
+    RolloverObserver, SnapshotOwnership, SyncState,
 };
 
 // Fenced delta envelope codec.

@@ -12,6 +12,7 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use crate::errors::WalrustError;
 use crate::ltx;
@@ -173,6 +174,52 @@ pub struct PullCursor {
     pub checksum: u64,
 }
 
+/// A loud replication event the core surfaces to an embedding process (the CLI
+/// binary, haqlite, ...). The core library has no webhook client of its own, so
+/// this is the plumbing an embedder wires to its own alert channel.
+#[derive(Debug, Clone)]
+pub struct RolloverEvent {
+    /// Database name.
+    pub db_name: String,
+    /// Which sync mode observed the rollover.
+    pub mode: &'static str,
+    /// Whether walrust recovered (re-anchored with a snapshot) or refused
+    /// (hard-failed pending an external re-anchor).
+    pub recovered: bool,
+    /// Human-readable detail for the alert.
+    pub message: String,
+}
+
+/// Optional sink for [`RolloverEvent`]s. Cloneable (shares one `Arc`) and
+/// `Debug` (so it can live on `SyncState`/`ReplicationConfig`) without exposing
+/// the closure. Default is a no-op.
+#[derive(Clone, Default)]
+pub struct RolloverObserver(Option<Arc<dyn Fn(RolloverEvent) + Send + Sync>>);
+
+impl std::fmt::Debug for RolloverObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.is_some() {
+            "RolloverObserver(set)"
+        } else {
+            "RolloverObserver(none)"
+        })
+    }
+}
+
+impl RolloverObserver {
+    /// Build an observer from a callback.
+    pub fn new(f: impl Fn(RolloverEvent) + Send + Sync + 'static) -> Self {
+        Self(Some(Arc::new(f)))
+    }
+
+    /// Deliver an event if an observer is installed.
+    pub fn emit(&self, event: RolloverEvent) {
+        if let Some(f) = &self.0 {
+            f(event);
+        }
+    }
+}
+
 /// State for a single database being synced.
 #[derive(Debug, Clone)]
 pub struct SyncState {
@@ -209,6 +256,9 @@ pub struct SyncState {
     /// validation for the next incremental read so a torn tail frame is rejected
     /// rather than shipped.
     pub wal_checksum_chain: Option<(u32, u32)>,
+    /// Runtime-only sink for loud rollover events. Not persisted; the embedder
+    /// installs it (e.g. wired to the CLI's webhook sender).
+    pub rollover_observer: RolloverObserver,
 }
 
 impl SyncState {
@@ -240,6 +290,7 @@ impl SyncState {
             db_checksum: None,
             wal_salt: None,
             wal_checksum_chain: None,
+            rollover_observer: RolloverObserver::default(),
         })
     }
 
@@ -1012,6 +1063,15 @@ async fn sync_wal_with_sequence(
                     "{}: WAL rollover detected; publishing a new snapshot instead of an incremental across the gap",
                     state.name
                 );
+                state.rollover_observer.emit(RolloverEvent {
+                    db_name: state.name.clone(),
+                    mode: "walrust-owned",
+                    recovered: true,
+                    message: format!(
+                        "{}: WAL rollover detected; re-anchoring with a fresh snapshot",
+                        state.name
+                    ),
+                });
                 take_snapshot(storage, prefix, state).await?;
                 save_state(storage, prefix, state).await?;
                 return Ok(1);
@@ -1021,10 +1081,17 @@ async fn sync_wal_with_sequence(
                 state.wal_generation = previous_wal_generation;
                 state.wal_salt = previous_wal_salt;
                 state.wal_checksum_chain = previous_wal_checksum_chain;
-                anyhow::bail!(
+                let message = format!(
                     "{}: WAL rollover detected after external base; refusing to publish deltas until the external base is re-anchored",
                     state.name
                 );
+                state.rollover_observer.emit(RolloverEvent {
+                    db_name: state.name.clone(),
+                    mode: "external-base",
+                    recovered: false,
+                    message: message.clone(),
+                });
+                anyhow::bail!(message);
             }
         }
     }
@@ -1113,6 +1180,15 @@ async fn sync_wal_with_sequence(
                             state.name,
                             new_seq
                         );
+                        state.rollover_observer.emit(RolloverEvent {
+                            db_name: state.name.clone(),
+                            mode: "walrust-owned",
+                            recovered: true,
+                            message: format!(
+                                "{}: same-seq changeset conflict at seq {} from a prior crashed publish; re-anchoring with a fresh snapshot",
+                                state.name, new_seq
+                            ),
+                        });
                         state.current_seq = new_seq;
                         state.current_txid = max_txid;
                         state.db_checksum = Some(adopted_post);
@@ -2451,6 +2527,9 @@ pub struct ReplicationConfig {
     /// `External` means some other layer owns the checkpointed base state
     /// and walrust should only ship / replay WAL deltas after that point.
     pub snapshot_ownership: SnapshotOwnership,
+    /// Optional sink for loud rollover events (re-anchor / refusal). The core
+    /// has no webhook client; an embedder wires this to its own alert channel.
+    pub rollover_observer: RolloverObserver,
 }
 
 /// Ownership of the base database state.
@@ -2477,6 +2556,7 @@ impl Default for ReplicationConfig {
             db_name: None,
             autonomous_snapshots: true,
             snapshot_ownership: SnapshotOwnership::Walrust,
+            rollover_observer: RolloverObserver::default(),
         }
     }
 }
@@ -2520,6 +2600,7 @@ pub async fn run_replication(
     if let Some(ref name) = config.db_name {
         state.name = name.clone();
     }
+    state.rollover_observer = config.rollover_observer.clone();
 
     if db_path.exists() {
         state.init_checksum()?;
@@ -2602,6 +2683,9 @@ pub async fn run_wal_replication(
     config.validate()?;
     state.current_seq = initial_seq;
     state.current_txid = initial_seq; // Keep txid in sync for initial state
+    if state.rollover_observer.0.is_none() {
+        state.rollover_observer = config.rollover_observer.clone();
+    }
 
     if state.db_checksum.is_none() && state.db_path.exists() {
         state.init_checksum()?;

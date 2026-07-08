@@ -893,6 +893,42 @@ async fn test_walrust_owned_flush_resnapshots_after_checkpoint_rollover() -> Res
 }
 
 #[tokio::test]
+async fn test_rollover_observer_fires_on_walrust_owned_reanchor() -> Result<()> {
+    // Obligation 2: the core has no webhook client, so it surfaces rollover
+    // re-anchors through a RolloverObserver an embedder wires to its alerts.
+    use std::sync::{Arc, Mutex};
+    let events: Arc<Mutex<Vec<walrust::RolloverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("rollover-observed.db");
+    let conn = create_wal_db(&db_path, 3);
+
+    let mut config = make_config();
+    config.rollover_observer = walrust::RolloverObserver::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    });
+    let replicator = Replicator::new(storage.clone(), "wal/", config);
+    replicator.add("rollover-observed", &db_path).await?;
+
+    write_rows(&conn, 100, 2);
+    replicator.flush("rollover-observed").await?;
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    write_rows(&conn, 200, 2);
+    replicator.flush("rollover-observed").await?;
+
+    let seen = events.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|e| e.mode == "walrust-owned" && e.recovered),
+        "a walrust-owned rollover re-anchor must emit a recovered RolloverEvent; got {seen:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_external_mode_refuses_checkpoint_rollover_until_reanchored() -> Result<()> {
     let storage = MemStorage::new();
     let dir = tempfile::tempdir().unwrap();

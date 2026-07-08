@@ -244,6 +244,7 @@ impl Replicator {
         // Build state and take initial snapshot OUTSIDE the map lock
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
+        state.rollover_observer = self.config.rollover_observer.clone();
 
         if db_path.exists() {
             state.init_checksum()?;
@@ -313,6 +314,7 @@ impl Replicator {
 
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
+        state.rollover_observer = self.config.rollover_observer.clone();
 
         if db_path.exists() {
             state.init_checksum()?;
@@ -407,6 +409,7 @@ impl Replicator {
         let prefix = self.prefix.clone();
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
+        state.rollover_observer = self.config.rollover_observer.clone();
         sync::initialize_external_base_state(self.storage.as_ref(), &prefix, &mut state, base)
             .await?;
 
