@@ -263,6 +263,15 @@ The root binary drives its own webhook-wired watch loops, so this channel is for
 library embedders (haqlite, etc.). Proven by
 `test_rollover_observer_fires_on_walrust_owned_reanchor` (revert-verified).
 
+Adversarial review (Phase 2B, 2026-07-08): the observer coverage was PARTIAL — it
+fired on the walrust-owned re-anchor, external-base refusal, and B11 re-anchor, but
+NOT on the fenced external-mode rollover refusal (`sync_wal_fenced_delta`), which is
+a fourth rollover site. Fixed: that refusal now emits a `recovered=false`
+`mode="fenced-external"` event before its bail, matching the external-base refusal.
+Proven by the new `test_rollover_observer_fires_on_fenced_external_refusal`
+(fenced flush after a forced TRUNCATE emits the event). All four core rollover
+sites now emit.
+
 ### A4 — walrust's own checkpoint timer destroys unshipped frames
 - `src/sync/watch_shadow.rs:663-681`: comment says "First, ensure all shadow
   data is uploaded" — no such code exists. `ShadowWal::checkpoint()`
@@ -792,6 +801,29 @@ locally (sandbox MinIO clock skew, see A6).
   `shadow::tests::test_restore_read_cursor_detects_downtime_checkpoint`
   (revert-verified), and the extended
   `legacy_shadow_progress_persistence_is_owned_by_core` round-trip.
+
+  Adversarial review (Phase 2B, 2026-07-08): two additions.
+  (a) Back-compat now has a dedicated proof: a pre-B4 progress file (no
+  `wal_copy_offset`/`wal_salt`/`wal_checksum_chain`) loads with no panic and falls
+  back conservatively — `wal_copy_offset` defaults to 0 (re-read from the WAL
+  head) and salt/chain to None (`restore_read_cursor` becomes a no-op, seeding
+  nothing stale). Proven by
+  `legacy_pre_b4_shadow_progress_loads_with_safe_defaults`. And
+  `test_restore_read_cursor_detects_downtime_checkpoint` was re-revert-verified
+  with a TRUE no-op `restore_read_cursor` (it FAILS: generation does not advance),
+  confirming the salt restore — not just the offset-shrink path — is load-bearing.
+  (b) Recovery-completeness scope: the downtime detection bumps the generation and
+  re-seeds per-frame validation, but does NOT eagerly re-snapshot. The frames an
+  external checkpoint folded away during downtime live in the main DB FILE and are
+  re-imaged by the next periodic snapshot (the snapshot timer re-reads the whole
+  DB file). An eager re-snapshot on every generation bump is deliberately NOT
+  wired because a generation bump in shadow mode is normally BENIGN (walrust's own
+  copy-then-checkpoint also bumps it), and the PASSIVE-fold-vs-destructive-reset
+  distinction is not cheaply available (the same residual class as the A3
+  first-checkpoint window and B5). So a downtime checkpoint's completeness is
+  bounded by `snapshot_interval`, matching the A3/B5 residual; it is not silent
+  loss (the generation-boundary chain re-seed keeps restore fail-closed on any gap
+  rather than short).
 - B5 — Shadow WAL salt seeded `(0,0)` when no WAL exists at startup and only
   updated inside the rollover branch (`src/shadow.rs:83-86, 184`): for a
   fresh DB, all future checkpoints are invisible. Also page_size defaults to
@@ -914,19 +946,49 @@ locally (sandbox MinIO clock skew, see A6).
   can classify it. Identical bytes remain an idempotent success (retry / lost
   PUT-response safety).
   (2) Recovery/re-anchor. In walrust-owned mode, a same-seq conflict whose
-  existing object is *our own* prior publish at that seq (it decodes as a
-  changeset at that seq whose `prev_checksum` equals our current pre-apply
-  checksum — the exact signature of a durable put whose `save_state` never ran)
-  is adopted as committed and the stream re-anchors with a fresh snapshot,
-  folding in any frames written after the crash. A foreign/garbage same-seq
-  object still hard-fails (typed equivocation). External-base mode surfaces the
-  typed equivocation; its documented recovery is `initialize_external_base_state`
-  from a new base (which already adopts a matching same-seq changeset via
-  `external_same_seq_changeset_checksum`). Proven by
+  existing object is *provably our own* prior publish at that seq is adopted as
+  committed and the stream re-anchors with a fresh snapshot, folding in any
+  frames written after the crash. A foreign object, a second live writer's
+  divergent object, or garbage still hard-fails (typed equivocation).
+  External-base mode surfaces the typed equivocation; its documented recovery is
+  `initialize_external_base_state` from a new base (which already adopts a
+  matching same-seq changeset via `external_same_seq_changeset_checksum`).
+
+  Adversarial review (Phase 2B, 2026-07-08): the walrust-owned recovery's
+  ORIGINAL discriminator was `(seq match, prev_checksum match)` and was
+  documented as "the exact signature of a durable put whose save_state never
+  ran". That claim was OVERSTATED: `prev_checksum` is the pre-apply base
+  checksum, so ANY second live writer sharing the same lineage + base state
+  (e.g. an HA failover where the promoted node restored from the same backup and
+  the original node came back) publishes a DIFFERENT changeset at the same seq
+  with the IDENTICAL `(seq, prev_checksum)` signature. The recovery therefore
+  silently ADOPTED a second writer's object and re-anchored on it — actively
+  re-legitimizing split-brain (a regression versus the pre-B11 hard-fail).
+  Confirmed empirically by a two-writer test that the original code passed
+  through `Ok(1)` instead of erroring.
+
+  FIX (this review): the recovery is now gated on a durable, local, fsynced
+  publish-intent write-ahead record (`PublishIntent`,
+  `.walrust-<db>/publish-intent.json`, temp+fsync+rename+dir-fsync). Before each
+  walrust-owned CAS put, we load the PRIOR intent (the pre-crash one) and then
+  record the intent for THIS publish. A same-seq conflict is adopted ONLY if the
+  prior local intent names this exact publish (matching lineage, seq, base
+  checksum) AND the stored object's checksum is byte-for-byte the one we
+  recorded — proof THIS process authored it. A second writer records its own
+  intent on its OWN disk, so its object's checksum never matches ours and the
+  conflict correctly hard-fails; a failover node whose last intent is at a
+  different seq also hard-fails. This is a state-durability authorship proof, NOT
+  a distributed fence: a full writer-fencing/lease token is later-phase, but the
+  local intent closes the silent split-brain re-legitimization within Phase-2B
+  scope. Proven by
   `sync::tests::walrust_owned_reanchors_after_crash_window_same_seq_conflict`
-  (revert-verified: disabling the recovery makes the post-crash row unrestorable)
-  and `sync::tests::walrust_owned_sync_rejects_foreign_same_seq_changeset`;
-  the existing `walrust_owned_sync_rejects_divergent_existing_changeset` and
+  (revert-verified: disabling the adoption makes the post-crash row
+  unrestorable), the new
+  `sync::tests::walrust_owned_sync_rejects_second_writer_same_base_same_seq`
+  (revert-verified: it FAILED against the original `(seq, prev_checksum)`
+  discriminator and PASSES with the intent gate), and
+  `sync::tests::walrust_owned_sync_rejects_foreign_same_seq_changeset`; the
+  existing `walrust_owned_sync_rejects_divergent_existing_changeset` and
   `publish_delta_envelope_rejects_same_seq_divergent_bytes` still pass.
 - B12 — journal_mode change away from WAL => replication silently freezes
   (0 frames forever, no error/webhook) (`wal_sync.rs:99-115`,

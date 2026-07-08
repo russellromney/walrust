@@ -1057,6 +1057,53 @@ async fn test_fenced_external_mode_refuses_checkpoint_rollover_until_reanchored(
     Ok(())
 }
 
+#[tokio::test]
+async fn test_rollover_observer_fires_on_fenced_external_refusal() -> Result<()> {
+    // Obligation 2 coverage gap: the fenced external-mode rollover REFUSAL is a
+    // rollover site too. It must surface a recovered=false RolloverEvent, not
+    // just an anyhow bail, so an embedder alerts on the poisoned stream.
+    use std::sync::{Arc, Mutex};
+    let events: Arc<Mutex<Vec<walrust::RolloverEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&events);
+
+    let storage = MemStorage::new();
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("fenced-observed.db");
+    let conn = create_wal_db(&db_path, 3);
+    let base_seq =
+        walrust::sync::change_counter_from_file(&db_path).expect("read base change counter");
+
+    let mut config = make_external_config();
+    config.rollover_observer = walrust::RolloverObserver::new(move |ev| {
+        sink.lock().unwrap().push(ev);
+    });
+    let replicator =
+        Replicator::try_new(storage.clone(), "wal/", config).expect("external config valid");
+    replicator.add("fenced-observed", &db_path).await?;
+    replicator
+        .set_external_delta_base("fenced-observed", 7, "writer-a", base_seq, [0x42; 32])
+        .await?;
+
+    write_rows(&conn, 100, 2);
+    replicator.flush("fenced-observed").await?;
+
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
+    write_rows(&conn, 200, 2);
+    let _ = replicator
+        .flush("fenced-observed")
+        .await
+        .expect_err("fenced rollover must refuse");
+
+    let seen = events.lock().unwrap();
+    assert!(
+        seen.iter()
+            .any(|e| e.mode == "fenced-external" && !e.recovered),
+        "a fenced external-mode rollover refusal must emit a recovered=false RolloverEvent; got {seen:?}"
+    );
+    drop(conn);
+    Ok(())
+}
+
 /// flush() after writing WAL frames should upload an LTX file and return frame count > 0.
 #[tokio::test]
 async fn test_flush_uploads_ltx() {
