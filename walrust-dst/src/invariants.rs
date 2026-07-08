@@ -495,8 +495,8 @@ pub fn prop_production_published_delta_restore() -> Result<()> {
 /// property is self-validating, not a rubber stamp.
 pub fn prop_fenced_delta_restore() -> Result<()> {
     use std::sync::Arc;
-    use walrust::walrust_core::ltx as core_ltx;
     use walrust::walrust_core::external_delta;
+    use walrust::walrust_core::ltx as core_ltx;
     use walrust::walrust_core::{
         list_delta_envelopes_after, ReplicationConfig, Replicator, SnapshotOwnership,
     };
@@ -530,7 +530,8 @@ pub fn prop_fenced_delta_restore() -> Result<()> {
                 )
                 .unwrap();
                 insert_item_batch(&conn, 1, base_rows, "base").unwrap();
-                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+                conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                    .unwrap();
                 std::fs::copy(&db_path, &base_copy).unwrap();
 
                 let storage = MockStorageBackend::new(
@@ -563,7 +564,8 @@ pub fn prop_fenced_delta_restore() -> Result<()> {
 
                 let mut next_id = base_rows as i64 + 1;
                 for batch in 0..batches {
-                    insert_item_batch(&conn, next_id, rows_per_batch, &format!("b{batch}")).unwrap();
+                    insert_item_batch(&conn, next_id, rows_per_batch, &format!("b{batch}"))
+                        .unwrap();
                     next_id += rows_per_batch as i64;
                     // Best-effort flush. The Replicator's background loop shares
                     // this DbState and may publish some commits itself, so we do

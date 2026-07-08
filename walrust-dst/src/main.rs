@@ -337,8 +337,8 @@ fn run_chaos_tests(fault_types: &[&str], seed: u64, iterations: u32) -> anyhow::
                 results.extend(all_results);
 
                 // Real child-process SIGKILL crash recovery (not MadSim-gated).
-                let binary = std::env::current_exe()
-                    .context("locate walrust-dst binary for crash child")?;
+                let binary =
+                    std::env::current_exe().context("locate walrust-dst binary for crash child")?;
                 let crash = chaos::chaos_process_crash_recovery(&binary, seed, iterations.max(5))?;
                 print_chaos_result(&crash);
                 if !crash.passed {
@@ -357,10 +357,9 @@ fn run_chaos_tests(fault_types: &[&str], seed: u64, iterations: u32) -> anyhow::
             }
             "crashes" if !run_all => {
                 println!("  Testing fault: crashes (real child-process SIGKILL)");
-                let binary = std::env::current_exe()
-                    .context("locate walrust-dst binary for crash child")?;
-                let result =
-                    chaos::chaos_process_crash_recovery(&binary, seed, iterations.max(5))?;
+                let binary =
+                    std::env::current_exe().context("locate walrust-dst binary for crash child")?;
+                let result = chaos::chaos_process_crash_recovery(&binary, seed, iterations.max(5))?;
                 print_chaos_result(&result);
                 if !result.passed {
                     all_passed = false;
@@ -433,7 +432,9 @@ pub fn evaluate_soak_result(
     }
     if let Some(trend) = memory_trend_pct {
         if trend >= max_memory_trend_pct {
-            breaches.push(format!("memory trend {trend:.1}% >= {max_memory_trend_pct:.1}%"));
+            breaches.push(format!(
+                "memory trend {trend:.1}% >= {max_memory_trend_pct:.1}%"
+            ));
         }
     }
     if fd_growth >= max_fd_growth {
