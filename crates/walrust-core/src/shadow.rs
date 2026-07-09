@@ -850,6 +850,109 @@ mod tests {
         );
     }
 
+    /// Priority 1(b) — the REWIND question. A torn trailing frame was a
+    /// partially-copied REAL committed WAL frame. After healing, resume must
+    /// RE-COPY that frame from the live WAL (no silent data loss) AND must NOT
+    /// duplicate the whole frames that preceded the tear in the same
+    /// not-yet-persisted copy batch (no TXID-stream corruption). Both directions
+    /// are asserted against a clean-copy oracle built from the same live WAL.
+    #[tokio::test]
+    async fn e1_heal_then_resume_recopies_torn_frame_without_loss_or_corruption() {
+        use crate::legacy_shadow::{encode_shadow_to_ltx, ShadowSyncInput};
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("app.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t (v) VALUES ('a0');",
+        )
+        .unwrap();
+
+        // --- Durable checkpoint: copy commit A, persist its cursor. ---
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let (_frames_a, off_a) = shadow.copy_frames(0).await.unwrap();
+        let salt_a = shadow.wal_read_salt();
+        let chain_a = shadow.wal_read_chain();
+        let page_size = shadow.page_size();
+        let seg = shadow.shadow_dir().join(format_segment_name(0, 0));
+        assert!(off_a > 0, "commit A must have produced frames");
+
+        // --- Commit B: several more frames land in the live WAL. ---
+        for i in 0..5 {
+            conn.execute("INSERT INTO t (v) VALUES (?1)", [format!("b{i}")])
+                .unwrap();
+        }
+
+        // The interrupted copy of B: its whole frames reach the shadow on disk,
+        // but the crash happens before wal_copy_offset is persisted (it stays
+        // off_a) and the final frame is left torn.
+        let (_frames_b, _off_b) = shadow.copy_frames(off_a).await.unwrap();
+        let clean_len = std::fs::metadata(&seg).unwrap().len();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
+            f.write_all(&[0u8; 30]).unwrap(); // torn partial frame
+        }
+        drop(shadow);
+
+        // --- Restart: heal must drop the torn tail back to whole frames. ---
+        let mut restarted = ShadowWal::new(&db_path).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&seg).unwrap().len(),
+            clean_len,
+            "heal must truncate the torn tail to the whole-frame boundary"
+        );
+
+        // Resume from the PERSISTED (pre-B) cursor — the rewind under test.
+        restarted.restore_read_cursor(salt_a, chain_a);
+        let (_resumed, _new_off) = restarted.copy_frames(off_a).await.unwrap();
+
+        // Oracle: a pristine shadow built once from the same final live WAL.
+        let oracle_dir = tempdir().unwrap();
+        let oracle_db = oracle_dir.path().join("app.db");
+        std::fs::copy(&db_path, &oracle_db).unwrap();
+        std::fs::copy(
+            db_path.with_extension("db-wal"),
+            oracle_db.with_extension("db-wal"),
+        )
+        .unwrap();
+        let mut oracle = ShadowWal::new(&oracle_db).await.unwrap();
+        oracle.copy_frames(0).await.unwrap();
+        let oracle_seg = oracle.shadow_dir().join(format_segment_name(0, 0));
+        let oracle_len = std::fs::metadata(&oracle_seg).unwrap().len();
+
+        let healed_len = std::fs::metadata(&seg).unwrap().len();
+
+        // The encoded LTX is what actually ships. It must carry every distinct
+        // page exactly once with the same TXID range as a clean copy — the torn
+        // frame present (no loss) and any structurally duplicated frames
+        // collapsed by the page-dedup reader (no TXID-stream corruption).
+        let encode_one = |sdir: &std::path::Path, gen| {
+            encode_shadow_to_ltx(&ShadowSyncInput {
+                db_path: db_path.clone(),
+                name: "app".into(),
+                current_txid: 50,
+                db_checksum: Some(123),
+                generation: gen,
+                shadow_sync_offset: 0,
+                page_size,
+                shadow_dir: sdir.to_path_buf(),
+            })
+            .unwrap()
+            .map(|(r, _)| (r.unique_pages, r.min_txid, r.max_txid))
+        };
+        let healed = encode_one(restarted.shadow_dir(), restarted.generation());
+        let oracle_res = encode_one(oracle.shadow_dir(), oracle.generation());
+        assert_eq!(
+            healed, oracle_res,
+            "healed shadow must decode the same unique pages and TXID range as a \
+             clean copy (healed_seg_len={healed_len}, oracle_seg_len={oracle_len})"
+        );
+    }
+
     #[tokio::test]
     async fn test_shadow_wal_new_rejects_delete_mode_without_converting() {
         let dir = tempdir().unwrap();

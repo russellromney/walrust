@@ -54,10 +54,7 @@ impl DbLock {
             .write(true)
             .open(&path)
             .map_err(|e| {
-                WalrustError::config(format!(
-                    "failed to open lock file {}: {e}",
-                    path.display()
-                ))
+                WalrustError::config(format!("failed to open lock file {}: {e}", path.display()))
             })?;
 
         // Non-blocking exclusive advisory lock.
@@ -156,6 +153,77 @@ mod tests {
         }
         // After the first guard drops, a new instance can acquire again.
         let _second = DbLock::acquire(&db_path).expect("lock must be reacquirable after drop");
+    }
+
+    /// Priority-6: the single-writer guard relies on the OS releasing the
+    /// advisory flock when the holding process dies, even on SIGKILL (no
+    /// graceful drop runs). Fork a child that takes the lock, SIGKILL it, and
+    /// prove a fresh instance can then reacquire. The child touches only
+    /// async-signal-safe syscalls after fork.
+    #[test]
+    fn e5_lock_reacquires_after_holder_is_sigkilled() {
+        use std::ffi::CString;
+        use std::time::Duration;
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("app.db");
+        std::fs::write(&db_path, b"").unwrap();
+        let lock_path = DbLock::lock_path_for(&db_path);
+        let c_lock = CString::new(lock_path.to_str().unwrap()).unwrap();
+
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // Child: pure syscalls only (safe after fork in a threaded parent).
+            unsafe {
+                let fd = libc::open(c_lock.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644);
+                if fd < 0 {
+                    libc::_exit(1);
+                }
+                if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
+                    libc::_exit(2);
+                }
+                libc::sleep(30);
+                libc::_exit(0);
+            }
+        }
+
+        // Parent: wait until the child owns the lock.
+        let mut held = false;
+        for _ in 0..200 {
+            if DbLock::is_held_by_another(&db_path) {
+                held = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(held, "child must acquire the lock before we SIGKILL it");
+        assert!(
+            DbLock::acquire(&db_path).is_err(),
+            "lock must be contended while the child holds it"
+        );
+
+        // Hard-kill the holder; the OS must release its flock on process death.
+        unsafe {
+            libc::kill(pid, libc::SIGKILL);
+            let mut status = 0i32;
+            libc::waitpid(pid, &mut status, 0);
+        }
+
+        let mut reacquired = None;
+        for _ in 0..200 {
+            match DbLock::acquire(&db_path) {
+                Ok(lock) => {
+                    reacquired = Some(lock);
+                    break;
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+        assert!(
+            reacquired.is_some(),
+            "lock must be reacquirable after the holder is SIGKILLed"
+        );
     }
 
     #[test]

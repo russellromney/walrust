@@ -236,7 +236,7 @@ mod tests {
         // there. Those snapshots supersede the holes, so verify must be silent.
         let liveset = vec![
             live("a", 2, 46),
-            live("b", 48, 97), // hole at 47, bridged by snapshot(max=47)
+            live("b", 48, 97),  // hole at 47, bridged by snapshot(max=47)
             live("c", 99, 150), // hole at 98, bridged by snapshot(max=98)
         ];
         let snapshots: std::collections::BTreeSet<u64> = [1, 47, 98].into_iter().collect();
@@ -256,6 +256,26 @@ mod tests {
         let gaps = detect_live_txid_gaps(&liveset, &snapshots);
         assert_eq!(gaps.len(), 1, "unbridged hole must be a real gap: {gaps:?}");
         assert_eq!(gaps[0], ("b".to_string(), 47, 48));
+    }
+
+    #[test]
+    fn e3_gap_below_latest_snapshot_above_older_retained_snapshot_still_alarms() {
+        // Priority-5 case. Two retained snapshots: an old base at TXID 1 and the
+        // latest at TXID 100. The incremental pool has an UNBRIDGED hole at
+        // 51-59 (no snapshot there) and a snapshot-punched hole at 100. A PITR
+        // into 60-99 genuinely depends on the missing 51-59 range: the latest
+        // snapshot at 100 is ABOVE that range and cannot serve as its base, and
+        // the old base at 1 cannot reach 60 across the hole. verify MUST alarm
+        // on 51-59, while the snapshot at 100 correctly supersedes the hole at
+        // 100 (restores >= 100 use it as base).
+        let liveset = vec![live("a", 2, 50), live("b", 60, 99), live("c", 101, 150)];
+        let snapshots: std::collections::BTreeSet<u64> = [1, 100].into_iter().collect();
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots);
+        assert_eq!(
+            gaps,
+            vec![("b".to_string(), 51, 60)],
+            "the unbridged mid-range hole must alarm and the snapshot@100 hole must not: {gaps:?}"
+        );
     }
 
     #[test]

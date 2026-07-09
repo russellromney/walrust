@@ -381,8 +381,10 @@ pub async fn plan_legacy_compaction(
         .map(|(_, min, max)| (*min, *max))
         .collect();
     live_sorted.sort_unstable();
-    let snapshot_txids: std::collections::BTreeSet<u64> =
-        snapshot_entries.iter().map(|entry| entry.sequence).collect();
+    let snapshot_txids: std::collections::BTreeSet<u64> = snapshot_entries
+        .iter()
+        .map(|entry| entry.sequence)
+        .collect();
     let mut bridge_snapshots: HashSet<u64> = HashSet::new();
     let mut prev_max: Option<u64> = None;
     for (min, max) in &live_sorted {
@@ -668,7 +670,10 @@ mod tests {
             );
         }
         assert!(
-            !plan.delete.iter().any(|e| [10, 20, 30].contains(&e.sequence)),
+            !plan
+                .delete
+                .iter()
+                .any(|e| [10, 20, 30].contains(&e.sequence)),
             "no bridge snapshot may be deleted: {:?}",
             plan.delete.iter().map(|e| e.sequence).collect::<Vec<_>>()
         );

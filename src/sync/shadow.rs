@@ -330,21 +330,16 @@ mod tests {
         let webhook = WebhookSender::new(vec![]);
         let calls = std::cell::Cell::new(0u32);
 
-        let result = run_shadow_sync_with_retry(
-            "Shadow sync",
-            "app",
-            &retry_policy,
-            &webhook,
-            || {
+        let result =
+            run_shadow_sync_with_retry("Shadow sync", "app", &retry_policy, &webhook, || {
                 calls.set(calls.get() + 1);
                 async {
                     Err(anyhow::anyhow!(
                         "Invalid page num: transaction ID must be non-zero"
                     ))
                 }
-            },
-        )
-        .await;
+            })
+            .await;
 
         assert!(result.is_err(), "permanent encode error must propagate");
         assert_eq!(
@@ -367,17 +362,12 @@ mod tests {
         let webhook = WebhookSender::new(vec![]);
         let calls = std::cell::Cell::new(0u32);
 
-        let result = run_shadow_sync_with_retry(
-            "Shadow sync",
-            "app",
-            &retry_policy,
-            &webhook,
-            || {
+        let result =
+            run_shadow_sync_with_retry("Shadow sync", "app", &retry_policy, &webhook, || {
                 calls.set(calls.get() + 1);
                 async { Err(anyhow::anyhow!("connection reset by peer")) }
-            },
-        )
-        .await;
+            })
+            .await;
 
         assert!(result.is_err());
         assert_eq!(
