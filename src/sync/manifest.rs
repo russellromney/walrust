@@ -2,11 +2,11 @@ use anyhow::Result;
 use hadb_storage_s3::S3Storage;
 #[cfg(test)]
 pub(crate) use walrust_core::legacy_manifest::build_ltx_key;
-pub(crate) use walrust_core::legacy_manifest::{is_snapshot, DiscoveredLtx, GENERATION_LIVE};
 use walrust_core::legacy_manifest::{
     discover_all_legacy_ltx, discover_legacy_snapshots, discover_legacy_state,
     find_latest_legacy_snapshot, list_legacy_generation_files,
 };
+pub(crate) use walrust_core::legacy_manifest::{is_snapshot, DiscoveredLtx, GENERATION_LIVE};
 
 // ============================================
 // Litestream-compatible format helpers
