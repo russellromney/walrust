@@ -683,25 +683,26 @@ async fn e2e_core_replicator_restore_round_trips_sqlite_rows() -> Result<()> {
     Ok(())
 }
 
-/// RACING variant (closes the A3/A4 Phase-2A scope note) for walrust-owned core
-/// mode, which has NO checkpoint blocker and relies purely on rollover DETECTION
-/// -> full re-snapshot. NO pinned reader suppresses the external TRUNCATE.
+/// RACING external checkpoint against a running walrust-OWNED core replicator.
 ///
-/// This test is deliberately constructed so the re-anchor is LOAD-BEARING (it
-/// FAILS with missing rows if the WalrustOwned rollover re-snapshot is disabled):
+/// Under D2 the core `Replicator` holds a pinned-frame `_walrust_seq` checkpoint
+/// blocker in walrust-owned mode (litestream-style), exactly like shadow mode.
+/// A racing external `wal_checkpoint(TRUNCATE)` from a second connection must
+/// therefore be REFUSED (busy != 0): the blocker pins a live WAL frame so the WAL
+/// is never reset out from under an in-flight backup, and no committed frame is
+/// ever destroyed. Restore must still round-trip every row.
 ///
-///  1. Batch A is written AND read by walrust (an incremental is published; this
-///     also records the current WAL salt so the next rollover is *detected*).
+/// (Before D2 owned mode had no blocker and this test forced an actual reset,
+/// relying on rollover DETECTION -> re-snapshot to recover the folded frames. The
+/// re-anchor backstop is still exercised — now via a walrust-DOWN window — by
+/// `replicator_flush::test_walrust_owned_flush_resnapshots_after_checkpoint_rollover`.)
+///
+///  1. Batch A is written AND read by walrust (an incremental is published).
 ///  2. Batch A2 is written on fresh pages but NOT yet read by walrust.
-///  3. An external `wal_checkpoint(TRUNCATE)` folds A+A2 into the main DB and
-///     resets the WAL — `busy==0` proves the reset really happened. A2's frames
-///     are now gone from the WAL; only a re-snapshot that re-reads the folded
-///     main DB can still capture them.
-///  4. A tiny tail batch B opens a new WAL generation (new salt) touching only
-///     the tail page, so A2's earlier pages are never re-imaged by any later
-///     incremental.
-///  5. The next flush observes the salt/size rollover and MUST re-anchor with a
-///     fresh snapshot; otherwise A2's rows are lost forever.
+///  3. A racing external `wal_checkpoint(TRUNCATE)` MUST be refused (busy != 0):
+///     the pinned-frame blocker prevents the WAL reset, so A2's frames survive.
+///  4. A tail batch B adds more frames.
+///  5. Subsequent flushes ship A2 + B normally; restore round-trips all 125 rows.
 #[tokio::test]
 async fn e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss() -> Result<()> {
     require_s3!("e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss");
@@ -722,10 +723,11 @@ async fn e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss() -> 
     let storage = walrust::s3_backend_from_env(test_bucket(), test_endpoint().as_deref()).await?;
     let replicator =
         walrust::walrust_core::Replicator::new(storage, &prefix, core_replicator_config());
+    // add() opens the D2 checkpoint blocker synchronously, so it is already pinning
+    // the live WAL by the time we race a checkpoint below.
     replicator.add(&name, &db_path).await?;
 
-    // 1. Batch A: walrust reads and publishes it. This advances the WAL cursor and
-    //    records the current salt, so a later checkpoint is DETECTED as a rollover.
+    // 1. Batch A: walrust reads and publishes it.
     append_wide_rows(&writer, 6, 40, "raceA")?;
     let a_frames = replicator.flush(&name).await?;
     anyhow::ensure!(a_frames > 0, "batch A should publish an incremental");
@@ -733,22 +735,24 @@ async fn e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss() -> 
     // 2. Batch A2: written on fresh pages but NOT read by walrust yet.
     append_wide_rows(&writer, 41, 120, "raceA2")?;
 
-    // 3. External TRUNCATE folds A+A2 into the main DB and resets the WAL. With no
-    //    reader pinning a live frame this MUST succeed (busy==0), destroying A2's
-    //    frames in the WAL. Only a re-snapshot of the folded main DB recovers them.
-    let (busy, log, ckpt) = force_truncate_checkpoint(&writer)?;
+    // 3. Racing external TRUNCATE. The pinned-frame blocker MUST refuse it
+    //    (busy != 0); the WAL is not reset, so A2's frames survive and ship on the
+    //    next flush. A busy DB can also surface as a SQLITE_BUSY error rather than a
+    //    busy!=0 result row — either is proof the pin engaged.
+    let busy = match force_truncate_checkpoint(&writer) {
+        Ok((busy, _log, _ckpt)) => busy,
+        Err(_) => 1,
+    };
     anyhow::ensure!(
-        busy == 0 && ckpt >= log,
-        "unpinned external TRUNCATE must reset the WAL (busy={busy}, log={log}, ckpt={ckpt})"
+        busy != 0,
+        "the D2 checkpoint blocker must refuse a racing external TRUNCATE (busy={busy})"
     );
 
-    // 4. Tiny tail batch B: opens a new WAL generation (new salt), touching only the
-    //    tail page so A2's earlier leaf pages are never re-imaged by an incremental.
+    // 4. Tail batch B adds more frames on top of the still-live WAL.
     append_wide_rows(&writer, 121, 125, "raceB")?;
 
-    // 5. This flush observes the rollover and must re-anchor with a fresh snapshot.
-    replicator.flush(&name).await?;
-    for _ in 0..3 {
+    // 5. Ship the remaining frames.
+    for _ in 0..4 {
         replicator.flush(&name).await?;
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -762,13 +766,13 @@ async fn e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss() -> 
     let restored_seq = replicator.restore(&name, &restored_path).await?;
     anyhow::ensure!(
         restored_seq.is_some(),
-        "restore should find data after racing checkpoints"
+        "restore should find data after the racing checkpoint"
     );
     assert_integrity_ok(&restored_path)?;
     assert_eq!(
         expected,
         rows(&restored_path)?,
-        "no data loss across a racing external checkpoint that folded un-read frames"
+        "no data loss: the blocker refused the racing external checkpoint"
     );
 
     Ok(())

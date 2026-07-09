@@ -216,6 +216,13 @@ impl Replicator {
     /// In walrust-owned mode, takes an initial snapshot (blocks until uploaded).
     /// In external-base-state mode, registers without uploading a snapshot.
     ///
+    /// **Side effect (walrust-owned mode):** walrust creates a `_walrust_seq`
+    /// table in the database and holds a long-running read transaction that pins
+    /// a live WAL frame, so an external process cannot checkpoint the WAL out
+    /// from under an in-flight backup. This mirrors Litestream's `_litestream_seq`
+    /// table. The table holds a single counter row; walrust bumps it and re-pins
+    /// the fresh WAL around each of its own checkpoints.
+    ///
     /// Returns error if initialization fails — the database is NOT added in that case.
     pub async fn add(&self, name: &str, db_path: &Path) -> Result<()> {
         self.add_with_wal_path(name, db_path, &db_path.with_extension("db-wal"))

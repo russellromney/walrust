@@ -1525,4 +1525,58 @@ mod tests {
             "shadow generation must advance after salt mismatch"
         );
     }
+
+    #[tokio::test]
+    async fn test_initial_shadow_copy_no_eager_snapshot_without_downtime_checkpoint() {
+        // D3 (negative): if the live WAL salt did NOT change while walrust was
+        // down (no external checkpoint), the initial copy must NOT flag the
+        // database for an eager snapshot. Eager snapshots fire ONLY on mismatch.
+        let (_temp, db_path, conn) = create_real_wal_db();
+
+        // First "process": copy WAL frames and remember the salt/offset.
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
+        assert!(!frames.is_empty(), "pre-restart copy must read frames");
+        let saved_salt = shadow.wal_read_salt();
+        let saved_chain = shadow.wal_read_chain();
+        drop(shadow);
+
+        // Normal writes while walrust is "down" — appended to the SAME WAL, no
+        // checkpoint, so the salt is unchanged.
+        conn.execute("INSERT INTO items (value) VALUES ('delta')", [])
+            .unwrap();
+
+        // Second "process": restart with the persisted cursor.
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        shadow.restore_read_cursor(saved_salt, saved_chain);
+        let generation_before = shadow.generation();
+
+        let mut db_states = HashMap::new();
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name: "no-downtime-ckpt".to_string(),
+                db_path: db_path.clone(),
+                wal_path: db_path.with_extension("db-wal"),
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                shadow,
+                shadow_sync_generation: 0,
+                shadow_sync_offset: 0,
+                wal_copy_offset: offset,
+            },
+        );
+
+        let eager = initial_shadow_copy(&mut db_states).await.unwrap();
+        assert!(
+            !eager.contains(&db_path),
+            "no salt mismatch means no eager snapshot must be scheduled"
+        );
+        assert_eq!(
+            db_states[&db_path].shadow.generation(),
+            generation_before,
+            "shadow generation must not advance without a downtime checkpoint"
+        );
+    }
 }

@@ -1773,14 +1773,34 @@ executed the recorded remainder.
   transaction. `take_snapshot` / `take_snapshot_with_retry` release the blocker,
   run `wal_checkpoint(TRUNCATE)`, then reacquire it immediately and write a fresh
   `_walrust_seq` row so the new WAL is pinned at once and its salt is recorded.
-- **Proving test:** `walrust_core::sync::tests::test_owned_replicator_holds_checkpoint_blocker_after_add`.
+- **Proving test:** `walrust_core::sync::tests::test_owned_replicator_holds_checkpoint_blocker_after_add`
+  drives a real `Replicator::add` and asserts an external `wal_checkpoint(TRUNCATE)`
+  from a second connection returns `busy != 0`.
+- **Behavior change vs Phase-2A (adversarial review, 2026-07-08):** owned mode
+  previously had NO blocker, so the Phase-2A racing E2E
+  `e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss` forced an
+  actual external TRUNCATE and asserted `busy==0` (the reset happened), then relied
+  on rollover DETECTION -> re-snapshot to recover the folded frames. With D2 the
+  blocker now REFUSES that external checkpoint (`busy != 0`), so that E2E was
+  updated to assert refusal + full round-trip (prevention supersedes recovery in
+  steady state). The re-anchor backstop is still load-bearing and is now exercised
+  via a walrust-DOWN window by
+  `walrust_core::replicator_flush::test_walrust_owned_flush_resnapshots_after_checkpoint_rollover`
+  and `..::test_rollover_observer_fires_on_walrust_owned_reanchor` (drop the
+  replicator, external TRUNCATE while down, reopen -> re-anchor). Revert-verified.
+- **Cost note:** the blocker writes one `_walrust_seq` bookkeeping frame per
+  open/reopen and per post-checkpoint reacquire (same as Litestream's
+  `_litestream_seq`); this is a single row, not per-frame or per-sync work.
 
 ### D3 — Shadow downtime-checkpoint completeness (from B4)
 - **Status:** Fixed.
 - **Fix:** on restart, when the initial shadow copy detects a WAL salt mismatch
   (external checkpoint while walrust was down), the database is flagged for an
   eager snapshot before the periodic timers start.
-- **Proving test:** `walrust::sync::watch_shadow::tests::test_initial_shadow_copy_detects_downtime_checkpoint`.
+- **Proving tests:** `walrust::sync::watch_shadow::tests::test_initial_shadow_copy_detects_downtime_checkpoint`
+  (fires on salt mismatch) and
+  `walrust::sync::watch_shadow::tests::test_initial_shadow_copy_no_eager_snapshot_without_downtime_checkpoint`
+  (does NOT fire when a normal restart appends to the same WAL with no external checkpoint).
 
 ### D4 — Rollover CheckpointDetected webhook variant (from A3)
 - **Status:** Fixed.
