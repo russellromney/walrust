@@ -1758,101 +1758,103 @@ executed the recorded remainder.
 
 ## DEFERRED (final register)
 
-Everything still open after the fix waves, so nothing vanishes. Each item:
-**risk**, **trigger scenario**, **suggested future fix**. None is a silent
-data-loss path in steady-state operation; all are shouldn't-happen edges bounded
-by an existing safety net (periodic snapshot, pinned-reader blocker, fail-closed
-chain verify), or observability/ergonomics gaps.
-
 ### D1 — Writer-lease / split-brain immunity token (from B11)
-- **Risk:** the walrust-owned crash-window recovery is gated on a local, fsynced
-  `PublishIntent` authorship proof, not a distributed fence. It correctly refuses
-  a second writer's same-seq object, but it is a state-durability proof, not a
-  lease. Two nodes that both believe they hold the writer role can still each make
-  local progress until their CAS puts collide.
-- **Trigger:** HA failover where the promoted node and a revived original node
-  both publish under the same lineage/base before either observes the other's
-  objects.
-- **Suggested fix:** a real lease/epoch token from an external store (the hadb
-  internal-lease-store the pinned `hadb-*` branch is named for), checked at
-  publish time so a stale epoch cannot CAS at all. Larger than a fix wave.
+- **Status:** Out of scope by design.
+- **Rationale:** walrust is single-writer. A second writer fails loudly on CAS
+  collision; the local `PublishIntent` authorship proof is a durability fence,
+  not a distributed lease. A true multi-writer lease/epoch token belongs in the
+  external coordinator (the hadb internal-lease-store work), not in walrust.
 
 ### D2 — Core walrust-owned first-checkpoint window (from A3)
-- **Risk:** rollover DETECTION needs a previously-recorded WAL salt, which is
-  `None` immediately after a snapshot (the WAL is empty). An external checkpoint
-  that folds un-read frames in that brief first-read window is not detected as a
-  rollover; its un-re-imaged pages can be lost.
-- **Trigger:** an external process checkpoints a walrust-OWNED WAL (which walrust
-  sets `autocheckpoint=0` on) in the gap between a snapshot and walrust's first
-  incremental read.
-- **Suggested fix:** record the first post-snapshot WAL salt as SQLite writes it,
-  without a full read, so the window has a reset signal. Phase 2B tried the
-  offset-24 counter and a DB-file hash; both were rejected (false-positive on
-  benign PASSIVE folds, would weaken the honest pinned-reader E2Es). Exposure is
-  bounded by `snapshot_interval` (the next snapshot re-images the DB file).
+- **Status:** Fixed.
+- **Design note:** walrust-owned mode now holds the same pinned-frame checkpoint
+  blocker shadow mode uses (litestream-style): `add()` creates `_walrust_seq`,
+  writes a row so the WAL always has a real frame, and opens a long-running read
+  transaction. `take_snapshot` / `take_snapshot_with_retry` release the blocker,
+  run `wal_checkpoint(TRUNCATE)`, then reacquire it immediately and write a fresh
+  `_walrust_seq` row so the new WAL is pinned at once and its salt is recorded.
+- **Proving test:** `walrust_core::sync::tests::test_owned_replicator_holds_checkpoint_blocker_after_add`
+  drives a real `Replicator::add` and asserts an external `wal_checkpoint(TRUNCATE)`
+  from a second connection returns `busy != 0`.
+- **Behavior change vs Phase-2A (adversarial review, 2026-07-08):** owned mode
+  previously had NO blocker, so the Phase-2A racing E2E
+  `e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss` forced an
+  actual external TRUNCATE and asserted `busy==0` (the reset happened), then relied
+  on rollover DETECTION -> re-snapshot to recover the folded frames. With D2 the
+  blocker now REFUSES that external checkpoint (`busy != 0`), so that E2E was
+  updated to assert refusal + full round-trip (prevention supersedes recovery in
+  steady state). The re-anchor backstop is still load-bearing and is now exercised
+  via a walrust-DOWN window by
+  `walrust_core::replicator_flush::test_walrust_owned_flush_resnapshots_after_checkpoint_rollover`
+  and `..::test_rollover_observer_fires_on_walrust_owned_reanchor` (drop the
+  replicator, external TRUNCATE while down, reopen -> re-anchor). Revert-verified.
+- **Cost note:** the blocker writes one `_walrust_seq` bookkeeping frame per
+  open/reopen and per post-checkpoint reacquire (same as Litestream's
+  `_litestream_seq`); this is a single row, not per-frame or per-sync work.
 
 ### D3 — Shadow downtime-checkpoint completeness (from B4)
-- **Risk:** on restart, the shadow reader detects a downtime checkpoint (salt
-  mismatch) and bumps the generation + re-seeds per-frame validation, but does
-  NOT eagerly re-snapshot. Frames an external checkpoint folded away during
-  downtime live in the main DB file, not re-imaged until the next periodic
-  snapshot.
-- **Trigger:** process is down while an external checkpoint TRUNCATEs the shadow's
-  source WAL, then walrust restarts.
-- **Suggested fix:** an eager re-snapshot on a downtime generation bump — deferred
-  because a generation bump in shadow mode is normally BENIGN (walrust's own
-  copy-then-checkpoint bumps it too) and the PASSIVE-fold-vs-destructive-reset
-  distinction is not cheaply available (same residual class as D2). Bounded by
-  `snapshot_interval`; the generation-boundary chain re-seed keeps restore
-  fail-closed on any gap (short restore errors, never silent).
+- **Status:** Fixed.
+- **Fix:** on restart, when the initial shadow copy detects a WAL salt mismatch
+  (external checkpoint while walrust was down), the database is flagged for an
+  eager snapshot before the periodic timers start.
+- **Proving tests:** `walrust::sync::watch_shadow::tests::test_initial_shadow_copy_detects_downtime_checkpoint`
+  (fires on salt mismatch) and
+  `walrust::sync::watch_shadow::tests::test_initial_shadow_copy_no_eager_snapshot_without_downtime_checkpoint`
+  (does NOT fire when a normal restart appends to the same WAL with no external checkpoint).
 
 ### D4 — Rollover CheckpointDetected webhook variant (from A3)
-- **Risk:** rollover events ride the `upload_failed` webhook channel with a
-  distinct message rather than a dedicated `CheckpointDetected` variant, so an
-  external consumer cannot filter rollovers by event type. Library embedders have
-  the typed `RolloverObserver`; the webhook half is binary-only.
-- **Trigger:** an operator wiring alerting who wants to route rollover events
-  separately from upload failures.
-- **Suggested fix:** add a `CheckpointDetected` variant. Deferred: the `hadb-io`
-  webhook enum is a pinned external dependency (Phase-0 decision); changing it is
-  cross-repo. Also, shadow mode treats a salt change as a routine generation roll
-  (walrust's own checkpoints change the salt), so a blocker-failure external
-  rollover in shadow mode is not distinctly alerted — same observability gap.
+- **Status:** Fixed.
+- **Fix:** added a `CheckpointDetected` variant to `hadb-io/src/webhook.rs` in the
+  `checkpoint-detected` branch of `hadb`, bumped the pinned `hadb` rev in
+  walrust's `Cargo.toml` files, and routed rollover notifications through the new
+  variant instead of `upload_failed`.
+- **hadb rev bumped from → to:** `c3eab301…` → `1100d3b615743405c676ecefa5743f2c277ea25f`.
+- **Proving test:** `walrust::sync::wal_sync::tests::test_checkpoint_detected_webhook_event_is_sent_for_rollover`.
 
 ### D5 — A5 drain-at-commit-boundary invariant (from A5)
-- **Risk:** the generation-aware shadow sync cursor's drain condition relies on
-  the invariant that a generation ends at a commit boundary. Uncommitted trailing
-  frames would stall the cursor.
-- **Trigger:** a generation whose tail is uncommitted frames (should not occur —
-  the checked reader stops at the last committed frame).
-- **Suggested fix:** the stall is the intended fail-safe (it never advances past
-  an incomplete generation), but it is an unenforced invariant rather than an
-  asserted one. A defensive assertion + loud error would make the assumption
-  explicit.
+- **Status:** Fixed.
+- **Fix:** `advance_shadow_sync_cursor_if_drained` now checks the last frame of a
+  fully-drained shadow generation and returns a typed
+  `WalrustError::ShadowGenerationNotAtCommitBoundary` instead of silently
+  advancing past a non-commit tail.
+- **Proving test:** `walrust_core::legacy_shadow_watch::tests::test_advance_cursor_rejects_generation_tail_not_at_commit_boundary`.
 
 ### D6 — B13 cross-generation same-(min,max) cache collision (from B13)
-- **Risk:** restore cache substitution binds a cached object to the requested
-  key's `(min,max)` TXID range, closing the bare-TXID hole. A same-`(min,max)`
-  collision across generations after a TXID-rewinding reset would still pass the
-  binding.
-- **Trigger:** a TXID-rewinding reset that produces two objects sharing an exact
-  `(min,max)` interval in different generations, with the wrong one cached.
-- **Suggested fix:** bind the substitution to lineage/etag as well as the TXID
-  range. Backstopped today by the DB-anchored restore-chain `pre/post_apply`
-  checksums (`apply_ltx_to_db_checked`), which are computed from actual DB bytes
-  and catch a wrong-lineage substitution downstream.
+- **Status:** Accepted.
+- **Rationale:** a same-`(min,max)` cross-generation cache collision is
+  theoretically possible, but it is backstopped by the restore chain's
+  `pre/post_apply` checksums (`apply_ltx_to_db_checked`), which are computed from
+  actual DB bytes and catch a wrong-lineage substitution downstream. Fixing the
+  cache binding to include lineage/etag is future work outside this register.
 
 ### D7 — MEDIUM/LOW ergonomics (not on a durability path)
-- **Config glob matching nothing is a warn+skip, not an error** (`config.rs`):
-  risk is a silent typo'd glob backing up nothing; trigger is a mistyped path
-  pattern; fix is warn→error, deferred because it changes semantics for existing
-  configs and is not a durability path.
-- **CLI clap defaults silently override walrust.toml values** (`main.rs`): risk
-  is a surprising precedence; trigger is setting a value in the toml that a clap
-  default shadows; fix is a presence check on the CLI arg before override.
-- **Corruption webhook fired via `tokio::spawn` on the exit path** (`restore.rs`):
-  risk is the webhook is lost when the process exits before the task runs; trigger
-  is a corruption-triggered exit; fix is to await the notification before exit.
-- **Legacy `sync_wal_and_manifest` grows the manifest unboundedly** (`sync.rs`):
-  risk is manifest bloat over long uptime; trigger is a very long-lived stream on
-  the legacy manifest path; fix is periodic compaction of the manifest.
+
+#### D7.1 — Empty config glob matches nothing
+- **Status:** Fixed.
+- **Fix:** a glob that matches zero databases is now a startup `ERROR`. Added
+  `allow_empty_globs = true` to opt out for genuinely optional patterns.
+- **Proving tests:** `walrust::config::tests::test_empty_glob_is_error_by_default`,
+  `walrust::config::tests::test_empty_glob_allowed_with_opt_in`.
+
+#### D7.2 — CLI clap defaults override walrust.toml
+- **Status:** Fixed.
+- **Fix:** `resolve_cache_config` now uses `matches.value_source()` to apply CLI
+  `cache_retention` / `uploader_concurrency` only when the user actually passed the
+  flag, so toml values win over clap defaults.
+- **Proving test:** `walrust::config::tests::test_resolve_cache_config_from_config_file`.
+
+#### D7.3 — Corruption webhook lost on restore exit path
+- **Status:** Fixed.
+- **Fix:** `restore.rs` now awaits the corruption webhook notification (with a
+  5-second timeout) before returning, instead of firing it via `tokio::spawn`.
+- **Proving test:** `walrust::sync::restore::tests::test_restore_failure_awaits_corruption_webhook_before_returning`.
+
+#### D7.4 — Legacy `sync_wal_and_manifest` path
+- **Status:** Fixed.
+- **Fix:** deleted `sync_wal_and_manifest`, the `Manifest`/`LtxEntry` structs,
+  `load_manifest`, `save_manifest`, and their tests from
+  `crates/walrust-core/src/sync.rs`. The remaining manifest helpers in
+  `src/sync/manifest.rs` are manifest-free discovery functions only.
+- **Proving coverage:** verified by `cargo check` and the continued passing of the
+  replicator / manifest convergence tests that previously shared the codebase
+  with the deleted path.

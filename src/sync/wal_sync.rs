@@ -141,7 +141,7 @@ pub(crate) async fn do_sync(
         );
         tracing::error!("{}", event);
         webhook_sender
-            .notify_upload_failed(&state.db_state.name, &event, 1)
+            .notify_checkpoint_detected(&state.db_state.name, &event)
             .await;
     }
 
@@ -434,6 +434,37 @@ mod tests {
         assert_eq!(payload["database"], "delete-mode-webhook");
         assert!(
             payload["error"].as_str().unwrap().contains("journal_mode"),
+            "{payload:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint_detected_webhook_event_is_sent_for_rollover() {
+        // D4: rollover events must use the dedicated checkpoint_detected webhook
+        // variant, not piggyback on upload_failed.
+        let (url, webhook_body) = capture_one_webhook().await;
+        let webhook_sender = Arc::new(WebhookSender::new(vec![WebhookConfig {
+            url,
+            events: vec!["checkpoint_detected".to_string()],
+            secret: None,
+        }]));
+
+        webhook_sender
+            .notify_checkpoint_detected("rollover-db", "checkpoint/rollover detected")
+            .await;
+
+        let body = tokio::time::timeout(std::time::Duration::from_secs(2), webhook_body)
+            .await
+            .unwrap()
+            .unwrap();
+        let payload: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(payload["event"], "checkpoint_detected");
+        assert_eq!(payload["database"], "rollover-db");
+        assert!(
+            payload["error"]
+                .as_str()
+                .unwrap()
+                .contains("checkpoint/rollover detected"),
             "{payload:?}"
         );
     }

@@ -35,7 +35,7 @@ fn format_segment_name(generation: u64, index: u64) -> String {
     )
 }
 
-fn ensure_connection_in_wal_mode(conn: &Connection, db_path: &Path) -> Result<()> {
+pub(crate) fn ensure_connection_in_wal_mode(conn: &Connection, db_path: &Path) -> Result<()> {
     let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
     if mode.eq_ignore_ascii_case("wal") {
         Ok(())
@@ -135,8 +135,9 @@ impl ShadowWal {
         parent.join(format!(".walrust-{}", db_name.to_string_lossy()))
     }
 
-    /// Open a read connection that prevents SQLite from auto-checkpointing
-    fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
+    /// Open a read connection that prevents SQLite from auto-checkpointing.
+    /// Also used by walrust-owned replication to pin the live WAL (D2).
+    pub(crate) fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
         let conn = Connection::open(db_path)?;
 
         ensure_connection_in_wal_mode(&conn, db_path)?;

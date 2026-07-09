@@ -1,8 +1,10 @@
 //! Legacy shadow-watch lifecycle helpers shared by the root CLI wrapper.
 
+use crate::errors::WalrustError;
 use crate::legacy_cache::LocalCache;
 use crate::legacy_shadow::{ShadowSyncInput, ShadowSyncOutput};
 use crate::shadow::ShadowWal;
+use crate::wal::FRAME_HEADER_SIZE;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -11,6 +13,8 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::fs::File as AsyncFile;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
 const SHADOW_PROGRESS_FILE: &str = "progress.json";
 
@@ -254,6 +258,43 @@ pub fn save_shadow_watch_progress(state: &ShadowWatchState) -> Result<()> {
     )
 }
 
+/// Read the `db_size` field of the last frame in a shadow generation.
+///
+/// Returns `Ok(None)` if the generation has no segment data. A non-zero
+/// `db_size` marks a commit frame; zero means the generation ends mid-
+/// transaction.
+async fn last_frame_db_size_in_generation(
+    shadow: &ShadowWal,
+    generation: u64,
+) -> Result<Option<u32>> {
+    let segments = shadow.list_segments(generation).await?;
+    let Some(last) = segments.last() else {
+        return Ok(None);
+    };
+    if last.size == 0 {
+        return Ok(None);
+    }
+
+    let frame_size = FRAME_HEADER_SIZE + shadow.page_size() as u64;
+    if last.size < frame_size {
+        anyhow::bail!(
+            "shadow segment {:?} is smaller than one frame ({} < {})",
+            last.path,
+            last.size,
+            frame_size
+        );
+    }
+
+    let header_offset = last.size - frame_size;
+    let mut file = AsyncFile::open(&last.path).await?;
+    file.seek(SeekFrom::Start(header_offset)).await?;
+    let mut header = [0u8; FRAME_HEADER_SIZE as usize];
+    file.read_exact(&mut header).await?;
+
+    let db_size = u32::from_be_bytes([header[4], header[5], header[6], header[7]]);
+    Ok(Some(db_size))
+}
+
 pub async fn advance_shadow_sync_cursor_if_drained(state: &mut ShadowWatchState) -> Result<()> {
     loop {
         let live_generation = state.shadow.generation();
@@ -274,6 +315,30 @@ pub async fn advance_shadow_sync_cursor_if_drained(state: &mut ShadowWatchState)
         let generation_size: u64 = segments.iter().map(|segment| segment.size).sum();
         if state.shadow_sync_offset < generation_size {
             return Ok(());
+        }
+
+        // The shadow sync cursor assumes each generation ends at a commit
+        // boundary. If we have drained a generation whose tail frame is not a
+        // commit, something is wrong; fail loudly instead of silently stalling.
+        if generation_size > 0 {
+            let tail_db_size =
+                last_frame_db_size_in_generation(&state.shadow, state.shadow_sync_generation)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "{}: failed to read tail frame of shadow generation {}",
+                            state.name, state.shadow_sync_generation
+                        )
+                    })?;
+            if tail_db_size.map(|v| v == 0).unwrap_or(true) {
+                return Err(WalrustError::ShadowGenerationNotAtCommitBoundary(format!(
+                    "{}: shadow generation {} tail is not at a commit boundary (last frame db_size={:?})",
+                    state.name,
+                    state.shadow_sync_generation,
+                    tail_db_size
+                ))
+                .into());
+            }
         }
 
         tracing::debug!(
@@ -332,5 +397,98 @@ pub async fn apply_shadow_sync_results_strict(
     match first_error {
         Some(e) => Err(e).context("final shadow sync failed"),
         None => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write_shadow_frame(page_number: u32, db_size: u32, page_size: u32) -> Vec<u8> {
+        let mut frame = Vec::with_capacity((FRAME_HEADER_SIZE + page_size as u64) as usize);
+        let mut header = [0u8; FRAME_HEADER_SIZE as usize];
+        header[0..4].copy_from_slice(&page_number.to_be_bytes());
+        header[4..8].copy_from_slice(&db_size.to_be_bytes());
+        frame.extend_from_slice(&header);
+        frame.extend_from_slice(&vec![0u8; page_size as usize]);
+        frame
+    }
+
+    async fn shadow_state_with_generation_tail(
+        dir: &tempfile::TempDir,
+        tail_db_size: u32,
+    ) -> ShadowWatchState {
+        let db_path = dir.path().join("test.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             PRAGMA wal_autocheckpoint=0; \
+             CREATE TABLE t (id INTEGER PRIMARY KEY); \
+             INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let page_size = shadow.page_size();
+        let shadow_dir = shadow.shadow_dir().to_path_buf();
+        drop(shadow);
+
+        let gen0_path = shadow_dir.join(format!("{:016x}-{:016x}.wal", 0u64, 0u64));
+        let gen1_path = shadow_dir.join(format!("{:016x}-{:016x}.wal", 1u64, 0u64));
+
+        // Generation 0 ends with the requested tail frame.
+        let gen0_segment = write_shadow_frame(1, tail_db_size, page_size);
+        tokio::fs::write(&gen0_path, &gen0_segment).await.unwrap();
+
+        // A later generation exists so the drain cursor tries to advance past gen 0.
+        let gen1_segment = write_shadow_frame(1, 1, page_size);
+        tokio::fs::write(&gen1_path, &gen1_segment).await.unwrap();
+
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        ShadowWatchState {
+            name: "test".to_string(),
+            db_path,
+            wal_path: shadow.shadow_dir().join("test.db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            shadow_sync_generation: 0,
+            shadow_sync_offset: gen0_segment.len() as u64,
+            wal_copy_offset: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_advance_cursor_rejects_generation_tail_not_at_commit_boundary() {
+        let dir = tempdir().unwrap();
+        let mut state = shadow_state_with_generation_tail(&dir, 0).await;
+
+        let err = advance_shadow_sync_cursor_if_drained(&mut state)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not at a commit boundary"),
+            "expected commit-boundary error, got: {msg}"
+        );
+        assert!(
+            msg.contains("db_size=Some(0)"),
+            "error should report the offending db_size: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_advance_cursor_accepts_generation_tail_at_commit_boundary() {
+        let dir = tempdir().unwrap();
+        let mut state = shadow_state_with_generation_tail(&dir, 3).await;
+
+        advance_shadow_sync_cursor_if_drained(&mut state)
+            .await
+            .expect("commit boundary should allow advancement");
+        assert_eq!(state.shadow_sync_generation, 1);
+        assert_eq!(state.shadow_sync_offset, 0);
     }
 }

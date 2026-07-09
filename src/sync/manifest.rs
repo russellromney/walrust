@@ -2,16 +2,11 @@ use anyhow::Result;
 use hadb_storage_s3::S3Storage;
 #[cfg(test)]
 pub(crate) use walrust_core::legacy_manifest::build_ltx_key;
-pub(crate) use walrust_core::legacy_manifest::{
-    database_prefix, is_snapshot, DiscoveredLtx, GENERATION_LIVE,
-};
 use walrust_core::legacy_manifest::{
     discover_all_legacy_ltx, discover_legacy_snapshots, discover_legacy_state,
     find_latest_legacy_snapshot, list_legacy_generation_files,
 };
-
-use super::types::Manifest;
-use crate::s3;
+pub(crate) use walrust_core::legacy_manifest::{is_snapshot, DiscoveredLtx, GENERATION_LIVE};
 
 // ============================================
 // Litestream-compatible format helpers
@@ -99,41 +94,6 @@ pub(crate) async fn discover_all_ltx_from_s3(
 ) -> Result<Vec<DiscoveredLtx>> {
     let storage = s3_storage(client, bucket);
     discover_all_legacy_ltx(&storage, prefix, db_name).await
-}
-
-/// Load manifest from S3
-pub(crate) async fn load_manifest(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    prefix: &str,
-    db_name: &str,
-) -> Result<Manifest> {
-    let manifest_key = format!("{}manifest.json", database_prefix(prefix, db_name));
-    match s3::download_bytes(client, bucket, &manifest_key).await {
-        Ok(data) => Ok(serde_json::from_slice(&data)?),
-        Err(_) => Ok(Manifest {
-            name: db_name.to_string(),
-            ..Default::default()
-        }),
-    }
-}
-
-/// Save manifest to S3
-pub(crate) async fn save_manifest(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    prefix: &str,
-    manifest: &Manifest,
-) -> Result<()> {
-    let manifest_key = format!("{}manifest.json", database_prefix(prefix, &manifest.name));
-    s3::upload_bytes(
-        client,
-        bucket,
-        &manifest_key,
-        serde_json::to_vec_pretty(manifest)?,
-    )
-    .await?;
-    Ok(())
 }
 
 #[cfg(test)]

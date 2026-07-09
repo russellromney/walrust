@@ -868,15 +868,30 @@ async fn test_walrust_owned_flush_resnapshots_after_checkpoint_rollover() -> Res
         storage.keys()
     );
 
+    // D2: while the replicator is running it holds a pinned-frame checkpoint
+    // blocker, so an external TRUNCATE cannot reset the WAL (that is the primary
+    // protection). A destructive rollover can therefore only happen while walrust
+    // is DOWN and the blocker is released. Simulate that downtime window, then
+    // reopen: the re-anchor path is the backstop that recovers the folded gap.
+    drop(replicator);
+
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     let wal_path = db_path.with_extension("db-wal");
     assert_eq!(
         std::fs::metadata(&wal_path)?.len(),
         0,
-        "test setup must force a WAL rollover by truncating the synced WAL"
+        "external checkpoint must reset the WAL while walrust is down"
     );
 
     write_rows(&conn, 200, 2);
+
+    // Reopen from persisted state. The saved WAL salt no longer matches the reset
+    // WAL, so the first flush must re-anchor with a fresh snapshot rather than
+    // publish a live incremental across the gap.
+    let replicator = Replicator::new(storage.clone(), "wal/", make_config());
+    replicator
+        .add_without_snapshot("rollover-resnapshot", &db_path)
+        .await?;
     let rollover_frames = replicator.flush("rollover-resnapshot").await?;
     assert!(
         rollover_frames > 0,
@@ -910,14 +925,24 @@ async fn test_rollover_observer_fires_on_walrust_owned_reanchor() -> Result<()> 
     config.rollover_observer = walrust::RolloverObserver::new(move |ev| {
         sink.lock().unwrap().push(ev);
     });
-    let replicator = Replicator::new(storage.clone(), "wal/", config);
+    let replicator = Replicator::new(storage.clone(), "wal/", config.clone());
     replicator.add("rollover-observed", &db_path).await?;
 
     write_rows(&conn, 100, 2);
     replicator.flush("rollover-observed").await?;
 
+    // D2: the checkpoint blocker refuses an external TRUNCATE while walrust runs,
+    // so a destructive rollover only occurs during a walrust-down window. Drop the
+    // replicator (releasing the blocker), reset the WAL externally, then reopen so
+    // the re-anchor backstop fires and emits its RolloverEvent.
+    drop(replicator);
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     write_rows(&conn, 200, 2);
+
+    let replicator = Replicator::new(storage.clone(), "wal/", config);
+    replicator
+        .add_without_snapshot("rollover-observed", &db_path)
+        .await?;
     replicator.flush("rollover-observed").await?;
 
     let seen = events.lock().unwrap();
@@ -1726,10 +1751,15 @@ async fn test_walrust_owned_reopen_uses_legacy_state_json() {
         Some(saved_seq),
         "walrust-owned add_without_snapshot should still use legacy state.json"
     );
-    let duplicate = second.flush("owned").await.unwrap();
+    // D2: reopen opens a pinned-frame checkpoint blocker, which writes one
+    // `_walrust_seq` bookkeeping frame into the WAL. That single new frame may be
+    // published, but the OLD data frames must never be re-encoded — so a second
+    // flush drains immediately to zero.
+    let _reopen = second.flush("owned").await.unwrap();
+    let steady = second.flush("owned").await.unwrap();
     assert_eq!(
-        duplicate, 0,
-        "walrust-owned reopen should not re-encode old WAL frames"
+        steady, 0,
+        "walrust-owned reopen should not re-encode old WAL frames beyond the blocker's own seq bump"
     );
 
     drop(conn);

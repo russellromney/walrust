@@ -52,6 +52,11 @@ pub enum WalrustError {
     /// write is refused. Recovery is a re-anchor (walrust-owned: a fresh
     /// snapshot; external-base: re-initialize from a new external base).
     Equivocation(String),
+    /// Shadow generation tail is not at a commit boundary. The shadow sync
+    /// cursor assumes every drained generation ends on a committed frame;
+    /// a non-commit tail means the invariant is violated and continuing would
+    /// silently stall or drop data.
+    ShadowGenerationNotAtCommitBoundary(String),
     /// General/unknown errors
     General(String),
 }
@@ -67,6 +72,7 @@ impl WalrustError {
             WalrustError::Restore(_) => ExitStatus::Restore,
             WalrustError::RestoreNotFound(_) => ExitStatus::Restore,
             WalrustError::Equivocation(_) => ExitStatus::Integrity,
+            WalrustError::ShadowGenerationNotAtCommitBoundary(_) => ExitStatus::Integrity,
             WalrustError::General(_) => ExitStatus::General,
         }
     }
@@ -132,6 +138,9 @@ impl fmt::Display for WalrustError {
             WalrustError::Restore(msg) => write!(f, "restore error: {}", msg),
             WalrustError::RestoreNotFound(msg) => write!(f, "restore not found: {}", msg),
             WalrustError::Equivocation(msg) => write!(f, "equivocation: {}", msg),
+            WalrustError::ShadowGenerationNotAtCommitBoundary(msg) => {
+                write!(f, "shadow generation not at commit boundary: {}", msg)
+            }
             WalrustError::General(msg) => write!(f, "{}", msg),
         }
     }

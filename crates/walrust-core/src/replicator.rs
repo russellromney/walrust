@@ -216,6 +216,13 @@ impl Replicator {
     /// In walrust-owned mode, takes an initial snapshot (blocks until uploaded).
     /// In external-base-state mode, registers without uploading a snapshot.
     ///
+    /// **Side effect (walrust-owned mode):** walrust creates a `_walrust_seq`
+    /// table in the database and holds a long-running read transaction that pins
+    /// a live WAL frame, so an external process cannot checkpoint the WAL out
+    /// from under an in-flight backup. This mirrors Litestream's `_litestream_seq`
+    /// table. The table holds a single counter row; walrust bumps it and re-pins
+    /// the fresh WAL around each of its own checkpoints.
+    ///
     /// Returns error if initialization fails — the database is NOT added in that case.
     pub async fn add(&self, name: &str, db_path: &Path) -> Result<()> {
         self.add_with_wal_path(name, db_path, &db_path.with_extension("db-wal"))
@@ -245,6 +252,17 @@ impl Replicator {
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
         state.rollover_observer = self.config.rollover_observer.clone();
+
+        // Walrust-owned mode pins the live WAL with a long-running read
+        // transaction so an external checkpoint cannot restart it (D2).
+        let blocker =
+            crate::shadow::ShadowWal::open_checkpoint_blocker(db_path).with_context(|| {
+                format!(
+                    "Replicator: cannot open checkpoint blocker for '{}'",
+                    db_path.display()
+                )
+            })?;
+        state.checkpoint_blocker = Some(Arc::new(AsyncMutex::new(blocker)));
 
         if db_path.exists() {
             state.init_checksum()?;
@@ -372,6 +390,16 @@ impl Replicator {
                 state.wal_checksum_chain,
             );
         }
+
+        // Re-pin the live WAL in walrust-owned mode after reopening (D2).
+        let blocker =
+            crate::shadow::ShadowWal::open_checkpoint_blocker(db_path).with_context(|| {
+                format!(
+                    "Replicator: cannot open checkpoint blocker for '{}'",
+                    db_path.display()
+                )
+            })?;
+        state.checkpoint_blocker = Some(Arc::new(AsyncMutex::new(blocker)));
 
         let db_state = Arc::new(AsyncMutex::new(DbState {
             state,

@@ -13,9 +13,11 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::errors::WalrustError;
 use crate::ltx;
+use crate::shadow;
 use crate::wal;
 use hadb_io::RetryPolicy;
 use hadb_storage::StorageBackend;
@@ -124,37 +126,6 @@ enum DeltaSequence {
 // Types
 // ============================================================================
 
-/// Entry in the changeset manifest tracking a single changeset file.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LtxEntry {
-    /// Filename (e.g., "0000000000000001.hadbp")
-    pub filename: String,
-    /// Sequence number
-    pub seq: u64,
-    /// File size in bytes
-    pub size: u64,
-    /// Upload timestamp (ISO 8601)
-    pub created_at: String,
-    /// Whether this is a snapshot (full DB) or incremental
-    pub is_snapshot: bool,
-}
-
-/// Manifest tracking all changeset files for a database.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct Manifest {
-    /// Database name
-    pub name: String,
-    /// Current highest sequence number
-    pub current_seq: u64,
-    /// Page size of the database
-    pub page_size: u32,
-    /// List of changeset files
-    pub files: Vec<LtxEntry>,
-    /// Last known database checksum (for incremental chaining)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub last_checksum: Option<u64>,
-}
-
 /// Explicit base cursor for callers whose checkpoint/base state is owned by
 /// another layer, such as Turbolite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,7 +192,6 @@ impl RolloverObserver {
 }
 
 /// State for a single database being synced.
-#[derive(Debug, Clone)]
 pub struct SyncState {
     /// Database name
     pub name: String,
@@ -259,6 +229,54 @@ pub struct SyncState {
     /// Runtime-only sink for loud rollover events. Not persisted; the embedder
     /// installs it (e.g. wired to the CLI's webhook sender).
     pub rollover_observer: RolloverObserver,
+    /// Optional long-running read transaction that pins the live WAL so an
+    /// external checkpoint cannot restart it. Only set in walrust-owned mode
+    /// (D2). Not persisted; rebuilt on add()/reopen.
+    pub checkpoint_blocker: Option<Arc<Mutex<rusqlite::Connection>>>,
+}
+
+impl std::fmt::Debug for SyncState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SyncState")
+            .field("name", &self.name)
+            .field("db_path", &self.db_path)
+            .field("wal_path", &self.wal_path)
+            .field("wal_offset", &self.wal_offset)
+            .field("wal_generation", &self.wal_generation)
+            .field("current_seq", &self.current_seq)
+            .field("lineage_id", &self.lineage_id)
+            .field("external_base", &self.external_base)
+            .field("current_txid", &self.current_txid)
+            .field("last_snapshot", &self.last_snapshot)
+            .field("db_checksum", &self.db_checksum)
+            .field("wal_salt", &self.wal_salt)
+            .field("wal_checksum_chain", &self.wal_checksum_chain)
+            .field("rollover_observer", &self.rollover_observer)
+            .field("checkpoint_blocker", &self.checkpoint_blocker.is_some())
+            .finish()
+    }
+}
+
+impl Clone for SyncState {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            db_path: self.db_path.clone(),
+            wal_path: self.wal_path.clone(),
+            wal_offset: self.wal_offset,
+            wal_generation: self.wal_generation,
+            current_seq: self.current_seq,
+            lineage_id: self.lineage_id.clone(),
+            external_base: self.external_base.clone(),
+            current_txid: self.current_txid,
+            last_snapshot: self.last_snapshot,
+            db_checksum: self.db_checksum,
+            wal_salt: self.wal_salt,
+            wal_checksum_chain: self.wal_checksum_chain,
+            rollover_observer: self.rollover_observer.clone(),
+            checkpoint_blocker: self.checkpoint_blocker.clone(),
+        }
+    }
 }
 
 impl SyncState {
@@ -291,6 +309,7 @@ impl SyncState {
             wal_salt: None,
             wal_checksum_chain: None,
             rollover_observer: RolloverObserver::default(),
+            checkpoint_blocker: None,
         })
     }
 
@@ -545,42 +564,32 @@ async fn reset_wal_cursor_after_snapshot(state: &mut SyncState) {
     state.wal_checksum_chain = None;
 }
 
+/// Release the walrust-owned checkpoint blocker so walrust can run its own
+/// checkpoint. The read transaction must be rolled back before another
+/// connection can checkpoint the WAL (D2).
+async fn release_checkpoint_blocker(state: &mut SyncState) -> Result<()> {
+    if let Some(blocker) = state.checkpoint_blocker.take() {
+        let guard = blocker.lock().await;
+        guard.execute_batch("ROLLBACK;")?;
+    }
+    Ok(())
+}
+
+/// Re-establish the walrust-owned checkpoint blocker after a walrust-controlled
+/// checkpoint. Writing to `_walrust_seq` and opening a read transaction pins a
+/// real frame in the fresh WAL immediately (D2).
+async fn reacquire_checkpoint_blocker(state: &mut SyncState) -> Result<()> {
+    if state.checkpoint_blocker.is_some() {
+        return Ok(());
+    }
+    let conn = shadow::ShadowWal::open_checkpoint_blocker(&state.db_path)?;
+    state.checkpoint_blocker = Some(Arc::new(Mutex::new(conn)));
+    Ok(())
+}
+
 // ============================================================================
 // Manifest operations
 // ============================================================================
-
-/// Load manifest from storage.
-///
-/// A missing manifest (`Ok(None)` from the backend) is treated as a
-/// fresh database and returns an empty manifest. Transport errors and
-/// JSON parse errors propagate, so callers see real problems instead of
-/// silently resetting the replication position to zero.
-pub async fn load_manifest(
-    storage: &dyn StorageBackend,
-    prefix: &str,
-    db_name: &str,
-) -> Result<Manifest> {
-    let manifest_key = format!("{}{}/manifest.json", prefix, db_name);
-    match storage.get(&manifest_key).await? {
-        Some(data) => Ok(serde_json::from_slice(&data)
-            .map_err(|e| anyhow!("corrupt manifest at {manifest_key}: {e}"))?),
-        None => Ok(Manifest {
-            name: db_name.to_string(),
-            ..Default::default()
-        }),
-    }
-}
-
-/// Save manifest to storage.
-pub async fn save_manifest(
-    storage: &dyn StorageBackend,
-    prefix: &str,
-    manifest: &Manifest,
-) -> Result<()> {
-    let manifest_key = format!("{}{}/manifest.json", prefix, manifest.name);
-    let data = serde_json::to_vec_pretty(manifest)?;
-    storage.put(&manifest_key, &data).await
-}
 
 /// Save state.json for state persistence.
 pub async fn save_state(
@@ -2037,7 +2046,11 @@ pub async fn take_snapshot(
     state: &mut SyncState,
 ) -> Result<()> {
     let timestamp = Utc::now();
+    // Walrust-owned mode holds a read transaction to pin the WAL. Release it
+    // around our own checkpoint, then re-pin the fresh WAL immediately (D2).
+    release_checkpoint_blocker(state).await?;
     checkpoint_wal(&state.db_path).await?;
+    reacquire_checkpoint_blocker(state).await?;
     let page_size = get_page_size(&state.db_path).await?;
 
     // Use the file change counter as a txid source when available.
@@ -2325,7 +2338,9 @@ pub async fn take_snapshot_with_retry(
     retry_policy: &RetryPolicy,
 ) -> Result<()> {
     let timestamp = Utc::now();
+    release_checkpoint_blocker(state).await?;
     checkpoint_wal(&state.db_path).await?;
+    reacquire_checkpoint_blocker(state).await?;
     let page_size = get_page_size(&state.db_path).await?;
 
     let cc = change_counter_from_file(&state.db_path).unwrap_or(0);
@@ -2496,39 +2511,6 @@ pub async fn sync_wal_with_retry(
     save_state(storage, prefix, state).await?;
 
     Ok(frame_count as u64)
-}
-
-// ============================================================================
-// Legacy manifest-based sync (kept for walrust CLI compatibility)
-// ============================================================================
-
-/// Sync WAL changes and update the manifest.
-pub async fn sync_wal_and_manifest(
-    storage: &dyn StorageBackend,
-    prefix: &str,
-    state: &mut SyncState,
-    manifest: &mut Manifest,
-) -> Result<u64> {
-    let frames = sync_wal(storage, prefix, state).await?;
-
-    if frames > 0 {
-        let new_seq = state.current_seq;
-        let changeset_key = build_state_changeset_key(prefix, state, GENERATION_LIVE, new_seq);
-
-        manifest.files.push(LtxEntry {
-            filename: changeset_key,
-            seq: new_seq,
-            size: 0,
-            created_at: Utc::now().to_rfc3339(),
-            is_snapshot: false,
-        });
-        manifest.current_seq = new_seq;
-        manifest.last_checksum = state.db_checksum;
-
-        save_manifest(storage, prefix, manifest).await?;
-    }
-
-    Ok(frames)
 }
 
 /// Maximum concurrent S3 downloads for incremental pulling.
@@ -3788,55 +3770,6 @@ mod tests {
             std::fs::read(&output).unwrap(),
             original_output,
             "failed snapshot-source restore must leave existing output untouched"
-        );
-    }
-
-    // ------------------------------------------------------------------
-    // load_manifest fail-fast semantics
-    //
-    // A missing manifest is a legitimate first-run case and must return
-    // an empty manifest; transport and parse errors are real problems
-    // and must propagate, not silently reset replication state.
-    // ------------------------------------------------------------------
-
-    #[tokio::test]
-    async fn load_manifest_missing_returns_empty() {
-        let storage = TestStorage::new();
-        let m = load_manifest(&storage, "prefix/", "mydb").await.unwrap();
-        assert_eq!(m.name, "mydb");
-        assert_eq!(m.current_seq, 0);
-        assert!(m.files.is_empty());
-    }
-
-    #[tokio::test]
-    async fn load_manifest_transport_error_propagates() {
-        let storage = FailOnKeyStorage {
-            inner: TestStorage::new(),
-            fail_key: "prefix/mydb/manifest.json".to_string(),
-        };
-        let err = load_manifest(&storage, "prefix/", "mydb")
-            .await
-            .unwrap_err();
-        // Previous behavior would have silently swallowed this and
-        // returned a fresh-DB manifest; the fix propagates.
-        let msg = err.to_string();
-        assert!(
-            msg.contains("simulated download failure") || msg.contains("manifest.json"),
-            "expected propagated transport error, got: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    async fn load_manifest_corrupt_json_propagates() {
-        let mut storage = TestStorage::new();
-        let key = "prefix/mydb/manifest.json".to_string();
-        storage.insert(&key, b"{ this is not valid json".to_vec());
-        let err = load_manifest(&storage, "prefix/", "mydb")
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("corrupt manifest"),
-            "expected corrupt-manifest error, got: {err}"
         );
     }
 
@@ -5653,6 +5586,43 @@ mod tests {
             read_items(&resumed_follower),
             full_rows,
             "resumed follower must match the honest full reconstruct exactly"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_owned_replicator_holds_checkpoint_blocker_after_add() {
+        // D2: walrust-owned mode must pin the live WAL with a long-running read
+        // transaction, so an external TRUNCATE checkpoint cannot restart it.
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("owned.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL; \
+             PRAGMA wal_autocheckpoint=0; \
+             CREATE TABLE t (id INTEGER PRIMARY KEY); \
+             INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let storage: Arc<dyn StorageBackend> = Arc::new(TestStorage::new());
+        let rep = crate::Replicator::new(storage, "test/", ReplicationConfig::default());
+        rep.add("owned", &db_path).await.unwrap();
+
+        // `add()` takes an initial snapshot; the blocker must be reacquired
+        // afterwards so a concurrent external checkpoint is rejected.
+        let conn2 = rusqlite::Connection::open(&db_path).unwrap();
+        conn2
+            .busy_timeout(std::time::Duration::from_millis(100))
+            .unwrap();
+        let (busy, _log, _ckpt): (i64, i64, i64) = conn2
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        assert_ne!(
+            busy, 0,
+            "external TRUNCATE must be blocked while walrust holds the pinned-frame read transaction"
         );
     }
 }
