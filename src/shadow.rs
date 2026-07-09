@@ -5,9 +5,11 @@
 
 pub use walrust_core::shadow::{ShadowSegment, ShadowWal};
 
+#[cfg(test)]
 /// Hex width for root-side test/helpers that synthesize segment filenames.
 pub(crate) const SEGMENT_HEX_WIDTH: usize = 16;
 
+#[cfg(test)]
 /// Format a shadow segment filename: `{generation:016x}-{index:016x}.wal`.
 pub(crate) fn format_segment_name(generation: u64, index: u64) -> String {
     format!(

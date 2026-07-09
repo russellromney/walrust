@@ -52,8 +52,7 @@ pub use sync::{
     pull_incremental_into_sink, reconstruct_fenced_follower, restore_with_snapshot_source,
     run_wal_replication, sync_wal_fenced_delta, DeltaPublishResult, DiscoveredDelta,
     ExternalBaseCursor, FencedDeltaSyncParams, FencedFollowerCursor, FencedFollowerResult,
-    LtxEntry, Manifest, PullCursor, ReplicationConfig, RolloverEvent, RolloverObserver,
-    SnapshotOwnership, SyncState,
+    PullCursor, ReplicationConfig, RolloverEvent, RolloverObserver, SnapshotOwnership, SyncState,
 };
 
 // Fenced delta envelope codec.

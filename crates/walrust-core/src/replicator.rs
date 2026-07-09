@@ -246,6 +246,17 @@ impl Replicator {
         state.name = name.to_string();
         state.rollover_observer = self.config.rollover_observer.clone();
 
+        // Walrust-owned mode pins the live WAL with a long-running read
+        // transaction so an external checkpoint cannot restart it (D2).
+        let blocker =
+            crate::shadow::ShadowWal::open_checkpoint_blocker(db_path).with_context(|| {
+                format!(
+                    "Replicator: cannot open checkpoint blocker for '{}'",
+                    db_path.display()
+                )
+            })?;
+        state.checkpoint_blocker = Some(Arc::new(AsyncMutex::new(blocker)));
+
         if db_path.exists() {
             state.init_checksum()?;
             let base_change_counter = sync::change_counter_from_file(db_path).unwrap_or(0);
@@ -372,6 +383,16 @@ impl Replicator {
                 state.wal_checksum_chain,
             );
         }
+
+        // Re-pin the live WAL in walrust-owned mode after reopening (D2).
+        let blocker =
+            crate::shadow::ShadowWal::open_checkpoint_blocker(db_path).with_context(|| {
+                format!(
+                    "Replicator: cannot open checkpoint blocker for '{}'",
+                    db_path.display()
+                )
+            })?;
+        state.checkpoint_blocker = Some(Arc::new(AsyncMutex::new(blocker)));
 
         let db_state = Arc::new(AsyncMutex::new(DbState {
             state,
