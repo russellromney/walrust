@@ -32,6 +32,13 @@ max-threads = 1
 #   tests/production_e2e.rs: e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss,
 #     e2e_cli_watch_racing_checkpoint_no_data_loss.
 #
+# restart: replicator restart/reopen tests --
+#   tests/production_e2e.rs: e2e_core_replicator_restart_reopens_state_and_restores_cleanly
+#     holds read-transaction pins against an autocheckpointing writer and
+#     flaked once under parallel load ("snapshot checkpoint incomplete,
+#     busy=1"); the other restart-named tests are fast logic tests that are
+#     cheap to serialize alongside it.
+#
 # timer / interval: watch-timer and interval-named tests (generous match) --
 #   tests/production_e2e.rs: e2e_cli_watch_independent_snapshot_timer_round_trips_through_reset;
 #   plus a few interval-named config/cursor logic tests that are cheap either way.
@@ -54,6 +61,7 @@ max-threads = 1
 filter = '''
 test(~kill)
   | test(~racing)
+  | test(~restart)
   | test(~timer)
   | test(~interval)
   | test(~two_watchers)
