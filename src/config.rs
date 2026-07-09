@@ -41,6 +41,11 @@ pub struct Config {
     /// Database-specific configurations
     #[serde(default)]
     pub databases: Vec<DatabaseConfig>,
+
+    /// Allow glob patterns that match no databases to silently skip instead of
+    /// failing startup. Default false: a matched-nothing glob is a startup error.
+    #[serde(default)]
+    pub allow_empty_globs: bool,
 }
 
 /// Sync trigger configuration
@@ -326,8 +331,15 @@ impl Config {
             let paths = expand_glob(&db_config.path)?;
 
             if paths.is_empty() {
-                tracing::warn!("No databases found matching: {}", db_config.path);
-                continue;
+                if self.allow_empty_globs {
+                    tracing::warn!("No databases found matching: {}", db_config.path);
+                    continue;
+                }
+                return Err(WalrustError::config(format!(
+                    "No databases found matching: {} (set allow_empty_globs=true to permit optional globs)",
+                    db_config.path
+                ))
+                .into());
             }
 
             for path in paths {
@@ -596,6 +608,40 @@ mod tests {
     fn test_expand_glob_literal_nonexistent() {
         let result = expand_glob("/nonexistent/path/to/database.db");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_empty_glob_is_error_by_default() {
+        let toml = r#"
+            [[databases]]
+            path = "/nonexistent/*.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let err = config.resolve_databases().unwrap_err().to_string();
+        assert!(
+            err.contains("No databases found matching"),
+            "expected empty-glob error, got: {err}"
+        );
+        assert!(
+            err.contains("allow_empty_globs"),
+            "error should mention opt-out: {err}"
+        );
+    }
+
+    #[test]
+    fn test_empty_glob_allowed_with_opt_in() {
+        let toml = r#"
+            allow_empty_globs = true
+
+            [[databases]]
+            path = "/nonexistent/*.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let resolved = config.resolve_databases().unwrap();
+        assert!(
+            resolved.is_empty(),
+            "optional glob should resolve to no databases"
+        );
     }
 
     #[test]

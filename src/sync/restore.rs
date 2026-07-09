@@ -199,9 +199,15 @@ pub async fn restore(
                 let error_msg = format!("legacy LTX restore failed: {e}");
                 let webhook = webhook.clone();
                 let name = name.to_string();
-                tokio::spawn(async move {
+                let send = async move {
                     webhook.notify_corruption(&name, &error_msg).await;
-                });
+                };
+                if tokio::time::timeout(std::time::Duration::from_secs(5), send)
+                    .await
+                    .is_err()
+                {
+                    tracing::warn!("corruption webhook timed out after 5s");
+                }
             }
             return Err(classify_or_else(e, WalrustError::restore));
         }
@@ -282,7 +288,74 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WebhookConfig;
+    use crate::webhook::WebhookSender;
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use walrust_core::legacy_manifest::build_ltx_key;
+
+    async fn capture_one_webhook() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "webhook connection closed before request body");
+                buffer.extend_from_slice(&chunk[..n]);
+
+                if let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    if buffer.len() >= body_start + content_length {
+                        let body = String::from_utf8(
+                            buffer[body_start..body_start + content_length].to_vec(),
+                        )
+                        .unwrap();
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .unwrap();
+                        return body;
+                    }
+                }
+            }
+        });
+
+        (url, handle)
+    }
+
+    /// Start a minimal TCP listener that returns HTTP 500 for every request.
+    /// Used as a fake S3 endpoint so `restore()` fails and reaches the corruption
+    /// webhook path without needing real credentials or buckets.
+    async fn failing_s3_endpoint() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 512];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream
+                    .write_all(b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n")
+                    .await;
+            }
+        });
+        format!("http://{addr}")
+    }
 
     fn make_snapshot_ltx(txid: u64) -> Vec<u8> {
         let dir = tempfile::tempdir().unwrap();
@@ -334,5 +407,85 @@ mod tests {
             cache_substitute_for_key(&cache, "").is_none(),
             "empty key must fall back to S3"
         );
+    }
+
+    #[tokio::test]
+    async fn test_restore_failure_awaits_corruption_webhook_before_returning() {
+        // D7.3: the corruption webhook on the restore exit path must be awaited
+        // (with a short timeout) before the function returns. A fire-and-forget
+        // spawn would return before the POST is delivered.
+        let received = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let received_check = Arc::clone(&received);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let webhook_handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "webhook connection closed before request body");
+                buffer.extend_from_slice(&chunk[..n]);
+
+                if let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse::<usize>().ok())
+                        })
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    if buffer.len() >= body_start + content_length {
+                        // Delay before recording receipt so a fire-and-forget
+                        // caller would observe the flag still false on return.
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        received.store(true, std::sync::atomic::Ordering::SeqCst);
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .unwrap();
+                        return;
+                    }
+                }
+            }
+        });
+
+        let webhook_sender = Arc::new(WebhookSender::new(vec![WebhookConfig {
+            url,
+            events: vec!["corruption_detected".to_string()],
+            secret: None,
+        }]));
+
+        let output_dir = tempfile::tempdir().unwrap();
+        let output = output_dir.path().join("restored.db");
+        let endpoint = failing_s3_endpoint().await;
+
+        let _err = restore(
+            "missing-db",
+            &output,
+            "s3://bucket/prefix",
+            Some(&endpoint),
+            None,
+            None,
+            Some(webhook_sender),
+        )
+        .await
+        .expect_err("restore must fail against the failing S3 endpoint");
+
+        // With the fix, restore awaited the webhook, so the delayed server has
+        // already set the flag. With tokio::spawn, it would still be false here.
+        assert!(
+            received_check.load(std::sync::atomic::Ordering::SeqCst),
+            "restore must await the corruption webhook before returning"
+        );
+
+        // Clean up the server task.
+        let _ = webhook_handle.await;
     }
 }

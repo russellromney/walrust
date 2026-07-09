@@ -16,7 +16,7 @@ mod wal;
 mod webhook;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 use config::{Config, ResolvedDbConfig, RetentionConfig, SyncConfig};
 use errors::{classify_error, ExitStatus, WalrustError};
 use std::path::PathBuf;
@@ -383,7 +383,7 @@ struct WatchArgs {
     no_cache: bool,
 }
 
-/// Resolve watch configuration by merging config file with CLI args
+/// Resolve watch configuration by merging config file with CLI args.
 fn resolve_watch_config(
     config: &Option<Config>,
     cli: &WatchArgs,
@@ -574,8 +574,16 @@ fn merge_cli_retry_overrides(base: &retry::RetryConfig, cli: &WatchArgs) -> retr
     }
 }
 
-/// Resolve cache configuration from config file and CLI args
-fn resolve_cache_config(config: &Option<Config>, cli: &WatchArgs) -> config::CacheConfig {
+/// Resolve cache configuration from config file and CLI args.
+///
+/// `cache-retention` and `uploader-concurrency` have clap `default_value`s, so
+/// we use `value_source` to only override the toml when the user actually
+/// passed the flag.
+fn resolve_cache_config(
+    config: &Option<Config>,
+    cli: &WatchArgs,
+    matches: &clap::ArgMatches,
+) -> config::CacheConfig {
     let base = config.as_ref().map(|c| c.cache.clone()).unwrap_or_default();
 
     // CLI --enable-cache overrides config, --no-cache forces disable
@@ -585,17 +593,38 @@ fn resolve_cache_config(config: &Option<Config>, cli: &WatchArgs) -> config::Cac
         cli.enable_cache || base.enabled
     };
 
+    let retention = if user_provided(matches, "cache_retention") {
+        cli.cache_retention.clone()
+    } else {
+        base.retention.clone()
+    };
+
+    let uploader_concurrency = if user_provided(matches, "uploader_concurrency") {
+        cli.uploader_concurrency
+    } else {
+        base.uploader_concurrency
+    };
+
     config::CacheConfig {
         enabled,
-        retention: cli.cache_retention.clone(),
+        retention,
         max_size: cli.cache_max_size.unwrap_or(base.max_size),
         path: cli
             .cache_dir
             .as_ref()
             .map(|p| p.display().to_string())
             .or(base.path),
-        uploader_concurrency: cli.uploader_concurrency,
+        uploader_concurrency,
     }
+}
+
+/// True if the named argument was supplied by the user on the command line
+/// (as opposed to coming from a clap `default_value`).
+fn user_provided(matches: &clap::ArgMatches, id: &str) -> bool {
+    matches
+        .value_source(id)
+        .map(|src| src == clap::parser::ValueSource::CommandLine)
+        .unwrap_or(false)
 }
 
 /// Parse duration string like "5s", "1m", "30s", "2h"
@@ -665,7 +694,10 @@ async fn main() -> ExitCode {
 
 /// Run the CLI commands
 async fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let command = Cli::command();
+    let matches = command.get_matches();
+    let cli = Cli::from_arg_matches(&matches)?;
+    let watch_matches = matches.subcommand_matches("watch");
 
     // Load config file (optional)
     let config = Config::load(cli.config.as_deref())?;
@@ -752,7 +784,7 @@ async fn run() -> Result<()> {
             ) = resolve_watch_config(&config, &watch_args)?;
 
             // Resolve cache configuration
-            let cache_config = resolve_cache_config(&config, &watch_args);
+            let cache_config = resolve_cache_config(&config, &watch_args, watch_matches.unwrap());
             if cache_config.enabled {
                 tracing::info!(
                     "Disk cache enabled (experimental): retention={}, max_size={}MB",
@@ -1036,15 +1068,30 @@ mod tests {
     // Cache Config Resolution Tests
     // ============================================
 
+    fn matches_from_args(args: &[&str]) -> clap::ArgMatches {
+        use clap::CommandFactory;
+        let mut full_args = vec!["walrust", "watch"];
+        full_args.extend(args);
+        let matches = Cli::command()
+            .try_get_matches_from(full_args)
+            .expect("test args should parse");
+        matches
+            .subcommand_matches("watch")
+            .expect("watch subcommand should be present")
+            .clone()
+    }
+
     #[test]
     fn test_resolve_cache_config_defaults() {
         let cli = default_watch_args();
-        let config = resolve_cache_config(&None, &cli);
+        let matches = matches_from_args(&[]);
+        let config = resolve_cache_config(&None, &cli, &matches);
 
         assert!(!config.enabled);
         assert_eq!(config.retention, "24h");
         assert_eq!(config.max_size, 5 * 1024 * 1024 * 1024);
         assert!(config.path.is_none());
+        assert_eq!(config.uploader_concurrency, 4);
     }
 
     #[test]
@@ -1052,7 +1099,8 @@ mod tests {
         let mut cli = default_watch_args();
         cli.enable_cache = true;
 
-        let config = resolve_cache_config(&None, &cli);
+        let matches = matches_from_args(&["--enable-cache"]);
+        let config = resolve_cache_config(&None, &cli, &matches);
 
         assert!(config.enabled);
     }
@@ -1063,7 +1111,8 @@ mod tests {
         cli.enable_cache = true;
         cli.no_cache = true;
 
-        let config = resolve_cache_config(&None, &cli);
+        let matches = matches_from_args(&["--enable-cache", "--no-cache"]);
+        let config = resolve_cache_config(&None, &cli, &matches);
 
         assert!(!config.enabled); // --no-cache wins
     }
@@ -1075,13 +1124,26 @@ mod tests {
         cli.cache_retention = "7d".to_string();
         cli.cache_max_size = Some(5 * 1024 * 1024 * 1024);
         cli.cache_dir = Some(PathBuf::from("/custom/cache"));
+        cli.uploader_concurrency = 8;
 
-        let config = resolve_cache_config(&None, &cli);
+        let matches = matches_from_args(&[
+            "--enable-cache",
+            "--cache-retention",
+            "7d",
+            "--cache-max-size",
+            "5368709120",
+            "--cache-dir",
+            "/custom/cache",
+            "--uploader-concurrency",
+            "8",
+        ]);
+        let config = resolve_cache_config(&None, &cli, &matches);
 
         assert!(config.enabled);
         assert_eq!(config.retention, "7d");
         assert_eq!(config.max_size, 5 * 1024 * 1024 * 1024);
         assert_eq!(config.path, Some("/custom/cache".to_string()));
+        assert_eq!(config.uploader_concurrency, 8);
     }
 
     #[test]
@@ -1091,13 +1153,17 @@ mod tests {
         file_config.cache.retention = "48h".to_string();
         file_config.cache.max_size = 20 * 1024 * 1024 * 1024;
         file_config.cache.path = Some("/config/cache".to_string());
+        file_config.cache.uploader_concurrency = 16;
 
         let cli = default_watch_args();
-        let config = resolve_cache_config(&Some(file_config), &cli);
+        let matches = matches_from_args(&[]);
+        let config = resolve_cache_config(&Some(file_config), &cli, &matches);
 
         assert!(config.enabled);
-        assert_eq!(config.retention, "24h"); // CLI default overrides
+        // D7.2: CLI defaults must not override walrust.toml.
+        assert_eq!(config.retention, "48h"); // From file
         assert_eq!(config.max_size, 20 * 1024 * 1024 * 1024); // From file
         assert_eq!(config.path, Some("/config/cache".to_string())); // From file
+        assert_eq!(config.uploader_concurrency, 16); // From file
     }
 }
