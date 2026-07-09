@@ -90,6 +90,16 @@ pub async fn compact(
             format_age(now, entry.created_at)
         );
     }
+    // Declare the retained restore floor explicitly (E2): the oldest kept
+    // snapshot is the earliest point-in-time that stays restorable after this
+    // compaction. Anything below it is being dropped on purpose.
+    if let Some(floor) = plan.keep.iter().map(|e| e.sequence).min() {
+        println!(
+            "Earliest restorable point-in-time after compaction: TXID {} \
+             (older point-in-time restores are no longer available)",
+            floor
+        );
+    }
     println!();
 
     // Print what will be deleted

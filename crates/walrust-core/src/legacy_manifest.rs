@@ -366,9 +366,43 @@ pub async fn plan_legacy_compaction(
             .or_else(|| snapshot_entries.iter().map(|entry| entry.sequence).min())
     });
 
+    // Rescue every snapshot that bridges a hole in the surviving live
+    // incremental chain (E2). Taking a full snapshot at TXID H consumes that
+    // TXID: the gen-0 incremental stream jumps from ..H-1 straight to H+1..,
+    // leaving a single-TXID hole at H that ONLY the snapshot at H can fill.
+    // Deleting that snapshot strands every incremental after the hole from any
+    // earlier base, so PITR into that range fails with "restore incremental
+    // gap". Protecting the bridge snapshots keeps the whole retained range
+    // restorable. (Snapshots older than the live chain's base are still pruned,
+    // which shrinks the window honestly rather than corrupting it.)
+    let mut live_sorted: Vec<(u64, u64)> = live_incrementals
+        .iter()
+        .filter(|(_, min, max)| !(*min == 1 && *max == 1))
+        .map(|(_, min, max)| (*min, *max))
+        .collect();
+    live_sorted.sort_unstable();
+    let snapshot_txids: std::collections::BTreeSet<u64> =
+        snapshot_entries.iter().map(|entry| entry.sequence).collect();
+    let mut bridge_snapshots: HashSet<u64> = HashSet::new();
+    let mut prev_max: Option<u64> = None;
+    for (min, max) in &live_sorted {
+        if let Some(pmax) = prev_max {
+            if *min > pmax + 1 {
+                // Hole in [pmax+1 .. min-1]; the base that reconnects the chain
+                // at `min` is the highest snapshot strictly inside the hole
+                // (normally exactly at min-1).
+                if let Some(&bridge) = snapshot_txids.range(pmax + 1..*min).next_back() {
+                    bridge_snapshots.insert(bridge);
+                }
+            }
+        }
+        prev_max = Some(prev_max.map_or(*max, |p| p.max(*max)));
+    }
+
     let protected: HashSet<u64> = max_snapshot_txid
         .into_iter()
         .chain(base_for_live_chain)
+        .chain(bridge_snapshots)
         .collect();
 
     let rescued: Vec<_> = plan
@@ -561,6 +595,82 @@ mod tests {
         assert!(
             plan.delete.is_empty(),
             "the policy wanted to delete the old snapshot, but reachability must rescue it"
+        );
+    }
+
+    #[tokio::test]
+    async fn e2_compaction_rescues_bridge_snapshots_for_retained_pitr_points() {
+        // Layout mirrors the drill: three snapshot generations at TXIDs 10, 20,
+        // 30, each of which punched a single-TXID hole in the gen-0 live chain
+        // (2-9, 11-19, 21-29, 31-40). The snapshots at 10, 20, 30 are the ONLY
+        // objects supplying TXIDs 10, 20, 30, so each is a load-bearing bridge.
+        let storage = TestStorage {
+            objects: HashMap::from([
+                (
+                    "backups/app/0000/0000000000000002-0000000000000009.ltx".to_string(),
+                    Vec::new(),
+                ),
+                (
+                    "backups/app/0000/000000000000000b-0000000000000013.ltx".to_string(),
+                    Vec::new(),
+                ),
+                (
+                    "backups/app/0000/0000000000000015-000000000000001d.ltx".to_string(),
+                    Vec::new(),
+                ),
+                (
+                    "backups/app/0000/000000000000001f-0000000000000028.ltx".to_string(),
+                    Vec::new(),
+                ),
+            ]),
+        };
+        let now = Utc::now();
+        // All three snapshots land in the same hour bucket, so a `hourly=1`
+        // policy wants to keep only the latest (30) plus the minimum floor,
+        // deleting the intermediate bridges 10 and 20.
+        let snapshots = vec![
+            SnapshotEntry {
+                key: "backups/app/0001/0000000000000001-000000000000000a.ltx".to_string(),
+                created_at: now - chrono::Duration::minutes(3),
+                sequence: 10,
+                size: 10,
+            },
+            SnapshotEntry {
+                key: "backups/app/0002/0000000000000001-0000000000000014.ltx".to_string(),
+                created_at: now - chrono::Duration::minutes(2),
+                sequence: 20,
+                size: 10,
+            },
+            SnapshotEntry {
+                key: "backups/app/0003/0000000000000001-000000000000001e.ltx".to_string(),
+                created_at: now - chrono::Duration::minutes(1),
+                sequence: 30,
+                size: 10,
+            },
+        ];
+        let policy = RetentionPolicy {
+            hourly: 1,
+            daily: 0,
+            weekly: 0,
+            monthly: 0,
+            minimum: 1,
+        };
+
+        let plan = plan_legacy_compaction(&storage, "backups", "app", &snapshots, &policy, now)
+            .await
+            .unwrap();
+
+        let kept: Vec<_> = plan.keep.iter().map(|entry| entry.sequence).collect();
+        for txid in [10u64, 20, 30] {
+            assert!(
+                kept.contains(&txid),
+                "snapshot bridging the live-chain hole at {txid} must be retained (kept={kept:?})"
+            );
+        }
+        assert!(
+            !plan.delete.iter().any(|e| [10, 20, 30].contains(&e.sequence)),
+            "no bridge snapshot may be deleted: {:?}",
+            plan.delete.iter().map(|e| e.sequence).collect::<Vec<_>>()
         );
     }
 }
