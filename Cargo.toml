@@ -130,3 +130,12 @@ opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true
+
+# macOS link relief for dev/test builds: dsymutil runs per test binary (29 of
+# them in this workspace) and full debug info makes that slow. Keeping only
+# line-table debuginfo preserves panic/backtrace line numbers while dropping
+# the variable/type info dsymutil otherwise has to chew through, and unpacked
+# split-debuginfo skips the dsymutil bundling step entirely on macOS.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
