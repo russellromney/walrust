@@ -151,3 +151,63 @@ async fn legacy_restore_is_owned_by_core_and_replays_real_wal_incremental() {
     assert_eq!(restored_txid, 2);
     assert_eq!(marker_value(&restore_path), "incremental");
 }
+
+#[tokio::test]
+async fn e4_far_future_point_in_time_is_a_hard_error_naming_the_max() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("source.db");
+    let restore_path = dir.path().join("restored.db");
+    let storage = MemStorage::default();
+
+    let conn = rusqlite::Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "
+        PRAGMA page_size=4096;
+        PRAGMA journal_mode=WAL;
+        PRAGMA wal_autocheckpoint=0;
+        CREATE TABLE marker (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO marker (id, value) VALUES (1, 'snapshot');
+        PRAGMA wal_checkpoint(TRUNCATE);
+        ",
+    )
+    .unwrap();
+    let (snapshot, _checksum) =
+        legacy_ltx::encode_sqlite_snapshot_to_vec(&db_path, 4096, 1).unwrap();
+    storage
+        .put(&build_ltx_key("backups", "app", 1, 1, 1), &snapshot)
+        .await
+        .unwrap();
+
+    // Newest available TXID is 1. A far-future point-in-time must be a hard
+    // error naming the max available — not a silent latest-DB restore.
+    let err = walrust_core::legacy_restore::restore_legacy_ltx(
+        &storage,
+        "backups",
+        "app",
+        &restore_path,
+        Some(999_999),
+    )
+    .await
+    .expect_err("far-future point-in-time must fail");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("beyond the newest available TXID 1"),
+        "error must name the max available TXID, got: {msg}"
+    );
+    assert!(
+        !restore_path.exists(),
+        "no database should be written for an unreachable point-in-time"
+    );
+
+    // A point-in-time at exactly the newest available TXID still succeeds.
+    let txid = walrust_core::legacy_restore::restore_legacy_ltx(
+        &storage,
+        "backups",
+        "app",
+        &restore_path,
+        Some(1),
+    )
+    .await
+    .expect("point-in-time at the max available TXID must succeed");
+    assert_eq!(txid, 1);
+}

@@ -121,6 +121,19 @@ pub async fn restore_legacy_ltx(
         .into());
     }
 
+    // E4: a point-in-time beyond the newest available TXID must be a hard error
+    // naming the max available, not a silent fall-through that returns the
+    // latest DB with exit 0.
+    if let Some(pit) = point_in_time {
+        if pit > current_txid {
+            return Err(WalrustError::restore_not_found(format!(
+                "requested point-in-time TXID {pit} is beyond the newest available TXID \
+                 {current_txid} for database {db_name}"
+            ))
+            .into());
+        }
+    }
+
     let mut target_txid = point_in_time.unwrap_or(current_txid);
     let snapshot = if point_in_time.is_some() {
         find_latest_legacy_snapshot_at_or_before(storage, prefix, db_name, target_txid).await?
