@@ -80,9 +80,10 @@ hex = "0.4"
 walrust-core = { version = "0.3.1", path = "crates/walrust-core" }
 
 # Storage substrate (trait is always available; concrete S3 impl is feature-gated).
-# hadb-* are pinned to an explicit rev on branch `hoist-prereq-internal-lease-store`
-# for a reproducible clean-clone build (Cargo permits only one of branch/rev, so
-# the rev is the pin and the branch is documented here). A gitignored
+# hadb-* are pinned to an explicit rev on branch `checkpoint-detected` (adds the
+# CheckpointDetected webhook variant used by D4) for a reproducible clean-clone
+# build (Cargo permits only one of branch/rev, so the rev is the pin and the
+# branch is documented here). A gitignored
 # `.cargo/config.toml` `[patch]` -> `../hadb` overrides this for local dev.
 hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "1100d3b615743405c676ecefa5743f2c277ea25f" }
 hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", rev = "1100d3b615743405c676ecefa5743f2c277ea25f", optional = true }
