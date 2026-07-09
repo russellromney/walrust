@@ -28,12 +28,16 @@ build-python:
 	maturin build --release
 
 # Run all workspace tests with live storage credentials from Soup.
+# nextest runs everything in parallel except the tests pinned to the
+# `serial` test-group in .config/nextest.toml (real SIGKILLs, deliberate
+# races, split-brain/fenced-follower equivocation, a real chaos process
+# kill). nextest doesn't run doctests, so we run those separately.
 test:
-	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo test --workspace -- --test-threads=1'
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo nextest run --workspace --profile default && cargo test --workspace --doc'
 
-# Run tests with output
+# Run tests with output (implies serial execution so output doesn't interleave)
 test-verbose:
-	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo test --workspace -- --test-threads=1 --nocapture'
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo nextest run --workspace --profile default --no-capture && cargo test --workspace --doc -- --nocapture'
 
 # Run micro-benchmarks (cargo bench)
 bench:
