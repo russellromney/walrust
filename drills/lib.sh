@@ -201,7 +201,10 @@ SQL
 }
 
 db_count() {
-  sqlite3 "$1" "SELECT COUNT(*) FROM items;"
+  # .timeout sets a busy timeout (with no output) so a read that collides with
+  # a concurrent writer or a hostile TRUNCATE checkpoint waits briefly instead
+  # of erroring out with SQLITE_BUSY.
+  sqlite3 "$1" ".timeout 5000" "SELECT COUNT(*) FROM items;"
 }
 
 driver_count() {
@@ -257,18 +260,28 @@ PY
 pause_driver() {
   [ -n "${DRILL_DRIVER_PID:-}" ] || fail "write driver is not running"
   touch "$DRILL_DRIVER_PAUSE"
+  # Wait until the driver stops committing, polling the authoritative committed
+  # row count from the DB itself. The driver writes its count file just AFTER
+  # each commit, so that file can lag the DB by one row; sampling it here (as
+  # this used to) let pause_driver return a stale count while the DB already
+  # held one more committed row, producing an off-by-one restore mismatch.
   local before
   local after
-  before=$(driver_count)
+  before=$(db_count "$DRILL_DB")
   while :; do
     sleep "$DRILL_POLL_INTERVAL"
-    after=$(driver_count)
+    after=$(db_count "$DRILL_DB")
     if [ "$after" = "$before" ]; then
       printf '%s\n' "$after" >"$DRILL_DRIVER_COUNT"
       return 0
     fi
     before=$after
   done
+}
+
+resume_driver() {
+  [ -n "${DRILL_DRIVER_PID:-}" ] || fail "write driver is not running"
+  rm -f "$DRILL_DRIVER_PAUSE"
 }
 
 stop_driver() {
@@ -411,6 +424,32 @@ wait_restore_count() {
   fail "ROW DIFF: restored row count mismatch for $name; expected rows=$expected actual rows=${DRILL_LAST_ACTUAL:-unavailable}; restore output: ${DRILL_LAST_RESTORE_ERROR:-none}"
 }
 
+# Like wait_restore_count, but asserts the restored row count is at least
+# `min` instead of exactly `expected`. Use this for progress checks taken while
+# the write driver is still running, where an exact live count is a moving
+# target that the restore would race past. Still fails loudly (nonzero) if the
+# restore never succeeds or never reaches the lower bound within the timeout.
+wait_restore_count_at_least() {
+  local name=$1
+  local min=$2
+  shift 2
+  local deadline=$((SECONDS + DRILL_RESTORE_TIMEOUT))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    DRILL_LAST_RESTORE_ERROR=
+    DRILL_LAST_ACTUAL=
+    if DRILL_LAST_RESTORE_ERROR=$(run_restore_to "$name" "$DRILL_RESTORE" "$@" 2>&1); then
+      integrity_ok "$DRILL_RESTORE"
+      DRILL_LAST_ACTUAL=$(db_count "$DRILL_RESTORE")
+      if [ "$DRILL_LAST_ACTUAL" -ge "$min" ]; then
+        log "restore rows ok (>= $min): $DRILL_LAST_ACTUAL"
+        return 0
+      fi
+    fi
+    sleep "$DRILL_POLL_INTERVAL"
+  done
+  fail "ROW DIFF: restore never reached >= $min for $name; last actual rows=${DRILL_LAST_ACTUAL:-unavailable}; restore output: ${DRILL_LAST_RESTORE_ERROR:-none}"
+}
+
 wait_driver_count_at_least() {
   local min=$1
   local timeout=${2:-30}
@@ -496,7 +535,8 @@ expect_future_txid_error() {
   if run_restore_to "$name" "$out" --point-in-time "$txid" >"$DRILL_WORKDIR/future.out" 2>&1; then
     fail "future TXID restore unexpectedly succeeded: $txid"
   fi
-  log "future TXID restore failed as expected: $txid"
+  [ ! -e "$out" ] || fail "future TXID restore left an output file behind: $out"
+  log "future TXID restore failed as expected (no file): $txid"
 }
 
 force_truncate_checkpoint() {

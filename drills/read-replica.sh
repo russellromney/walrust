@@ -14,7 +14,11 @@ start_driver "$DRILL_DB" "${WALRUST_DRILL_DRIVER_INTERVAL:-0.05}" replica
 wait_driver_count_at_least 8 45
 start_walrust "$DRILL_DB"
 wait_for_shadow_blocker "$DRILL_DB"
-wait_restore_count "$name" "$(driver_count)"
+# The driver is still writing here, so the live count is a moving target an
+# exact restore would race past. Just confirm walrust has published a
+# restorable snapshot beyond the initial rows before attaching the replica;
+# the exact-count convergence checks happen below once the driver is paused.
+wait_restore_count_at_least "$name" 8
 start_replica "$DRILL_BUCKET_URI/$name" "$replica"
 
 deadline=$((SECONDS + ${WALRUST_DRILL_REPLICA_SECONDS:-45}))

@@ -32,7 +32,12 @@ while [ "$SECONDS" -lt "$end_at" ]; do
   if [ "$SECONDS" -ge "$next_restart" ]; then
     restart_walrust_pid_verified "$DRILL_DB"
     wait_for_shadow_blocker "$DRILL_DB"
+    # Pause the driver so the restore target is a fixed count, not a moving one,
+    # then assert an exact row-for-row match (proving no data was lost across
+    # the restart) before resuming load.
+    pause_driver
     wait_restore_count "$name" "$(driver_count)"
+    resume_driver
     next_restart=$((SECONDS + restart_every))
   fi
   if ! kill -0 "$DRILL_WALRUST_PID" >/dev/null 2>&1; then
