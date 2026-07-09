@@ -1858,3 +1858,131 @@ executed the recorded remainder.
 - **Proving coverage:** verified by `cargo check` and the continued passing of the
   replicator / manifest convergence tests that previously shared the codebase
   with the deleted path.
+
+## E — User-drill findings (2026-07-09)
+
+A user-realistic end-to-end drill session against `main` (bd3cbde) surfaced eight
+findings the spec-driven suite missed. Each is fixed test-first below (one commit
+per finding). Proving tests were confirmed to FAIL with the fix reverted at the
+call site.
+
+### E1 — Restart-under-load permanently and silently halts replication
+- **Repro:** `t10.sh` (200 rows/sec, PID-verified kill/restart of `walrust watch`
+  every ~2 min). After a restart every shadow sync failed forever with
+  `Shadow sync failed after 7 attempts: Invalid page num: transaction ID must be
+  non-zero`. Restore/verify reported success while ~4 min of committed data was
+  missing.
+- **Root cause:** A `kill -9` mid-write left a partial (torn) frame at the tail of
+  the active shadow segment. Shadow segments are a stream of fixed-size frames
+  (24-byte header + page_size); `ShadowWal::copy_frames` appends new frames in
+  append mode after that torn tail, shifting every following frame off its
+  boundary. `encode_shadow_to_ltx` then decodes a header out of a frame's
+  zero-padded region, yielding page number 0, which litepages rejects. (Its
+  `PageNumError` Display string is mislabeled "transaction ID must be non-zero",
+  which is why the drill looked like a TXID-0 bug — it is actually page-0.) The
+  "never exits" observation was two concurrent instances (see E5); a single
+  instance already propagates the error and exits nonzero.
+- **Fix:** (a) `ShadowWal::new` truncates every shadow segment down to a
+  whole-frame boundary on startup, dropping any torn tail; the durable
+  `wal_copy_offset` re-copies dropped frames cleanly so restarts resume
+  correctly. (b) Encode/validation errors are classified permanent and fail fast
+  (one attempt) with an error log + webhook instead of spinning the retry budget
+  and burying a hard fault under WARN spam.
+- **Proving tests:**
+  `walrust_core::shadow::tests::e1_shadow_new_heals_torn_tail_so_sync_resumes`,
+  `walrust_core::shadow::tests::e1_torn_segment_tail_decodes_as_invalid_page_num`,
+  `walrust::sync::shadow::tests::e1_permanent_encode_error_fails_fast_without_spinning`,
+  `walrust::sync::shadow::tests::e1_transient_error_still_retries_to_budget`,
+  `walrust::sync::shadow::tests::e1_classifies_corrupt_frame_error_as_permanent`.
+- **Status:** Fixed. Re-verified with a shortened t10 (see E-drill re-run note).
+
+### E2 — `compact` deletes generations retained PITR points need
+- **Repro:** `t5b.sh` — 5+ auto-snapshot generations; `compact --hourly 1 --daily 0
+  --weekly 0 --monthly 0 --force` pruned old generations; afterward PITR to a
+  pre-compact marked TXID failed ("restore incremental gap: expected next TXID 47,
+  got 48-52", exit 6). Latest restore still worked.
+- **Root cause:** Taking a full snapshot at TXID H consumes H, so the gen-0
+  incremental stream jumps from ..H-1 to H+1.., leaving a single-TXID hole at H
+  that only the snapshot at H can fill. The reachability rescue protected only
+  one base, so compaction deleted these bridge snapshots and stranded every
+  incremental after each hole.
+- **Fix:** `plan_legacy_compaction` now rescues every snapshot that bridges a hole
+  in the surviving live-incremental chain; `compact` also prints the earliest
+  restorable point-in-time so any dropped older window is declared explicitly.
+- **Proving test:**
+  `walrust_core::legacy_manifest::tests::e2_compaction_rescues_bridge_snapshots_for_retained_pitr_points`.
+- **Status:** Fixed.
+
+### E3 — `verify` false-positives "CRITICAL - data may be unrecoverable"
+- **Repro:** `t2c_clean.sh` — all restores (including PITR into the "gap")
+  succeeded while verify screamed exit 5 after any restart or interval snapshot.
+- **Root cause:** The gen-0 continuity check flagged every single-TXID hole a full
+  snapshot punches as a critical gap, not understanding that the snapshot
+  supersedes it.
+- **Fix:** A hole is only reported when no full snapshot sits at the TXID just
+  below where incrementals resume — i.e. only when an advertised restore point
+  actually depends on the missing range. Extracted into a pure
+  `detect_live_txid_gaps` helper, tested both ways.
+- **Proving tests:**
+  `walrust::sync::verify::tests::e3_snapshot_superseded_holes_are_not_reported_as_gaps`,
+  `walrust::sync::verify::tests::e3_unbridged_hole_is_still_a_real_gap`.
+- **Status:** Fixed.
+
+### E4 — `restore --point-in-time <far-future>` silently returns latest (exit 0)
+- **Repro:** A far-future TXID returned the latest DB with exit 0; `--point-in-time
+  0` correctly errored.
+- **Fix:** `restore_legacy_ltx` rejects a point-in-time beyond the newest available
+  TXID with a hard error naming the max available.
+- **Proving test:**
+  `walrust_core` integration `e4_far_future_point_in_time_is_a_hard_error_naming_the_max`.
+- **Status:** Fixed.
+
+### E5 — No guard against two concurrent instances on the same DB
+- **Repro:** Supervisor double-start; drills reproduced severe unrecoverable
+  corruption with two live instances (and contaminated the t10 run).
+- **Fix:** New advisory `flock` on `.walrust-<db>.lock` next to the DB, taken by
+  watch (both modes) and replicate and held for the process lifetime; a second
+  same-host instance fails fast with a clear message. Same-host guard only,
+  matching the single-writer design.
+- **Proving tests:** `walrust::lock::tests::e5_second_lock_on_same_db_fails_fast`,
+  `e5_lock_released_on_drop_allows_reacquire`, `e5_lock_path_is_next_to_db`.
+- **Status:** Fixed.
+
+### E6 — `walrust snapshot` while `watch` runs fails with a confusing `busy=1`
+- **Fix:** `snapshot` detects a watcher owns the DB via the E5 lock and returns an
+  actionable error (snapshots are taken by the watcher; use its interval or stop
+  it first) instead of the raw "snapshot checkpoint incomplete (busy=1...)".
+  README note added.
+- **Proving test:**
+  `walrust::sync::compact::tests::e6_snapshot_reports_actionable_error_when_watcher_holds_lock`.
+- **Status:** Fixed.
+
+### E7 — `allow_empty_globs = true` still hard-fails when all globs are empty
+- **Fix:** With the opt-in, zero matched databases starts and idles with a warning
+  instead of exiting 2; without it the empty case still errors. Code + README now
+  agree.
+- **Proving tests:**
+  `walrust` (bin) `tests::e7_allow_empty_globs_resolves_to_zero_databases_without_error`,
+  `tests::e7_empty_globs_without_opt_in_still_errors`.
+- **Status:** Fixed.
+
+### E8 — Docs (one commit)
+- **Fix:** (a) `--help` no longer claims "Litestream-compatible LTX format" — it
+  names the HADBP changeset format the code uses. (b) The unreproducible README
+  memory table (23–31 MB vs 36 MB) is replaced with the measured ~7–10 MB RSS for
+  both tools plus a workload-dependence caveat. (c) Added an S3 request-volume
+  section documenting the ~1s `wal-sync-interval` cost tradeoff (~9x more PUTs than
+  Litestream batching in drills) and the knobs that tune it.
+- **Status:** Fixed.
+
+#### E-drill re-run note
+Shortened t10 re-run against the rebuilt release binary (200 rows/sec, 3x
+60-second cycles = 2 PID-verified kill/restart cycles under load):
+- `Invalid page num` occurrences in watch.log: **0** (was: permanent spam after
+  the first restart).
+- No ERROR lines; replication resumed cleanly across both restarts.
+- restore exit 0, `PRAGMA integrity_check` ok, chain intact through TXID 1553.
+- verify exit **0** (E3: no false CRITICAL).
+- ground-truth rows 38156, restored 38070 — the 86-row delta is the sub-second
+  in-flight tail before the final `kill -9` (~0.4s at 200/s), i.e. the normal
+  async recovery-point window, not the multi-minute halt the bug caused.
