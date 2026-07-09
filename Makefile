@@ -1,4 +1,4 @@
-.PHONY: build release test clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-realworld help
+.PHONY: build release test basic-e2e drill clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-realworld help
 
 SOUP_PROJECT ?= turbolite
 SOUP_ENV ?= development
@@ -38,6 +38,12 @@ test:
 # Run tests with output (implies serial execution so output doesn't interleave)
 test-verbose:
 	$(TEST_RUNNER) sh -c '$(TEST_ENV); cargo nextest run --workspace --profile default --no-capture && cargo test --workspace --doc -- --nocapture'
+
+basic-e2e: build
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); WALRUST_BIN="$$(pwd)/target/debug/walrust" drills/basic-e2e.sh'
+
+drill: release
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); WALRUST_BIN="$$(pwd)/target/release/walrust" drills/run-all.sh'
 
 # Run micro-benchmarks (cargo bench)
 bench:
@@ -118,6 +124,8 @@ help:
 	@echo "  Test:"
 	@echo "    make test           - Run all tests (with S3 credentials via soup)"
 	@echo "    make test-verbose   - Run tests with output"
+	@echo "    make basic-e2e      - Run the fast basic_e2e drill tier"
+	@echo "    make drill          - Run the full drill suite"
 	@echo ""
 	@echo "  Benchmark:"
 	@echo "    make bench          - Run micro-benchmarks (cargo bench)"

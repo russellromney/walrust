@@ -102,6 +102,29 @@ walrust replicate s3://my-bucket/app --local replica.db --interval 5s
 
 This polls S3 for new changesets and applies them to a local database. The replica is a normal SQLite file — any application can open it read-only. Combine with `walrust watch` on the primary to get a continuously updated read replica on another machine.
 
+## Testing
+
+`make basic-e2e` runs the fast `basic_e2e` drill tier: lifecycle, one PID-verified restart under load, restore row-count assertions, and compact plus point-in-time restore checks. It builds the debug binary and is intended for PR gating.
+
+`make drill` runs the full user-drill suite with the release binary: lifecycle, restart-under-load, hostile external checkpoints, PITR including the future-TXID error case, compact-then-restore-every-retained-point, read replica convergence, and the 10-minute restart/RSS soak.
+
+Both targets read S3-compatible storage from the environment. Local Tigris runs can use Soup:
+
+```bash
+make basic-e2e
+make drill
+```
+
+For local MinIO or another endpoint, provide credentials and disable Soup:
+
+```bash
+AWS_ACCESS_KEY_ID=minioadmin \
+AWS_SECRET_ACCESS_KEY=minioadmin \
+AWS_ENDPOINT_URL_S3=http://127.0.0.1:9000 \
+TIERED_TEST_BUCKET=walrust-dev \
+make basic-e2e USE_SOUP=0
+```
+
 ## Memory usage
 
 walrust aims to be embeddable and memory-efficient: a single watcher holds a

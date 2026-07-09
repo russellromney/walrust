@@ -156,3 +156,84 @@ jobs:
       - name: sccache stats
         if: always()
         run: sccache --show-stats
+
+  basic_e2e:
+    name: basic_e2e
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://127.0.0.1:9000
+      AWS_ENDPOINT_URL_S3: http://127.0.0.1:9000
+      AWS_REGION: us-east-1
+      TIERED_TEST_BUCKET: walrust-ci
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/live && exit 0
+            sleep 2
+          done
+          echo "MinIO failed to become healthy" >&2
+          docker logs minio >&2
+          exit 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 shellcheck
+
+      - name: Create MinIO bucket
+        run: |
+          python -m pip install --user minio
+          python - <<'PY'
+          from minio import Minio
+
+          client = Minio(
+              "127.0.0.1:9000",
+              access_key="minioadmin",
+              secret_key="minioadmin",
+              secure=False,
+          )
+          bucket = "walrust-ci"
+          if not client.bucket_exists(bucket):
+              client.make_bucket(bucket)
+          print(f"Bucket {bucket} ready")
+          PY
+
+      - name: Shellcheck drills
+        run: shellcheck drills/*.sh
+
+      - name: basic_e2e
+        run: make basic-e2e USE_SOUP=0
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
