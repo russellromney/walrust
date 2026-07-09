@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use futures::future::join_all;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -256,6 +256,51 @@ async fn shutdown_shadow_uploaders(
     }
 }
 
+/// Perform the initial shadow copy on startup and detect databases whose live
+/// WAL salt changed while walrust was down.
+///
+/// Returns the set of database paths that should be snapshotted eagerly (D3).
+async fn initial_shadow_copy(
+    db_states: &mut HashMap<PathBuf, ShadowDbState>,
+) -> Result<HashSet<PathBuf>> {
+    let mut eager_snapshot: HashSet<PathBuf> = HashSet::new();
+
+    for (_db_path, state) in db_states.iter_mut() {
+        if !state.wal_path.exists() {
+            continue;
+        }
+
+        let generation_before = state.shadow.generation();
+        match state.shadow.copy_frames(state.wal_copy_offset).await {
+            Ok((frames, new_offset)) => {
+                if !frames.is_empty() {
+                    tracing::debug!(
+                        "{}: Initial shadow copy: {} frames",
+                        state.name,
+                        frames.len()
+                    );
+                    state.wal_copy_offset = new_offset;
+                }
+
+                if state.shadow.generation() > generation_before {
+                    tracing::info!(
+                        "{}: Downtime checkpoint detected (WAL salt mismatch); scheduling eager snapshot",
+                        state.name
+                    );
+                    eager_snapshot.insert(state.db_path.clone());
+                }
+            }
+            Err(e) => {
+                tracing::error!("{}: Initial shadow copy failed: {}", state.name, e);
+                return Err(e)
+                    .with_context(|| format!("{}: initial shadow copy failed", state.name));
+            }
+        }
+    }
+
+    Ok(eager_snapshot)
+}
+
 /// Shadow WAL mode decouples S3 uploads from SQLite's active WAL file:
 /// - Holds a read transaction to prevent SQLite auto-checkpoint
 /// - Copies WAL frames to shadow directory on notification
@@ -473,33 +518,17 @@ pub async fn watch_with_shadow(
             .await;
     }
 
-    // Initial copy of any existing WAL data to shadow
-    for (_db_path, state) in db_states.iter_mut() {
-        if state.wal_path.exists() {
-            match state.shadow.copy_frames(state.wal_copy_offset).await {
-                Ok((frames, new_offset)) => {
-                    if !frames.is_empty() {
-                        tracing::debug!(
-                            "{}: Initial shadow copy: {} frames",
-                            state.name,
-                            frames.len()
-                        );
-                        state.wal_copy_offset = new_offset;
-                    }
-                }
-                Err(e) => {
-                    tracing::error!("{}: Initial shadow copy failed: {}", state.name, e);
-                    return Err(e)
-                        .with_context(|| format!("{}: initial shadow copy failed", state.name));
-                }
-            }
-        }
-    }
+    // Initial copy of any existing WAL data to shadow. If the live WAL salt
+    // changed while we were down, `copy_frames` bumps the shadow generation;
+    // those databases need an eager snapshot instead of waiting for the periodic
+    // timer (D3).
+    let eager_snapshot_paths = initial_shadow_copy(&mut db_states).await?;
 
-    // Take initial snapshots if on_startup is enabled
+    // Take initial snapshots if on_startup is enabled, skipping any DB that is
+    // already scheduled for an eager snapshot below.
     for (db_path, state) in db_states.iter_mut() {
         let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
-        if sync_config.on_startup {
+        if sync_config.on_startup && !eager_snapshot_paths.contains(db_path) {
             // Convert to DbState temporarily for snapshot
             let mut db_state = DbState {
                 name: state.name.clone(),
@@ -537,6 +566,58 @@ pub async fn watch_with_shadow(
                     trigger.frames_since_snapshot = 0;
                     trigger.first_change_time = None;
                 }
+            }
+        }
+    }
+
+    // D3: eager snapshot for any database whose live WAL salt changed while we
+    // were down. This runs even when on_startup is disabled, so we do not wait
+    // for the periodic snapshot timer after a downtime checkpoint.
+    for db_path in &eager_snapshot_paths {
+        let state = db_states
+            .get_mut(db_path)
+            .expect("eager snapshot path must exist in db_states");
+        let mut db_state = DbState {
+            name: state.name.clone(),
+            db_path: state.db_path.clone(),
+            wal_path: state.wal_path.clone(),
+            wal_offset: 0,
+            wal_generation: state.shadow.generation(),
+            current_txid: state.current_txid,
+            last_snapshot: state.last_snapshot,
+            db_checksum: state.db_checksum,
+            wal_salt: None,
+            wal_checksum_chain: None,
+        };
+        if let Err(e) = take_snapshot_with_retry(
+            &client,
+            &bucket_name,
+            &prefix,
+            &mut db_state,
+            &retry_policy,
+            &webhook_sender,
+        )
+        .await
+        {
+            tracing::error!(
+                "{}: Eager snapshot after downtime checkpoint failed: {}",
+                state.name,
+                e
+            );
+            metrics_state.record_error(&state.name);
+        } else {
+            state.current_txid = db_state.current_txid;
+            state.last_snapshot = db_state.last_snapshot;
+            state.db_checksum = db_state.db_checksum;
+            state.shadow_sync_generation = state.shadow.generation();
+            state.shadow_sync_offset = state.shadow.segment_offset();
+            state.wal_copy_offset = 0;
+            save_shadow_progress(state)?;
+            metrics_state.record_snapshot(&state.name);
+
+            if let Some(trigger) = trigger_states.get_mut(db_path) {
+                trigger.frames_since_snapshot = 0;
+                trigger.first_change_time = None;
             }
         }
     }
@@ -1386,6 +1467,62 @@ mod tests {
         assert!(
             !cache.pending_uploads().is_empty(),
             "test must leave an unconfirmed cache upload pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_initial_shadow_copy_detects_downtime_checkpoint() {
+        // D3: if the live WAL salt changed while walrust was down, the initial
+        // copy must flag the database for an eager snapshot.
+        let (_temp, db_path, conn) = create_real_wal_db();
+
+        // First "process": copy WAL frames and remember the salt/offset.
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
+        assert!(!frames.is_empty(), "pre-restart copy must read frames");
+        let saved_salt = shadow.wal_read_salt();
+        let saved_chain = shadow.wal_read_chain();
+        drop(shadow);
+
+        // External checkpoint while walrust is down resets the WAL and changes salt.
+        let _: (i64, i64, i64) = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        conn.execute("INSERT INTO items (value) VALUES ('post-ckpt')", [])
+            .unwrap();
+
+        // Second "process": restart with the persisted cursor.
+        let restarted = ShadowWal::new(&db_path).await.unwrap();
+        let mut shadow = restarted;
+        shadow.restore_read_cursor(saved_salt, saved_chain);
+
+        let mut db_states = HashMap::new();
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name: "downtime-ckpt".to_string(),
+                db_path: db_path.clone(),
+                wal_path: db_path.with_extension("db-wal"),
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                shadow,
+                shadow_sync_generation: 0,
+                shadow_sync_offset: 0,
+                wal_copy_offset: offset,
+            },
+        );
+
+        let eager = initial_shadow_copy(&mut db_states).await.unwrap();
+        assert!(
+            eager.contains(&db_path),
+            "initial copy must flag a downtime-checkpointed DB for eager snapshot"
+        );
+        assert!(
+            db_states[&db_path].shadow.generation() > 0,
+            "shadow generation must advance after salt mismatch"
         );
     }
 }
