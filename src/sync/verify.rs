@@ -39,6 +39,31 @@ struct VerifiedLtxFile {
     post_apply_checksum: Checksum,
 }
 
+/// Detect real TXID gaps in the live (generation-0) incremental pool (E3).
+///
+/// `live` is `(key, min_txid, max_txid)` for each gen-0 file, sorted by
+/// `min_txid`; `snapshot_maxes` is the set of full-snapshot max TXIDs. A hole
+/// between consecutive incrementals is only a real gap when no full snapshot
+/// sits at the TXID just below where the incrementals resume — otherwise that
+/// snapshot is a valid restore base that supersedes the hole. Returns
+/// `(key, expected_next, actual_min)` for each genuine gap.
+pub(crate) fn detect_live_txid_gaps(
+    live: &[(String, u64, u64)],
+    snapshot_maxes: &std::collections::BTreeSet<u64>,
+) -> Vec<(String, u64, u64)> {
+    let mut gaps = Vec::new();
+    let mut expected_next: Option<u64> = None;
+    for (key, min_txid, max_txid) in live {
+        if let Some(expected) = expected_next {
+            if *min_txid > expected && !snapshot_maxes.contains(&(*min_txid - 1)) {
+                gaps.push((key.clone(), expected, *min_txid));
+            }
+        }
+        expected_next = Some(max_txid + 1);
+    }
+    gaps
+}
+
 fn verify_ltx_chain(files: &[VerifiedLtxFile]) -> Vec<VerifyIssue> {
     let mut issues = Vec::new();
 
@@ -198,6 +223,59 @@ mod tests {
             pre_apply_checksum: pre_apply_checksum.map(Checksum::new),
             post_apply_checksum: Checksum::new(post_apply_checksum),
         }
+    }
+
+    fn live(key: &str, min: u64, max: u64) -> (String, u64, u64) {
+        (key.to_string(), min, max)
+    }
+
+    #[test]
+    fn e3_snapshot_superseded_holes_are_not_reported_as_gaps() {
+        // Healthy post-restart / interval-snapshot chain: the incremental pool
+        // has single-TXID holes at 47 and 98 because full snapshots were taken
+        // there. Those snapshots supersede the holes, so verify must be silent.
+        let liveset = vec![
+            live("a", 2, 46),
+            live("b", 48, 97),  // hole at 47, bridged by snapshot(max=47)
+            live("c", 99, 150), // hole at 98, bridged by snapshot(max=98)
+        ];
+        let snapshots: std::collections::BTreeSet<u64> = [1, 47, 98].into_iter().collect();
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots);
+        assert!(
+            gaps.is_empty(),
+            "snapshot-superseded holes must not be reported: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn e3_unbridged_hole_is_still_a_real_gap() {
+        // Same shape, but no snapshot exists at TXID 47 to bridge the hole, so a
+        // restore into 48-97 would genuinely fail — verify must still flag it.
+        let liveset = vec![live("a", 2, 46), live("b", 48, 97)];
+        let snapshots: std::collections::BTreeSet<u64> = [1].into_iter().collect();
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots);
+        assert_eq!(gaps.len(), 1, "unbridged hole must be a real gap: {gaps:?}");
+        assert_eq!(gaps[0], ("b".to_string(), 47, 48));
+    }
+
+    #[test]
+    fn e3_gap_below_latest_snapshot_above_older_retained_snapshot_still_alarms() {
+        // Priority-5 case. Two retained snapshots: an old base at TXID 1 and the
+        // latest at TXID 100. The incremental pool has an UNBRIDGED hole at
+        // 51-59 (no snapshot there) and a snapshot-punched hole at 100. A PITR
+        // into 60-99 genuinely depends on the missing 51-59 range: the latest
+        // snapshot at 100 is ABOVE that range and cannot serve as its base, and
+        // the old base at 1 cannot reach 60 across the hole. verify MUST alarm
+        // on 51-59, while the snapshot at 100 correctly supersedes the hole at
+        // 100 (restores >= 100 use it as base).
+        let liveset = vec![live("a", 2, 50), live("b", 60, 99), live("c", 101, 150)];
+        let snapshots: std::collections::BTreeSet<u64> = [1, 100].into_iter().collect();
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots);
+        assert_eq!(
+            gaps,
+            vec![("b".to_string(), 51, 60)],
+            "the unbridged mid-range hole must alarm and the snapshot@100 hole must not: {gaps:?}"
+        );
     }
 
     #[test]
@@ -398,24 +476,35 @@ pub async fn verify(
         .collect();
     live_files.sort_by_key(|(_, _, min, _)| *min);
 
-    let mut expected_next_txid: Option<u64> = None;
-    for (key, _, min_txid, max_txid) in &live_files {
-        if let Some(expected) = expected_next_txid {
-            if *min_txid != expected && *min_txid > expected {
-                issues.push(VerifyIssue {
-                    filename: key.clone(),
-                    issue: format!(
-                        "TXID gap: expected min_txid={}, got {} (missing TXIDs {}-{})",
-                        expected,
-                        min_txid,
-                        expected,
-                        min_txid - 1
-                    ),
-                    is_orphan: false,
-                });
-            }
-        }
-        expected_next_txid = Some(max_txid + 1);
+    // E3: a full snapshot at TXID H supersedes any hole in the incremental pool
+    // below H — restore uses that snapshot as its base (min==1 full DB) and
+    // never needs the missing incrementals. Taking a snapshot at H in fact
+    // *punches* a single-TXID hole at H in the gen-0 stream by design, so the
+    // naive "every gen-0 TXID must be contiguous" check false-positives
+    // "CRITICAL - data may be unrecoverable" on every healthy chain. A hole is
+    // only a real gap if no snapshot base bridges it (i.e. no full snapshot
+    // exists at the TXID just below where the incrementals resume).
+    let snapshot_maxes: std::collections::BTreeSet<u64> = all_files
+        .iter()
+        .filter(|(_, gen, min, max)| *gen != GENERATION_LIVE || (*min == 1 && *max == 1))
+        .map(|(_, _, _, max)| *max)
+        .collect();
+    let live_triples: Vec<(String, u64, u64)> = live_files
+        .iter()
+        .map(|(key, _, min, max)| (key.clone(), *min, *max))
+        .collect();
+    for (key, expected, min_txid) in detect_live_txid_gaps(&live_triples, &snapshot_maxes) {
+        issues.push(VerifyIssue {
+            filename: key,
+            issue: format!(
+                "TXID gap: expected min_txid={}, got {} (missing TXIDs {}-{})",
+                expected,
+                min_txid,
+                expected,
+                min_txid - 1
+            ),
+            is_orphan: false,
+        });
     }
 
     println!();

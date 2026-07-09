@@ -14,6 +14,7 @@ pub mod config;
 #[cfg(feature = "s3")]
 pub mod dashboard;
 pub mod errors;
+pub mod lock;
 pub mod ltx;
 #[cfg(feature = "s3")]
 pub mod retention;

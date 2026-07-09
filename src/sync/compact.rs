@@ -90,6 +90,16 @@ pub async fn compact(
             format_age(now, entry.created_at)
         );
     }
+    // Declare the retained restore floor explicitly (E2): the oldest kept
+    // snapshot is the earliest point-in-time that stays restorable after this
+    // compaction. Anything below it is being dropped on purpose.
+    if let Some(floor) = plan.keep.iter().map(|e| e.sequence).min() {
+        println!(
+            "Earliest restorable point-in-time after compaction: TXID {} \
+             (older point-in-time restores are no longer available)",
+            floor
+        );
+    }
     println!();
 
     // Print what will be deleted
@@ -162,6 +172,20 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
         .and_then(|s| s.to_str())
         .ok_or_else(|| WalrustError::database("Invalid database path"))?;
 
+    // E6: a running watcher pins the WAL via its checkpoint blocker, so a manual
+    // snapshot's fail-closed TRUNCATE would surface a confusing "checkpoint
+    // incomplete (busy=1...)" error. Detect that case up front via the E5 lock
+    // and return an actionable message instead.
+    if crate::lock::DbLock::is_held_by_another(database) {
+        return Err(WalrustError::database(format!(
+            "a walrust watch process holds the checkpoint blocker for {}. \
+             Snapshots are taken automatically by the watcher — use its snapshot \
+             interval/triggers, or stop the watcher before taking a manual snapshot.",
+            database.display()
+        ))
+        .into());
+    }
+
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint)
         .await
@@ -181,4 +205,33 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
         bucket_name, output.key, output.generation, output.max_txid
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    /// E6: when a watcher holds the single-writer lock, `snapshot` must return
+    /// an actionable error naming the watcher — before it ever reaches the
+    /// fail-closed WAL TRUNCATE that would otherwise surface a confusing
+    /// "checkpoint incomplete (busy=1...)".
+    #[tokio::test]
+    async fn e6_snapshot_reports_actionable_error_when_watcher_holds_lock() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("app.db");
+        std::fs::write(&db, b"SQLite format 3\0").unwrap();
+
+        // Simulate a running watcher owning the DB.
+        let _watcher_lock = crate::lock::DbLock::acquire(&db).unwrap();
+
+        let err = snapshot(&db, "s3://bucket/prefix", None)
+            .await
+            .expect_err("snapshot must refuse while a watcher owns the DB");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("holds the checkpoint blocker") && msg.contains("stop the watcher"),
+            "message must be actionable, got: {msg}"
+        );
+    }
 }

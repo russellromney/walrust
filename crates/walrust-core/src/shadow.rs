@@ -35,6 +35,24 @@ fn format_segment_name(generation: u64, index: u64) -> String {
     )
 }
 
+/// Read the authoritative page size from a SQLite database file header.
+///
+/// The page size lives at byte offset 16 (big-endian u16) of the main DB file,
+/// where the special value `1` means 65536. Returns `None` if the file is
+/// missing or is not a SQLite database (e.g. before the first write), in which
+/// case callers fall back to the WAL-header-derived page size.
+fn db_header_page_size(db_path: &Path) -> Option<u32> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(db_path).ok()?;
+    let mut header = [0u8; 18];
+    file.read_exact(&mut header).ok()?;
+    if &header[0..16] != b"SQLite format 3\0" {
+        return None;
+    }
+    let raw = u16::from_be_bytes([header[16], header[17]]);
+    Some(if raw == 1 { 65_536 } else { raw as u32 })
+}
+
 pub(crate) fn ensure_connection_in_wal_mode(conn: &Connection, db_path: &Path) -> Result<()> {
     let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
     if mode.eq_ignore_ascii_case("wal") {
@@ -110,6 +128,22 @@ impl ShadowWal {
         let generation = Self::find_latest_generation(&shadow_dir)
             .await?
             .unwrap_or(0);
+
+        // E1: heal any torn shadow-segment tail left by a crash mid-write.
+        //
+        // Shadow segments are a stream of fixed-size frames (24-byte header +
+        // page_size data). A `kill -9` between the header write and the page
+        // write (or partway through either) leaves a partial trailing frame.
+        // On restart `copy_frames` appends fresh frames after that torn tail in
+        // append mode, which shifts every following frame off its boundary. The
+        // reader (`encode_shadow_to_ltx`) then decodes garbage headers, and a
+        // header landing on a frame's zero-padded region yields page number 0,
+        // which litepages rejects as "Invalid page num: transaction ID must be
+        // non-zero" — sync then fails forever. Truncating every segment down to
+        // a whole-frame boundary before the first append removes the torn tail;
+        // the durable `wal_copy_offset` re-copies any dropped frames cleanly.
+        let frame_page_size = db_header_page_size(db_path).unwrap_or(page_size);
+        Self::align_truncate_segments(&shadow_dir, frame_page_size).await?;
 
         // Open read connection to prevent auto-checkpoint
         let checkpoint_blocker = Self::open_checkpoint_blocker(db_path)?;
@@ -202,6 +236,47 @@ impl ShadowWal {
         }
 
         Ok(max_gen)
+    }
+
+    /// Truncate every shadow segment down to a whole-frame boundary, dropping
+    /// any partial trailing frame left by a crash mid-write (E1). Segments that
+    /// are already frame-aligned are left untouched, so this is a cheap no-op on
+    /// a clean start. `page_size` determines the frame size; a `page_size` of 0
+    /// (no header ever seen) means there can be no real frames yet, so nothing
+    /// is done.
+    async fn align_truncate_segments(shadow_dir: &Path, page_size: u32) -> Result<()> {
+        if page_size == 0 {
+            return Ok(());
+        }
+        let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+
+        let mut entries = fs::read_dir(shadow_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            if !name.to_string_lossy().ends_with(".wal") {
+                continue;
+            }
+            let path = entry.path();
+            let size = match fs::metadata(&path).await {
+                Ok(meta) => meta.len(),
+                Err(_) => continue,
+            };
+            let aligned = (size / frame_size) * frame_size;
+            if aligned != size {
+                tracing::warn!(
+                    "Shadow WAL: healing torn segment {} ({} -> {} bytes, dropped {} partial-frame byte(s))",
+                    path.display(),
+                    size,
+                    aligned,
+                    size - aligned
+                );
+                let file = OpenOptions::new().write(true).open(&path).await?;
+                file.set_len(aligned).await?;
+                file.sync_all().await?;
+            }
+        }
+        Self::fsync_dir(shadow_dir).await?;
+        Ok(())
     }
 
     /// Copy new WAL frames to the shadow WAL
@@ -656,6 +731,226 @@ mod tests {
         let shadow = ShadowWal::new(&db_path).await.unwrap();
         assert!(shadow.shadow_dir().exists());
         assert_eq!(shadow.generation(), 0);
+    }
+
+    // --- E1: torn shadow-segment tail after a crash-under-load restart ---
+
+    const E1_PAGE_SIZE: u32 = 4096;
+
+    fn e1_frame(page: u32, db_size: u32, fill: u8) -> Vec<u8> {
+        let mut frame = vec![0u8; (FRAME_HEADER_SIZE + E1_PAGE_SIZE as u64) as usize];
+        frame[0..4].copy_from_slice(&page.to_be_bytes());
+        frame[4..8].copy_from_slice(&db_size.to_be_bytes());
+        for b in frame[24..].iter_mut() {
+            *b = fill;
+        }
+        frame
+    }
+
+    /// Reproduces the exact drill symptom at the read layer: when a shadow
+    /// segment has a torn (non-frame-aligned) tail followed by more frame bytes,
+    /// the frame-by-frame reader misaligns and decodes a header out of a frame's
+    /// zero-padded region, producing page number 0 — which litepages surfaces as
+    /// "Invalid page num: transaction ID must be non-zero".
+    #[tokio::test]
+    async fn e1_torn_segment_tail_decodes_as_invalid_page_num() {
+        use crate::legacy_shadow::{encode_shadow_to_ltx, ShadowSyncInput};
+
+        let dir = tempdir().unwrap();
+        let shadow_dir = dir.path().join(".walrust-app");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+
+        let mut bytes = e1_frame(1, 1, 0xAB); // committed frame, page 1
+        bytes.extend_from_slice(&[0u8; 4]); // torn 4-byte tail (all zero)
+        bytes.extend_from_slice(&e1_frame(2, 2, 0xCD)); // appended committed frame
+        std::fs::write(shadow_dir.join(format_segment_name(0, 0)), &bytes).unwrap();
+
+        let input = ShadowSyncInput {
+            db_path: dir.path().join("app.db"),
+            name: "app".into(),
+            current_txid: 10,
+            db_checksum: Some(123), // avoid reading the (absent) db file for the checksum
+            generation: 0,
+            shadow_sync_offset: 0,
+            page_size: E1_PAGE_SIZE,
+            shadow_dir: shadow_dir.clone(),
+        };
+
+        let err = match encode_shadow_to_ltx(&input) {
+            Err(e) => e,
+            Ok(_) => panic!("misaligned torn tail must fail to encode"),
+        };
+        assert!(
+            err.to_string().contains("Invalid page num"),
+            "misaligned torn tail must surface the page-num error, got: {err}"
+        );
+    }
+
+    /// Fix gate: `ShadowWal::new` heals a torn segment tail on restart, so the
+    /// next append stays frame-aligned and the reader decodes the real pages
+    /// instead of a bogus page 0. With the healing disabled this fails because
+    /// the torn tail persists and `encode_shadow_to_ltx` errors.
+    #[tokio::test]
+    async fn e1_shadow_new_heals_torn_tail_so_sync_resumes() {
+        use crate::legacy_shadow::{encode_shadow_to_ltx, ShadowSyncInput};
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("app.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE t (id INTEGER PRIMARY KEY);
+             INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let frame_size = FRAME_HEADER_SIZE + E1_PAGE_SIZE as u64;
+        let shadow_dir = ShadowWal::shadow_dir_for(&db_path);
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+        let seg = shadow_dir.join(format_segment_name(0, 0));
+
+        // One committed frame plus a 30-byte torn tail (crash mid-write).
+        let mut bytes = e1_frame(1, 1, 0xAB);
+        bytes.extend_from_slice(&[0u8; 30]);
+        std::fs::write(&seg, &bytes).unwrap();
+
+        // Restart discovery must heal the torn tail.
+        let _shadow = ShadowWal::new(&db_path).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&seg).unwrap().len(),
+            frame_size,
+            "restart must truncate the torn tail to a whole-frame boundary"
+        );
+
+        // Simulate the post-restart append that copy_frames performs.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
+            f.write_all(&e1_frame(2, 2, 0xCD)).unwrap();
+        }
+
+        let input = ShadowSyncInput {
+            db_path: db_path.clone(),
+            name: "app".into(),
+            current_txid: 10,
+            db_checksum: Some(123),
+            generation: 0,
+            shadow_sync_offset: 0,
+            page_size: E1_PAGE_SIZE,
+            shadow_dir: shadow_dir.clone(),
+        };
+
+        let (result, _offset) = encode_shadow_to_ltx(&input)
+            .expect("healed segment must encode cleanly")
+            .expect("committed frames must produce an LTX buffer");
+        assert_eq!(
+            result.unique_pages, 2,
+            "both real pages (1 and 2) must decode, with no bogus page 0"
+        );
+    }
+
+    /// Priority 1(b) — the REWIND question. A torn trailing frame was a
+    /// partially-copied REAL committed WAL frame. After healing, resume must
+    /// RE-COPY that frame from the live WAL (no silent data loss) AND must NOT
+    /// duplicate the whole frames that preceded the tear in the same
+    /// not-yet-persisted copy batch (no TXID-stream corruption). Both directions
+    /// are asserted against a clean-copy oracle built from the same live WAL.
+    #[tokio::test]
+    async fn e1_heal_then_resume_recopies_torn_frame_without_loss_or_corruption() {
+        use crate::legacy_shadow::{encode_shadow_to_ltx, ShadowSyncInput};
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("app.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t (v) VALUES ('a0');",
+        )
+        .unwrap();
+
+        // --- Durable checkpoint: copy commit A, persist its cursor. ---
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let (_frames_a, off_a) = shadow.copy_frames(0).await.unwrap();
+        let salt_a = shadow.wal_read_salt();
+        let chain_a = shadow.wal_read_chain();
+        let page_size = shadow.page_size();
+        let seg = shadow.shadow_dir().join(format_segment_name(0, 0));
+        assert!(off_a > 0, "commit A must have produced frames");
+
+        // --- Commit B: several more frames land in the live WAL. ---
+        for i in 0..5 {
+            conn.execute("INSERT INTO t (v) VALUES (?1)", [format!("b{i}")])
+                .unwrap();
+        }
+
+        // The interrupted copy of B: its whole frames reach the shadow on disk,
+        // but the crash happens before wal_copy_offset is persisted (it stays
+        // off_a) and the final frame is left torn.
+        let (_frames_b, _off_b) = shadow.copy_frames(off_a).await.unwrap();
+        let clean_len = std::fs::metadata(&seg).unwrap().len();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
+            f.write_all(&[0u8; 30]).unwrap(); // torn partial frame
+        }
+        drop(shadow);
+
+        // --- Restart: heal must drop the torn tail back to whole frames. ---
+        let mut restarted = ShadowWal::new(&db_path).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&seg).unwrap().len(),
+            clean_len,
+            "heal must truncate the torn tail to the whole-frame boundary"
+        );
+
+        // Resume from the PERSISTED (pre-B) cursor — the rewind under test.
+        restarted.restore_read_cursor(salt_a, chain_a);
+        let (_resumed, _new_off) = restarted.copy_frames(off_a).await.unwrap();
+
+        // Oracle: a pristine shadow built once from the same final live WAL.
+        let oracle_dir = tempdir().unwrap();
+        let oracle_db = oracle_dir.path().join("app.db");
+        std::fs::copy(&db_path, &oracle_db).unwrap();
+        std::fs::copy(
+            db_path.with_extension("db-wal"),
+            oracle_db.with_extension("db-wal"),
+        )
+        .unwrap();
+        let mut oracle = ShadowWal::new(&oracle_db).await.unwrap();
+        oracle.copy_frames(0).await.unwrap();
+        let oracle_seg = oracle.shadow_dir().join(format_segment_name(0, 0));
+        let oracle_len = std::fs::metadata(&oracle_seg).unwrap().len();
+
+        let healed_len = std::fs::metadata(&seg).unwrap().len();
+
+        // The encoded LTX is what actually ships. It must carry every distinct
+        // page exactly once with the same TXID range as a clean copy — the torn
+        // frame present (no loss) and any structurally duplicated frames
+        // collapsed by the page-dedup reader (no TXID-stream corruption).
+        let encode_one = |sdir: &std::path::Path, gen| {
+            encode_shadow_to_ltx(&ShadowSyncInput {
+                db_path: db_path.clone(),
+                name: "app".into(),
+                current_txid: 50,
+                db_checksum: Some(123),
+                generation: gen,
+                shadow_sync_offset: 0,
+                page_size,
+                shadow_dir: sdir.to_path_buf(),
+            })
+            .unwrap()
+            .map(|(r, _)| (r.unique_pages, r.min_txid, r.max_txid))
+        };
+        let healed = encode_one(restarted.shadow_dir(), restarted.generation());
+        let oracle_res = encode_one(oracle.shadow_dir(), oracle.generation());
+        assert_eq!(
+            healed, oracle_res,
+            "healed shadow must decode the same unique pages and TXID range as a \
+             clean copy (healed_seg_len={healed_len}, oracle_seg_len={oracle_len})"
+        );
     }
 
     #[tokio::test]

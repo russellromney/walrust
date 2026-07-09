@@ -102,6 +102,10 @@ rusqlite = { version = "0.35", features = ["bundled"] }
 # Directory traversal (for shadow WAL size calculation)
 walkdir = "2"
 
+# Advisory file locking (single-writer guard, E5). Already in the dependency
+# graph transitively; declared directly for `libc::flock`.
+libc = "0.2"
+
 # Dashboard + metrics
 axum = "0.7"
 prometheus = "0.13"

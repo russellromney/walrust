@@ -51,50 +51,95 @@ pub(crate) async fn sync_shadow_to_cache(
     legacy_shadow::sync_shadow_to_cache(cache, upload_tx, input).await
 }
 
-/// Sync shadow WAL to cache with retry logic
-pub(crate) async fn sync_shadow_to_cache_with_retry(
-    cache: Arc<LocalCache>,
-    upload_tx: tokio::sync::mpsc::Sender<UploadMessage>,
-    input: ShadowSyncInput,
-    retry_policy: RetryPolicy,
-    webhook_sender: Arc<WebhookSender>,
-) -> Result<ShadowSyncOutput> {
-    let db_name = input.name.clone();
+/// A shadow-sync failure that will never succeed on retry (E1).
+///
+/// These come from the LTX encoder rejecting structurally invalid frames — a
+/// bad page number, TXID, page size, or changeset shape. The canonical case is
+/// the post-crash torn-tail corruption that decodes as page 0 and surfaces as
+/// "Invalid page num: transaction ID must be non-zero". Retrying such an error
+/// cannot help: it only burns the retry budget and buries a hard durability
+/// fault under transient-looking WARN spam. We must fail fast and loud instead
+/// (single error log + webhook + propagate, which exits the watcher nonzero).
+pub(crate) fn is_permanent_encode_error(error: &anyhow::Error) -> bool {
+    let msg = error.to_string();
+    msg.contains("Invalid page num")
+        || msg.contains("Invalid min TXID")
+        || msg.contains("Invalid max TXID")
+        || msg.contains("Invalid commit page")
+        || msg.contains("Invalid page size")
+        || msg.contains("Invalid TXID")
+        || msg.contains("changeset contains invalid page number")
+        || msg.contains("changeset page")
+        || msg.contains("is invalid for a SQLite changeset")
+}
+
+/// Shared retry driver for the shadow-sync paths. Retries transient errors with
+/// backoff, but fails fast on auth errors and on permanent encode/validation
+/// errors (E1) so a corrupt-frame fault surfaces hard instead of spinning
+/// forever. `label` distinguishes the cache vs direct path in logs.
+async fn run_shadow_sync_with_retry<F, Fut>(
+    label: &str,
+    db_name: &str,
+    retry_policy: &RetryPolicy,
+    webhook_sender: &WebhookSender,
+    mut op: F,
+) -> Result<ShadowSyncOutput>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<ShadowSyncOutput>>,
+{
     let mut attempts = 0u32;
 
     loop {
         attempts += 1;
-        match sync_shadow_to_cache(&cache, &upload_tx, input.clone()).await {
+        match op().await {
             Ok(output) => return Ok(output),
             Err(e) => {
                 let error_kind = classify_error(&e);
-                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
 
                 if error_kind == ErrorKind::AuthError {
-                    tracing::error!("{}: Auth error during shadow cache sync: {}", db_name, e);
+                    tracing::error!("{}: Auth error during {}: {}", db_name, label, e);
                     webhook_sender
-                        .notify_auth_failure(&db_name, &e.to_string())
+                        .notify_auth_failure(db_name, &e.to_string())
                         .await;
                     return Err(e);
                 }
 
-                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
+                if is_permanent_encode_error(&e) {
                     tracing::error!(
-                        "{}: Shadow cache sync failed after {} attempts: {}",
+                        "{}: {} hit a non-retryable encode error (frame corruption); \
+                         failing fast after {} attempt(s): {}",
                         db_name,
+                        label,
                         attempts,
                         e
                     );
                     webhook_sender
-                        .notify_upload_failed(&db_name, &e.to_string(), attempts)
+                        .notify_upload_failed(db_name, &e.to_string(), attempts)
+                        .await;
+                    return Err(e);
+                }
+
+                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
+                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
+                    tracing::error!(
+                        "{}: {} failed after {} attempts: {}",
+                        db_name,
+                        label,
+                        attempts,
+                        e
+                    );
+                    webhook_sender
+                        .notify_upload_failed(db_name, &e.to_string(), attempts)
                         .await;
                     return Err(e);
                 }
 
                 let delay = retry_policy.calculate_delay(attempts - 1);
                 tracing::warn!(
-                    "{}: Shadow cache sync attempt {}/{} failed, retrying in {:?}: {}",
+                    "{}: {} attempt {}/{} failed, retrying in {:?}: {}",
                     db_name,
+                    label,
                     attempts,
                     retry_policy.config().max_retries + 1,
                     delay,
@@ -104,6 +149,25 @@ pub(crate) async fn sync_shadow_to_cache_with_retry(
             }
         }
     }
+}
+
+/// Sync shadow WAL to cache with retry logic
+pub(crate) async fn sync_shadow_to_cache_with_retry(
+    cache: Arc<LocalCache>,
+    upload_tx: tokio::sync::mpsc::Sender<UploadMessage>,
+    input: ShadowSyncInput,
+    retry_policy: RetryPolicy,
+    webhook_sender: Arc<WebhookSender>,
+) -> Result<ShadowSyncOutput> {
+    let db_name = input.name.clone();
+    run_shadow_sync_with_retry(
+        "Shadow cache sync",
+        &db_name,
+        &retry_policy,
+        &webhook_sender,
+        || sync_shadow_to_cache(&cache, &upload_tx, input.clone()),
+    )
+    .await
 }
 
 /// Sync shadow WAL with retry logic
@@ -116,50 +180,14 @@ pub(crate) async fn sync_shadow_concurrent_with_retry(
     webhook_sender: Arc<WebhookSender>,
 ) -> Result<ShadowSyncOutput> {
     let db_name = input.name.clone();
-    let mut attempts = 0u32;
-
-    loop {
-        attempts += 1;
-        match sync_shadow_concurrent(&client, &bucket, &prefix, input.clone()).await {
-            Ok(output) => return Ok(output),
-            Err(e) => {
-                let error_kind = classify_error(&e);
-                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
-
-                if error_kind == ErrorKind::AuthError {
-                    tracing::error!("{}: Auth error during shadow sync: {}", db_name, e);
-                    webhook_sender
-                        .notify_auth_failure(&db_name, &e.to_string())
-                        .await;
-                    return Err(e);
-                }
-
-                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
-                    tracing::error!(
-                        "{}: Shadow sync failed after {} attempts: {}",
-                        db_name,
-                        attempts,
-                        e
-                    );
-                    webhook_sender
-                        .notify_upload_failed(&db_name, &e.to_string(), attempts)
-                        .await;
-                    return Err(e);
-                }
-
-                let delay = retry_policy.calculate_delay(attempts - 1);
-                tracing::warn!(
-                    "{}: Shadow sync attempt {}/{} failed, retrying in {:?}: {}",
-                    db_name,
-                    attempts,
-                    retry_policy.config().max_retries + 1,
-                    delay,
-                    e
-                );
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
+    run_shadow_sync_with_retry(
+        "Shadow sync",
+        &db_name,
+        &retry_policy,
+        &webhook_sender,
+        || sync_shadow_concurrent(&client, &bucket, &prefix, input.clone()),
+    )
+    .await
 }
 
 /// Internal compaction for watch mode (non-interactive, always force)
@@ -265,6 +293,88 @@ mod tests {
             .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
             .ok();
         (bucket, endpoint)
+    }
+
+    #[test]
+    fn e1_classifies_corrupt_frame_error_as_permanent() {
+        // The exact drill string, plus the encoder's sibling validation errors.
+        assert!(is_permanent_encode_error(&anyhow::anyhow!(
+            "Invalid page num: transaction ID must be non-zero"
+        )));
+        assert!(is_permanent_encode_error(&anyhow::anyhow!(
+            "Invalid min TXID: transaction ID must be non-zero"
+        )));
+        assert!(is_permanent_encode_error(&anyhow::anyhow!(
+            "changeset contains invalid page number 0"
+        )));
+        // Transient S3-shaped errors must stay retryable.
+        assert!(!is_permanent_encode_error(&anyhow::anyhow!(
+            "connection reset by peer"
+        )));
+        assert!(!is_permanent_encode_error(&anyhow::anyhow!(
+            "503 Service Unavailable"
+        )));
+    }
+
+    /// E1 loud-failure posture: a non-retryable encode error must fail fast
+    /// (exactly one attempt, no retry spin) and still fire the webhook, so the
+    /// watcher surfaces the fault hard and exits nonzero instead of silently
+    /// retrying forever.
+    #[tokio::test]
+    async fn e1_permanent_encode_error_fails_fast_without_spinning() {
+        let retry_policy = RetryPolicy::new(crate::retry::RetryConfig {
+            max_retries: 5,
+            base_delay_ms: 100,
+            ..Default::default()
+        });
+        let webhook = WebhookSender::new(vec![]);
+        let calls = std::cell::Cell::new(0u32);
+
+        let result =
+            run_shadow_sync_with_retry("Shadow sync", "app", &retry_policy, &webhook, || {
+                calls.set(calls.get() + 1);
+                async {
+                    Err(anyhow::anyhow!(
+                        "Invalid page num: transaction ID must be non-zero"
+                    ))
+                }
+            })
+            .await;
+
+        assert!(result.is_err(), "permanent encode error must propagate");
+        assert_eq!(
+            calls.get(),
+            1,
+            "permanent encode error must NOT be retried (no silent spinning)"
+        );
+    }
+
+    /// Control: a transient error is retried up to the configured budget, then
+    /// gives up — proving the fast-fail path above is specific to permanent
+    /// encode faults and did not disable normal retry behaviour.
+    #[tokio::test]
+    async fn e1_transient_error_still_retries_to_budget() {
+        let retry_policy = RetryPolicy::new(crate::retry::RetryConfig {
+            max_retries: 2,
+            base_delay_ms: 1,
+            ..Default::default()
+        });
+        let webhook = WebhookSender::new(vec![]);
+        let calls = std::cell::Cell::new(0u32);
+
+        let result =
+            run_shadow_sync_with_retry("Shadow sync", "app", &retry_policy, &webhook, || {
+                calls.set(calls.get() + 1);
+                async { Err(anyhow::anyhow!("connection reset by peer")) }
+            })
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(
+            calls.get(),
+            retry_policy.config().max_retries + 2,
+            "transient errors must exhaust the retry budget before giving up"
+        );
     }
 
     #[tokio::test]

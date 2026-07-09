@@ -5,6 +5,7 @@ mod cache;
 mod config;
 mod dashboard;
 mod errors;
+mod lock;
 mod ltx;
 mod retention;
 mod retry;
@@ -31,7 +32,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(
     long_about = "Walrust provides production-grade SQLite database backup and replication \
 to S3-compatible storage. Features include point-in-time recovery, GFS retention policies, \
-Litestream-compatible LTX format, and multi-database support in a single process."
+the HADBP changeset format (shared across the hadb ecosystem), and multi-database support \
+in a single process."
 )]
 struct Cli {
     /// Config file path (checks ./walrust.toml if not specified)
@@ -432,10 +434,21 @@ fn resolve_watch_config(
                 // Use databases from config file
                 let mut dbs = cfg.resolve_databases()?;
                 if dbs.is_empty() {
-                    return Err(WalrustError::config(
-                        "No databases specified (provide paths or configure in config file)",
-                    )
-                    .into());
+                    // E7: with allow_empty_globs, zero matched databases is a
+                    // supported state — start and idle with a warning, matching
+                    // the README, instead of hard-failing with exit 2.
+                    if cfg.allow_empty_globs {
+                        tracing::warn!(
+                            "No databases matched the configured globs; starting idle \
+                             (allow_empty_globs=true). walrust will run with no database \
+                             tasks until you add matching files and restart."
+                        );
+                    } else {
+                        return Err(WalrustError::config(
+                            "No databases specified (provide paths or configure in config file)",
+                        )
+                        .into());
+                    }
                 }
 
                 // Apply CLI overrides to each database's config
@@ -1165,5 +1178,42 @@ mod tests {
         assert_eq!(config.max_size, 20 * 1024 * 1024 * 1024); // From file
         assert_eq!(config.path, Some("/config/cache".to_string())); // From file
         assert_eq!(config.uploader_concurrency, 16); // From file
+    }
+
+    #[test]
+    fn e7_allow_empty_globs_resolves_to_zero_databases_without_error() {
+        let toml = r#"
+            allow_empty_globs = true
+            [s3]
+            bucket = "test-bucket"
+            [[databases]]
+            path = "/nonexistent/walrust-e7/*.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let cli = default_watch_args();
+
+        let resolved = resolve_watch_config(&Some(config), &cli)
+            .expect("allow_empty_globs=true must permit zero databases, not exit 2");
+        assert!(
+            resolved.0.is_empty(),
+            "expected zero resolved databases, got {:?}",
+            resolved.0
+        );
+    }
+
+    #[test]
+    fn e7_empty_globs_without_opt_in_still_errors() {
+        let toml = r#"
+            [s3]
+            bucket = "test-bucket"
+            [[databases]]
+            path = "/nonexistent/walrust-e7/*.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        let cli = default_watch_args();
+
+        let err = resolve_watch_config(&Some(config), &cli)
+            .expect_err("empty globs without opt-in must still fail");
+        assert!(err.to_string().contains("No databases"), "got: {err}");
     }
 }
