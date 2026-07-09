@@ -104,13 +104,27 @@ This polls S3 for new changesets and applies them to a local database. The repli
 
 ## Memory usage
 
-| Databases | Litestream | Walrust | Reduction |
-|-----------|------------|---------|-----------|
-| 1 | 36 MB | 23 MB | 36% |
-| 10 | 55 MB | 30 MB | 45% |
-| 100 | 160 MB | 31 MB | 81% |
+walrust aims to be embeddable and memory-efficient: a single watcher holds a
+bounded working set (shadow WAL frames + the changeset being encoded), so RSS is
+roughly constant regardless of database count rather than growing with it.
 
-*Measured with 100KB databases on macOS, syncing to Tigris S3. Walrust memory is roughly constant regardless of database count.*
+In recent side-by-side drills on macOS syncing small databases to Tigris S3,
+walrust and Litestream both measured **~7–10 MB RSS** and were statistically
+indistinguishable. Earlier versions of this README published a table claiming a
+large advantage (e.g. 23–31 MB vs 36 MB); that result did not reproduce and has
+been removed. Absolute numbers depend heavily on database size, allocator, and
+sync cadence — measure your own workload rather than relying on a headline
+figure.
+
+## S3 request volume
+
+walrust favors freshness over batching: the default `wal-sync-interval` is ~1s,
+so under sustained writes it issues roughly one PUT per interval per database.
+In the drills this produced on the order of **~9x more PUTs** than Litestream's
+coarser batching over the same window — a recovery-point-vs-cost tradeoff, not a
+defect. If S3 request cost matters more than a tight recovery point, raise
+`wal-sync-interval` (fewer, larger uploads) and/or lean on the snapshot
+triggers (`max-changes`, `max-interval`, `on-idle`) to control cadence.
 
 ## Acknowledgments
 

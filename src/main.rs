@@ -32,7 +32,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[command(
     long_about = "Walrust provides production-grade SQLite database backup and replication \
 to S3-compatible storage. Features include point-in-time recovery, GFS retention policies, \
-Litestream-compatible LTX format, and multi-database support in a single process."
+the HADBP changeset format (shared across the hadb ecosystem), and multi-database support \
+in a single process."
 )]
 struct Cli {
     /// Config file path (checks ./walrust.toml if not specified)
