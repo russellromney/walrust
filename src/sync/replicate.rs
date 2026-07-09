@@ -54,6 +54,10 @@ pub async fn replicate(
         (String::new(), path_part.to_string())
     };
 
+    // Single-writer guard: only one walrust instance may own the local replica
+    // target on this host (E5). Held for the lifetime of the replication loop.
+    let _db_lock = crate::lock::DbLock::acquire(local)?;
+
     let client = create_client(endpoint)
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;

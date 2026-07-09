@@ -97,6 +97,8 @@ pub async fn watch_with_independent_tasks(
 
     // Initialize and spawn independent task for each database
     let mut task_handles = Vec::new();
+    // Single-writer guards, held for the lifetime of this watch (E5).
+    let mut db_locks: Vec<crate::lock::DbLock> = Vec::new();
 
     for db_config in databases {
         let db_path = &db_config.path;
@@ -107,6 +109,9 @@ pub async fn watch_with_independent_tasks(
             ))
             .into());
         }
+
+        // Fail fast if another walrust instance already owns this database (E5).
+        db_locks.push(crate::lock::DbLock::acquire(db_path)?);
 
         let name = db_config.prefix.clone();
         let wal_path = db_path.with_extension("db-wal");

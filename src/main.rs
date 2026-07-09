@@ -5,6 +5,7 @@ mod cache;
 mod config;
 mod dashboard;
 mod errors;
+mod lock;
 mod ltx;
 mod retention;
 mod retry;
