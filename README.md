@@ -90,7 +90,7 @@ walrust watch  # auto-discovers walrust.toml
 
 Everything else (sync intervals, retention, retry, webhooks) has sensible defaults. See `walrust explain` for the full resolved config.
 
-A glob (`path = "/data/*.db"`) that matches no databases is a startup error by default, so a typo does not silently back up nothing. Set `allow_empty_globs = true` at the top level to permit genuinely optional patterns.
+A glob (`path = "/data/*.db"`) that matches no databases is a startup error by default, so a typo does not silently back up nothing. Set `allow_empty_globs = true` at the top level to permit genuinely optional patterns; when it is set and *every* configured glob is empty, `watch` starts and idles (logging a warning) instead of exiting, so a supervisor can boot walrust before the databases it will back up exist.
 
 **Reserved table.** In walrust-owned mode (the library `Replicator`), walrust creates a small `_walrust_seq` table in each watched database and holds a read transaction that pins a live WAL frame. This is how walrust stops an external process from checkpointing the WAL out from under an in-flight backup — the same technique Litestream uses with its `_litestream_seq` table. The table holds a single counter row and is safe to ignore.
 
