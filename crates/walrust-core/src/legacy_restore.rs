@@ -261,8 +261,24 @@ pub async fn restore_legacy_ltx(
         .into_iter()
         .filter(|c| c.range.max > floor && c.range.min <= target_txid)
         .collect();
-    let plan = plan_restore(&plan_pool, floor, target_txid)
-        .map_err(|e| WalrustError::restore(e.to_string()))?;
+    let plan = match plan_restore(&plan_pool, floor, target_txid) {
+        Ok(plan) => plan,
+        Err(e) => {
+            // A gap here may be granularity decay rather than a missing object:
+            // a LATER full snapshot absorbs the target (snapshot = ultimate
+            // compaction). Name both neighbors instead of reporting a bare gap.
+            let later: Vec<u64> =
+                crate::legacy_manifest::discover_legacy_snapshots(storage, prefix, db_name)
+                    .await
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|s| s.max_txid)
+                    .filter(|m| *m > floor)
+                    .collect();
+            let refined = crate::compaction::refine_gap_with_snapshot_spans(e, &later, target_txid);
+            return Err(WalrustError::restore(refined.to_string()).into());
+        }
+    };
 
     for cand in &plan.files {
         let bytes = read_required_object(storage, &cand.key).await?;

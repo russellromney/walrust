@@ -125,6 +125,50 @@ pub enum PlanError {
         nearest_below: u64,
         nearest_above: u64,
     },
+
+    /// The requested point-in-time seq falls inside a **later full snapshot's**
+    /// absorbed span with no finer object covering it. A snapshot is the
+    /// ultimate compaction: the history it absorbs is restorable only at the
+    /// snapshot's own boundary. Same decay semantics as a merged window —
+    /// loud, both neighbors named — never presented as a bare chain gap.
+    #[error(
+        "point-in-time seq {target} falls inside a later full snapshot's absorbed \
+         span with no finer coverage: PITR granularity has decayed for history \
+         this old. Nearest restorable points are seq {nearest_below} (below) and \
+         seq {nearest_above} (above, a full snapshot); restore to one of those."
+    )]
+    PitrInsideSnapshotSpan {
+        target: u64,
+        nearest_below: u64,
+        nearest_above: u64,
+    },
+}
+
+/// Refine a [`PlanError::ChainGap`] into [`PlanError::PitrInsideSnapshotSpan`]
+/// when a later full snapshot absorbs the target: the gap is granularity decay
+/// (the fine history was superseded by a snapshot), not a missing object.
+/// `later_snapshot_maxes` are the covered seqs of snapshots ABOVE the plan
+/// floor. Non-gap errors, and gaps no snapshot absorbs, pass through unchanged.
+pub fn refine_gap_with_snapshot_spans(
+    err: PlanError,
+    later_snapshot_maxes: &[u64],
+    target: u64,
+) -> PlanError {
+    if let PlanError::ChainGap { nearest_below, .. } = err {
+        if let Some(above) = later_snapshot_maxes
+            .iter()
+            .copied()
+            .filter(|s| *s >= target)
+            .min()
+        {
+            return PlanError::PitrInsideSnapshotSpan {
+                target,
+                nearest_below,
+                nearest_above: above,
+            };
+        }
+    }
+    err
 }
 
 /// Plan a restore from `floor` (the snapshot's covered seq) up to `target`.

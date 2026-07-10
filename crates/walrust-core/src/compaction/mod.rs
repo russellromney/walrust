@@ -135,7 +135,9 @@ pub use layout::{
     LayoutFile, Level, SeqRange, SourceHeader, L0_DIR, LEVELS_DIR,
 };
 pub use merge::{merge_changesets, verify_merged_bytes, MergeInput, MergeResult, PeakPages};
-pub use planner::{plan_restore, PlanCandidate, PlanError, RestorePlan};
+pub use planner::{
+    plan_restore, refine_gap_with_snapshot_spans, PlanCandidate, PlanError, RestorePlan,
+};
 pub use prune::{list_level_files, plan_level_prune};
 pub use range_layout::RangeLayout;
 pub use restore::{apply_plan, gather_candidates, plan_over_layout, DEFAULT_PREFETCH_DEPTH};

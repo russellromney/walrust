@@ -87,12 +87,39 @@ async fn point_in_time_restore_uses_latest_snapshot_not_after_target() -> Result
     let new_key = format!("{prefix}{name}/0002/0000000000000001-0000000000000005.ltx");
     walrust::s3::upload_bytes(&client, &bucket, &new_key, new_snapshot).await?;
 
-    walrust::sync::restore(
+    // TXID 3 is absorbed by the newer snapshot's span (1..=5) and no finer
+    // object covers it: per the compaction decay semantics this is a LOUD
+    // typed error naming both neighbors — never a silent floor to TXID 1 and
+    // never a bare chain-gap message.
+    let err = walrust::sync::restore(
         &name,
         &restored,
         &bucket_arg,
         endpoint.as_deref(),
         Some("3"),
+        None,
+        None,
+    )
+    .await
+    .expect_err("PIT inside a later snapshot's absorbed span must be a loud decay error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("absorbed") && msg.contains("seq 1") && msg.contains("seq 5"),
+        "decay error must name both neighbors (1 below, 5 above), got: {msg}"
+    );
+    assert!(
+        !restored.exists(),
+        "a failed PIT restore must not leave an output file"
+    );
+
+    // The A9 guarantee this test has always protected: the OLD retained
+    // snapshot is still restorable at its own boundary.
+    walrust::sync::restore(
+        &name,
+        &restored,
+        &bucket_arg,
+        endpoint.as_deref(),
+        Some("1"),
         None,
         None,
     )
@@ -102,7 +129,7 @@ async fn point_in_time_restore_uses_latest_snapshot_not_after_target() -> Result
     let marker: String = conn.query_row("SELECT value FROM marker", [], |row| row.get(0))?;
     assert_eq!(
         marker, "old-snapshot",
-        "PIT restore at TXID 3 must choose the latest snapshot <= target, not the newer TXID 5 snapshot"
+        "PIT restore at TXID 1 must restore the old retained snapshot, not the newer TXID 5 snapshot"
     );
     Ok(())
 }

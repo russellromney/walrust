@@ -2197,8 +2197,32 @@ pub async fn restore(
             ))
             .into());
         }
-        let plan = crate::compaction::plan_restore(&candidates, snapshot.seq, target)
-            .map_err(|e| anyhow::Error::from(WalrustError::restore(e.to_string())))?;
+        let plan = match crate::compaction::plan_restore(&candidates, snapshot.seq, target) {
+            Ok(plan) => plan,
+            Err(e) => {
+                // Same decay refinement as the legacy path: a later full
+                // snapshot absorbing the target is granularity decay, not a
+                // missing object.
+                let later: Vec<u64> = discover_latest_snapshot_in_namespace(
+                    storage_ref,
+                    prefix,
+                    db_name,
+                    lineage_id.as_deref(),
+                    ChangesetKind::Physical,
+                )
+                .await
+                .ok()
+                .flatten()
+                .map(|s| s.seq)
+                .into_iter()
+                .filter(|m| *m > snapshot.seq)
+                .collect();
+                let refined = crate::compaction::refine_gap_with_snapshot_spans(e, &later, target);
+                return Err(anyhow::Error::from(WalrustError::restore(
+                    refined.to_string(),
+                )));
+            }
+        };
         tracing::info!(
             "Restoring from snapshot (seq {}) + leveled plan of {} objects to seq {}",
             snapshot.seq,
