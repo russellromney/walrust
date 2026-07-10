@@ -198,10 +198,19 @@ silently ignore the knob and let the bucket grow).
 
 Two honest caveats, one sentence each:
 
-- **Version skew:** a leveled bucket is **not restorable by walrust binaries
-  older than this release** — they don't know the `levels/` layout exists — so
-  compaction ships dark; only enable it once every binary that might restore the
-  bucket understands levels.
+- **Version skew (empirically confirmed, not theoretical):** a leveled bucket
+  is **not restorable by walrust binaries older than this release** — they
+  don't know the `levels/` layout exists — so compaction ships dark; only
+  enable it once every binary that might restore the bucket understands
+  levels. `drills/version-skew.sh` (manual/`make drill-version-skew` only)
+  builds a real leveled bucket and runs a real pre-compaction `walrust
+  restore` (crates.io `0.5.1`) against it. Observed outcome: **exit 0** — no
+  error reported to the operator — producing a **corrupt database**
+  (`PRAGMA integrity_check` fails with `btreeInitPage() returns error code
+  11` on the pages that existed only inside the merged-and-deleted range).
+  That is worse than a short restore: silent corruption with a success exit
+  code. This is the confirmed hazard the `enabled = false` default exists to
+  prevent.
 - **PITR granularity decays with age:** point-in-time restore stays second-exact
   inside `keep_fine_window`, but a target that falls *strictly inside* an older
   merged window fails loudly, naming the nearest restorable points on both sides,

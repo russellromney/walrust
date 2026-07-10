@@ -87,6 +87,19 @@ existing F5-era chain-gap handler in `replicate_poll` — no product change was
 needed. Teaching `replicate` to read `levels/` directly (skipping the
 snapshot re-download) is future work, not required for correctness.
 
+**Residue (e2e gap closure): version skew is now empirically confirmed, not
+theoretical.** `drills/version-skew.sh` (manual/`make drill-version-skew`
+only — needs crates.io network access) builds a real leveled bucket and runs
+a real pre-compaction `walrust restore` (crates.io `0.5.1`, the newest
+version published there; `0.5.2` does not exist on crates.io despite being
+the version this drill was originally specified against — falls back to
+`0.5.1` automatically, both predate compaction by a wide margin) against it.
+Observed: **exit 0** with a **corrupt database** (`integrity_check` fails on
+the pages that existed only inside the merged-and-deleted range) — worse than
+a short restore, and silent (no error surfaced to the operator). The README
+version-skew warning is upgraded from theoretical to confirmed with this
+citation.
+
 **Status:** rename `compact`→`prune` shipped. C1 (COMPACTED v2 format) shipped.
 **C2a (layout-agnostic merge engine, write side) shipped** — `CompactionLayout`
 trait + seq/range adapters, streaming k-way merge with a proven memory bound,
