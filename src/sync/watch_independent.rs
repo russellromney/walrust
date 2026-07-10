@@ -25,6 +25,16 @@ use super::types::{CacheState, DbState, DbTaskState, SyncInput, TriggerState};
 use super::verify::validate_backup_integrity;
 use super::wal_sync::{do_sync, sync_wal_concurrent_with_retry, take_snapshot_with_retry};
 
+/// C2a compaction gate for the legacy (litestream-heritage) watch path.
+///
+/// **Off, and not reachable from `walrust.toml` or the CLI.** Enabling
+/// compaction before the C2b restore planner can read leveled buckets would
+/// make backups unrestorable by the shipped restore path — see the
+/// `walrust_core::compaction` module header. The trigger check below piggybacks
+/// on the poll-sync tick; it is compiled but inert until this constant flips
+/// (which ships with the C2b planner).
+const COMPACTION_ENABLED: bool = false;
+
 /// Watch databases using independent per-DB tasks for maximum concurrency
 ///
 /// Each database gets its own task that independently:
@@ -420,6 +430,61 @@ pub async fn watch_with_independent_tasks(
     Ok(())
 }
 
+/// One gated compaction tick for the legacy range (`min-max.ltx`) layout.
+/// Builds an `S3Storage` view of the raw client, seeds in-memory triggers on
+/// first use, records the L0 file this sync produced, and runs L0→L1 / L1→L2
+/// merges when the count batches fill. Only reached when [`COMPACTION_ENABLED`]
+/// is true (default false).
+async fn maybe_compact_legacy(
+    client: &Arc<aws_sdk_s3::Client>,
+    bucket: &str,
+    prefix: &str,
+    db_name: &str,
+    triggers: &mut Option<walrust_core::compaction::CompactionTriggers>,
+    produced_l0: bool,
+) -> Result<()> {
+    use walrust_core::compaction::layout::CompactionLayout;
+    use walrust_core::compaction::{
+        run_level_compaction, CompactionTriggers, RangeLayout, TriggerConfig,
+    };
+
+    let storage: Arc<dyn StorageBackend> =
+        Arc::new(S3Storage::new((**client).clone(), bucket.to_string()));
+    let layout = RangeLayout::new(storage, prefix, db_name);
+    let cfg = TriggerConfig::default();
+
+    if triggers.is_none() {
+        let l0 = layout.list_level(0).await?.len();
+        let l1 = layout.list_level(1).await?.len();
+        *triggers = Some(CompactionTriggers::seeded(cfg, l0, l1));
+    }
+    let t = triggers.as_mut().unwrap();
+    if produced_l0 {
+        t.on_l0_written();
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    if t.should_compact_l0_to_l1() {
+        let merged = run_level_compaction(&layout, 0, cfg.l1_batch, cfg.keep_fine_window, now_ms)
+            .await?
+            .merged_count();
+        if merged > 0 {
+            t.on_l0_to_l1_merged(merged);
+        }
+    }
+    if t.should_compact_l1_to_l2() {
+        let merged = run_level_compaction(&layout, 1, cfg.l2_batch, cfg.keep_fine_window, now_ms)
+            .await?
+            .merged_count();
+        if merged > 0 {
+            t.on_l1_to_l2_merged(merged);
+        }
+    }
+    Ok(())
+}
+
 async fn run_db_task(
     mut state: DbTaskState,
     client: Arc<aws_sdk_s3::Client>,
@@ -434,6 +499,10 @@ async fn run_db_task(
     let db_name = state.db_state.name.clone();
     let wal_path = state.db_state.wal_path.clone();
     let validation_interval = state.sync_config.validation_interval;
+
+    // In-memory compaction trigger state (C2a). Seeded lazily on the first
+    // gated tick; inert while COMPACTION_ENABLED is false.
+    let mut compaction_triggers: Option<walrust_core::compaction::CompactionTriggers> = None;
 
     // Poll interval: check WAL size and sync every N seconds
     let poll_interval = Duration::from_secs(state.sync_config.wal_sync_interval);
@@ -507,6 +576,17 @@ async fn run_db_task(
                     Ok(frame_count) => {
                         if frame_count > 0 {
                             tracing::debug!("{}: Synced {} frames", db_name, frame_count);
+                        }
+                        // C2a compaction tick — piggybacks on sync activity.
+                        // Gated OFF by default and unreachable from config; a
+                        // failure here never disturbs the sync path.
+                        if COMPACTION_ENABLED {
+                            if let Err(e) = maybe_compact_legacy(
+                                &client, &bucket, &prefix, &db_name,
+                                &mut compaction_triggers, frame_count > 0,
+                            ).await {
+                                tracing::error!("{}: compaction failed: {}", db_name, e);
+                            }
                         }
                     }
                     Err(e) => {
