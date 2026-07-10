@@ -105,6 +105,12 @@ struct StoredObject {
 }
 
 /// Mock storage backend for testing.
+///
+/// Every field is an `Arc<Mutex<..>>` (or a cheap `Clone` config), so `Clone`
+/// yields a second handle onto the *same* underlying store, RNG, and operation
+/// log — used by the state-machine harness to hand a compaction `RangeLayout` a
+/// `StorageBackend` view of the exact bucket the legacy engine writes to.
+#[derive(Clone)]
 pub struct MockStorageBackend {
     /// In-memory storage.
     storage: Arc<Mutex<HashMap<String, StoredObject>>>,

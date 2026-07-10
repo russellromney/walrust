@@ -133,6 +133,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::Result;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
@@ -142,6 +144,9 @@ use rusqlite::Connection;
 use tempfile::TempDir;
 
 use walrust::retention::{RetentionPolicy, SnapshotEntry};
+use walrust::walrust_core::compaction::{
+    level_subpath, parse_range_name, run_level_compaction, CompactionError, RangeLayout,
+};
 use walrust::walrust_core::legacy_manifest::{
     discover_legacy_snapshots, discover_legacy_state, plan_legacy_prune,
 };
@@ -165,6 +170,20 @@ const FIXED_NOW_UNIX: i64 = 1_700_000_000;
 /// much larger budget (attempts are in-memory and sub-millisecond).
 const TRANSIENT_RETRIES: u32 = 40;
 const TRANSIENT_RETRIES_BULK: u32 = 3000;
+
+/// Synthetic "now" handed to the compaction engine (no wall-clock in the
+/// oracle). Placed astronomically far in the future so every real-timestamp L0
+/// object (`created_ms` ~ 2026) is older than any generated `keep_fine_window`
+/// and is therefore eligible to merge — the age-gating window is generated and
+/// threaded through, but eligibility stays deterministic so a Compact op
+/// reliably forms the merged windows the decay grader checks. (The window's own
+/// age arithmetic is unit-tested in `compaction::trigger`.)
+const COMPACTION_NOW_MS: i64 = 4_000_000_000_000_000;
+
+/// Highest compaction level the oracle observes when reading merged windows back
+/// from the layout. Matches the restore planner's probe cap; the oracle only
+/// drives L0→L1→L2, so this is generous headroom.
+const OBSERVE_MAX_LEVEL: u32 = 16;
 
 // ============================================================================
 // Op vocabulary + strategy
@@ -194,6 +213,19 @@ pub enum Op {
     /// Restore a recorded mark to a fresh path and CHECK against the model.
     /// `mark_sel` indexes into the recorded marks (mod count).
     RestorePit { mark_sel: u16 },
+    /// Run the REAL leveled-compaction merge engine over the legacy `.ltx`
+    /// bucket to quiescence with the generated batch sizes, folding the fine L0
+    /// incrementals into coarse merged L1/L2 objects (and deleting the folded
+    /// sources). Distinct from [`Op::Prune`]: prune deletes whole snapshots by
+    /// retention policy; Compact MERGES incrementals and must never lose durable
+    /// coverage. After it runs, the model re-observes the merged windows from the
+    /// object listing (ground truth) and grades every later `RestorePit` with the
+    /// granularity-decay rules. See [`Harness::compact`].
+    Compact {
+        l1_batch: u8,
+        l2_batch: u8,
+        keep_fine_secs: u16,
+    },
 }
 
 /// A deterministic, seeded fault configuration for the fault phase.
@@ -343,6 +375,15 @@ struct Model {
     /// boundary. (The E2 rescue keeps every bridge the chain needs; these are
     /// only the legitimately prunable, non-load-bearing snapshots.)
     deleted_snapshot_txids: BTreeSet<u64>,
+    /// Inclusive seq spans `[min, max]` (with `max > min`) of the merged
+    /// compaction objects currently present at levels `>= 1`, re-read from the
+    /// object listing (GROUND TRUTH, never the planner) after each `Compact` op.
+    /// A merged window fossilizes the per-second points it folded away: PITR to
+    /// a txid STRICTLY inside a window (`min <= txid < max`) is granularity
+    /// decay, while its `max` boundary stays an exact restore point. Compaction
+    /// only deletes the L0 sources it folds, so a txid inside a surviving window
+    /// has no finer coverage left. See [`Model::pit_decayed`].
+    merged_windows: Vec<(u64, u64)>,
 }
 
 impl Model {
@@ -391,6 +432,23 @@ impl Model {
             .snapshot_txids
             .range(s_star + 1..=target)
             .any(|t| self.deleted_snapshot_txids.contains(t))
+    }
+
+    /// Granularity-decay classification for a point-in-time, computed ONLY from
+    /// the merged-window listing (ground truth) recorded after the last
+    /// `Compact`. A target `m` is decayed iff it falls STRICTLY inside a merged
+    /// window (`min <= m < m_max`): the per-second point at `m` was folded into a
+    /// coarse object and its fine source deleted, so the point is no longer
+    /// individually restorable — restore must surface the loud typed decay
+    /// outcome. A target ON a window's `max` boundary is NOT decayed (the merged
+    /// object restores to it exactly), nor is a target in the un-merged fine L0
+    /// tail above every window. Windows never span a snapshot seq (the L0 chain
+    /// breaks there and the merge refuses to cross it), so a snapshot boundary is
+    /// never misread as decayed.
+    fn pit_decayed(&self, m: u64) -> bool {
+        self.merged_windows
+            .iter()
+            .any(|&(lo, hi)| lo <= m && m < hi)
     }
 }
 
@@ -917,6 +975,286 @@ impl Harness {
             }
         }
     }
+
+    // ---- compaction (the REAL merge engine over the legacy bucket) ----------
+
+    /// Run leveled compaction to quiescence over the SAME mock bucket the legacy
+    /// engine writes, then re-observe the merged windows into the model.
+    ///
+    /// The layout adapter is [`RangeLayout`] — the compaction adapter for the
+    /// litestream-heritage `.ltx` heritage this harness drives (its L0 pool is
+    /// `{db}/0000/{min}-{max}.ltx`, exactly what `RangeLayout::list_level(0)`
+    /// reads). `RangeLayout` and the owned `SeqLayout` are thin wrappers over one
+    /// `GenLayoutCore` with identical seq-contiguous merge semantics — they
+    /// differ only in the level-0 filename extension — so this exercises the same
+    /// engine, batching, and `levels/L*/` key scheme the owned layout uses. It is
+    /// also the exact path the real `walrust watch` compaction tick runs
+    /// (`sync::watch_independent::compaction_tick`), and the restore it must
+    /// survive (`restore_legacy_ltx`) is the same one the oracle already grades.
+    ///
+    /// One `Compact` op drains ALL eligible merges (L0→L1 then L1→L2, repeated
+    /// until a pass merges nothing) so a merged layout forms within a bounded op
+    /// sequence. The whole pass is retried as a unit on transient injected faults
+    /// (merge is crash-idempotent: a re-run converges via the engine's
+    /// exact-range recovery), and a corrupting-fault plan may make it fail
+    /// loudly — in which case the write-verify-delete ordering leaves the sources
+    /// intact, and the always-appended `RestoreLatest` proves coverage survived.
+    async fn compact(&mut self, l1_batch: u8, l2_batch: u8, keep_fine_secs: u16) -> Result<()> {
+        let layout = RangeLayout::new(Arc::new(self.storage.clone()), &self.prefix, &self.name);
+        let keep = Duration::from_secs(keep_fine_secs as u64);
+
+        let mut attempt = 0;
+        loop {
+            match self
+                .compact_pass(&layout, l1_batch as usize, l2_batch as usize, keep)
+                .await
+            {
+                Ok(()) => break,
+                Err(e) => {
+                    let transient = is_compaction_transient(&e);
+                    if self.faults.has_transient() && transient && attempt < TRANSIENT_RETRIES_BULK
+                    {
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(anyhow::Error::new(e));
+                }
+            }
+        }
+
+        // GROUND TRUTH: re-read the merged windows from the object listing.
+        self.observe_merged_windows(&layout).await?;
+        Ok(())
+    }
+
+    /// One compaction pass: repeatedly fire L0→L1 and L1→L2 until neither merges
+    /// anything. A `NonContiguous` residue after the engine's own seq-contiguous
+    /// batch clipping would be a genuine fork/corruption and propagates loudly.
+    async fn compact_pass(
+        &self,
+        layout: &RangeLayout,
+        l1_batch: usize,
+        l2_batch: usize,
+        keep: Duration,
+    ) -> Result<(), CompactionError> {
+        // Bound: each merge strictly reduces object count at its source level, so
+        // the fixpoint is reached in far fewer than this many passes; the cap
+        // only guards against a hypothetical non-converging engine bug.
+        for _ in 0..256 {
+            let mut progressed = false;
+            if l1_batch >= 1 {
+                let o = run_level_compaction(layout, 0, l1_batch, keep, COMPACTION_NOW_MS).await?;
+                progressed |= o.merged_count() > 0;
+            }
+            if l2_batch >= 1 {
+                let o = run_level_compaction(layout, 1, l2_batch, keep, COMPACTION_NOW_MS).await?;
+                progressed |= o.merged_count() > 0;
+            }
+            if !progressed {
+                return Ok(());
+            }
+        }
+        Ok(())
+    }
+
+    /// Re-read the inclusive seq spans of the merged objects at levels `>= 1`
+    /// straight from the object listing — one LIST per level, filenames parsed,
+    /// NO planner and NO header reads. Only true windows (`max > min`) are
+    /// recorded; a point-merge (`max == min`) is a clean boundary, not a decay
+    /// window. Retried as a unit on transient faults.
+    async fn observe_merged_windows(&mut self, layout: &RangeLayout) -> Result<()> {
+        let _ = layout; // key scheme is shared; we list the raw bucket directly.
+        let mut attempt = 0;
+        let windows = loop {
+            match self.list_merged_windows().await {
+                Ok(w) => break w,
+                Err(e) => {
+                    if self.faults.has_transient()
+                        && is_transient(&e)
+                        && attempt < TRANSIENT_RETRIES_BULK
+                    {
+                        attempt += 1;
+                        continue;
+                    }
+                    return Err(e);
+                }
+            }
+        };
+        self.model.merged_windows = windows;
+        Ok(())
+    }
+
+    async fn list_merged_windows(&self) -> Result<Vec<(u64, u64)>> {
+        use hadb_storage::StorageBackend;
+        let mut windows = Vec::new();
+        for level in 1..=OBSERVE_MAX_LEVEL {
+            let dir = format!("{}{}/{}/", self.prefix, self.name, level_subpath(level));
+            for key in self.storage.list(&dir, None).await? {
+                let Some(filename) = key.rsplit('/').next() else {
+                    continue;
+                };
+                if let Some(range) = parse_range_name(filename, "ltx") {
+                    if range.max > range.min {
+                        windows.push((range.min, range.max));
+                    }
+                }
+            }
+        }
+        Ok(windows)
+    }
+
+    /// Grade a `RestorePit` after compaction, with the granularity-decay rules.
+    ///
+    /// - An EXACT point (a merged-window `max` boundary, a snapshot, or a
+    ///   surviving fine tail point) must restore to EXACTLY the mark's rows.
+    /// - A DECAYED point (strictly inside a surviving merged window, fine source
+    ///   folded away) must be a LOUD outcome: the typed `RestoreNotFound`
+    ///   (snapshot-span decay) or the surfaced "falls inside merged window" text
+    ///   (`PlanError::PitrInsideMergedWindow`). Never a bare chain gap, never a
+    ///   silent wrong-point `Ok`.
+    /// - Under a corrupting fault plan a torn/corrupt object may fail loudly, and
+    ///   an `Ok` restore must STILL be row-exact (silent wrongness is the hunt).
+    ///   A partially-completed compaction under faults can leave the fine sources
+    ///   intact under a merged window; a decayed-classified point that then
+    ///   restores exactly is accepted precisely because its rows match.
+    async fn check_restore_pit_compaction(
+        &self,
+        out: &Path,
+        mark: &Mark,
+        op_index: usize,
+    ) -> Result<()> {
+        let decayed = self.model.pit_decayed(mark.txid);
+        match self.restore_to(out, Some(mark.txid)).await {
+            Ok(final_txid) => {
+                let ids = match Self::restored_ids(out) {
+                    Ok(ids) => ids,
+                    Err(e) => {
+                        if self.faults.can_corrupt() {
+                            return Ok(()); // A torn/corrupt object may fail loudly.
+                        }
+                        return Err(anyhow::anyhow!(
+                            "op[{op_index}] RestorePit(txid {}): engine returned Ok but the \
+                             restored DB is unreadable/corrupt: {e}",
+                            mark.txid
+                        ));
+                    }
+                };
+                grade_pit_compaction_ok(
+                    decayed,
+                    self.faults.can_corrupt(),
+                    final_txid,
+                    mark.txid,
+                    &ids,
+                    &mark.rows,
+                    &self.model.merged_windows,
+                    op_index,
+                )
+            }
+            Err(e) => {
+                if self.faults.can_corrupt() {
+                    return Ok(()); // Torn/corrupt objects may fail loudly.
+                }
+                if decayed {
+                    // The only acceptable loud outcomes for decay: the typed
+                    // snapshot-span RestoreNotFound, or the merged-window planner
+                    // error surfaced verbatim. A BARE chain gap is forbidden —
+                    // that is exactly the "compaction lost coverage" failure.
+                    let typed_not_found = matches!(
+                        e.downcast_ref::<walrust::walrust_core::errors::WalrustError>(),
+                        Some(walrust::walrust_core::errors::WalrustError::RestoreNotFound(_))
+                    );
+                    let msg = format!("{e:#}");
+                    if typed_not_found || msg.contains("falls inside merged window") {
+                        return Ok(());
+                    }
+                    return Err(anyhow::anyhow!(
+                        "op[{op_index}] RestorePit(txid {}) is granularity decay (inside merged \
+                         window(s) {:?}) but FAILED with a non-decay error — a bare chain gap is \
+                         forbidden, compaction must not lose coverage: {e:#}",
+                        mark.txid,
+                        self.model.merged_windows,
+                    ));
+                }
+                Err(anyhow::anyhow!(
+                    "op[{op_index}] RestorePit(txid {}) is an EXACT point (merged windows {:?}) but \
+                     FAILED with no corrupting faults — compaction must keep every non-decayed \
+                     marked point restorable: {e:#}",
+                    mark.txid,
+                    self.model.merged_windows,
+                ))
+            }
+        }
+    }
+}
+
+/// Classify a compaction error as the transient (retryable) injected fault: its
+/// `Storage(..)` variant carries the mock's injected-error string.
+fn is_compaction_transient(err: &CompactionError) -> bool {
+    matches!(err, CompactionError::Storage(s) if s.contains("Service unavailable (injected)"))
+}
+
+/// Pure accept-direction verdict for a compaction PITR that returned `Ok`.
+///
+/// Extracted from [`Harness::check_restore_pit_compaction`] so the accept-side
+/// guards are DIRECTLY testable. This matters: with a correct engine every
+/// inside-window PITR errors loudly, so the real engine only ever drives the
+/// `Err` arm of the grader — the "silent decayed `Ok` is a bug" and "overshoot"
+/// guards are never exercised by the generated/pinned replays (proven by
+/// neutering them and watching every case still pass). Routing the verdict
+/// through this pure function lets `grade_pit_compaction_ok_*` unit tests
+/// exercise a *simulated* buggy engine directly, giving the accept direction
+/// real teeth (fail-on-revert) instead of dead defense-in-depth.
+///
+/// The three ways an `Ok` restore is wrong:
+///   1. it OVERSHOT the target (`final_txid > mark_txid`) — always a bug;
+///   2. it silently restored a DECAYED point (strictly inside a merged window,
+///      fine source folded away) with no corrupting fault to excuse it — decay
+///      must be a loud typed error, never a silent `Ok`;
+///   3. it returned the WRONG rows for the mark (checked for every classification
+///      — a decayed point that survives a partial merge under faults is exact and
+///      therefore fine; anything else is silent corruption).
+#[allow(clippy::too_many_arguments)]
+fn grade_pit_compaction_ok(
+    decayed: bool,
+    can_corrupt: bool,
+    final_txid: u64,
+    mark_txid: u64,
+    restored: &[i64],
+    expected: &[i64],
+    merged_windows: &[(u64, u64)],
+    op_index: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        final_txid <= mark_txid,
+        "op[{op_index}] RestorePit(txid {mark_txid}) overshot to txid {final_txid}"
+    );
+    // A decayed point must never be a SILENT success. With no corrupting faults
+    // the fine source is gone, so an Ok here means the planner failed to detect
+    // the decay — a real bug.
+    if decayed && !can_corrupt {
+        anyhow::bail!(
+            "op[{op_index}] RestorePit(txid {mark_txid}) returned Ok(final {final_txid}) for a \
+             point STRICTLY INSIDE merged window(s) {merged_windows:?} — granularity decay must be \
+             a loud typed error, never a silent restore. Restored {} rows.",
+            restored.len(),
+        );
+    }
+    // Whatever the classification, an Ok restore must be row-exact for the mark.
+    anyhow::ensure!(
+        restored == expected,
+        "op[{op_index}] RestorePit(txid {mark_txid}) returned WRONG rows{} at final txid \
+         {final_txid}: expected {} (len {}), restored = {} (len {}). Merged windows: {merged_windows:?}",
+        if can_corrupt {
+            " under faults (silent corruption)"
+        } else {
+            ""
+        },
+        preview(expected),
+        expected.len(),
+        preview(restored),
+        restored.len(),
+    );
+    Ok(())
 }
 
 // ============================================================================
@@ -949,7 +1287,14 @@ fn guard_durable<T>(faults: &FaultPlan, r: Result<T>, op_index: usize, what: &st
 }
 
 /// Execute one generated scenario end to end against the real engine.
-async fn run_case(ops: &[Op], faults: FaultPlan) -> Result<()> {
+///
+/// `compaction` selects the point-in-time grader: `false` uses the prune-
+/// foreclosure oracle ([`Harness::check_restore_pit`], phases 1/2, no `Compact`
+/// ops); `true` uses the granularity-decay oracle
+/// ([`Harness::check_restore_pit_compaction`], the compaction phase). Both
+/// phases share the exact same `RestoreLatest` grader — compaction must never
+/// change latest-restore correctness.
+async fn run_case(ops: &[Op], faults: FaultPlan, compaction: bool) -> Result<()> {
     let tmp = TempDir::new()?;
     let restores = TempDir::new()?;
     let mut h = Harness::new(&tmp, faults.clone())?;
@@ -1004,7 +1349,19 @@ async fn run_case(ops: &[Op], faults: FaultPlan) -> Result<()> {
                 let idx = (*mark_sel as usize) % h.model.marks.len();
                 let mark = h.model.marks[idx].clone();
                 let out = restores.path().join(format!("pit_{i}.db"));
-                h.check_restore_pit(&out, &mark, i).await?;
+                if compaction {
+                    h.check_restore_pit_compaction(&out, &mark, i).await?;
+                } else {
+                    h.check_restore_pit(&out, &mark, i).await?;
+                }
+            }
+            Op::Compact {
+                l1_batch,
+                l2_batch,
+                keep_fine_secs,
+            } => {
+                let r = h.compact(*l1_batch, *l2_batch, *keep_fine_secs).await;
+                guard_durable(&faults, r, i, "Compact")?;
             }
         }
     }
@@ -1034,7 +1391,7 @@ fn run_phase(default_cases: u32, with_faults: bool) -> Result<()> {
     let mut runner = TestRunner::new(config(default_cases));
     let rt = tokio::runtime::Runtime::new()?;
     let result = runner.run(&scenario_strategy(with_faults), |(ops, faults)| {
-        rt.block_on(run_case(&ops, faults))
+        rt.block_on(run_case(&ops, faults, false))
             .map_err(|e| TestCaseError::fail(format!("{e:#}")))
     });
     result.map_err(|e| {
@@ -1059,6 +1416,113 @@ pub fn run_state_machine_no_faults(default_cases: u32) -> Result<()> {
 /// panic; transient-only plans must fully recover.
 pub fn run_state_machine_with_faults(default_cases: u32) -> Result<()> {
     run_phase(default_cases, true)
+}
+
+// ============================================================================
+// Compaction phase (the REAL merge engine + granularity-decay oracle)
+// ============================================================================
+
+/// Op strategy for the compaction phase: the legacy vocabulary PLUS `Compact`,
+/// and deliberately NO `Prune`. Compaction and prune both foreclose points, but
+/// through independent mechanisms; grading them together would tangle two decay
+/// models, so the compaction phase isolates the merge-decay rule (prune
+/// foreclosure stays proven by phases 1/2). Batches are small (2..=6) so the
+/// short generated sequences actually fill them and form merged windows; a mark
+/// then routinely lands strictly inside one. `keep_fine_secs` is generated and
+/// threaded through, but with the far-future `COMPACTION_NOW_MS` every L0 object
+/// is eligible regardless, so merges reliably fire (see `COMPACTION_NOW_MS`).
+fn op_strategy_compaction() -> impl Strategy<Value = Op> {
+    prop_oneof![
+        5 => (1u32..20).prop_map(|rows| Op::WriteTxn { rows }),
+        5 => Just(Op::Flush),
+        2 => Just(Op::Snapshot),
+        2 => Just(Op::Checkpoint),
+        2 => Just(Op::KillRestart),
+        4 => Just(Op::Mark),
+        4 => (2u8..=6, 2u8..=4, 0u16..7200).prop_map(|(l1_batch, l2_batch, keep_fine_secs)| {
+            Op::Compact {
+                l1_batch,
+                l2_batch,
+                keep_fine_secs,
+            }
+        }),
+        2 => Just(Op::RestoreLatest),
+        4 => (0u16..1000).prop_map(|mark_sel| Op::RestorePit { mark_sel }),
+    ]
+}
+
+/// A compaction scenario: an op sequence (with `Compact`, no `Prune`) plus a
+/// fault plan, and a trailing `RestoreLatest` so every case proves compaction
+/// preserved the latest state exactly.
+fn scenario_strategy_compaction(with_faults: bool) -> impl Strategy<Value = (Vec<Op>, FaultPlan)> {
+    let ops = prop::collection::vec(op_strategy_compaction(), 6..40);
+    let fault = if with_faults {
+        (
+            0u64..1_000_000,
+            0u8..3u8,
+            prop::option::of(256usize..8192),
+            0u8..3u8,
+        )
+            .prop_map(|(seed, t, torn, c)| FaultPlan {
+                transient_rate: match t {
+                    0 => 0.0,
+                    1 => 0.02,
+                    _ => 0.05,
+                },
+                torn_at_bytes: torn,
+                corruption_rate: match c {
+                    0 => 0.0,
+                    1 => 0.02,
+                    _ => 0.08,
+                },
+                seed,
+            })
+            .boxed()
+    } else {
+        (0u64..1_000_000).prop_map(FaultPlan::none).boxed()
+    };
+    (ops, fault).prop_map(|(mut ops, fault)| {
+        ops.push(Op::RestoreLatest);
+        (ops, fault)
+    })
+}
+
+fn run_compaction_phase(default_cases: u32, with_faults: bool) -> Result<()> {
+    let mut runner = TestRunner::new(config(default_cases));
+    let rt = tokio::runtime::Runtime::new()?;
+    let result = runner.run(
+        &scenario_strategy_compaction(with_faults),
+        |(ops, faults)| {
+            rt.block_on(run_case(&ops, faults, true))
+                .map_err(|e| TestCaseError::fail(format!("{e:#}")))
+        },
+    );
+    result.map_err(|e| {
+        anyhow::anyhow!(
+            "compaction state machine ({}) failed:\n{e}",
+            if with_faults {
+                "with faults"
+            } else {
+                "no faults"
+            }
+        )
+    })
+}
+
+/// Phase 3: the REAL leveled-compaction engine folds the legacy bucket, and
+/// every restore is graded with the granularity-decay rules — latest exact,
+/// merged-window boundary exact, strictly-inside a loud typed decay, never a
+/// bare gap, never a silent wrong point.
+pub fn run_compaction_state_machine(default_cases: u32) -> Result<()> {
+    run_compaction_phase(default_cases, false)
+}
+
+/// Phase 3 under faults: `Compact` runs inside the torn/transient/corruption
+/// fault plans. A failed merge leaves sources intact (write-verify-delete), the
+/// trailing `RestoreLatest` proves coverage survived, and any `Ok` restore is
+/// still row-exact.
+pub fn run_compaction_state_machine_with_faults(default_cases: u32) -> Result<()> {
+    run_compaction_phase(default_cases, true)
 }
 
 // ============================================================================
@@ -1098,7 +1562,8 @@ mod tests {
             Op::RestorePit { mark_sel: 0 },
             Op::RestoreLatest,
         ];
-        rt.block_on(run_case(&ops, FaultPlan::none(0))).unwrap();
+        rt.block_on(run_case(&ops, FaultPlan::none(0), false))
+            .unwrap();
     }
 
     /// The shrunk E2 catch-proof sequence. With the bridge-snapshot rescue in
@@ -1125,7 +1590,8 @@ mod tests {
             Op::RestorePit { mark_sel: 0 },
             Op::RestoreLatest,
         ];
-        rt.block_on(run_case(&ops, FaultPlan::none(0))).unwrap();
+        rt.block_on(run_case(&ops, FaultPlan::none(0), false))
+            .unwrap();
     }
 
     #[test]
@@ -1169,5 +1635,215 @@ mod tests {
                 "far-future PITR must be a typed RestoreNotFound, got: {err:#}"
             );
         });
+    }
+
+    // ---- compaction phase (Op::Compact + granularity-decay oracle) ----------
+
+    /// Fail-on-revert teeth for the accept-direction of the decay grader.
+    ///
+    /// A correct engine errors loudly on every inside-window PITR, so the
+    /// generated + pinned replays only ever drive the grader's `Err` arm — remove
+    /// the accept-side guards and every one of them still passes (verified during
+    /// C3b adversarial review). These tests exercise the accept verdict
+    /// (`grade_pit_compaction_ok`) against a SIMULATED buggy engine, so the
+    /// "silent decayed Ok is a bug", "overshoot", and "wrong rows" guards have
+    /// real teeth. Reverting any guard in `grade_pit_compaction_ok` fails here.
+    #[test]
+    fn grade_pit_compaction_ok_rejects_silent_decay() {
+        let windows = [(3u64, 9u64)];
+        // Simulated bug: the engine silently restored an inside-window point
+        // (txid 5, strictly inside [3,9]) as an Ok, no corrupting fault. Even
+        // with "correct-looking" rows this MUST be rejected — decay is loud.
+        let err = grade_pit_compaction_ok(
+            /*decayed*/ true,
+            /*can_corrupt*/ false,
+            /*final_txid*/ 5,
+            /*mark_txid*/ 5,
+            /*restored*/ &[1, 2, 3, 4, 5],
+            /*expected*/ &[1, 2, 3, 4, 5],
+            &windows,
+            7,
+        )
+        .expect_err("a silent Ok for a strictly-inside decayed point must be rejected");
+        assert!(
+            format!("{err:#}").contains("STRICTLY INSIDE"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn grade_pit_compaction_ok_rejects_overshoot_and_wrong_rows() {
+        // Overshoot: final past the target is always a bug, decayed or not.
+        assert!(grade_pit_compaction_ok(false, false, 10, 5, &[1], &[1], &[], 0).is_err());
+        // Wrong rows for an exact (non-decayed) point with no faults.
+        let e = grade_pit_compaction_ok(false, false, 5, 5, &[1, 2], &[1, 2, 3], &[], 0)
+            .expect_err("wrong rows must be rejected");
+        assert!(format!("{e:#}").contains("WRONG rows"), "got: {e:#}");
+    }
+
+    #[test]
+    fn grade_pit_compaction_ok_accepts_valid_outcomes() {
+        // Exact non-decayed point, row-exact: fine.
+        grade_pit_compaction_ok(false, false, 5, 5, &[1, 2, 3], &[1, 2, 3], &[(3, 9)], 0).unwrap();
+        // Decayed point that SURVIVED a partial merge under faults (fine source
+        // not yet deleted) and is row-exact: accepted precisely because the rows
+        // match. Remove the `can_corrupt` escape and this would wrongly fail.
+        grade_pit_compaction_ok(true, true, 5, 5, &[1, 2, 3], &[1, 2, 3], &[(3, 9)], 0).unwrap();
+    }
+
+    #[test]
+    fn compaction_state_machine_generated_sequences() {
+        run_compaction_state_machine(DEFAULT_CASES).unwrap();
+    }
+
+    #[test]
+    fn compaction_state_machine_generated_sequences_under_faults() {
+        run_compaction_state_machine_with_faults(DEFAULT_CASES).unwrap();
+    }
+
+    /// Pinned decay proof (safety-critical; fail-on-revert). Builds a real
+    /// incremental chain of twelve marked boundaries, folds it with the REAL
+    /// merge engine (`l1_batch=4`, `l2_batch=2`), and proves the three decay
+    /// guarantees at once:
+    ///   1. compaction forms merged windows (the fine sources are gone);
+    ///   2. restore-to-latest is STILL row-exact through the merged objects;
+    ///   3. every marked point grades correctly — a merged-window `max` boundary
+    ///      (and the fine tail) restores EXACTLY; a point strictly inside a merged
+    ///      window is the loud typed decay outcome, never a silent success and
+    ///      never a bare chain gap.
+    /// The final asserts require BOTH an exact and a decayed mark to have been
+    /// exercised, so the test cannot pass vacuously. If the planner ever restored
+    /// an inside-window point silently, or `restore_legacy_ltx` lost coverage and
+    /// returned a bare gap, `check_restore_pit_compaction` fails here immediately.
+    #[test]
+    fn replay_compaction_forms_windows_and_grades_decay() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let restores = TempDir::new().unwrap();
+            let mut h = Harness::new(&tmp, FaultPlan::none(0)).unwrap();
+
+            h.durable_flush().await.unwrap(); // initial base snapshot
+            for _ in 0..12 {
+                h.mark().await.unwrap(); // one committed row + a durable boundary
+            }
+            h.compact(4, 2, 0).await.unwrap();
+
+            assert!(
+                !h.model.merged_windows.is_empty(),
+                "compaction must fold the fine chain into at least one merged window; \
+                 got no windows (layout: {:?})",
+                h.model.merged_windows
+            );
+
+            // (2) Latest restore is unchanged by compaction.
+            let out = restores.path().join("latest.db");
+            h.check_restore_latest(&out, 900).await.unwrap();
+
+            // (3) Grade every marked boundary; require both classes to appear.
+            let marks = h.model.marks.clone();
+            let mut saw_exact = false;
+            let mut saw_decay = false;
+            for (k, mark) in marks.iter().enumerate() {
+                if h.model.pit_decayed(mark.txid) {
+                    saw_decay = true;
+                } else {
+                    saw_exact = true;
+                }
+                let o = restores.path().join(format!("pit_{k}.db"));
+                h.check_restore_pit_compaction(&o, mark, k).await.unwrap();
+            }
+            assert!(
+                saw_exact,
+                "expected at least one exact (merged-boundary/tail) point among {:?} \
+                 with windows {:?}",
+                marks.iter().map(|m| m.txid).collect::<Vec<_>>(),
+                h.model.merged_windows
+            );
+            assert!(
+                saw_decay,
+                "expected at least one point strictly inside a merged window among {:?} \
+                 with windows {:?}",
+                marks.iter().map(|m| m.txid).collect::<Vec<_>>(),
+                h.model.merged_windows
+            );
+        });
+    }
+
+    /// Pinned reproducer for the compaction-aware-head PRODUCT FIX (fail-on-
+    /// revert). The DST compaction phase found this shrunk sequence: compaction
+    /// folds the fine L0 tail into a merged `levels/L1/` range whose `max`
+    /// extends past the highest gen-folder TXID, then a `KillRestart` re-discovers
+    /// the head. Before the fix, `discover_legacy_state` ignored `levels/`, so the
+    /// restart discovered a stale-low head and the `--on-startup` eager snapshot
+    /// landed BELOW the merged coverage — and the final `RestoreLatest` failed
+    /// with "restore chain gap ... at seq 6". With the fix (discovery includes
+    /// merged-level maxes) the head is correct, the eager base sits above the
+    /// merged range, and restore-to-latest is exact. Reverting the fix in
+    /// `legacy_manifest::discover_legacy_state` makes this replay fail.
+    #[test]
+    fn replay_compaction_restart_after_head_folded() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ops = vec![
+            Op::WriteTxn { rows: 1 },
+            Op::Checkpoint,
+            Op::WriteTxn { rows: 1 },
+            Op::WriteTxn { rows: 1 },
+            Op::Mark,
+            Op::WriteTxn { rows: 1 },
+            Op::WriteTxn { rows: 1 },
+            Op::Flush,
+            Op::WriteTxn { rows: 1 },
+            Op::Flush,
+            Op::Compact {
+                l1_batch: 2,
+                l2_batch: 2,
+                keep_fine_secs: 0,
+            },
+            Op::KillRestart,
+            Op::RestoreLatest,
+        ];
+        rt.block_on(run_case(&ops, FaultPlan::none(0), true))
+            .unwrap();
+    }
+
+    /// Catch-proof anchor (fail-on-revert for the C3a seq-contiguous batch
+    /// clipping — a real compaction protection). A `Snapshot` between flushes
+    /// breaks the L0 chain (the snapshot consumes its own seq and the next
+    /// incremental chains from it, leaving a seq gap in `0000/`). The engine's
+    /// `contiguous_batch` clips a merge to a seq-contiguous run and refuses to
+    /// straddle that break, so this sequence compacts cleanly and every restore
+    /// stays exact.
+    ///
+    /// Neuter that clip to a naive `take(batch)` and the SAME sequence makes
+    /// `run_level_compaction` return `NonContiguous` — `Op::Compact` then fails
+    /// with no faults and the compaction oracle catches it via `guard_durable`.
+    /// The generated no-fault compaction phase finds and shrinks such a sequence
+    /// (Snapshot/KillRestart + Compact); this pinned replay is the minimal
+    /// reproducer kept as a permanent guard. With the clip intact it PASSES.
+    #[test]
+    fn replay_compaction_survives_snapshot_chain_break() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ops = vec![
+            Op::WriteTxn { rows: 2 },
+            Op::Flush,
+            Op::WriteTxn { rows: 2 },
+            Op::Flush,
+            Op::Snapshot, // breaks the L0 seq chain
+            Op::WriteTxn { rows: 2 },
+            Op::Flush,
+            Op::WriteTxn { rows: 2 },
+            Op::Flush,
+            Op::Mark,
+            Op::Compact {
+                l1_batch: 2,
+                l2_batch: 2,
+                keep_fine_secs: 0,
+            },
+            Op::RestorePit { mark_sel: 0 },
+            Op::RestoreLatest,
+        ];
+        rt.block_on(run_case(&ops, FaultPlan::none(0), true))
+            .unwrap();
     }
 }

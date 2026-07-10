@@ -149,6 +149,22 @@ pub async fn discover_legacy_state(
                     max_txid = max_txid.max(file_max_txid);
                 }
             }
+        } else if parts.len() == 3 && parts[0] == crate::compaction::LEVELS_DIR {
+            // Compaction merged object: `{db}/levels/L{N}/{min}-{max}.ltx`. A
+            // merged range can extend PAST the highest gen-folder TXID once its
+            // fine L0 tail has been folded away (e.g. `keep_fine_window = 0`, or
+            // a batch that reached the head). The head must reflect that folded
+            // coverage: otherwise a watch RESTART discovers a stale-low head,
+            // resumes writing incrementals at a seq the merged range already
+            // owns (a chain fork), and — with `--on-startup` — publishes an
+            // eager base snapshot BELOW the merged coverage that then poisons
+            // restore-to-latest as an unchained floor. Levels are not
+            // generations, so `max_generation` is left untouched. (Found by the
+            // DST compaction state machine: Compact → KillRestart →
+            // RestoreLatest chain gap.)
+            if let Some(range) = crate::compaction::parse_range_name(parts[2], "ltx") {
+                max_txid = max_txid.max(range.max);
+            }
         } else if parts.len() == 1 {
             if let Some(file_max_txid) = parse_legacy_flat_ltx_filename(parts[0]) {
                 max_txid = max_txid.max(file_max_txid);
@@ -548,6 +564,45 @@ mod tests {
             .unwrap();
         assert_eq!(all.len(), 4);
         assert_eq!(all.last().unwrap().max_txid, 4);
+    }
+
+    /// Fail-on-revert for the compaction-aware head. When compaction has folded
+    /// the fine L0 tail into a merged `levels/L*/` range whose `max` extends past
+    /// the highest gen-folder TXID, the discovered head MUST reflect that folded
+    /// coverage — otherwise a watch restart resumes at a stale seq the merged
+    /// range already owns and (with `--on-startup`) publishes a base snapshot
+    /// below the merged coverage that poisons restore-to-latest. Here the only
+    /// surviving gen-folder object is the snapshot at TXID 1 and a lone L0 tail
+    /// at TXID 2; seqs 3..=9 live only in the merged L1 range. The head is 9.
+    /// (Reverting the `levels/` branch makes this report 2 — the DST compaction
+    /// state machine's Compact → KillRestart → RestoreLatest chain gap.)
+    #[tokio::test]
+    async fn discover_head_reflects_merged_level_coverage() {
+        let storage = TestStorage {
+            objects: HashMap::from([
+                (
+                    "backups/app/0001/0000000000000001-0000000000000001.ltx".to_string(),
+                    Vec::new(),
+                ),
+                (
+                    "backups/app/0000/0000000000000002-0000000000000002.ltx".to_string(),
+                    Vec::new(),
+                ),
+                (
+                    "backups/app/levels/L1/0000000000000003-0000000000000009.ltx".to_string(),
+                    Vec::new(),
+                ),
+            ]),
+        };
+        let (current_txid, max_generation) = discover_legacy_state(&storage, "backups", "app")
+            .await
+            .unwrap();
+        assert_eq!(
+            current_txid, 9,
+            "head must include the merged L1 range's max, not just gen-folder TXIDs"
+        );
+        // Merged levels are NOT generations: max_generation stays the snapshot's.
+        assert_eq!(max_generation, 1);
     }
 
     #[tokio::test]
