@@ -71,7 +71,7 @@ bench_cleanup() {
   stop_pid "$LS_RSS_PID"
   stop_pid "$LS_DRIVER_PID"
   stop_litestream
-  stop_main_driver_tree
+  stop_driver
   drill_cleanup
   # drill_cleanup's rm -rf can lose a race with a final buffered write on
   # macOS (ENOTEMPTY); a second sweep after everything is dead is silent.
@@ -244,7 +244,7 @@ wait_litestream_restore_count "$LS_CONFIG" "$LS_DB" "$EXPECTED_LS" "$DRILL_WORKD
 
 stop_pid "$W_RSS_PID"; W_RSS_PID=
 stop_pid "$LS_RSS_PID"; LS_RSS_PID=
-stop_main_driver_tree
+stop_driver
 stop_pid "$LS_DRIVER_PID"; LS_DRIVER_PID=
 stop_walrust
 stop_litestream

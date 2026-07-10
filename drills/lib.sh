@@ -286,6 +286,12 @@ resume_driver() {
 
 stop_driver() {
   if [ -n "${DRILL_DRIVER_PID:-}" ] && kill -0 "$DRILL_DRIVER_PID" >/dev/null 2>&1; then
+    # The driver is a subshell whose python child does the actual writing.
+    # Killing only the subshell orphaned that python child, which kept
+    # committing rows and rewriting its count file forever (an orphan from an
+    # old drill run was found still alive on the dev box). Kill the child
+    # first, then the subshell.
+    pkill -TERM -P "$DRILL_DRIVER_PID" >/dev/null 2>&1 || true
     kill "$DRILL_DRIVER_PID" >/dev/null 2>&1 || true
     wait "$DRILL_DRIVER_PID" >/dev/null 2>&1 || true
   fi

@@ -52,8 +52,14 @@ local MinIO (started by the script via docker). Measures:
   polls the bucket for the first new object that *contains* the sentinel
   bytes (raw search, LZ4-frame fallback) and records commit-to-visible lag.
   Reported as median/p95 per tool.
-- **RSS** sampled every 5s via the shared `drills/lib.sh` sampler;
-  reported min/median/max.
+- **RSS** sampled every 5s via the shared `drills/lib.sh` sampler
+  (one process per tool: walrust's single `watch`, litestream's single
+  `replicate`); reported min/median/max. When reading an RSS gap, remember
+  the known asymmetry: litestream 0.5's `replicate` runs an always-on in-band
+  compaction/snapshot monitor with no off switch, so it is doing compaction
+  work in the same process being measured, while walrust's `watch` does not
+  compact in-band (`walrust compact` is a separate invocation). Part of any
+  RSS gap is that background work; re-measure once walrust compacts in-band.
 
 Ends with the validity check for both tools. Knobs are env vars documented
 at the top of the script; defaults: 300s duration, 1s sync interval,

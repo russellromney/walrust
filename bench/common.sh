@@ -76,16 +76,6 @@ write_litestream_config() {
   done
 }
 
-# Stop the lib-managed write driver AND its python child. stop_driver alone
-# kills only the driver subshell; the orphaned python would keep writing its
-# count file and race workdir deletion during cleanup.
-stop_main_driver_tree() {
-  if [ -n "${DRILL_DRIVER_PID:-}" ]; then
-    pkill -TERM -P "$DRILL_DRIVER_PID" >/dev/null 2>&1 || true
-  fi
-  stop_driver
-}
-
 BENCH_LITESTREAM_PID=
 start_litestream() {
   local config=$1
