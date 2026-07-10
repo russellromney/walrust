@@ -286,7 +286,130 @@ fn body_offset(header: &SourceHeader) -> u64 {
     }
 }
 
-/// Read a source header from storage with a single small range GET.
+/// Litestream LTX file magic (`litepages`). A legacy L0 object begins with this;
+/// a merged (HADBP) object begins with `HADBP`. Sniffing the magic lets one
+/// layout read **both** heritages: real LTX at L0, HADBP at the merged levels.
+const LTX_MAGIC: &[u8; 4] = b"LTX1";
+
+/// Parse an LTX (litestream-heritage) L0 object into a [`SourceHeader`].
+///
+/// The seam (wave C3a): a legacy L0 pool holds **real LTX** bytes, but the merge
+/// engine speaks HADBP page geometry and an HADBP chain. We present each LTX
+/// source as a **pseudo-COMPACTED** header carrying its **LTX-domain** chain
+/// values — `prev_checksum` = the LTX `pre_apply_checksum`, `declared_end` =
+/// the LTX `post_apply_checksum` (from the trailer). The merge then:
+///   - checks contiguity in the LTX domain (`source[i+1].prev == source[i]`'s
+///     declared end), exactly the chain the LTX writer built, and
+///   - stamps the produced HADBP object's `prev`/`declared_end` with those same
+///     LTX values, so a mixed LTX→HADBP→LTX restore chain links with **one**
+///     running checksum in the LTX domain.
+/// The HADBP content checksum over the merged pages is independent and still
+/// protects page integrity. Pages are `PageIdSize::U32` (LTX `PageNum` is u32).
+///
+/// Reads/decodes the whole object (LTX files are small per-second incrementals)
+/// because the `post_apply_checksum` lives in the trailer; `finish()` also
+/// verifies the file checksum, so a torn LTX source is caught here.
+pub(crate) fn parse_ltx_source_header(bytes: &[u8]) -> Result<SourceHeader, CompactionError> {
+    use crate::legacy_ltx::Decoder;
+    let (mut decoder, header) = Decoder::new(std::io::Cursor::new(bytes.to_vec()))
+        .map_err(|e| CompactionError::Storage(format!("ltx header decode: {e}")))?;
+    let page_size = header.page_size.into_inner();
+    let mut buf = vec![0u8; page_size as usize];
+    let mut page_count: u32 = 0;
+    while decoder
+        .decode_page(&mut buf)
+        .map_err(|e| CompactionError::Storage(format!("ltx page decode: {e}")))?
+        .is_some()
+    {
+        page_count = page_count.saturating_add(1);
+    }
+    let trailer = decoder
+        .finish()
+        .map_err(|e| CompactionError::Storage(format!("ltx trailer verify: {e}")))?;
+    let created_ms = header
+        .timestamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(SourceHeader {
+        page_id_size: PageIdSize::U32,
+        page_size,
+        seq: header.max_txid.into_inner(),
+        prev_checksum: header
+            .pre_apply_checksum
+            .map(|c| c.into_inner())
+            .unwrap_or(0),
+        page_count,
+        created_ms,
+        declared_end_checksum: Some(trailer.post_apply_checksum.into_inner()),
+    })
+}
+
+/// A [`ChangesetPageStream`] over a real **LTX** L0 object. Yields the LTX pages
+/// (decompressed, `U32` page ids) in ascending order, then a single synthetic
+/// **empty end-page-count marker** at `commit + 1`. The marker makes the merged
+/// HADBP object declare the final DB size exactly as walrust's HADBP
+/// incrementals do (an empty page at `end_page_count + 1`), so a restore
+/// truncates/grows correctly; intermediate sources' markers are elided by the
+/// merge, leaving one canonical marker. Streams one page at a time (the litepages
+/// decoder is itself streaming), so the merge stays memory-bounded.
+struct LtxChangesetStream {
+    decoder: crate::legacy_ltx::Decoder<'static, std::io::Cursor<Vec<u8>>>,
+    page_size: usize,
+    /// Final DB page count (LTX header `commit`); the marker sits at `commit + 1`.
+    commit: u64,
+    pages_done: bool,
+    marker_pending: bool,
+}
+
+impl LtxChangesetStream {
+    fn open(bytes: Vec<u8>) -> Result<Self, CompactionError> {
+        let (decoder, header) = crate::legacy_ltx::Decoder::new(std::io::Cursor::new(bytes))
+            .map_err(|e| CompactionError::Storage(format!("ltx open: {e}")))?;
+        Ok(Self {
+            page_size: header.page_size.into_inner() as usize,
+            commit: header.commit.into_inner() as u64,
+            decoder,
+            pages_done: false,
+            marker_pending: true,
+        })
+    }
+}
+
+#[async_trait]
+impl ChangesetPageStream for LtxChangesetStream {
+    async fn next_page(&mut self) -> Result<Option<PageEntry>, CompactionError> {
+        if !self.pages_done {
+            let mut data = vec![0u8; self.page_size];
+            match self
+                .decoder
+                .decode_page(&mut data)
+                .map_err(|e| CompactionError::Storage(format!("ltx page decode: {e}")))?
+            {
+                Some(pn) => {
+                    return Ok(Some(PageEntry {
+                        page_id: PageId::U32(pn.into_inner()),
+                        data,
+                    }));
+                }
+                None => self.pages_done = true,
+            }
+        }
+        if self.marker_pending {
+            self.marker_pending = false;
+            return Ok(Some(PageEntry {
+                page_id: PageId::U32((self.commit + 1) as u32),
+                data: Vec::new(),
+            }));
+        }
+        Ok(None)
+    }
+}
+
+/// Read a source header from storage, sniffing the object format. HADBP objects
+/// (merged levels) parse from a single 48-byte ranged GET; real LTX L0 objects
+/// require the full object (the `post_apply_checksum` is in the trailer) — they
+/// are small per-second incrementals, and this cost is paid only at merge time.
 pub(crate) async fn read_header_from_storage(
     storage: &dyn StorageBackend,
     key: &str,
@@ -296,7 +419,41 @@ pub(crate) async fn read_header_from_storage(
         .await
         .map_err(|e| CompactionError::Storage(e.to_string()))?
         .ok_or_else(|| CompactionError::Storage(format!("missing object {key}")))?;
+    if head.len() >= 4 && &head[0..4] == LTX_MAGIC {
+        let bytes = storage
+            .get(key)
+            .await
+            .map_err(|e| CompactionError::Storage(e.to_string()))?
+            .ok_or_else(|| CompactionError::Storage(format!("missing object {key}")))?;
+        return parse_ltx_source_header(&bytes);
+    }
     parse_source_header(&head)
+}
+
+/// Open a source for streaming page reads, sniffing the object format: HADBP →
+/// ranged-GET [`StorageChangesetStream`]; real LTX → whole-object
+/// [`LtxChangesetStream`] (the litepages decoder needs the framed stream).
+pub(crate) async fn open_source_stream(
+    storage: Arc<dyn StorageBackend>,
+    key: &str,
+) -> Result<Box<dyn ChangesetPageStream>, CompactionError> {
+    let head = storage
+        .range_get(key, 0, (HEADER_V1_SIZE + DECLARED_FIELD) as u32)
+        .await
+        .map_err(|e| CompactionError::Storage(e.to_string()))?
+        .ok_or_else(|| CompactionError::Storage(format!("missing object {key}")))?;
+    if head.len() >= 4 && &head[0..4] == LTX_MAGIC {
+        let bytes = storage
+            .get(key)
+            .await
+            .map_err(|e| CompactionError::Storage(e.to_string()))?
+            .ok_or_else(|| CompactionError::Storage(format!("missing object {key}")))?;
+        return Ok(Box::new(LtxChangesetStream::open(bytes)?));
+    }
+    let header = parse_source_header(&head)?;
+    Ok(Box::new(StorageChangesetStream::open(
+        storage, key, &header,
+    )))
 }
 
 /// A [`ChangesetPageStream`] over a HADBP object in a [`StorageBackend`].
@@ -466,12 +623,7 @@ impl GenLayoutCore {
         &self,
         file: &LayoutFile,
     ) -> Result<Box<dyn ChangesetPageStream>, CompactionError> {
-        let header = read_header_from_storage(self.storage.as_ref(), &file.key).await?;
-        Ok(Box::new(StorageChangesetStream::open(
-            self.storage.clone(),
-            &file.key,
-            &header,
-        )))
+        open_source_stream(self.storage.clone(), &file.key).await
     }
 
     pub(crate) async fn write_merged(

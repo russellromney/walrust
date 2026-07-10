@@ -80,8 +80,35 @@ watermark (E2-class, with a fail-on-revert proof), and the single
 removed). Un-leveled buckets restore byte-identically to before. A merge-engine
 fix now preserves SQLite's end-page-count marker so merged objects apply
 cleanly. The e2e proves both layouts restore-to-latest row-exact + PITR
-boundary/inside-window + deleted-L0-tail + crash-overlap. **C3 is next**: oracle
-granularity-decay extension, kill-mid-compaction drill, restore-speed bench.
+boundary/inside-window + deleted-L0-tail + crash-overlap. C2b **severed the CLI**
+(its restore path was not wired to the planner) — leveled compaction was
+library/owned-mode only.
+
+**C3a (CLI planner wiring + batch-boundary liveness) shipped** — the C2b CLI
+sever is **lifted**. (1) **Liveness**: `run_level_compaction` clips a batch to a
+seq-contiguous run instead of a rigid oldest-`batch` window, so a batch that
+straddles a snapshot chain-break merges the contiguous prefix (or skips a lone
+straddler) and **converges** instead of erroring `NonContiguous` forever
+(fail-on-revert proven). (2) **The LTX→HADBP restore seam**: the merge engine
+now reads real litestream **LTX** L0 sources (magic-sniffing layout,
+`litepages` page stream + synthetic end-page-count marker) and stamps the
+produced **HADBP** merged object's `prev`/`declared_end` with the LTX pre/post
+of its range, so `legacy_restore::restore_legacy_ltx` — now leveled-aware over
+the reused `plan_restore` planner — replays an interleaved LTX↔HADBP chain with
+**one running checksum in the LTX domain** (DB-anchored `verify_chain` across the
+seam), reusing the C2b TXID PITR-decay error. Cache substitution bypasses
+`levels/L*/` objects. `reject_cli_compaction` and its tests are removed;
+`[compaction] enabled` works for the CLI too (still default false for version
+skew). Proven byte/row-exact across the seam, plus an owned-mode VACUUM-shrink
+e2e and an S3-gated real-`walrust watch` CLI e2e (L1+L2 fire, superseded L0
+deleted, restore/PITR/verify all correct). The C3a adversarial review executed
+that S3 e2e for the first time and fixed three defects it exposed: `verify`'s
+snapshot-chain check was not level-aware (false gap on a compacted bucket), and
+three read consumers (`list_merged_ranges`, owned `gather_candidates`,
+`prune::list_level_files`) stopped at the first empty level — missing a populated
+L2 above a fully-promoted (empty) L1 — plus the cache-bypass was made structural.
+**C3b is next**: oracle granularity-decay extension, kill-mid-compaction drill,
+restore-speed bench, default-on.
 
 Merge many small incremental changesets into fewer, larger ones so long-history
 databases restore fast and buckets stay small. Litestream's level design is the

@@ -28,8 +28,12 @@ use super::CompactionError;
 use std::collections::HashMap;
 
 /// List every object across the merged levels (L ≥ 1) of a layout, for
-/// watermark pruning. Probing stops at the first empty level (levels fill
-/// bottom-up), capped defensively.
+/// watermark pruning. Every level `1..=MAX_LEVEL_PROBE` is probed — the scan does
+/// **not** stop at the first empty level, because promotion empties a lower level
+/// when it folds all of its objects up (an L1→L2 merge deletes its L1 sources),
+/// so a populated L2 routinely sits above an empty L1. Stopping early would leave
+/// higher-level objects below the watermark uncollected (a space leak). The cap
+/// bounds the LISTs.
 pub async fn list_level_files(
     layout: &dyn CompactionLayout,
 ) -> Result<Vec<LayoutFile>, CompactionError> {
@@ -37,9 +41,6 @@ pub async fn list_level_files(
     let mut out = Vec::new();
     for level in 1..=MAX_LEVEL_PROBE {
         let files = layout.list_level(level).await?;
-        if files.is_empty() {
-            break;
-        }
         out.extend(files);
     }
     Ok(out)

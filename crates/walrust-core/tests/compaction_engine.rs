@@ -421,12 +421,17 @@ async fn revert_proof_crash_between_write_and_delete_converges() {
 #[tokio::test]
 async fn revert_proof_non_contiguous_sources_rejected() {
     let store = MemStore::new();
-    // Seqs 1,2, then a GAP (skip 3), then 4 chained from a wrong prev so the
-    // chain is broken between 2 and 4.
+    // Seqs 1,2,3 with NO seq gap, but seq 3 chains from a wrong prev — a fork /
+    // chain-break that the cheap seq-contiguity batch selector cannot see. The
+    // C3a liveness clip therefore selects all three (they look contiguous), and
+    // the merge's checksum-contiguity net MUST still reject it. This proves the
+    // merge never silently bridges a broken chain even when the seqs are dense.
+    // (The seq-*gap* case — a snapshot boundary — is now clipped, not errored;
+    // see `straddling_snapshot_break_converges_no_eternal_noncontiguous`.)
     let c1 = cs(1, 0, vec![pg(0, 1, 16)]);
     let c2 = cs(2, chain_end(&c1), vec![pg(0, 2, 16)]);
-    let c4 = cs(4, 0xDEAD_BEEF, vec![pg(0, 4, 16)]); // prev does not chain
-    for c in [&c1, &c2, &c4] {
+    let c3 = cs(3, 0xDEAD_BEEF, vec![pg(0, 3, 16)]); // seq-contiguous, prev broken
+    for c in [&c1, &c2, &c3] {
         put_l0_seq(&store, "p/", "db", c).await;
     }
     let layout = SeqLayout::new(store.clone(), "p/", "db");
@@ -604,4 +609,68 @@ async fn partial_overlap_existing_merged_is_loud_error() {
     // All four L0 sources survive; the pre-existing L1 object is untouched.
     assert_eq!(store.list("p/db/0000/", None).await.unwrap().len(), 4);
     assert_eq!(store.list("p/db/levels/L1/", None).await.unwrap().len(), 1);
+}
+
+// ── Liveness (C3a): batch selection clips at snapshot chain-breaks ───────────
+
+/// A fixed-size L0 batch straddling a snapshot chain-break must NOT stall on
+/// `NonContiguous` forever. The engine clips the batch to the contiguous run
+/// (skipping a lone leading straddler) and converges.
+///
+/// **Fail-on-revert:** restoring the old rigid `all.into_iter().take(batch)`
+/// selection makes the very first `run_level_compaction` below select the
+/// straddling files (seqs 1,3,4,5) and return `CompactionError::NonContiguous`
+/// on every tick forever — this test would then fail at the first `.unwrap()`.
+#[tokio::test]
+async fn straddling_snapshot_break_converges_no_eternal_noncontiguous() {
+    let store = MemStore::new();
+
+    // Seq 1 chains from 0. A snapshot then consumed seq 2 (not in L0), so the
+    // post-snapshot chain restarts from the snapshot's checksum (0x5EED), a
+    // genuine chain-break: cs(3).prev != chain_end(cs(1)).
+    let c1 = cs(1, 0, vec![pg(0, 1, 16), pg(1, 0x11, 16)]);
+    put_l0_seq(&store, "p/", "db", &c1).await;
+    assert_ne!(chain_end(&c1), 0x5EED, "the snapshot breaks the chain");
+
+    let post = make_chain(3, 5, 0x5EED); // seqs 3,4,5,6,7 contiguous
+    for c in &post {
+        put_l0_seq(&store, "p/", "db", c).await;
+    }
+
+    let layout = SeqLayout::new(store.clone(), "p/", "db");
+    let l0_before = store.list("p/db/0000/", None).await.unwrap();
+    assert_eq!(
+        l0_before.len(),
+        6,
+        "seqs 1,3,4,5,6,7 present: {l0_before:?}"
+    );
+
+    // Tick 1: the oldest 4 files (1,3,4,5) straddle the break. Old code errors
+    // NonContiguous here forever; the fix skips the lone straddler [1] and
+    // merges the contiguous run [3,4,5,6].
+    let o = run_level_compaction(&layout, 0, 4, Duration::from_secs(0), NOW)
+        .await
+        .expect("must not error across the chain-break");
+    assert_eq!(o.merged_count(), 4, "merged the contiguous run [3..=6]");
+
+    let l0 = store.list("p/db/0000/", None).await.unwrap();
+    let l1 = store.list("p/db/levels/L1/", None).await.unwrap();
+    assert_eq!(
+        l0.len(),
+        2,
+        "only the straddler [1] and tail [7] remain: {l0:?}"
+    );
+    assert_eq!(l1.len(), 1, "one merged L1 range written: {l1:?}");
+    assert!(
+        l1[0].ends_with(&format!("{:016x}-{:016x}.hadbp", 3u64, 6u64)),
+        "merged range must be [3,6]: {l1:?}"
+    );
+
+    // Tick 2: remaining L0 is {1, 7} — lone files separated by breaks. No merge
+    // is possible, but it must be a quiet NoOp, never an error loop.
+    let o2 = run_level_compaction(&layout, 0, 4, Duration::from_secs(0), NOW)
+        .await
+        .expect("a non-mergeable window is a NoOp, not an error");
+    assert_eq!(o2.merged_count(), 0, "nothing left to merge → NoOp");
+    assert!(matches!(o2, CompactionOutcome::NoOp));
 }

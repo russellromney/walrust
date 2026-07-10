@@ -318,10 +318,6 @@ pub async fn watch_with_shadow(
     webhooks: Vec<WebhookConfig>,
     cache_config: CacheConfig,
 ) -> Result<()> {
-    // Exposure-vs-read-path gap: refuse leveled compaction on the CLI layout,
-    // whose restore path cannot read leveled buckets. See `reject_cli_compaction`.
-    super::reject_cli_compaction(&databases)?;
-
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(
         create_client(endpoint)

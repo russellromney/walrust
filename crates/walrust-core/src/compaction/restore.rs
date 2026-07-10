@@ -57,8 +57,9 @@ use crate::errors::WalrustError;
 pub const DEFAULT_PREFETCH_DEPTH: usize = 4;
 
 /// Levels above L0 to probe when gathering candidates. The design builds two
-/// (L1, L2) but leaves room; probing stops at the first empty level, capped
-/// here so a hostile bucket cannot force unbounded LISTs.
+/// (L1, L2) but leaves room; capped here so a hostile bucket cannot force
+/// unbounded LISTs. Every level up to the cap is probed (no early stop on an
+/// empty level) — see the note in [`gather_candidates`].
 const MAX_LEVEL_PROBE: Level = 16;
 
 /// Gather every restorable object relevant to a restore from `floor` up to
@@ -89,12 +90,14 @@ pub async fn gather_candidates(
     let l0 = layout.list_level(0).await?;
     push_from(l0, &mut out);
 
-    // Merged levels, bottom-up, until an empty level (levels fill bottom-up).
+    // Merged levels. Every level `1..=MAX_LEVEL_PROBE` is probed — the scan does
+    // **not** stop at the first empty level. Promotion empties a lower level when
+    // it folds all of its objects up (an L1→L2 merge deletes its L1 sources), so a
+    // populated L2 routinely sits above an empty L1. Stopping early would drop that
+    // L2 from the candidate pool and make the planner report a phantom ChainGap on
+    // a perfectly restorable bucket. The cap still bounds the LISTs.
     for level in 1..=MAX_LEVEL_PROBE {
         let files = layout.list_level(level).await?;
-        if files.is_empty() {
-            break;
-        }
         push_from(files, &mut out);
     }
 

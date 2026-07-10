@@ -76,7 +76,17 @@ pub(crate) fn detect_live_txid_gaps(
     gaps
 }
 
-fn verify_ltx_chain(files: &[VerifiedLtxFile]) -> Vec<VerifyIssue> {
+/// Verify the snapshot→incremental LTX chain, **level-aware**. A hole between the
+/// snapshot (or a prior incremental) and the next incremental is a real gap only
+/// when the merged compaction levels do **not** contiguously cover it: when they
+/// do, the fine L0 objects were folded up a level (their seqs live in an HADBP
+/// merged range that carries the running LTX-domain checksum across the seam), so
+/// it is a compaction, not a loss. Across such a seam the surviving L0 tail's
+/// `pre_apply` chains from the *merged range's* end, not from the latest snapshot,
+/// so the L0-only checksum link is broken **by design** — the bridged branch
+/// therefore skips both the gap alarm and that checksum check (the merged object's
+/// own content checksum and the DB-anchored restore verify guard its integrity).
+fn verify_ltx_chain(files: &[VerifiedLtxFile], merged_ranges: &[SeqRange]) -> Vec<VerifyIssue> {
     let mut issues = Vec::new();
 
     let Some(snapshot) = files
@@ -102,14 +112,21 @@ fn verify_ltx_chain(files: &[VerifiedLtxFile]) -> Vec<VerifyIssue> {
 
     for file in incrementals {
         if file.min_txid != expected_next_txid {
-            issues.push(VerifyIssue {
-                filename: file.key.clone(),
-                issue: format!(
-                    "TXID gap after snapshot chain: expected min_txid={}, got {}",
-                    expected_next_txid, file.min_txid
-                ),
-                is_orphan: false,
-            });
+            // Only a hole the merged levels do NOT cover is a genuine gap.
+            let level_bridges = ranges_cover(expected_next_txid, file.min_txid - 1, merged_ranges);
+            if !level_bridges {
+                issues.push(VerifyIssue {
+                    filename: file.key.clone(),
+                    issue: format!(
+                        "TXID gap after snapshot chain: expected min_txid={}, got {}",
+                        expected_next_txid, file.min_txid
+                    ),
+                    is_orphan: false,
+                });
+            }
+            // Whether bridged (compaction seam) or a genuine gap, the L0 checksum
+            // link across the discontinuity is not meaningful — advance to a fresh
+            // segment anchored on this file.
             expected_next_txid = file.max_txid + 1;
             expected_pre_apply = file.post_apply_checksum;
             continue;
@@ -204,7 +221,17 @@ pub(crate) async fn validate_backup_integrity(
             Err(e) => return Err(WalrustError::s3(format!("Download failed: {}", e)).into()),
         }
     }
-    issues.extend(verify_ltx_chain(&verified_files));
+    // Level-aware chain check: a hole the merged compaction levels cover is a
+    // compaction seam, not a gap (same rule as the CLI `verify` path). Periodic
+    // validation runs against a possibly-compacting bucket, so it must not
+    // false-alarm on a folded L0 pool.
+    let merged_ranges: Vec<SeqRange> = {
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(S3Storage::new(client.clone(), bucket.to_string()));
+        let layout = RangeLayout::new(storage, prefix, db_name);
+        list_merged_ranges(&layout).await.unwrap_or_default()
+    };
+    issues.extend(verify_ltx_chain(&verified_files, &merged_ranges));
 
     Ok(ValidationResult {
         verified_count,
@@ -342,12 +369,60 @@ mod tests {
             ),
         ];
 
-        let issues = verify_ltx_chain(&files);
+        let issues = verify_ltx_chain(&files, &[]);
         assert!(
             issues
                 .iter()
                 .any(|issue| issue.issue.contains("checksum chain break")),
             "verify must reject an incremental whose pre_apply does not match the snapshot post_apply"
+        );
+    }
+
+    #[test]
+    fn chain_snapshot_to_compacted_tail_is_not_a_gap() {
+        // The compacted-CLI shape the e2e hit: snapshot@1, the fine L0 seqs 2..=11
+        // folded into merged levels (gone from gen-0), leaving only the L0 tail at
+        // seq 12. The snapshot→incremental chain check must see the merged range
+        // [2,11] bridge the hole and stay silent — no "TXID gap after snapshot
+        // chain" and no false checksum break across the (by-design-broken) seam.
+        let files = vec![
+            verified_file("db/0001/…-…snap.ltx", 1, 1, 1, None, 0x1111),
+            // seq 12 chains from the merged range end (0x9999), NOT the snapshot.
+            verified_file("db/0000/…000c.ltx", 0, 12, 12, Some(0x9999), 0xAAAA),
+        ];
+        let merged = vec![SeqRange::new(2, 11)];
+        let issues = verify_ltx_chain(&files, &merged);
+        assert!(
+            issues.is_empty(),
+            "a snapshot→compacted-tail chain bridged by a merged range must be clean: {issues:?}"
+        );
+
+        // Fail-on-revert: with NO merged range to bridge, the same hole IS a gap.
+        let issues_unbridged = verify_ltx_chain(&files, &[]);
+        assert!(
+            issues_unbridged
+                .iter()
+                .any(|i| i.issue.contains("TXID gap after snapshot chain")),
+            "without a bridging merged range the hole must alarm: {issues_unbridged:?}"
+        );
+    }
+
+    #[test]
+    fn chain_partially_covered_hole_still_alarms() {
+        // A merged range that does not fully cover the hole must NOT suppress the
+        // gap: snapshot@1, tail at seq 12, but the merged range only reaches [2,9]
+        // (seqs 10,11 are genuinely missing).
+        let files = vec![
+            verified_file("db/0001/…snap.ltx", 1, 1, 1, None, 0x1111),
+            verified_file("db/0000/…000c.ltx", 0, 12, 12, Some(0x9999), 0xAAAA),
+        ];
+        let merged = vec![SeqRange::new(2, 9)];
+        let issues = verify_ltx_chain(&files, &merged);
+        assert!(
+            issues
+                .iter()
+                .any(|i| i.issue.contains("TXID gap after snapshot chain")),
+            "a hole the merged range only partially covers must still alarm: {issues:?}"
         );
     }
 }
@@ -510,7 +585,18 @@ pub async fn verify(
             Err(e) => return Err(WalrustError::s3(format!("Download failed: {}", e)).into()),
         }
     }
-    issues.extend(verify_ltx_chain(&verified_files));
+    // Level-aware: a hole in the L0 pool that a merged L1/L2 range covers is a
+    // *compaction*, not a gap. List the merged ranges under `{db}/levels/L*/`
+    // (HADBP objects; a header-read failure conservatively yields no bridges, so
+    // verify errs toward alarming, never toward silence). Computed once and shared
+    // by both the snapshot-chain check and the between-incrementals check.
+    let merged_ranges: Vec<SeqRange> = {
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(S3Storage::new(client.clone(), bucket_name.clone()));
+        let layout = RangeLayout::new(storage, &prefix, name);
+        list_merged_ranges(&layout).await.unwrap_or_default()
+    };
+    issues.extend(verify_ltx_chain(&verified_files, &merged_ranges));
 
     // Check TXID continuity in generation 0 (live)
     let mut live_files: Vec<_> = all_files
@@ -536,16 +622,6 @@ pub async fn verify(
         .iter()
         .map(|(key, _, min, max)| (key.clone(), *min, *max))
         .collect();
-    // Level-aware: a hole in the L0 pool that a merged L1/L2 range covers is a
-    // *compaction*, not a gap. List the merged ranges under `{db}/levels/L*/`
-    // (HADBP objects; a header-read failure conservatively yields no bridges, so
-    // verify errs toward alarming, never toward silence).
-    let merged_ranges: Vec<SeqRange> = {
-        let storage: Arc<dyn StorageBackend> =
-            Arc::new(S3Storage::new(client.clone(), bucket_name.clone()));
-        let layout = RangeLayout::new(storage, &prefix, name);
-        list_merged_ranges(&layout).await.unwrap_or_default()
-    };
     for (key, expected, min_txid) in
         detect_live_txid_gaps(&live_triples, &snapshot_maxes, &merged_ranges)
     {
