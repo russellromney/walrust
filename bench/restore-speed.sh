@@ -340,10 +340,46 @@ measure_restores WC walrust walrust-compacted "s3://$BENCH_BUCKET/$WC_PREFIX" "$
 measure_restores WP walrust walrust-plain "s3://$BENCH_BUCKET/$WP_PREFIX" "$WP_ROWS" "$WP_PREFIX"
 measure_restores LS litestream "$LS_DB" "" "$LS_ROWS" "$LS_PREFIX"
 
-# Validity gate: a wrong restore invalidates the whole run.
+# Validity gate 1: each subject's restore must be row-exact against its OWN
+# build count (catches a broken restore for that subject).
 [ "$WC_OK" = "1" ] || fail "VALIDITY: walrust-compacted restore was not row-exact — aborting"
 [ "$WP_OK" = "1" ] || fail "VALIDITY: walrust-plain restore was not row-exact — aborting"
 [ "$LS_OK" = "1" ] || fail "VALIDITY: litestream restore was not row-exact — aborting"
+
+# Validity gate 2: cross-subject sanity band. The three subjects run the SAME
+# driver rate for the SAME duration, so their histories must be comparable — a
+# restore/wall-clock comparison across wildly different row counts is apples to
+# oranges and the whole table is invalid. Per-subject gate 1 above only checks a
+# subject against ITSELF; if one driver died early (or a cell built against the
+# wrong DB), that subject can pass gate 1 while being 100x smaller than the
+# others, silently poisoning the comparison. Require every subject's row count
+# within BENCH_BAND_PCT% of the max (default 25%: generous headroom for driver
+# jitter, but a broken/paused cell — e.g. the 160x gap that motivated this gate —
+# aborts loudly with no numbers). Since gate 1 pins restored == built per subject,
+# banding the build counts bands the restored counts too.
+BENCH_BAND_PCT=${BENCH_BAND_PCT:-25}
+BAND_VERDICT=$(WC_ROWS="$WC_ROWS" WP_ROWS="$WP_ROWS" LS_ROWS="$LS_ROWS" BAND_PCT="$BENCH_BAND_PCT" \
+  "$DRILL_PYTHON" -c '
+import os
+pct = os.environ["BAND_PCT"]
+rows = {"walrust-compacted": int(os.environ["WC_ROWS"]),
+        "walrust-plain": int(os.environ["WP_ROWS"]),
+        "litestream": int(os.environ["LS_ROWS"])}
+band = float(pct) / 100.0
+hi = max(rows.values())
+lo_ok = hi * (1.0 - band)
+bad = {k: v for k, v in rows.items() if v < lo_ok}
+detail = ", ".join("{}={}".format(k, v) for k, v in sorted(rows.items()))
+if hi <= 0:
+    print("INVALID: every subject built zero rows - the workload never ran")
+elif bad:
+    print("INVALID: row counts diverge beyond {}% band (max={}, floor={:.0f}); "
+          "offenders {}; all: {}".format(pct, hi, lo_ok, sorted(bad), detail))
+else:
+    print("OK")
+')
+[ "$BAND_VERDICT" = "OK" ] || fail "VALIDITY: cross-subject row-count band failed — $BAND_VERDICT"
+log "cross-subject row-count band OK (within ${BENCH_BAND_PCT}%): WC=$WC_ROWS WP=$WP_ROWS LS=$LS_ROWS"
 
 stop_minio_trace "$TRACE_NAME" "$RESULTS_DIR/trace.jsonl"
 TRACE_STOPPED=1

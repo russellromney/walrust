@@ -188,9 +188,13 @@ l1_batch = 60            # L0 objects folded per L1 merge
 l2_batch = 24            # L1 objects folded per L2 merge
 ```
 
-Compaction works in **both** the `walrust` CLI (`walrust watch` compacts,
-`walrust restore` / `verify` read the leveled bucket across the LTX→HADBP seam)
-and **library / owned mode** via the `Replicator`.
+Compaction works in **both** the `walrust` CLI (`walrust watch
+--independent-tasks` compacts, `walrust restore` / `verify` read the leveled
+bucket across the LTX→HADBP seam) and **library / owned mode** via the
+`Replicator`. On the CLI, compaction ticks **only in independent-tasks mode**;
+the default shadow watch loop does not compact, so starting it with `[compaction]
+enabled = true` fails loudly and points you at `--independent-tasks` (it will not
+silently ignore the knob and let the bucket grow).
 
 Two honest caveats, one sentence each:
 

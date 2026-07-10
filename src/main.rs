@@ -421,6 +421,26 @@ struct WatchArgs {
     no_cache: bool,
 }
 
+/// Fail loudly (E7) when the default shadow watch loop is asked to run with
+/// leveled compaction enabled. Leveled compaction only ticks in the
+/// independent-tasks loop (`maybe_compact_legacy` in `watch_independent.rs`); the
+/// shadow loop has no compaction tick, so accepting the config there would
+/// silently ignore the knob and let a bucket the operator believes is compacting
+/// grow unbounded. Refuse to start and point at the mode that honors it.
+fn reject_shadow_compaction(dbs: &[ResolvedDbConfig]) -> Result<()> {
+    if let Some(db) = dbs.iter().find(|d| d.compaction.enabled) {
+        return Err(WalrustError::config(format!(
+            "[compaction] enabled = true is set (for database {}), but leveled compaction only \
+             runs in independent-tasks watch mode. The default shadow watch loop does not compact \
+             and would silently ignore the setting. Re-run `walrust watch` with \
+             --independent-tasks, or set [compaction] enabled = false.",
+            db.path.display()
+        ))
+        .into());
+    }
+    Ok(())
+}
+
 /// Resolve watch configuration by merging config file with CLI args.
 fn resolve_watch_config(
     config: &Option<Config>,
@@ -875,6 +895,17 @@ async fn run() -> Result<()> {
                 )
                 .await?;
             } else {
+                // Fail loudly on a silently-ignored knob (E7): leveled
+                // compaction only ticks in the independent-tasks watch loop
+                // (`maybe_compact_legacy` in `watch_independent.rs`). The default
+                // shadow loop has no compaction tick, so starting it with
+                // `[compaction] enabled = true` would accept the config and never
+                // compact — a config no-op that silently defeats the user's
+                // intent (and, worse, lets a bucket the user believes is being
+                // compacted grow unbounded). Refuse to start instead, pointing at
+                // the mode that honors the knob. (C3b adversarial review.)
+                reject_shadow_compaction(&resolved_dbs)?;
+
                 // Default: shadow WAL mode (decouples uploads from SQLite WAL)
                 sync::watch_with_shadow(
                     resolved_dbs,
@@ -1272,5 +1303,44 @@ mod tests {
         let err = resolve_watch_config(&Some(config), &cli)
             .expect_err("empty globs without opt-in must still fail");
         assert!(err.to_string().contains("No databases"), "got: {err}");
+    }
+
+    fn db_with_compaction(enabled: bool) -> ResolvedDbConfig {
+        ResolvedDbConfig {
+            path: std::path::PathBuf::from("/tmp/app.db"),
+            prefix: "app".to_string(),
+            sync: SyncConfig::default(),
+            retention: RetentionConfig::default(),
+            compaction: walrust_core::compaction::CompactionSettings {
+                enabled,
+                ..Default::default()
+            },
+        }
+    }
+
+    /// E7 fail-loudly: the default shadow watch loop has no compaction tick, so
+    /// starting it with `[compaction] enabled = true` must be refused (not a
+    /// silent no-op that lets the bucket grow unbounded). Reverting
+    /// `reject_shadow_compaction` (or its call site) makes this fail.
+    #[test]
+    fn shadow_watch_rejects_enabled_compaction() {
+        let err = reject_shadow_compaction(&[db_with_compaction(true)])
+            .expect_err("shadow loop must refuse enabled compaction");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("independent-tasks"),
+            "error must point at independent-tasks mode; got: {msg}"
+        );
+    }
+
+    /// The refusal is scoped to the enabled knob: compaction off (the default) or
+    /// independent-tasks mode (which never calls this) start normally.
+    #[test]
+    fn shadow_watch_allows_compaction_off() {
+        reject_shadow_compaction(&[db_with_compaction(false)])
+            .expect("compaction off must start the shadow loop normally");
+        // Mixed set: one db enabled among several still trips the guard.
+        let mixed = [db_with_compaction(false), db_with_compaction(true)];
+        assert!(reject_shadow_compaction(&mixed).is_err());
     }
 }

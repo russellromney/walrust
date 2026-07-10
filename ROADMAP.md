@@ -61,13 +61,22 @@ cannot restore a leveled bucket); **flipping the default to `true` is a separate
 release decision** for once every binary that might restore a bucket understands
 the `levels/` layout.
 
+**Shadow-loop guard (C3b adversarial review): leveled compaction only ticks in
+the independent-tasks watch loop.** The default shadow loop has no compaction
+tick, so rather than silently ignore `[compaction] enabled = true` (a config
+no-op that would let a bucket the operator believes is compacting grow
+unbounded — an E7 fail-loudly violation), `walrust watch` now **refuses to
+start** in shadow mode with compaction enabled and points the operator at
+`--independent-tasks`. Unit-tested (`shadow_watch_rejects_enabled_compaction`);
+the drill and bench both run `--independent-tasks`.
+
 **Non-blocking residue** (small future items, not shipped in C3b): the C3a
 reviewer's note that the legacy L0→L1 idempotency path in
 `engine::verify_existing` re-reads the last source's full bytes to recompute
 `chain_end` (an extra bounded GET on the crash-recovery convergence path only —
-correct, just not the cheapest); and leveled compaction only ticks in the
-independent-tasks watch loop, so the default shadow loop silently ignores the
-`[compaction]` knob (documented; the drill uses `--independent-tasks`).
+correct, just not the cheapest). Wiring a compaction tick into the shadow loop
+itself (so it need not sever) is possible future work, but not required for
+correctness now that the sever is loud.
 
 **Status:** rename `compact`→`prune` shipped. C1 (COMPACTED v2 format) shipped.
 **C2a (layout-agnostic merge engine, write side) shipped** — `CompactionLayout`

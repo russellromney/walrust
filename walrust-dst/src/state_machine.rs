@@ -1126,11 +1126,6 @@ impl Harness {
         let decayed = self.model.pit_decayed(mark.txid);
         match self.restore_to(out, Some(mark.txid)).await {
             Ok(final_txid) => {
-                anyhow::ensure!(
-                    final_txid <= mark.txid,
-                    "op[{op_index}] RestorePit(txid {}) overshot to txid {final_txid}",
-                    mark.txid
-                );
                 let ids = match Self::restored_ids(out) {
                     Ok(ids) => ids,
                     Err(e) => {
@@ -1144,40 +1139,16 @@ impl Harness {
                         ));
                     }
                 };
-                // A decayed point must never be a SILENT success. With no
-                // corrupting faults the fine source is gone, so an Ok here means
-                // the planner failed to detect the decay — a real bug.
-                if decayed && !self.faults.can_corrupt() {
-                    anyhow::bail!(
-                        "op[{op_index}] RestorePit(txid {}) returned Ok(final {final_txid}) for a \
-                         point STRICTLY INSIDE merged window(s) {:?} — granularity decay must be a \
-                         loud typed error, never a silent restore. Restored {} rows.",
-                        mark.txid,
-                        self.model.merged_windows,
-                        ids.len(),
-                    );
-                }
-                // Whatever the classification, an Ok restore must be row-exact
-                // for the mark. (A decayed point that survives under faults —
-                // fine source not yet deleted — is exact and therefore fine.)
-                anyhow::ensure!(
-                    ids == mark.rows,
-                    "op[{op_index}] RestorePit(txid {}) returned WRONG rows{} at final txid \
-                     {final_txid}: expected {} (len {}), restored = {} (len {}). Merged windows: \
-                     {:?}",
+                grade_pit_compaction_ok(
+                    decayed,
+                    self.faults.can_corrupt(),
+                    final_txid,
                     mark.txid,
-                    if self.faults.can_corrupt() {
-                        " under faults (silent corruption)"
-                    } else {
-                        ""
-                    },
-                    preview(&mark.rows),
-                    mark.rows.len(),
-                    preview(&ids),
-                    ids.len(),
-                    self.model.merged_windows,
-                );
-                Ok(())
+                    &ids,
+                    &mark.rows,
+                    &self.model.merged_windows,
+                    op_index,
+                )
             }
             Err(e) => {
                 if self.faults.can_corrupt() {
@@ -1220,6 +1191,70 @@ impl Harness {
 /// `Storage(..)` variant carries the mock's injected-error string.
 fn is_compaction_transient(err: &CompactionError) -> bool {
     matches!(err, CompactionError::Storage(s) if s.contains("Service unavailable (injected)"))
+}
+
+/// Pure accept-direction verdict for a compaction PITR that returned `Ok`.
+///
+/// Extracted from [`Harness::check_restore_pit_compaction`] so the accept-side
+/// guards are DIRECTLY testable. This matters: with a correct engine every
+/// inside-window PITR errors loudly, so the real engine only ever drives the
+/// `Err` arm of the grader — the "silent decayed `Ok` is a bug" and "overshoot"
+/// guards are never exercised by the generated/pinned replays (proven by
+/// neutering them and watching every case still pass). Routing the verdict
+/// through this pure function lets `grade_pit_compaction_ok_*` unit tests
+/// exercise a *simulated* buggy engine directly, giving the accept direction
+/// real teeth (fail-on-revert) instead of dead defense-in-depth.
+///
+/// The three ways an `Ok` restore is wrong:
+///   1. it OVERSHOT the target (`final_txid > mark_txid`) — always a bug;
+///   2. it silently restored a DECAYED point (strictly inside a merged window,
+///      fine source folded away) with no corrupting fault to excuse it — decay
+///      must be a loud typed error, never a silent `Ok`;
+///   3. it returned the WRONG rows for the mark (checked for every classification
+///      — a decayed point that survives a partial merge under faults is exact and
+///      therefore fine; anything else is silent corruption).
+#[allow(clippy::too_many_arguments)]
+fn grade_pit_compaction_ok(
+    decayed: bool,
+    can_corrupt: bool,
+    final_txid: u64,
+    mark_txid: u64,
+    restored: &[i64],
+    expected: &[i64],
+    merged_windows: &[(u64, u64)],
+    op_index: usize,
+) -> Result<()> {
+    anyhow::ensure!(
+        final_txid <= mark_txid,
+        "op[{op_index}] RestorePit(txid {mark_txid}) overshot to txid {final_txid}"
+    );
+    // A decayed point must never be a SILENT success. With no corrupting faults
+    // the fine source is gone, so an Ok here means the planner failed to detect
+    // the decay — a real bug.
+    if decayed && !can_corrupt {
+        anyhow::bail!(
+            "op[{op_index}] RestorePit(txid {mark_txid}) returned Ok(final {final_txid}) for a \
+             point STRICTLY INSIDE merged window(s) {merged_windows:?} — granularity decay must be \
+             a loud typed error, never a silent restore. Restored {} rows.",
+            restored.len(),
+        );
+    }
+    // Whatever the classification, an Ok restore must be row-exact for the mark.
+    anyhow::ensure!(
+        restored == expected,
+        "op[{op_index}] RestorePit(txid {mark_txid}) returned WRONG rows{} at final txid \
+         {final_txid}: expected {} (len {}), restored = {} (len {}). Merged windows: {merged_windows:?}",
+        if can_corrupt {
+            " under faults (silent corruption)"
+        } else {
+            ""
+        },
+        preview(expected),
+        expected.len(),
+        preview(restored),
+        restored.len(),
+    );
+    Ok(())
 }
 
 // ============================================================================
@@ -1603,6 +1638,58 @@ mod tests {
     }
 
     // ---- compaction phase (Op::Compact + granularity-decay oracle) ----------
+
+    /// Fail-on-revert teeth for the accept-direction of the decay grader.
+    ///
+    /// A correct engine errors loudly on every inside-window PITR, so the
+    /// generated + pinned replays only ever drive the grader's `Err` arm — remove
+    /// the accept-side guards and every one of them still passes (verified during
+    /// C3b adversarial review). These tests exercise the accept verdict
+    /// (`grade_pit_compaction_ok`) against a SIMULATED buggy engine, so the
+    /// "silent decayed Ok is a bug", "overshoot", and "wrong rows" guards have
+    /// real teeth. Reverting any guard in `grade_pit_compaction_ok` fails here.
+    #[test]
+    fn grade_pit_compaction_ok_rejects_silent_decay() {
+        let windows = [(3u64, 9u64)];
+        // Simulated bug: the engine silently restored an inside-window point
+        // (txid 5, strictly inside [3,9]) as an Ok, no corrupting fault. Even
+        // with "correct-looking" rows this MUST be rejected — decay is loud.
+        let err = grade_pit_compaction_ok(
+            /*decayed*/ true,
+            /*can_corrupt*/ false,
+            /*final_txid*/ 5,
+            /*mark_txid*/ 5,
+            /*restored*/ &[1, 2, 3, 4, 5],
+            /*expected*/ &[1, 2, 3, 4, 5],
+            &windows,
+            7,
+        )
+        .expect_err("a silent Ok for a strictly-inside decayed point must be rejected");
+        assert!(
+            format!("{err:#}").contains("STRICTLY INSIDE"),
+            "got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn grade_pit_compaction_ok_rejects_overshoot_and_wrong_rows() {
+        // Overshoot: final past the target is always a bug, decayed or not.
+        assert!(grade_pit_compaction_ok(false, false, 10, 5, &[1], &[1], &[], 0).is_err());
+        // Wrong rows for an exact (non-decayed) point with no faults.
+        let e = grade_pit_compaction_ok(false, false, 5, 5, &[1, 2], &[1, 2, 3], &[], 0)
+            .expect_err("wrong rows must be rejected");
+        assert!(format!("{e:#}").contains("WRONG rows"), "got: {e:#}");
+    }
+
+    #[test]
+    fn grade_pit_compaction_ok_accepts_valid_outcomes() {
+        // Exact non-decayed point, row-exact: fine.
+        grade_pit_compaction_ok(false, false, 5, 5, &[1, 2, 3], &[1, 2, 3], &[(3, 9)], 0).unwrap();
+        // Decayed point that SURVIVED a partial merge under faults (fine source
+        // not yet deleted) and is row-exact: accepted precisely because the rows
+        // match. Remove the `can_corrupt` escape and this would wrongly fail.
+        grade_pit_compaction_ok(true, true, 5, 5, &[1, 2, 3], &[1, 2, 3], &[(3, 9)], 0).unwrap();
+    }
 
     #[test]
     fn compaction_state_machine_generated_sequences() {
