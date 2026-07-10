@@ -276,7 +276,19 @@ pub async fn restore_legacy_ltx(
                     .filter(|m| *m > floor)
                     .collect();
             let refined = crate::compaction::refine_gap_with_snapshot_spans(e, &later, target_txid);
-            return Err(WalrustError::restore(refined.to_string()).into());
+            // Snapshot-span decay = "this point is not restorable at that
+            // grain": typed as RestoreNotFound (same family as a beyond-newest
+            // target) so callers and the DST oracle can match it without
+            // string-parsing. Genuine gaps stay in the restore/integrity family.
+            let err = if matches!(
+                refined,
+                crate::compaction::PlanError::PitrInsideSnapshotSpan { .. }
+            ) {
+                WalrustError::restore_not_found(refined.to_string())
+            } else {
+                WalrustError::restore(refined.to_string())
+            };
+            return Err(err.into());
         }
     };
 

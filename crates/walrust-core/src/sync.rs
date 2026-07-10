@@ -2218,9 +2218,17 @@ pub async fn restore(
                 .filter(|m| *m > snapshot.seq)
                 .collect();
                 let refined = crate::compaction::refine_gap_with_snapshot_spans(e, &later, target);
-                return Err(anyhow::Error::from(WalrustError::restore(
-                    refined.to_string(),
-                )));
+                // Same typing rule as the legacy path: decay -> RestoreNotFound,
+                // genuine gap -> restore error.
+                let err = if matches!(
+                    refined,
+                    crate::compaction::PlanError::PitrInsideSnapshotSpan { .. }
+                ) {
+                    WalrustError::restore_not_found(refined.to_string())
+                } else {
+                    WalrustError::restore(refined.to_string())
+                };
+                return Err(anyhow::Error::from(err));
             }
         };
         tracing::info!(
