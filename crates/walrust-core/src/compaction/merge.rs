@@ -576,4 +576,79 @@ mod tests {
         assert_eq!(got.pages, want);
         assert_eq!(chain_end(&got), chain_end(&cs3));
     }
+
+    #[tokio::test]
+    async fn last_writer_wins_is_tied_to_source_order_not_adjacency() {
+        // Page 5 is present in source 1 AND source 3 (source 2 does not touch
+        // it). The winner must be source 3 by ORDER, proving last-writer-wins is
+        // decided by source position (seq rank), not by heap-pop accident or by
+        // adjacency of the two writers.
+        let cs1 = PhysicalChangeset::new(
+            1,
+            0,
+            PageIdSize::U64,
+            4096,
+            vec![pg(0, 0x11, 8), pg(5, 0x1F, 8)], // page 5 = 0x1F here
+        );
+        let cs2 = PhysicalChangeset::new(
+            2,
+            chain_end(&cs1),
+            PageIdSize::U64,
+            4096,
+            vec![pg(1, 0x22, 8)], // does NOT touch page 5
+        );
+        let cs3 = PhysicalChangeset::new(
+            3,
+            chain_end(&cs2),
+            PageIdSize::U64,
+            4096,
+            vec![pg(5, 0x3F, 8)], // page 5 = 0x3F here → must win
+        );
+        let tracker = PeakPages::new();
+        let res = merge_changesets(
+            vec![
+                source_from(&cs1, SeqRange::point(1)),
+                source_from(&cs2, SeqRange::point(2)),
+                source_from(&cs3, SeqRange::point(3)),
+            ],
+            &tracker,
+        )
+        .await
+        .unwrap();
+        let got = physical::decode(&res.bytes).unwrap();
+        let page5 = got
+            .pages
+            .iter()
+            .find(|p| p.page_id.to_u64() == 5)
+            .expect("page 5 present");
+        assert_eq!(
+            page5.data,
+            vec![0x3F; 8],
+            "page 5 must come from source 3 (highest order), not source 1"
+        );
+        assert_eq!(chain_end(&got), chain_end(&cs3));
+    }
+
+    #[tokio::test]
+    async fn overlapping_chain_rejected_as_non_contiguous() {
+        // Two sources that both fork from the SAME predecessor (both prev == 0):
+        // an overlap/branch rather than a gap. The contiguity check must reject
+        // it — source[1].prev (0) != source[0].chain_end.
+        let cs_a = PhysicalChangeset::new(1, 0, PageIdSize::U64, 4096, vec![pg(0, 1, 8)]);
+        let cs_b = PhysicalChangeset::new(2, 0, PageIdSize::U64, 4096, vec![pg(1, 2, 8)]);
+        let tracker = PeakPages::new();
+        let err = merge_changesets(
+            vec![
+                source_from(&cs_a, SeqRange::point(1)),
+                source_from(&cs_b, SeqRange::point(2)),
+            ],
+            &tracker,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CompactionError::NonContiguous(_)),
+            "overlapping/branched chain must be rejected, got {err:?}"
+        );
+    }
 }

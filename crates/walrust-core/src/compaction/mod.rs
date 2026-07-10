@@ -30,19 +30,40 @@
 //!   (`{s}-{s}`) interleaves correctly with ranges. `ext` is `hadbp`
 //!   (`ChangesetKind::Physical`) for the seq layout and `ltx` for the
 //!   litestream-heritage range layout.
-//! - **Level → generation directory**: `{prefix}{db}/{gen:04x}/`. Level 0 (raw)
-//!   is generation `0x0000` — the existing incremental pool (hadb's
-//!   `GENERATION_INCREMENTAL`); the compaction engine only *reads* it. Level
-//!   `L >= 1` maps to generation `COMPACTION_GEN_BASE + (L - 1)` with
-//!   `COMPACTION_GEN_BASE = 0x0010`, so compaction generations sit well clear of
-//!   the incremental pool (`0x0000`) and the snapshot pool (`0x0001`), leaving
-//!   `0x0002..=0x000f` for future non-compaction generations.
+//! - **Level → directory**: Level 0 (raw) is the existing incremental pool at
+//!   `{prefix}{db}/0000/` (hadb's `GENERATION_INCREMENTAL`); the compaction
+//!   engine only *reads* it. Level `L >= 1` lives under a **dedicated
+//!   `{prefix}{db}/levels/L{L}/` sub-path**, deliberately *not* a hex generation
+//!   folder.
+//!
+//! ### Why levels are not generation folders (the collision that shaped this)
+//!
+//! The litestream-heritage legacy layout also lives under `{prefix}{db}/`, and
+//! it stores **snapshots in generation folders whose number increments by one
+//! per snapshot** (`snapshot_gen = current_gen + 1`, `legacy_wal_sync`). So the
+//! 16th snapshot of any long-lived database lands in `0010/`. An earlier design
+//! put compaction L1 at generation `0x0010` — the *same folder*. That was a
+//! two-way corruption:
+//!   - `legacy_manifest::discover_legacy_snapshots` treats **every** file in
+//!     generations `1..=max` as a snapshot, so it would classify compaction
+//!     merged objects (HADBP payloads, `.ltx` extension) as snapshot bases in
+//!     discovery / restore / verify / prune.
+//!   - Compaction's `list_level(1)` would list `0010/` and `parse_range_name`
+//!     the real `{min}-{max}.ltx` snapshots there, ingesting them as merge
+//!     sources.
+//! The dedicated `levels/L{L}/` sub-path is **structurally invisible** to every
+//! existing scanner: legacy discovery only accepts the `{gen}/{file}` (2-part)
+//! and `{file}` (1-part) relative shapes and parses the generation with
+//! `from_str_radix(_, 16)`, which rejects `levels` and `L1`. Owned-mode
+//! discovery only scans `0000/` (incrementals) and the fixed snapshot
+//! generation. No consumer of generation numbers can misread a compaction
+//! object.
 //!
 //! The **seq layout** (owned mode) names level-0 files `{seq:016x}.hadbp` (one
 //! seq per file; hadb's canonical `format_key`) and every merged level with the
-//! range-name scheme above. The **range layout** (litestream heritage) uses the
-//! range-name scheme at *every* level, in generation folders — the min-max
-//! filename discipline litestream already uses for its live LTX pool.
+//! range-name scheme above, under `levels/L{L}/`. The **range layout**
+//! (litestream heritage) uses the range-name scheme at every level — `0000/` for
+//! L0 (its live LTX pool) and `levels/L{L}/` for merged levels.
 //!
 //! ## Decision: both adapters carry HADBP payloads
 //!
@@ -56,16 +77,43 @@
 //! layouts", exactly as the roadmap requires. (Documented per "decide and
 //! document; no one answers questions.")
 //!
-//! ## Memory bound (hard requirement)
+//! ## Memory bound (hard requirement) — the honest two-part statement
 //!
-//! The merge streams sources page-by-page. Peak working set is
-//! `O(page_size × source_count + page-id frontier)` — one frontier page per
-//! source plus the emit slot — never `O(total bytes)`. Sources are iterated via
-//! [`ChangesetPageStream`], never slurped. The serialized *output* object is
-//! materialized once for the single `StorageBackend::put` (the trait has no
-//! streaming put); that is `O(output size)`, inherent to producing one object
-//! with a trailer checksum, and bounded by the merged result — not by
-//! re-buffering all N sources. See [`merge`] and its `peak_pages` proof test.
+//! **Streaming frontier (the hard requirement):** the merge holds at most one
+//! frontier page per source plus one emit slot — `O(page_size × source_count +
+//! page-id frontier)`, **never `O(total bytes)`**. Sources are iterated via
+//! [`ChangesetPageStream`], never slurped. Proven by
+//! [`merge::tests::peak_pages_bounded_far_below_total`], which merges 2000 pages
+//! across 4 sources while a RAII page counter records a peak of `<= sources + 1`.
+//!
+//! **Output/verify buffer (inherent, honestly `O(output size)`):** the engine
+//! **hand-rolls a streaming encoder** in [`merge::merge_changesets`]
+//! (`emit_page` appends each merged page directly to the output byte buffer). It
+//! deliberately does **not** build a `PhysicalChangeset { pages: Vec<..> }` and
+//! call `physical::encode`, which would require the full page vector in memory —
+//! so there is no hidden `O(output)` page-vec materialization at the encode
+//! stage. The one unavoidable `O(output size)` buffer is the serialized bytes
+//! handed to the single `StorageBackend::put` (the trait has no streaming put),
+//! and symmetrically the read-back `verify_merged_bytes` decode. `output size`
+//! is the count of *unique* merged pages; in the pathological no-overlap case it
+//! approaches total input size, but it is a **single** materialization, not
+//! `O(sources × bytes)`. Removing even this buffer needs a streaming put +
+//! streaming decode on `StorageBackend`/hadb — **deferred to C2b/hadb**; the
+//! honest current bound is stated here rather than claimed away.
+//!
+//! ## List cost at startup and merge time (S3 request budget)
+//!
+//! Header reads are **ranged** (`range_get(key, 0, 48)`), never full-object
+//! GETs. Two distinct costs:
+//!   - **Seeding trigger state** (`CompactionTriggers::seeded`, once per DB at
+//!     startup): uses `count_level`, which is **one LIST per level, zero header
+//!     reads**. A level with `N` files costs 1 LIST, independent of `N`.
+//!   - **A merge tick** (only when a count batch fills): `list_level` does 1
+//!     LIST + `N` ranged 48-byte header reads for the level, because
+//!     `last_modified_ms` (needed for the L0 `keep_fine_window` check) lives in
+//!     each object's HADBP header and `StorageBackend` exposes no HEAD. So a
+//!     fire costs `1 LIST + N ranged-GETs` at the source level. This is paid
+//!     only when merging, not on idle ticks.
 
 pub mod engine;
 pub mod layout;
@@ -76,8 +124,8 @@ pub mod trigger;
 
 pub use engine::{run_level_compaction, CompactionOutcome};
 pub use layout::{
-    format_range_name, level_generation, parse_range_name, ChangesetPageStream, CompactionLayout,
-    LayoutFile, Level, SeqRange, SourceHeader, COMPACTION_GEN_BASE,
+    format_range_name, level_subpath, parse_range_name, ChangesetPageStream, CompactionLayout,
+    LayoutFile, Level, SeqRange, SourceHeader, L0_DIR, LEVELS_DIR,
 };
 pub use merge::{merge_changesets, verify_merged_bytes, MergeInput, MergeResult, PeakPages};
 pub use range_layout::RangeLayout;
@@ -109,6 +157,15 @@ pub enum CompactionError {
     /// page-count sanity). Sources are NOT deleted.
     #[error("compaction: merged object failed verification: {0}")]
     VerificationFailed(String),
+
+    /// The target level already holds a merged object whose seq range *overlaps*
+    /// the batch being merged but is not an exact-range match. Only an
+    /// exact-range object is idempotent crash convergence; a partial
+    /// subset/superset overlap is an unexpected, inconsistent state (e.g. a prior
+    /// run merged a different batch size). The engine refuses to merge into it
+    /// rather than silently leaving an orphan. Nothing is written or deleted.
+    #[error("compaction: unexpected overlapping merged object at target level: {0}")]
+    OverlappingExisting(String),
 
     /// A changeset object was malformed on read.
     #[error("compaction: malformed changeset at {key}: {source}")]

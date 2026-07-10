@@ -240,7 +240,14 @@ async fn engine_e2e_seq_layout() {
         put_l0_seq(&store, "p/", "db", c).await;
     }
     let layout = SeqLayout::new(store.clone(), "p/", "db");
-    run_e2e_for(store.clone(), layout, "p/db/0000/", "p/db/0010/", &chain).await;
+    run_e2e_for(
+        store.clone(),
+        layout,
+        "p/db/0000/",
+        "p/db/levels/L1/",
+        &chain,
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -251,7 +258,14 @@ async fn engine_e2e_range_layout() {
         put_l0_range(&store, "p/", "db", c).await;
     }
     let layout = RangeLayout::new(store.clone(), "p/", "db");
-    run_e2e_for(store.clone(), layout, "p/db/0000/", "p/db/0010/", &chain).await;
+    run_e2e_for(
+        store.clone(),
+        layout,
+        "p/db/0000/",
+        "p/db/levels/L1/",
+        &chain,
+    )
+    .await;
 }
 
 // ── keep_fine_window: young files exempt ─────────────────────────────────────
@@ -275,7 +289,11 @@ async fn young_l0_files_are_exempt_and_back_off() {
         .unwrap();
     assert!(matches!(outcome, CompactionOutcome::NoOp));
     assert_eq!(store.list("p/db/0000/", None).await.unwrap().len(), 4);
-    assert!(store.list("p/db/0010/", None).await.unwrap().is_empty());
+    assert!(store
+        .list("p/db/levels/L1/", None)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 // ── Revert proof 1: read-back verify failure preserves sources ──────────────
@@ -345,7 +363,11 @@ async fn revert_proof_readback_failure_preserves_sources() {
     // Sources are UNTOUCHED (never deleted against an unverified object).
     assert_eq!(store.list("p/db/0000/", None).await.unwrap().len(), 5);
     // The partial/unsound output was deleted (loud-failure posture).
-    assert!(store.list("p/db/0010/", None).await.unwrap().is_empty());
+    assert!(store
+        .list("p/db/levels/L1/", None)
+        .await
+        .unwrap()
+        .is_empty());
 }
 
 // ── Revert proof 2: crash between write and delete → idempotent converge ─────
@@ -391,7 +413,7 @@ async fn revert_proof_crash_between_write_and_delete_converges() {
     // The merged object is byte-identical (not re-merged) and sources are gone.
     assert_eq!(store.get(&merged_key).await.unwrap().unwrap(), merged_bytes);
     assert!(store.list("p/db/0000/", None).await.unwrap().is_empty());
-    assert_eq!(store.list("p/db/0010/", None).await.unwrap().len(), 1);
+    assert_eq!(store.list("p/db/levels/L1/", None).await.unwrap().len(), 1);
 }
 
 // ── Revert proof 3: non-contiguous sources rejected, nothing deleted/written ─
@@ -416,7 +438,11 @@ async fn revert_proof_non_contiguous_sources_rejected() {
         "expected NonContiguous, got {err:?}"
     );
     // Nothing written at L1, sources preserved.
-    assert!(store.list("p/db/0010/", None).await.unwrap().is_empty());
+    assert!(store
+        .list("p/db/levels/L1/", None)
+        .await
+        .unwrap()
+        .is_empty());
     assert_eq!(store.list("p/db/0000/", None).await.unwrap().len(), 3);
 }
 
@@ -443,7 +469,7 @@ async fn cascade_l0_to_l1_to_l2() {
         .unwrap();
     assert_eq!(o2.merged_count(), 2);
 
-    let l1 = store.list("p/db/0010/", None).await.unwrap();
+    let l1 = store.list("p/db/levels/L1/", None).await.unwrap();
     assert_eq!(l1.len(), 2, "two L1 files");
 
     // L1→L2: merge the two L1 files (compacted sources → declared_end path).
@@ -451,8 +477,12 @@ async fn cascade_l0_to_l1_to_l2() {
         .await
         .unwrap();
     assert_eq!(o3.merged_count(), 2);
-    assert!(store.list("p/db/0010/", None).await.unwrap().is_empty());
-    let l2 = store.list("p/db/0011/", None).await.unwrap();
+    assert!(store
+        .list("p/db/levels/L1/", None)
+        .await
+        .unwrap()
+        .is_empty());
+    let l2 = store.list("p/db/levels/L2/", None).await.unwrap();
     assert_eq!(l2.len(), 1, "one L2 file");
 
     // The L2 file must span the whole original chain and chain end-to-end.
@@ -466,4 +496,112 @@ async fn cascade_l0_to_l1_to_l2() {
     let via_sources = apply_all(&chain, 0);
     let via_l2 = apply_one(&merged, 0);
     assert_eq!(via_sources, via_l2, "cross-level merge preserves DB bytes");
+}
+
+// ── Collision proof: compaction levels vs legacy snapshot generations ────────
+
+/// The headline of this review. In the litestream-heritage layout, snapshots
+/// increment the generation folder by one per snapshot (`snapshot_gen =
+/// current_gen + 1`), so the 16th snapshot lands in `0010/` — the folder an
+/// earlier design reserved for compaction L1. This test pins the redesign:
+/// compaction levels live under a dedicated `levels/L{n}/` sub-path that legacy
+/// discovery cannot see, and compaction listing cannot see legacy snapshots.
+#[tokio::test]
+async fn compaction_levels_do_not_collide_with_legacy_snapshot_generations() {
+    use walrust_core::compaction::layout::CompactionLayout;
+    use walrust_core::legacy_manifest::{
+        build_ltx_key, discover_all_legacy_ltx, discover_legacy_state,
+    };
+
+    let store = MemStore::new();
+
+    // A real legacy LTX snapshot in generation 0x0010 — the 16th snapshot of a
+    // long-lived database. This is the folder the OLD compaction scheme
+    // reserved for L1.
+    let snap16 = build_ltx_key("", "db", 0x10, 1, 100);
+    store.put(&snap16, b"a-real-ltx-snapshot").await.unwrap();
+
+    // Seed L0 range-layout sources and run an L0→L1 compaction.
+    let chain = make_chain(1, 6, 0);
+    for c in &chain {
+        put_l0_range(&store, "", "db", c).await;
+    }
+    let layout = RangeLayout::new(store.clone(), "", "db");
+
+    // Compaction's L1 listing must NOT pick up the legacy snapshot in gen 0x0010.
+    assert!(
+        layout.list_level(1).await.unwrap().is_empty(),
+        "compaction L1 listing must not ingest the legacy snapshot at gen 0x0010"
+    );
+
+    let outcome = run_level_compaction(&layout, 0, chain.len(), Duration::from_secs(0), NOW)
+        .await
+        .unwrap();
+    assert_eq!(outcome.merged_count(), chain.len());
+
+    // The merged L1 object lives under levels/, and gen 0x0010 still holds ONLY
+    // the legacy snapshot (compaction wrote nothing there).
+    assert_eq!(
+        store.list("db/levels/L1/", None).await.unwrap().len(),
+        1,
+        "L1 merged object must live under db/levels/L1/"
+    );
+    assert_eq!(
+        store.list("db/0010/", None).await.unwrap(),
+        vec![snap16.clone()],
+        "db/0010/ must contain only the legacy snapshot, never compaction output"
+    );
+
+    // Legacy discovery is blind to compaction levels: the `levels/` dir does not
+    // register as a generation, and no compaction object is surfaced as a legacy
+    // LTX/snapshot.
+    let (_txid, max_gen) = discover_legacy_state(&*store, "", "db").await.unwrap();
+    assert_eq!(
+        max_gen, 0x10,
+        "the levels/ sub-path must not register as a generation"
+    );
+    let all = discover_all_legacy_ltx(&*store, "", "db").await.unwrap();
+    assert!(
+        all.iter().all(|f| !f.key.contains("levels/")),
+        "legacy discovery must never surface a compaction level object: {:?}",
+        all.iter().map(|f| f.key.clone()).collect::<Vec<_>>()
+    );
+}
+
+// ── Convergence is exact-range only: a partial overlap is a loud error ───────
+
+#[tokio::test]
+async fn partial_overlap_existing_merged_is_loud_error() {
+    let store = MemStore::new();
+    let chain = make_chain(1, 4, 0);
+    for c in &chain {
+        put_l0_seq(&store, "p/", "db", c).await;
+    }
+    let layout = SeqLayout::new(store.clone(), "p/", "db");
+
+    // A prior run with a SMALLER batch merged only seqs 1-2 into L1 (and deleted
+    // those two sources). Re-seed them so a full batch-4 run is possible again.
+    let first = run_level_compaction(&layout, 0, 2, Duration::from_secs(0), NOW)
+        .await
+        .unwrap();
+    assert_eq!(first.merged_count(), 2);
+    for c in &chain[..2] {
+        put_l0_seq(&store, "p/", "db", c).await;
+    }
+    assert_eq!(store.list("p/db/0000/", None).await.unwrap().len(), 4);
+    assert_eq!(store.list("p/db/levels/L1/", None).await.unwrap().len(), 1);
+
+    // A batch-4 run targets range 1-4, which is a SUPERSET of the existing 1-2
+    // L1 object — an overlap that is not an exact match. This must be a loud
+    // error, with nothing written or deleted.
+    let err = run_level_compaction(&layout, 0, 4, Duration::from_secs(0), NOW)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, CompactionError::OverlappingExisting(_)),
+        "partial-overlap existing merged object must be a loud error, got {err:?}"
+    );
+    // All four L0 sources survive; the pre-existing L1 object is untouched.
+    assert_eq!(store.list("p/db/0000/", None).await.unwrap().len(), 4);
+    assert_eq!(store.list("p/db/levels/L1/", None).await.unwrap().len(), 1);
 }

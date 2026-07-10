@@ -2,8 +2,9 @@
 //!
 //! Level-0 files are the existing one-object-per-seq incrementals
 //! (`{prefix}{db}/0000/{seq:016x}.hadbp`, hadb's canonical `format_key`).
-//! Merged levels use the forever range-name scheme with the `hadbp` extension.
-//! See the module header for the full key scheme.
+//! Merged levels use the forever range-name scheme with the `hadbp` extension,
+//! under the dedicated `{prefix}{db}/levels/L{L}/` sub-path. See the module
+//! header for the full key scheme (and why levels are not generation folders).
 
 use std::sync::Arc;
 
@@ -32,6 +33,9 @@ impl SeqLayout {
 impl CompactionLayout for SeqLayout {
     async fn list_level(&self, level: Level) -> Result<Vec<LayoutFile>, CompactionError> {
         self.core.list_level(level).await
+    }
+    async fn count_level(&self, level: Level) -> Result<usize, CompactionError> {
+        self.core.count_level(level).await
     }
     async fn read_header(&self, file: &LayoutFile) -> Result<SourceHeader, CompactionError> {
         self.core.read_header(file).await

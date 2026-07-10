@@ -8,7 +8,7 @@
 //! and they must never diverge in capability.
 //!
 //! The key-naming functions here ([`format_range_name`], [`parse_range_name`],
-//! [`level_generation`]) are the **forever** scheme; see the module header.
+//! [`level_subpath`]) are the **forever** scheme; see the module header.
 
 use std::sync::Arc;
 
@@ -21,23 +21,42 @@ use super::CompactionError;
 /// Compaction level. `0` = raw (L0), `1` = L1, `2` = L2, …
 pub type Level = u32;
 
-/// First generation reserved for compaction output. Level `L >= 1` maps to
-/// `COMPACTION_GEN_BASE + (L - 1)`. Kept well clear of the incremental pool
-/// (`0x0000`) and the snapshot pool (`0x0001`). **Forever.**
-pub const COMPACTION_GEN_BASE: u64 = 0x0010;
+/// Storage sub-path (under `{prefix}{db}/`) that holds a compaction level's
+/// merged objects. Levels `L >= 1` live under this dedicated directory, **not**
+/// in a hex generation folder. **Forever.**
+///
+/// Why not a generation number: the litestream-heritage legacy layout stores
+/// both live incrementals and *snapshots* under `{db}/{gen:04x}/`, and its
+/// snapshot generation **increments by one per snapshot** (`snapshot_gen =
+/// current_gen + 1` in `legacy_wal_sync`). The 16th snapshot therefore lands in
+/// `0010/` — exactly where a `0x0010`-based compaction L1 would have gone. That
+/// is a two-way corruption: legacy discovery (`discover_legacy_snapshots`,
+/// which treats every file in generations `1..=max` as a snapshot) would
+/// classify compaction merged objects as snapshots, and compaction's
+/// `list_level` would ingest real LTX snapshots as merge sources. A dedicated
+/// non-hex sub-path is structurally invisible to every existing discovery path:
+/// legacy scanners only accept `{gen}/{file}` (2 parts) and `{file}` (1 part)
+/// relative shapes, and `parse_generation("levels")` / `("L1")` fail because
+/// they are not hex.
+pub const LEVELS_DIR: &str = "levels";
+
+/// Directory name for compaction level 0 — the existing incremental pool that
+/// the compactor only *reads*. **Forever.**
+pub const L0_DIR: &str = "0000";
 
 /// Fixed hex width for a `u64` seq bound in a range filename. **Forever.**
 pub const SEQ_HEX_WIDTH: usize = 16;
 
-/// Map a compaction level to its storage generation directory number.
+/// Map a compaction level to its storage sub-path (under `{prefix}{db}/`).
 ///
-/// - Level 0 → `0x0000` (the incremental pool; read-only for compaction).
-/// - Level `L >= 1` → `COMPACTION_GEN_BASE + (L - 1)`.
-pub fn level_generation(level: Level) -> u64 {
+/// - Level 0 → `0000` (the incremental pool; read-only for compaction).
+/// - Level `L >= 1` → `levels/L{L}` (a dedicated namespace no existing
+///   discovery path can misread — see [`LEVELS_DIR`]).
+pub fn level_subpath(level: Level) -> String {
     if level == 0 {
-        0x0000
+        L0_DIR.to_string()
     } else {
-        COMPACTION_GEN_BASE + (level as u64 - 1)
+        format!("{LEVELS_DIR}/L{level}")
     }
 }
 
@@ -122,6 +141,15 @@ pub trait CompactionLayout: Send + Sync {
     /// List files at `level`, each with its seq range and last-modified time,
     /// sorted ascending by `range.min`.
     async fn list_level(&self, level: Level) -> Result<Vec<LayoutFile>, CompactionError>;
+
+    /// Count the objects at `level` cheaply — one LIST, no per-object header
+    /// reads. Used only to seed trigger state at startup, where the count is all
+    /// that matters. The default falls back to `list_level(..).len()` (which
+    /// reads headers); adapters over a real backend override it with a LIST-only
+    /// count to avoid `O(files)` ranged GETs at startup.
+    async fn count_level(&self, level: Level) -> Result<usize, CompactionError> {
+        Ok(self.list_level(level).await?.len())
+    }
 
     /// Parse the light header of a source: geometry + linkage metadata, without
     /// reading its pages.
@@ -373,12 +401,7 @@ impl GenLayoutCore {
     }
 
     fn level_dir(&self, level: Level) -> String {
-        format!(
-            "{}{}/{:04x}/",
-            self.prefix,
-            self.db_name,
-            level_generation(level)
-        )
+        format!("{}{}/{}/", self.prefix, self.db_name, level_subpath(level))
     }
 
     pub(crate) async fn list_level(
@@ -410,6 +433,26 @@ impl GenLayoutCore {
         }
         files.sort_by_key(|f| (f.range.min, f.range.max));
         Ok(files)
+    }
+
+    /// Count the parseable objects at `level` with a **single LIST and no
+    /// per-object header reads** — the cheap path used to seed trigger state at
+    /// startup, where only the count matters. (`list_level` additionally reads
+    /// one ranged header per file for `last_modified_ms`; that cost is only paid
+    /// at merge time, not for seeding.)
+    pub(crate) async fn count_level(&self, level: Level) -> Result<usize, CompactionError> {
+        let dir = self.level_dir(level);
+        let keys = self
+            .storage
+            .list(&dir, None)
+            .await
+            .map_err(|e| CompactionError::Storage(e.to_string()))?;
+        let count = keys
+            .iter()
+            .filter_map(|key| key.strip_prefix(&dir))
+            .filter(|filename| parse_range_name(filename, self.ext).is_some())
+            .count();
+        Ok(count)
     }
 
     pub(crate) async fn read_header(
@@ -478,11 +521,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn level_generation_scheme_is_frozen() {
-        assert_eq!(level_generation(0), 0x0000);
-        assert_eq!(level_generation(1), 0x0010);
-        assert_eq!(level_generation(2), 0x0011);
-        assert_eq!(level_generation(3), 0x0012);
+    fn level_subpath_scheme_is_frozen() {
+        // L0 is the existing incremental pool (read-only for compaction).
+        assert_eq!(level_subpath(0), "0000");
+        // L>=1 live under a dedicated non-hex namespace so no legacy/owned
+        // generation scanner can misread them (see the collision note on
+        // LEVELS_DIR).
+        assert_eq!(level_subpath(1), "levels/L1");
+        assert_eq!(level_subpath(2), "levels/L2");
+        assert_eq!(level_subpath(3), "levels/L3");
+    }
+
+    #[test]
+    fn level_dirs_are_not_valid_generation_hex() {
+        // The legacy layout parses a generation folder with
+        // `u64::from_str_radix(component, 16)`. Every component of a compaction
+        // L>=1 sub-path must fail that parse, so a legacy scan can never treat a
+        // compaction object as a snapshot generation.
+        for level in 1..=8u32 {
+            for component in level_subpath(level).split('/') {
+                assert!(
+                    u64::from_str_radix(component, 16).is_err(),
+                    "level {level} path component {component:?} must not parse as hex"
+                );
+            }
+        }
     }
 
     #[test]

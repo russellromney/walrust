@@ -1,11 +1,14 @@
 //! Litestream-heritage **range layout** adapter.
 //!
-//! Every level (including L0) names files with the min-max range scheme in
-//! generation folders (`{prefix}{db}/{gen:04x}/{min:016x}-{max:016x}.ltx`) —
-//! the filename discipline litestream uses for its live LTX pool. Payloads are
-//! HADBP changesets (see the module header's "both adapters carry HADBP
-//! payloads" decision); the `ltx` extension names the heritage key namespace,
-//! not the LTX byte format.
+//! Every level names files with the min-max range scheme — the filename
+//! discipline litestream uses for its live LTX pool. L0 is the live pool at
+//! `{prefix}{db}/0000/{min:016x}-{max:016x}.ltx`; merged levels live under the
+//! dedicated `{prefix}{db}/levels/L{L}/{min:016x}-{max:016x}.ltx` sub-path
+//! (**not** a hex generation folder — see the module header for the legacy
+//! snapshot-generation collision that forces this). Payloads are HADBP
+//! changesets (see the module header's "both adapters carry HADBP payloads"
+//! decision); the `ltx` extension names the heritage key namespace, not the LTX
+//! byte format.
 
 use std::sync::Arc;
 
@@ -34,6 +37,9 @@ impl RangeLayout {
 impl CompactionLayout for RangeLayout {
     async fn list_level(&self, level: Level) -> Result<Vec<LayoutFile>, CompactionError> {
         self.core.list_level(level).await
+    }
+    async fn count_level(&self, level: Level) -> Result<usize, CompactionError> {
+        self.core.count_level(level).await
     }
     async fn read_header(&self, file: &LayoutFile) -> Result<SourceHeader, CompactionError> {
         self.core.read_header(file).await

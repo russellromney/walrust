@@ -141,9 +141,11 @@ async fn maybe_compact_owned(
     let cfg = TriggerConfig::default();
 
     if db.compaction_triggers.is_none() {
-        // Seed from a single LIST per level (startup / first tick).
-        let l0 = layout.list_level(0).await?.len();
-        let l1 = layout.list_level(1).await?.len();
+        // Seed from a single LIST per level, zero header reads (startup / first
+        // tick). `count_level` is LIST-only precisely so seeding a level with N
+        // files does not fan out to N ranged header GETs.
+        let l0 = layout.count_level(0).await?;
+        let l1 = layout.count_level(1).await?;
         db.compaction_triggers = Some(CompactionTriggers::seeded(cfg, l0, l1));
     }
     let triggers = db.compaction_triggers.as_mut().unwrap();

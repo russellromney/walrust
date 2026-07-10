@@ -454,8 +454,9 @@ async fn maybe_compact_legacy(
     let cfg = TriggerConfig::default();
 
     if triggers.is_none() {
-        let l0 = layout.list_level(0).await?.len();
-        let l1 = layout.list_level(1).await?.len();
+        // LIST-only counts (no per-object header reads) to seed trigger state.
+        let l0 = layout.count_level(0).await?;
+        let l1 = layout.count_level(1).await?;
         *triggers = Some(CompactionTriggers::seeded(cfg, l0, l1));
     }
     let t = triggers.as_mut().unwrap();

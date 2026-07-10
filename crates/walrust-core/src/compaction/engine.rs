@@ -161,13 +161,38 @@ pub async fn run_level_compaction(
 }
 
 /// Look for a merged object at `level` covering exactly `range`.
+///
+/// Convergence is **exact-range only**. If the level instead holds an object
+/// whose range *overlaps* the target (a subset/superset from a prior run with a
+/// different batch, or otherwise inconsistent state), that is not idempotent
+/// convergence — it is a loud [`CompactionError::OverlappingExisting`]. We must
+/// not merge into an overlapping level (it would strand an orphan the restore
+/// planner could not reconcile), and we cannot assume it is safe to delete
+/// (it may cover seqs outside this batch).
 async fn find_existing_merged(
     layout: &dyn CompactionLayout,
     level: Level,
     range: SeqRange,
 ) -> Result<Option<LayoutFile>, CompactionError> {
     let files = layout.list_level(level).await?;
-    Ok(files.into_iter().find(|f| f.range == range))
+    let mut exact = None;
+    for f in files {
+        if f.range == range {
+            exact = Some(f);
+        } else if ranges_overlap(f.range, range) {
+            return Err(CompactionError::OverlappingExisting(format!(
+                "target range {:016x}-{:016x} overlaps existing merged object {} \
+                 ({:016x}-{:016x}); only an exact-range object is convergence",
+                range.min, range.max, f.key, f.range.min, f.range.max
+            )));
+        }
+    }
+    Ok(exact)
+}
+
+/// Inclusive seq ranges overlap iff each starts at or before the other ends.
+fn ranges_overlap(a: SeqRange, b: SeqRange) -> bool {
+    a.min <= b.max && b.min <= a.max
 }
 
 /// Verify an existing merged object fully covers the source batch: it decodes
