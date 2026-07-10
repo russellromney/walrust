@@ -1986,3 +1986,68 @@ Shortened t10 re-run against the rebuilt release binary (200 rows/sec, 3x
 - ground-truth rows 38156, restored 38070 — the 86-row delta is the sub-second
   in-flight tail before the final `kill -9` (~0.4s at 200/s), i.e. the normal
   async recovery-point window, not the multi-minute halt the bug caused.
+
+## E9 — Rollover publish-failure window (proptest-harness bonus finding, adjudicated)
+
+Raised by the proptest state-machine harness (PR #23) while its oracle was being
+calibrated, and flagged in the PR for product-side eyes. Adjudicated here during
+adversarial review of that PR.
+
+- **Observation.** `upload_rollover_snapshot`
+  (`walrust-core::legacy_wal_sync`) folds the WAL into the local `.db` file with
+  `checkpoint_wal_truncate` **before** it `storage.put`s the rollover snapshot
+  (`legacy_wal_sync.rs:622` truncate, `:645` put). If that put fails (e.g. a
+  transient storage error), the committed rows are already folded into the local
+  DB file but not yet in remote storage. The next sync tick can then read an
+  empty WAL and honestly report `Ok(0 frames)` while those folded rows are still
+  unpublished. The harness surfaced this via the shrunk sequence
+  `[Mark, KillRestart…, Mark, RestoreLatest]` under a transient fault plan.
+
+- **Adjudication: NOT a silent-loss bug. Correctly-handled durability-ack
+  subtlety / the known single-node async-replication boundary.** Grounded in the
+  code:
+  1. On a failed rollover publish, `sync_wal_to_storage` returns `Err`;
+     `sync_watched_db_once_to_storage` only calls
+     `apply_sync_output_to_watched_state` on `Ok` (`legacy_wal_sync.rs:94-96`).
+     The in-memory cursors (`wal_offset`, `current_txid`, `wal_salt`) do **not**
+     advance past the unpublished rows.
+  2. `current_txid` (the durability cursor) advances **only** when
+     `frame_count > 0` (`apply_sync_output_to_watched_state`,
+     `legacy_wal_sync.rs:79-81`). The empty-WAL early return has
+     `frame_count: 0` and `new_current_txid: input.current_txid`
+     (`:239-250`): **no `Ok(0)` tick ever acknowledges those rows as durable.**
+  3. The folded rows are durably in the local `.db` file. Because state did not
+     advance, the next tick re-detects the rollover (`size_rollover`: current WAL
+     size < the stale `wal_offset`, or a salt mismatch) and re-runs
+     `upload_rollover_snapshot`, which re-folds (idempotent) and re-encodes a
+     **full-DB** snapshot — now containing the folded rows — and publishes it.
+     On a full restart the same rows survive in the local `.db` and are
+     republished by the D3 eager-startup snapshot.
+  4. So the rows are **recoverable on the next successful tick or restart**: they
+     leave the gen-0 incremental *stream* momentarily but are captured by the
+     next snapshot/rollover. They are lost only under the universal single-node
+     boundary — the local disk is destroyed before any successful publish —
+     which is true of every not-yet-replicated write and is not widened here,
+     precisely because no `Ok` falsely signals them durable.
+
+- **Harness verdict.** The oracle models this soundly and conservatively: an
+  `Ok(0)`-with-pending flush confirms nothing (`Harness::durable_flush`,
+  `confirmed = frame_count > 0 || checkpoint_detected || !pending_at_entry`), so
+  `durable_len` does not advance during the window and catches up exactly when
+  the rows actually ship (the next rollover returns `frame_count:1`,
+  `checkpoint_detected:true`). `RestoreLatest`'s exact-equality check therefore
+  holds at every point in the window — no false accept, no false alarm.
+
+- **Product change:** none. The order (truncate-before-put) could be reversed as
+  a defensive narrowing of the window, but it is not a correctness defect and
+  touching the critical path is out of scope for a test-harness PR (whose
+  `git diff origin/main -- crates/ src/` must stay empty). Registered as a known
+  residual, adjacent to D2 (core walrust-owned first-checkpoint window).
+
+- **Harness coverage added (this review).** The E4 far-future-PITR guard in
+  `restore_legacy_ltx` (a fixed product bug, see E4) was **not** exercised by the
+  generated sequences: a `Mark` only ever names a real published boundary at or
+  below the head, so the fuzz never requests a point-in-time beyond the newest
+  TXID. Pinned it with `replay_e4_future_pit_is_typed_not_found`
+  (`walrust-dst/src/state_machine.rs`), verified test-first (fails with the E4
+  branch reverted — the restore then silently returns `Ok` at the head).

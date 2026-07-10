@@ -9,6 +9,10 @@ mod invariants;
 pub mod metrics;
 pub mod mock_storage;
 mod properties;
+// Entry points are exercised via `cargo test -p walrust-dst state_machine`
+// (and the nightly deep sweep); the CLI binary itself does not call them.
+#[cfg_attr(not(test), allow(dead_code))]
+mod state_machine;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
