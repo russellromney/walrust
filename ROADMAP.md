@@ -78,6 +78,15 @@ correct, just not the cheapest). Wiring a compaction tick into the shadow loop
 itself (so it need not sever) is possible future work, but not required for
 correctness now that the sever is loud.
 
+**Residue (e2e gap closure): `replicate` stays levels-blind by design.**
+`walrust replicate` only tails the flat gen-0 incremental pool; it never reads
+`levels/L*/`. Proven safe as-is (`drills/replica-vs-compaction.sh`, S3-gated):
+a replica frozen mid-stream while compaction folds and deletes the exact L0
+range it needs next re-bootstraps from the newest snapshot through the
+existing F5-era chain-gap handler in `replicate_poll` — no product change was
+needed. Teaching `replicate` to read `levels/` directly (skipping the
+snapshot re-download) is future work, not required for correctness.
+
 **Status:** rename `compact`→`prune` shipped. C1 (COMPACTED v2 format) shipped.
 **C2a (layout-agnostic merge engine, write side) shipped** — `CompactionLayout`
 trait + seq/range adapters, streaming k-way merge with a proven memory bound,

@@ -223,6 +223,12 @@ replica is a normal SQLite file — any application can open it read-only.
 Combine with `walrust watch` on the primary for a live read replica on another
 machine.
 
+`replicate` does not read `levels/` — it only tails the flat incremental pool.
+If compaction prunes a tail the replica hasn't applied yet, the replica
+re-bootstraps from the newest snapshot (same handler as any other chain gap),
+converging automatically at the cost of a full snapshot download; a shorter
+`keep_fine_window` gives the replica more slack before that happens.
+
 ## Monitoring
 
 `walrust verify` exits nonzero on real chain problems only (holes superseded by
