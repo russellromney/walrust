@@ -178,6 +178,38 @@ via `add_without_snapshot()` on every phase (relying on
 passes: L1/L2 fire, two SIGKILL/respawn cycles survive, and the library
 `restore()` API reads the compacted, crash-cycled stream row-exact.
 
+**Residue (e2e gap closure): gap 5 — a non-obvious retention-policy floor that
+any short-lived leveled-prune test needs to know about.** Extending
+`drills/prune-retained.sh` with a leveled phase (real compacting
+`walrust watch --independent-tasks`, L1 **and** L2 both required to fire,
+`walrust prune` run against it, before/after level-object listing checked
+directly against the watermark rule in
+`crates/walrust-core/src/compaction/prune.rs`) kept retaining the on-startup
+snapshot no matter how long compaction ran, making the watermark permanently
+`1` and the rule untestable (nothing ever below it). Root cause: hadb-io's
+`RetentionPolicy` has a hard-coded `minimum: 2` safety floor (not exposed by
+`walrust prune`'s `--hourly/--daily/--weekly/--monthly` flags). Any test
+whose whole run fits inside one real clock hour collapses GFS hourly
+bucketing to a single bucket (one entry: the newest), so the minimum-2 floor
+always pads by walking every snapshot **ascending by sequence** and adding
+the single oldest one — deterministically the on-startup snapshot. This is
+correct, intentional retention-safety behavior, not a bug, but it means the
+oldest snapshot in any sub-hour drill run is unconditionally protected
+however aggressive the count-based policy is. The drill works around it
+directly and safely (see the code comment at the relevant step): once L1 and
+L2 have both fired, deletes every snapshot in the leveled phase except the
+newest two plus the one hand-recorded PITR target, satisfying the exact same
+minimum-2 floor with recent survivors instead of the ancient one — safe
+specifically because compaction has, by that point, already folded well past
+the early history, so nothing needs an ancient base to restore. Also fixed
+along the way (drill-only, not a product issue): `drills/lib.sh`'s
+`pause_driver`/`driver_count`/`wait_driver_count_at_least` are hard-coded to
+`$DRILL_DB`, an implicit one-database-per-run assumption every other drill
+happens to satisfy; this phase needed its own database (to avoid the
+minimum-2 floor anchoring on the FLAT phase's old snapshots too) and so
+needed local, database-aware replacements (`level_pause_driver` etc.),
+documented inline. Passed 5/5 consecutive live-S3 runs after the fix.
+
 **Status:** rename `compact`→`prune` shipped. C1 (COMPACTED v2 format) shipped.
 **C2a (layout-agnostic merge engine, write side) shipped** — `CompactionLayout`
 trait + seq/range adapters, streaming k-way merge with a proven memory bound,
