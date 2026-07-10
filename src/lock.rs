@@ -160,6 +160,11 @@ mod tests {
     /// graceful drop runs). Fork a child that takes the lock, SIGKILL it, and
     /// prove a fresh instance can then reacquire. The child touches only
     /// async-signal-safe syscalls after fork.
+    ///
+    /// Readiness is a pipe, not a poll: the child writes one byte after its
+    /// flock succeeds, so the parent waits on an event instead of a deadline
+    /// (a 4s poll budget flaked on loaded CI runners). If the child dies
+    /// without acquiring, its pipe end closes and the read returns EOF.
     #[test]
     fn e5_lock_reacquires_after_holder_is_sigkilled() {
         use std::ffi::CString;
@@ -171,11 +176,20 @@ mod tests {
         let lock_path = DbLock::lock_path_for(&db_path);
         let c_lock = CString::new(lock_path.to_str().unwrap()).unwrap();
 
+        let mut pipe_fds = [0i32; 2];
+        assert_eq!(
+            unsafe { libc::pipe(pipe_fds.as_mut_ptr()) },
+            0,
+            "pipe failed"
+        );
+        let (pipe_r, pipe_w) = (pipe_fds[0], pipe_fds[1]);
+
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
             // Child: pure syscalls only (safe after fork in a threaded parent).
             unsafe {
+                libc::close(pipe_r);
                 let fd = libc::open(c_lock.as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o644);
                 if fd < 0 {
                     libc::_exit(1);
@@ -183,21 +197,27 @@ mod tests {
                 if libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
                     libc::_exit(2);
                 }
+                // Signal readiness: the lock is held from this moment on.
+                let byte = [1u8];
+                if libc::write(pipe_w, byte.as_ptr() as *const libc::c_void, 1) != 1 {
+                    libc::_exit(3);
+                }
                 libc::sleep(30);
                 libc::_exit(0);
             }
         }
 
-        // Parent: wait until the child owns the lock.
-        let mut held = false;
-        for _ in 0..200 {
-            if DbLock::is_held_by_another(&db_path) {
-                held = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(held, "child must acquire the lock before we SIGKILL it");
+        // Parent: block until the child signals it holds the lock (or EOF if
+        // the child died without acquiring).
+        unsafe { libc::close(pipe_w) };
+        let mut buf = [0u8; 1];
+        let n = unsafe { libc::read(pipe_r, buf.as_mut_ptr() as *mut libc::c_void, 1) };
+        unsafe { libc::close(pipe_r) };
+        assert_eq!(
+            n, 1,
+            "child must acquire the lock and signal readiness before we SIGKILL it \
+             (read returned {n}: 0 = child exited without acquiring)"
+        );
         assert!(
             DbLock::acquire(&db_path).is_err(),
             "lock must be contended while the child holds it"
