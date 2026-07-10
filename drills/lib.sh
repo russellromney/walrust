@@ -286,6 +286,12 @@ resume_driver() {
 
 stop_driver() {
   if [ -n "${DRILL_DRIVER_PID:-}" ] && kill -0 "$DRILL_DRIVER_PID" >/dev/null 2>&1; then
+    # The driver is a subshell whose python child does the actual writing.
+    # Killing only the subshell orphaned that python child, which kept
+    # committing rows and rewriting its count file forever (an orphan from an
+    # old drill run was found still alive on the dev box). Kill the child
+    # first, then the subshell.
+    pkill -TERM -P "$DRILL_DRIVER_PID" >/dev/null 2>&1 || true
     kill "$DRILL_DRIVER_PID" >/dev/null 2>&1 || true
     wait "$DRILL_DRIVER_PID" >/dev/null 2>&1 || true
   fi
@@ -582,4 +588,194 @@ wait_replica_count() {
     sleep "$DRILL_POLL_INTERVAL"
   done
   fail "ROW DIFF: replica row count mismatch; expected rows=$expected actual rows=$actual"
+}
+
+# ---------------------------------------------------------------------------
+# Shared helpers for bench/ scripts (append-only extension).
+#
+# bench/ scripts source this library to reuse the write driver and process
+# management instead of duplicating them. Everything below is additive: no
+# drill behavior changes. Drills are correctness gates; bench scripts are
+# measurement tools that reuse this plumbing.
+# ---------------------------------------------------------------------------
+
+# Spawn an additional write driver with caller-owned count/pause files and log
+# directory. Reuses start_driver (single source of driver code) by swapping the
+# globals it reads, then restoring them. Sets SPAWNED_DRIVER_PID.
+# shellcheck disable=SC2034  # read by sourcing bench scripts
+SPAWNED_DRIVER_PID=
+spawn_driver() {
+  local db=$1
+  local count_file=$2
+  local pause_file=$3
+  local interval=$4
+  local label=$5
+  local logdir=$6
+  local s_count=$DRILL_DRIVER_COUNT
+  local s_pause=$DRILL_DRIVER_PAUSE
+  local s_workdir=$DRILL_WORKDIR
+  local s_pid=${DRILL_DRIVER_PID:-}
+  mkdir -p "$logdir"
+  DRILL_DRIVER_COUNT=$count_file
+  DRILL_DRIVER_PAUSE=$pause_file
+  DRILL_WORKDIR=$logdir
+  start_driver "$db" "$interval" "$label"
+  # shellcheck disable=SC2034  # read by sourcing bench scripts
+  SPAWNED_DRIVER_PID=$DRILL_DRIVER_PID
+  DRILL_DRIVER_COUNT=$s_count
+  DRILL_DRIVER_PAUSE=$s_pause
+  DRILL_WORKDIR=$s_workdir
+  DRILL_DRIVER_PID=$s_pid
+}
+
+# Pause a spawned driver via its pause file and wait (bounded) until the DB
+# commit count is stable, mirroring pause_driver's convergence logic.
+pause_driver_files() {
+  local db=$1
+  local pause_file=$2
+  local timeout=${3:-30}
+  touch "$pause_file"
+  local before
+  local after
+  local deadline=$((SECONDS + timeout))
+  before=$(db_count "$db")
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep "$DRILL_POLL_INTERVAL"
+    after=$(db_count "$db")
+    if [ "$after" = "$before" ]; then
+      return 0
+    fi
+    before=$after
+  done
+  fail "driver for $db did not quiesce within ${timeout}s"
+}
+
+# Stop an arbitrary spawned process by PID (driver, sampler, probe).
+# Kills direct children FIRST: a driver is a subshell whose python child
+# would otherwise be orphaned by killing only the subshell and keep writing
+# its count file forever (racing directory cleanup).
+stop_pid() {
+  local pid=${1:-}
+  if [ -n "$pid" ] && kill -0 "$pid" >/dev/null 2>&1; then
+    pkill -TERM -P "$pid" >/dev/null 2>&1 || true
+    kill "$pid" >/dev/null 2>&1 || true
+    wait "$pid" >/dev/null 2>&1 || true
+  fi
+}
+
+# RSS sampler: append "epoch_seconds<TAB>rss_kb" to outfile every interval
+# seconds until the target pid exits. Run via start_rss_sampler; sets
+# SPAWNED_RSS_SAMPLER_PID. The sleep here is pacing, not synchronization.
+rss_sampler_loop() {
+  local pid=$1
+  local interval=$2
+  local outfile=$3
+  local rss
+  while kill -0 "$pid" >/dev/null 2>&1; do
+    rss=$(ps -o rss= -p "$pid" 2>/dev/null | tr -d ' ')
+    if [ -n "$rss" ]; then
+      printf '%s\t%s\n' "$(date +%s)" "$rss" >>"$outfile"
+    fi
+    sleep "$interval"
+  done
+}
+
+# shellcheck disable=SC2034  # read by sourcing bench scripts
+SPAWNED_RSS_SAMPLER_PID=
+start_rss_sampler() {
+  rss_sampler_loop "$1" "$2" "$3" &
+  # shellcheck disable=SC2034  # read by sourcing bench scripts
+  SPAWNED_RSS_SAMPLER_PID=$!
+}
+
+# ---------------------------------------------------------------------------
+# Local MinIO container + request-trace helpers (bench scripts and CI).
+# ---------------------------------------------------------------------------
+
+# Start a MinIO container with a pre-created bucket (created directly in the
+# data dir before the server starts, so no client bootstrap is needed).
+# Usage: start_minio_container NAME HOST_PORT BUCKET
+start_minio_container() {
+  local name=$1
+  local port=$2
+  local bucket=$3
+  require_cmd docker
+  require_cmd curl
+  docker run -d --name "$name" -p "$port:9000" \
+    -e MINIO_ROOT_USER=minioadmin \
+    -e MINIO_ROOT_PASSWORD=minioadmin \
+    --entrypoint sh \
+    minio/minio:latest \
+    -c "mkdir -p /data/$bucket && exec minio server /data" >/dev/null
+  local deadline=$((SECONDS + 60))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if curl -sf "http://127.0.0.1:$port/minio/health/live" >/dev/null 2>&1; then
+      log "minio container $name healthy on port $port (bucket $bucket)"
+      return 0
+    fi
+    sleep 1
+  done
+  docker logs "$name" >&2 2>/dev/null || true
+  fail "MinIO container $name did not become healthy"
+}
+
+stop_minio_container() {
+  local name=${1:-}
+  if [ -n "$name" ]; then
+    docker rm -f "$name" >/dev/null 2>&1 || true
+  fi
+}
+
+# Start an `mc admin trace --json -v` sidecar sharing the MinIO container's
+# network namespace. Every S3 request (api, path, headers incl. User-Agent)
+# is captured as JSON lines retrievable via stop_minio_trace.
+# Usage: start_minio_trace TRACE_NAME MINIO_NAME
+start_minio_trace() {
+  local trace_name=$1
+  local minio_name=$2
+  docker run -d --name "$trace_name" \
+    --network "container:$minio_name" \
+    --entrypoint sh \
+    minio/mc \
+    -c 'mc alias set local http://127.0.0.1:9000 minioadmin minioadmin >/dev/null && exec mc admin trace --json -v local' >/dev/null
+  # Bounded wait for the tracer to attach (its first log line is the alias add).
+  local deadline=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$trace_name" 2>/dev/null)" = "true" ]; then
+      log "minio trace container $trace_name running"
+      return 0
+    fi
+    sleep 1
+  done
+  docker logs "$trace_name" >&2 2>/dev/null || true
+  fail "MinIO trace container $trace_name did not start"
+}
+
+# Snapshot the trace log to a file and remove the tracer.
+# Usage: stop_minio_trace TRACE_NAME OUTFILE
+stop_minio_trace() {
+  local trace_name=$1
+  local outfile=$2
+  docker logs "$trace_name" >"$outfile" 2>/dev/null || true
+  docker rm -f "$trace_name" >/dev/null 2>&1 || true
+}
+
+# Start walrust in config-file mode (multi-database watch via walrust.toml).
+# Mirrors start_walrust's process handling; sync knobs come from the config
+# file rather than CLI flags so nothing silently overrides it.
+# Usage: start_walrust_config CONFIG_TOML BUCKET_URI LOGFILE
+start_walrust_config() {
+  local config=$1
+  local bucket_uri=$2
+  local logfile=$3
+  "$WALRUST_BIN" watch \
+    --config "$config" \
+    --bucket "$bucket_uri" \
+    --endpoint "$DRILL_ENDPOINT" \
+    --no-metrics \
+    --no-cache \
+    >"$logfile" 2>&1 &
+  DRILL_WALRUST_PID=$!
+  log "walrust (config mode) pid=$DRILL_WALRUST_PID"
+  wait_process_alive "$DRILL_WALRUST_PID" "walrust watch --config"
 }

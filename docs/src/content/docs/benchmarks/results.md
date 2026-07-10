@@ -1,96 +1,67 @@
 ---
 title: Latest Benchmark Results
-description: Detailed benchmark data from the latest walrust release
+description: Detailed benchmark data from the latest verified bench run
 ---
 
-This page shows detailed benchmark results. Results are updated with each release.
+Numbers below come from local runs of the `bench/` scripts (see
+[Methodology](/benchmarks/methodology/)); each cites its results directory.
+Every number passed the end-of-run validity check (restore +
+`integrity_check` + exact row-count match against the write driver's ground
+truth) for both tools.
 
-## Memory Scaling
+## Head-to-head vs Litestream
 
-Memory usage (RSS) when watching multiple SQLite databases:
+`bench/results-20260710T065609Z` — `bench/compare-litestream.sh` on macOS
+(Apple Silicon), local MinIO, walrust 0.5.2 vs Litestream 0.5.2, **both at a
+1s sync interval**, identical 20 rows/s write drivers, 3-minute window:
 
-| Databases | walrust (MB) | litestream (MB) | Reduction |
-|-----------|--------------|-----------------|-----------|
-| 1         | 19           | 36              | 47%       |
-| 10        | 19           | 55              | 65%       |
-| 100       | 20           | 160             | 88%       |
+| Metric | walrust | litestream |
+|--------|---------|------------|
+| Rows written (ground truth) | 3385 | 3390 |
+| S3 PUT requests | 182 | 187 |
+| S3 GET requests | 1 | 0 |
+| S3 LIST requests | 2 | 41 |
+| S3 DELETE requests | 0 | 5 |
+| S3 total requests | 185 | 233 |
+| Replication lag median | 0.57s | 0.68s |
+| Replication lag p95 | 1.33s | 1.10s |
+| RSS min / median / max (MB) | 14.4 / 15.1 / 21.8 | 7.6 / 58.4 / 70.0 |
 
-*Measured with 100KB databases, syncing to Tigris S3 on macOS.*
+Request counts are server-side (MinIO trace), not object listings.
+Litestream's extra LIST/DELETE traffic comes from its always-on compaction
+monitor — an asymmetry the run header prints. At matched sync intervals PUT
+volume is equivalent; earlier claims of a large PUT-count gap did not
+reproduce against Litestream 0.5.x.
 
-## Startup Time
+## Multi-database RSS scaling
 
-Time to start watching N databases (mean of 3 runs):
+`bench/results-20260710T070916Z` — `bench/multidb-rss.sh`, steady shape
+(5 rows/s per database), one process per tool watching all N databases,
+120s per cell, same 1s sync interval on both tools ("end" = median of the
+last 3 samples; min/max over the cell):
 
-| Databases | Startup Time (ms) |
-|-----------|-------------------|
-| 1         | 45                |
-| 10        | 82                |
-| 100       | 423               |
+| N databases | walrust RSS end (min/max) MB | litestream RSS end (min/max) MB |
+|-------------|------------------------------|---------------------------------|
+| 1 | 14.7 (12.0/21.7) | 52.5 (0.3/60.8) |
+| 10 | 19.6 (18.9/27.1) | 142.9 (0.4/151.8) |
 
-## Change Detection Latency
+walrust stayed roughly flat as database count grew; litestream grew ~10 MB
+per additional database under this workload. Re-run with
+`BENCH_DB_COUNTS="1 10 50"` for the full curve.
 
-Time from SQLite write to walrust detection:
+## Test environment
 
-| Databases | p50 (ms) | p95 (ms) | p99 (ms) |
-|-----------|----------|----------|----------|
-| 1         | 2.1      | 4.8      | 8.2      |
-| 10        | 4.3      | 12.1     | 18.7     |
-| 100       | 8.7      | 28.4     | 52.3     |
+- **Platform**: macOS (Apple Silicon), local MinIO via docker
+- **walrust**: 0.5.2 (release build) — **litestream**: 0.5.2
+- Local MinIO removes real-network latency; replication lag against real
+  S3/Tigris will be higher.
 
-## CPU Usage Under Load
-
-Average CPU usage during concurrent writes:
-
-| Databases | CPU % |
-|-----------|-------|
-| 1         | 2.1   |
-| 10        | 8.4   |
-| 100       | 24.7  |
-
-## Sync Latency (End-to-End)
-
-Time from SQLite write to data available in S3:
-
-| Operation      | p50 (ms) | p95 (ms) | p99 (ms) |
-|----------------|----------|----------|----------|
-| Single write   | 45       | 82       | 124      |
-| Batch (100)    | 52       | 98       | 156      |
-
-*Note: Using MinIO local storage. Real S3 latency will be higher due to network.*
-
-## Restore Performance
-
-Time to restore database from S3:
-
-| Database Size | Restore Time (ms) |
-|---------------|-------------------|
-| 100 KB        | 234               |
-| 1 MB          | 412               |
-| 10 MB         | 1,847             |
-
-## Test Environment
-
-These results were collected on:
-
-- **Platform**: macOS (Apple Silicon)
-- **Storage**: Tigris S3
-- **Database size**: 100KB each
-- **walrust**: v0.4.0
-- **litestream**: v0.5.2
-
-## Running Your Own Benchmarks
+## Running your own
 
 ```bash
-# Start MinIO
-make bench-minio
-
-# Run and get JSON output
-python bench/compare.py --use-minio --json
-python bench/multidb.py --use-minio --json
-python bench/realworld.py --use-minio --json
+make bench-compare
+make bench-multidb
 ```
 
-## CI Artifacts
-
-Benchmark JSON files are available as artifacts on each release:
-- [Latest release artifacts](https://github.com/russellromney/walrust/releases/latest)
+CI runs the same scripts on demand (`bench.yml` workflow dispatch) and
+uploads `bench/results-*` artifacts.

@@ -108,3 +108,6 @@ __pycache__
 *-results.json
 tests/*-results.json
 tests/*.log
+
+# Bench results (see bench/README.md)
+bench/results-*/

@@ -3,160 +3,76 @@ title: Benchmark Methodology
 description: How walrust benchmarks are conducted for transparency and reproducibility
 ---
 
-This page describes how walrust benchmarks are conducted, ensuring transparency and reproducibility.
+The benchmark scripts in `bench/` are built for honesty first. The rules
+below are enforced by the scripts themselves; the full policy lives in
+`bench/README.md`.
 
-## Environment
+## Shared plumbing with the correctness drills
 
-### Local Development
+Bench scripts source `drills/lib.sh` — the same write driver, PID-verified
+process management, and restore assertions that gate PRs. There is no
+separate "benchmark harness" that could drift from what correctness testing
+exercises.
 
-Benchmarks can be run locally using MinIO as an S3-compatible storage backend:
+## Matched knobs, printed asymmetries
 
-```bash
-make bench-minio   # Start MinIO container
-make bench-all     # Run full suite
-```
+A comparison only runs with the same sync interval explicitly set on both
+tools (walrust `--wal-sync-interval` / litestream `replica.sync-interval`),
+the same write workload, and the same S3 target. Every run prints the
+matched knobs *and* the known asymmetries (e.g. Litestream v0.5's always-on
+compaction monitor, which has no off switch) in its output header. If a knob
+cannot be matched, it is stated, never silently absorbed.
 
-This ensures consistent results regardless of network conditions.
+## True request counts
 
-### CI Environment
+S3 request counts come from a server-side `mc admin trace --json -v`
+sidecar attached to the MinIO container — every PUT/GET/LIST/DELETE that
+actually hit the server, attributed per tool by object path (with a
+User-Agent fallback for path-ambiguous requests such as bulk deletes).
+End-state object listings are **not** used for request counts: they miss
+deleted and compacted objects. The harness's own probe traffic is excluded
+by its User-Agent.
 
-GitHub Actions runs benchmarks on each release with:
-- **Runner**: `ubuntu-latest` (2-core CPU, 7 GB RAM)
-- **Storage**: MinIO service container
-- **Litestream**: v0.5.2 for comparison
+## Replication lag
 
-## Benchmark Categories
+Every ~10 seconds a sentinel row with a unique value is committed to each
+tool's database. The probe then polls the bucket and records the time until
+a new object appears that *contains* the sentinel bytes (raw byte search,
+LZ4-frame fallback for compressed snapshot objects). Reported as median and
+p95 per tool.
 
-### Memory Comparison (`bench/compare.py`)
+## Memory
 
-Measures RSS memory usage of walrust vs litestream when watching N databases:
+RSS is sampled every 5 seconds via `ps` from the shared library sampler.
+The multi-database benchmark (`bench/multidb-rss.sh`) runs one process per
+tool watching N databases (walrust via `walrust.toml`, litestream via its
+yaml) across idle, steady, and bursty load shapes to test constant-vs-linear
+scaling in database count.
 
-1. Create N SQLite databases with sample data
-2. Start walrust/litestream watching all databases
-3. Wait for initial sync to complete
-4. Measure RSS memory via `psutil`
-5. (Optional) Generate write load and measure "active" memory
+## Validity check: broken syncs produce no numbers
 
-**Parameters:**
-- Database counts: 1, 10, 100 (configurable)
-- Sample size: 100 rows per database
-- Measurement delay: 5 seconds after startup
+Every run ends by restoring from the bucket and asserting `PRAGMA
+integrity_check` plus an exact row-count match against the driver's ground
+truth for every tool measured. A failed check aborts the run with a nonzero
+exit before results are written.
 
-### Multi-Database Performance (`bench/multidb.py`)
+## Environment and reproducibility
 
-#### Startup Time
-Time from process start to ready state:
-1. Create N pre-synced databases
-2. Start walrust, measure time until watching
-3. Repeat 3 times, report mean
-
-#### Change Detection Latency
-Time from SQLite commit to walrust detection:
-1. Start walrust watching N databases
-2. Insert row, record timestamp
-3. Monitor walrust output for detection
-4. Calculate latency, collect 100 samples per database count
-5. Report p50, p95, p99 percentiles
-
-#### CPU Scaling
-CPU usage under load as database count increases:
-1. Start walrust watching N databases
-2. Generate concurrent write load
-3. Sample CPU usage over 10 seconds
-4. Report average CPU percentage
-
-### Real-World Benchmarks (`bench/realworld.py`)
-
-#### Sync Latency
-End-to-end time from write to S3:
-1. Insert row into database
-2. Wait for S3 object to appear
-3. Measure total latency
-4. Collect 50 samples, report percentiles
-
-#### Restore Performance
-Time to restore database from S3:
-1. Sync database with sample data
-2. Delete local database
-3. Run `walrust restore`
-4. Measure total time
-
-#### LTX Throughput
-Speed of LTX file generation:
-1. Generate WAL frames programmatically
-2. Convert to LTX format
-3. Measure throughput in MB/s
-
-## Statistical Methods
-
-### Percentile Calculation
-
-We use linear interpolation for percentiles (same as NumPy):
-
-```python
-def percentile(data, p):
-    sorted_data = sorted(data)
-    k = (len(sorted_data) - 1) * p / 100
-    f = int(k)
-    c = f + 1
-    if c >= len(sorted_data):
-        return sorted_data[-1]
-    return sorted_data[f] + (k - f) * (sorted_data[c] - sorted_data[f])
-```
-
-### Outlier Handling
-
-- No outliers are removed from latency measurements
-- Results report both mean and percentiles for transparency
-- Standard deviation is included where applicable
-
-## Reproducibility
-
-### Running Locally
+Scripts start their own MinIO container (docker) and clean up all processes,
+containers, and bucket objects on exit:
 
 ```bash
-# Clone and build
-git clone https://github.com/russellromney/walrust.git
-cd walrust
 cargo build --release
-
-# Run with MinIO
-make bench-minio
-make bench-all
+make bench-compare
+make bench-multidb
 ```
 
-### Verification
+CI runs the same scripts via `.github/workflows/bench.yml`
+(`workflow_dispatch` only — benchmarks never gate PRs and never run on a
+schedule) and uploads `bench/results-*` as artifacts. Each run's
+`results.json` schema is documented in `bench/README.md`. Performance claims
+in the README must cite a `bench/results-<timestamp>/` file by date.
 
-Compare your results with CI results:
-- CI results are uploaded as artifacts on each release
-- JSON output allows programmatic comparison
-
-### Known Limitations
-
-1. **CI variability**: GitHub Actions runners have variable performance
-2. **Memory measurement**: RSS includes shared libraries
-3. **Network latency**: MinIO eliminates S3 latency, real S3 will be slower
-4. **Warm cache**: Multiple runs may benefit from OS file cache
-
-## Output Format
-
-All benchmarks output JSON with this schema:
-
-```json
-{
-  "version": "1.0",
-  "environment": {
-    "platform": "linux",
-    "python_version": "3.12.0",
-    "walrust_version": "0.4.0",
-    "litestream_version": "0.5.2",
-    "storage_backend": "minio",
-    "timestamp": "2024-01-15T12:00:00Z"
-  },
-  "benchmarks": {
-    "memory_scaling": [...],
-    "startup_time": [...],
-    ...
-  }
-}
-```
+Known limitations: CI runner performance varies; RSS includes shared
+libraries; a local MinIO removes real-network latency, so real S3/Tigris
+replication lag will be higher than the local numbers.

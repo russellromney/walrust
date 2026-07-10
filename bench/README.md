@@ -1,218 +1,155 @@
-# Walrust Benchmarks
+# Walrust benchmarks
 
-Performance benchmarks for walrust covering micro-benchmarks, comparison with litestream, and real-world scenarios.
+`bench/` is the single home for measurements and comparisons. It shares one
+library with the correctness drills — `drills/lib.sh` provides the write
+driver, walrust process management, restore assertions, and the local
+MinIO/trace helpers — so bench numbers are produced by the exact same
+plumbing the correctness gates use.
 
-## Quick Start
+## The contract
 
-```bash
-# Micro-benchmarks (WAL parsing, SHA256)
-make bench
+- **drills/ = correctness.** Assertions, exit codes, gates PRs.
+- **bench/ = measurement.** Numbers, tables, comparisons. Bench NEVER gates
+  a PR and never runs on a schedule; it runs on demand
+  (`workflow_dispatch` in `.github/workflows/bench.yml`) or locally.
+- **Bench still verifies correctness at the end.** Every bench run finishes
+  with the drill restore + `PRAGMA integrity_check` + exact row-count check
+  against the driver's ground truth, for every tool measured. If that check
+  fails, the run exits nonzero and produces no results — a benchmark of a
+  broken sync must not produce numbers.
+- Micro-benchmarks (`benches/benchmarks.rs`, `cargo bench`) are separate and
+  unchanged.
 
-# Compare walrust vs litestream (memory/CPU)
-make bench-compare
+## Knob-matching policy
 
-# Real-world benchmarks (sync latency, restore performance)
-make bench-realworld
-```
+A comparison is only honest if the tools run with the same knobs. Every
+comparison script MUST print, in its output header:
 
-## Benchmark Types
+1. the exact matched knobs and the config key used to set them on each tool
+   (e.g. walrust `--wal-sync-interval 1` vs litestream
+   `replica.sync-interval: 1s`), and
+2. the known asymmetries — anything one tool does that the other cannot be
+   configured to match (e.g. litestream v0.5's always-on compaction
+   monitor). Asymmetries are printed, never silently absorbed.
 
-### 1. Micro-benchmarks (`cargo bench`)
+If a knob genuinely cannot be matched, say so in the header and count its
+effects toward the tool that has it.
 
-CPU-bound operations measured with [brunch](https://docs.rs/brunch):
+## Scripts
 
-- **WAL header parsing**: ~47ns per header
-- **WAL frame parsing**: ~32ns per frame
-- **SHA256 checksums**: 6μs (1KB) → 5ms (1MB)
+### `bench/compare-litestream.sh` — head-to-head vs litestream
 
-Run with: `make bench` or `cargo bench`
+One database per tool, identical write drivers, same sync interval, same
+local MinIO (started by the script via docker). Measures:
 
-### 2. Comparison Benchmarks (`compare.py`)
+- **True S3 request counts** from the server side: an `mc admin trace
+  --json -v` sidecar records every request; requests are attributed to a
+  tool by object-path prefix (falling back to User-Agent for requests
+  without a distinguishing path, e.g. bulk deletes) and the harness's own
+  probe traffic (minio-py User-Agent) is excluded. This is *not* an
+  end-state object listing — deleted/compacted objects are still counted.
+- **Replication lag**: every ~10s a sentinel row is inserted; the probe
+  polls the bucket for the first new object that *contains* the sentinel
+  bytes (raw search, LZ4-frame fallback) and records commit-to-visible lag.
+  Reported as median/p95 per tool.
+- **RSS** sampled every 5s via the shared `drills/lib.sh` sampler
+  (one process per tool: walrust's single `watch`, litestream's single
+  `replicate`); reported min/median/max. When reading an RSS gap, remember
+  the known asymmetry: litestream 0.5's `replicate` runs an always-on in-band
+  compaction/snapshot monitor with no off switch, so it is doing compaction
+  work in the same process being measured, while walrust's `watch` does not
+  compact in-band (`walrust compact` is a separate invocation). Part of any
+  RSS gap is that background work; re-measure once walrust compacts in-band.
 
-Memory usage comparison between walrust and litestream under different workloads.
-
-#### Idle Databases (no active writes)
-
-| DBs | Litestream | Walrust | Savings |
-|-----|------------|---------|---------|
-| 5 | 40 MB | 13 MB | **27 MB** |
-| 10 | 50 MB | 14 MB | **36 MB** |
-| 20 | 62 MB | 17 MB | **45 MB** |
-| 50 | 71 MB | 17 MB | **54 MB** |
-
-#### Under Write Load
-
-Results with active writes (10-100 writes/sec per database):
-
-| DBs | Writes/s/db | Litestream | Walrust | Savings |
-|-----|-------------|------------|---------|---------|
-| 10 | 10 | 42 MB | 23 MB | **19 MB** |
-| 10 | 50 | 38 MB | 20 MB | **18 MB** |
-| 10 | 100 | 68 MB | 22 MB | **46 MB** |
-| 20 | 10 | 80 MB | 19 MB | **61 MB** |
-| 20 | 50 | 95 MB | 23 MB | **71 MB** |
-| 20 | 100 | 103 MB | 24 MB | **78 MB** |
-| 50 | 10 | 266 MB | 21 MB | **245 MB** |
-| 50 | 50 | 227 MB | 29 MB | **198 MB** |
-| 50 | 100 | 285 MB | 45 MB | **240 MB** |
-
-#### Key Findings
-
-- Both tools run as a single process watching multiple databases
-- **Walrust scales flat**: 17-45 MB for 5-50 databases regardless of write load
-- **Litestream scales linearly**: Memory grows with both DB count and write rate
-- **At 50 DBs + 100 writes/sec/db**: walrust uses **6x less memory** (45 MB vs 285 MB)
-- Memory savings increase dramatically under load
-
-**Usage:**
-```bash
-# Full comparison (idle)
-python bench/compare.py
-
-# Specific database counts
-python bench/compare.py --dbs 1,5,10,20,50
-
-# With active write load
-python bench/compare.py --dbs 10,20,50 --writes-per-sec 10
-python bench/compare.py --dbs 10,20,50 --writes-per-sec 50
-python bench/compare.py --dbs 10,20,50 --writes-per-sec 100
-
-# Only walrust (skip litestream)
-python bench/compare.py --walrust-only
-
-# Longer measurement (default: 5s)
-python bench/compare.py --duration 10
-
-# JSON output
-python bench/compare.py --json
-```
-
-**Requirements:**
-- `uv pip install psutil`
-- `brew install litestream` (optional, for comparison)
-
-### 3. Real-World Benchmarks (`realworld.py`)
-
-End-to-end performance metrics that users care about:
-
-#### a) Sync Latency
-Time from SQLite commit to S3 object appearing.
-
-Measures: p50, p95, p99, mean, max latency over N commits.
-
-#### b) Restore Performance
-Time to restore databases of various sizes from S3.
-
-Measures: download time, restore time, throughput (MB/s).
-
-#### c) Multi-DB Throughput
-Concurrent writes to N databases, measuring walrust's ability to keep up.
-
-Measures: writes/sec sustained, sync lag, CPU%, memory.
-
-#### d) Network Recovery
-Recovery time after simulated network outage.
-
-Measures: catchup time, writes lost (should be 0).
-
-#### e) Write Throughput
-Maximum sustainable commits per second with walrust watching.
-
-Measures: max commits/sec, average latency.
-
-#### f) Checkpoint Impact
-Impact of SQLite checkpoints on sync latency.
-
-Measures: normal latency, post-checkpoint latency, checkpoint duration.
-
-**Usage:**
-```bash
-# Run all real-world benchmarks
-python bench/realworld.py
-
-# Run specific test
-python bench/realworld.py --test sync
-python bench/realworld.py --test restore
-python bench/realworld.py --test multi-db
-python bench/realworld.py --test network
-python bench/realworld.py --test throughput
-python bench/realworld.py --test checkpoint
-
-# JSON output
-python bench/realworld.py --json
-```
-
-**Requirements:**
-- `uv pip install psutil boto3`
-- Tigris/S3 credentials in environment
-- `WALSYNC_TEST_BUCKET` env var
-
-## Environment Setup
+Ends with the validity check for both tools. Knobs are env vars documented
+at the top of the script; defaults: 300s duration, 1s sync interval,
+20 rows/s.
 
 ```bash
-# Tigris credentials (from ourfam/.env or similar)
-export AWS_ACCESS_KEY_ID=...
-export AWS_SECRET_ACCESS_KEY=...
-export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
-export WALSYNC_TEST_BUCKET=s3://walrust-bench
-
-# Or use direnv/.envrc
+WALRUST_BIN=target/release/walrust bench/compare-litestream.sh
 ```
 
-## CI Integration
+### `bench/multidb-rss.sh` — RSS scaling in database count
 
-Add to GitHub Actions:
+The question: is RSS constant or linear in the number of watched databases?
+For each N (default 1, 10, 50) and each load shape, runs **one** walrust
+`watch` process with N databases in a generated `walrust.toml`, then **one**
+litestream `replicate` process with the same N databases in its yaml, and
+samples RSS over time. Load shapes (`BENCH_SHAPES`, any of `idle steady
+bursty`): idle = write once before start, no live writers; steady = a modest
+per-db driver (default 5 rows/s); bursty = 10s on / 50s off.
 
-```yaml
-- name: Build release binary
-  run: cargo build --release
+Ends with the validity check on a sample (first/middle/last) of each cell's
+databases.
 
-- name: Run micro-benchmarks
-  run: cargo bench
-
-- name: Run real-world benchmarks
-  env:
-    AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-    AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-    AWS_ENDPOINT_URL_S3: ${{ secrets.AWS_ENDPOINT_URL_S3 }}
-    WALSYNC_TEST_BUCKET: s3://walrust-bench
-  run: python bench/realworld.py --json > bench-results.json
-
-- name: Upload benchmark results
-  uses: actions/upload-artifact@v3
-  with:
-    name: benchmark-results
-    path: bench-results.json
+```bash
+WALRUST_BIN=target/release/walrust BENCH_DB_COUNTS="1 10 50" BENCH_SHAPES="steady" bench/multidb-rss.sh
 ```
 
-## Interpreting Results
+## Results
 
-**Sync latency:**
-- p50 < 100ms: Good
-- p95 < 500ms: Acceptable
-- p99 < 1s: Watch for network issues
-- Max > 5s: Check S3 endpoint
+Each run writes `bench/results-<utc-timestamp>/` (gitignored) containing the
+raw inputs (`rss-*.tsv`, `lag-*.tsv`, `trace.jsonl`), `run-meta.json`,
+`report.txt` (the plain-text table, also printed to stdout), and
+`results.json`.
 
-**Restore:**
-- 10MB/s+: Good for Tigris
-- 50MB/s+: Good for S3 same-region
-- <5MB/s: Check network
+### results.json schema (compare-litestream, `schema_version: 1`)
 
-**Multi-DB:**
-- Memory ~10MB regardless of DB count: Good
-- CPU <20% for 10 DBs @ 100 writes/sec: Good
-- Sync lag p95 <1s: Good
+```jsonc
+{
+  "benchmark": "compare-litestream",
+  "schema_version": 1,
+  "meta": {                      // knobs as run: duration_seconds,
+    "sync_interval_seconds": 1,  // sync/driver/sentinel/rss cadences,
+    "versions": {...},           // tool versions, bucket/prefixes,
+    "rows": {...},               // rows written per tool (ground truth),
+    "validity": "..."            // what the end check asserted
+  },
+  "requests": {
+    "walrust":    { "classes": {"PUT": n, "GET": n, "LIST": n,
+                                "DELETE": n, "HEAD": n, "OTHER": n},
+                    "apis": {"s3.PutObject": n, ...}, "total": n },
+    "litestream": { ... },
+    "excluded_probe_requests": n,   // harness traffic, not counted
+    "unattributed_requests": n      // neither tool; should be ~0
+  },
+  "rss": { "walrust":    {"samples": n, "min_mb": x, "median_mb": x, "max_mb": x},
+           "litestream": { ... } },
+  "replication_lag": {
+    "walrust":    {"samples": n, "timeouts": n, "median_s": x, "p95_s": x,
+                   "max_s": x, "methods": {"raw": n, "lz4": n}},
+    "litestream": { ... }
+  }
+}
+```
 
-## Adding New Benchmarks
+### results.json schema (multidb-rss, `schema_version: 1`)
 
-1. Add to `realworld.py` as a new function
-2. Return a dataclass with results
-3. Add CLI flag if needed
-4. Update this README
+```jsonc
+{
+  "benchmark": "multidb-rss",
+  "schema_version": 1,
+  "meta": { "db_counts": [1,10,50], "shapes": ["steady"],
+            "cell_duration_seconds": n, "sync_interval_seconds": n,
+            "versions": {...}, "cells": [...], "validity": "..." },
+  "rss": {
+    "<tool>-n<N>-<shape>": {"samples": n, "min_mb": x, "median_mb": x,
+                            "max_mb": x, "end_mb": x},  // end = median of
+    ...                                                 // last 3 samples
+  }
+}
+```
 
-## Notes
+## Citing bench numbers
 
-- Benchmarks require real S3/Tigris (no mocking)
-- Use dedicated test bucket to avoid prod data
-- Some benchmarks may incur S3 costs (minimal)
-- Network-dependent results may vary
+Any performance claim in the top-level README (or docs) MUST cite a bench
+results file by date — e.g. "~1s median replication lag
+(bench/results-20260710T…, compare-litestream)". A claim without a results
+file behind it is a rumor; re-run the bench instead of restating it. When a
+new run contradicts a published claim, update the claim.
+
+## CI
+
+`.github/workflows/bench.yml` runs both scripts against MinIO on ubuntu via
+`workflow_dispatch` only (inputs: duration, db counts, shapes) and uploads
+`bench/results-*` as an artifact. No cron, no PR gating.
