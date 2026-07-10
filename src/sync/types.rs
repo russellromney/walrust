@@ -159,6 +159,8 @@ pub(crate) struct DbTaskState {
     pub(crate) trigger_state: TriggerState,
     /// Per-DB sync config
     pub(crate) sync_config: SyncConfig,
+    /// Resolved leveled-compaction settings (experimental, off by default).
+    pub(crate) compaction: walrust_core::compaction::CompactionSettings,
 }
 
 /// Optional cache state for disk-based upload queue

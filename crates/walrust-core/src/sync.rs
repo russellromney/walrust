@@ -2105,18 +2105,19 @@ pub async fn take_snapshot(
 /// Discovers available changesets by listing S3 objects (no manifest needed).
 /// Returns the seq that was actually restored to.
 pub async fn restore(
-    storage: &dyn StorageBackend,
+    storage: Arc<dyn StorageBackend>,
     prefix: &str,
     db_name: &str,
     output: &Path,
     point_in_time: Option<&str>,
 ) -> Result<u64> {
     let target_seq = parse_point_in_time_seq(point_in_time)?;
+    let storage_ref = storage.as_ref();
 
-    let lineage_id = active_lineage_id(storage, prefix, db_name).await?;
+    let lineage_id = active_lineage_id(storage_ref, prefix, db_name).await?;
     let snapshot = match target_seq {
         Some(target) => discover_latest_snapshot_at_or_before_in_namespace(
-            storage,
+            storage_ref,
             prefix,
             db_name,
             lineage_id.as_deref(),
@@ -2131,7 +2132,7 @@ pub async fn restore(
             ))
         })?,
         None => discover_latest_snapshot_in_namespace(
-            storage,
+            storage_ref,
             prefix,
             db_name,
             lineage_id.as_deref(),
@@ -2146,32 +2147,11 @@ pub async fn restore(
         })?,
     };
 
-    // Find incrementals after the snapshot
-    let mut incrementals = discover_after_in_namespace(
-        storage,
-        prefix,
-        db_name,
-        lineage_id.as_deref(),
-        GENERATION_LIVE,
-        snapshot.seq,
-        ChangesetKind::Physical,
-    )
-    .await?;
-    if let Some(target) = target_seq {
-        incrementals.retain(|changeset| changeset.seq <= target);
-    }
-
-    tracing::info!(
-        "Restoring from snapshot (seq {}) + {} incrementals",
-        snapshot.seq,
-        incrementals.len()
-    );
-
     let staged_restore = AtomicRestore::new(output);
     let staged_output = staged_restore.path();
 
     // Apply snapshot
-    let snapshot_data = storage
+    let snapshot_data = storage_ref
         .get(&snapshot.key)
         .await?
         .ok_or_else(|| anyhow!("snapshot key {} not found", snapshot.key))?;
@@ -2182,34 +2162,110 @@ pub async fn restore(
         decode_result.checksum
     );
 
-    let mut restored_seq = snapshot.seq;
-    let mut current_checksum = decode_result.checksum;
+    // Level-aware restore. Compaction only ever runs on the non-lineage owned
+    // path (see `maybe_compact_owned`), so leveled buckets always have
+    // `lineage_id == None`. If any merged level exists, the greedy planner picks
+    // coarse merged ranges over the fine L0 points they supersede and the
+    // executor applies the plan (bounded prefetch, strict-order apply, chain
+    // linkage through `chain_end`). An un-leveled bucket takes the original
+    // linear path below, byte-identically.
+    let leveled = if lineage_id.is_none() {
+        let layout = crate::compaction::SeqLayout::new(storage.clone(), prefix, db_name);
+        !crate::compaction::list_merged_ranges(&layout)
+            .await
+            .unwrap_or_default()
+            .is_empty()
+    } else {
+        false
+    };
 
-    // Apply incrementals in order. A gap or checksum-chain break means the
-    // restore cannot prove success, so it is a hard error.
-    for inc in &incrementals {
-        let expected_seq = restored_seq + 1;
-        if inc.seq != expected_seq {
-            return Err(anyhow!(
-                "restore incremental gap: expected seq {expected_seq}, got seq {} at {}",
-                inc.seq,
-                inc.key
-            ));
+    let restored_seq = if leveled {
+        let layout = crate::compaction::SeqLayout::new(storage.clone(), prefix, db_name);
+        let candidates =
+            crate::compaction::gather_candidates(&layout, snapshot.seq, u64::MAX).await?;
+        let max_available = candidates
+            .iter()
+            .map(|c| c.range.max)
+            .max()
+            .unwrap_or(snapshot.seq)
+            .max(snapshot.seq);
+        let target = target_seq.unwrap_or(max_available);
+        if target > max_available {
+            return Err(WalrustError::restore_not_found(format!(
+                "requested point-in-time seq {target} is beyond the newest available seq \
+                 {max_available} for database '{db_name}'"
+            ))
+            .into());
+        }
+        let plan = crate::compaction::plan_restore(&candidates, snapshot.seq, target)
+            .map_err(|e| anyhow::Error::from(WalrustError::restore(e.to_string())))?;
+        tracing::info!(
+            "Restoring from snapshot (seq {}) + leveled plan of {} objects to seq {}",
+            snapshot.seq,
+            plan.files.len(),
+            target
+        );
+        crate::compaction::apply_plan(
+            &layout,
+            &plan,
+            staged_output,
+            decode_result.checksum,
+            crate::compaction::DEFAULT_PREFETCH_DEPTH,
+        )
+        .await?
+    } else {
+        // Find incrementals after the snapshot (un-leveled bucket: the original
+        // linear path, unchanged).
+        let mut incrementals = discover_after_in_namespace(
+            storage_ref,
+            prefix,
+            db_name,
+            lineage_id.as_deref(),
+            GENERATION_LIVE,
+            snapshot.seq,
+            ChangesetKind::Physical,
+        )
+        .await?;
+        if let Some(target) = target_seq {
+            incrementals.retain(|changeset| changeset.seq <= target);
         }
 
-        let data = storage
-            .get(&inc.key)
-            .await?
-            .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
-        let result = ltx::apply_changeset_to_db(&data, staged_output, current_checksum)?;
         tracing::info!(
-            "Applied incremental (seq {}, checksum: {:016x})",
-            inc.seq,
-            result.checksum
+            "Restoring from snapshot (seq {}) + {} incrementals",
+            snapshot.seq,
+            incrementals.len()
         );
-        restored_seq = inc.seq;
-        current_checksum = result.checksum;
-    }
+
+        let mut restored_seq = snapshot.seq;
+        let mut current_checksum = decode_result.checksum;
+
+        // Apply incrementals in order. A gap or checksum-chain break means the
+        // restore cannot prove success, so it is a hard error.
+        for inc in &incrementals {
+            let expected_seq = restored_seq + 1;
+            if inc.seq != expected_seq {
+                return Err(anyhow!(
+                    "restore incremental gap: expected seq {expected_seq}, got seq {} at {}",
+                    inc.seq,
+                    inc.key
+                ));
+            }
+
+            let data = storage_ref
+                .get(&inc.key)
+                .await?
+                .ok_or_else(|| anyhow!("incremental key {} not found", inc.key))?;
+            let result = ltx::apply_changeset_to_db(&data, staged_output, current_checksum)?;
+            tracing::info!(
+                "Applied incremental (seq {}, checksum: {:016x})",
+                inc.seq,
+                result.checksum
+            );
+            restored_seq = inc.seq;
+            current_checksum = result.checksum;
+        }
+        restored_seq
+    };
 
     verify_sqlite_integrity(staged_output)?;
     staged_restore.publish(output)?;
@@ -2842,6 +2898,13 @@ pub struct ReplicationConfig {
     /// Optional sink for loud rollover events (re-anchor / refusal). The core
     /// has no webhook client; an embedder wires this to its own alert channel.
     pub rollover_observer: RolloverObserver,
+    /// Leveled-compaction control (experimental). Default: **off**
+    /// (`enabled = false`) per version-skew safety — see the compaction module
+    /// header. Set `compaction.enabled = true` (and tune `keep_fine_window`,
+    /// `l1_batch`, `l2_batch`) to fold long incremental histories into a few
+    /// merged levels for fast restore. This is the **single** control; there is
+    /// no separate internal gate.
+    pub compaction: crate::compaction::CompactionSettings,
 }
 
 /// Ownership of the base database state.
@@ -2869,6 +2932,7 @@ impl Default for ReplicationConfig {
             autonomous_snapshots: true,
             snapshot_ownership: SnapshotOwnership::Walrust,
             rollover_observer: RolloverObserver::default(),
+            compaction: crate::compaction::CompactionSettings::default(),
         }
     }
 }
@@ -3484,7 +3548,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let output = dir.path().join("restored.db");
 
-        let err = restore(&storage, "test/", "missing", &output, None)
+        let err = restore(Arc::new(storage), "test/", "missing", &output, None)
             .await
             .expect_err("missing snapshot must be a typed restore error");
 
@@ -3631,7 +3695,7 @@ mod tests {
         let incremental_key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 3);
         storage.insert(&incremental_key, incremental);
 
-        let err = restore(&storage, "test/", "mydb", &output, None)
+        let err = restore(Arc::new(storage), "test/", "mydb", &output, None)
             .await
             .expect_err("restore must reject a gap from seq 1 to seq 3");
 
@@ -3662,7 +3726,7 @@ mod tests {
         let new_key = build_changeset_key("test/", "mydb", GENERATION_SNAPSHOT, 5);
         storage.insert(&new_key, new_snapshot);
 
-        let restored_seq = restore(&storage, "test/", "mydb", &output, Some("3"))
+        let restored_seq = restore(Arc::new(storage), "test/", "mydb", &output, Some("3"))
             .await
             .expect("core restore should choose the latest snapshot <= target");
 
@@ -3695,7 +3759,7 @@ mod tests {
         let incremental_key = build_changeset_key("test/", "mydb", GENERATION_LIVE, 3);
         storage.insert(&incremental_key, incremental);
 
-        restore(&storage, "test/", "mydb", &output, None)
+        restore(Arc::new(storage), "test/", "mydb", &output, None)
             .await
             .expect_err("restore must fail before publishing over the existing output");
 
@@ -4931,7 +4995,7 @@ mod tests {
         );
 
         // Restore must round-trip all three committed rows.
-        restore(&storage, "p/", &state.name, &restored_path, None)
+        restore(Arc::new(storage), "p/", &state.name, &restored_path, None)
             .await
             .expect("restore after re-anchor");
         let rconn = rusqlite::Connection::open(&restored_path).unwrap();

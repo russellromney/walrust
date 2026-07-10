@@ -85,6 +85,20 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
             }
             println!();
 
+            // Compaction (experimental, off by default)
+            println!("Compaction (experimental):");
+            if cfg.compaction.enabled {
+                println!("  Enabled:         yes");
+                println!("  keep_fine_window: {}", cfg.compaction.keep_fine_window);
+                println!("  l1_batch:        {}", cfg.compaction.l1_batch);
+                println!("  l2_batch:        {}", cfg.compaction.l2_batch);
+                println!("  WARNING: leveled buckets are NOT restorable by walrust binaries");
+                println!("           older than this release (version skew).");
+            } else {
+                println!("  Enabled:         no (default; ship-dark for version skew)");
+            }
+            println!();
+
             // Retention Policy
             println!("Retention Policy (GFS rotation):");
             println!(

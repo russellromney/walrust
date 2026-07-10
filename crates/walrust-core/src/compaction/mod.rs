@@ -6,16 +6,18 @@
 //! database restores from a snapshot + a few coarse-grain files + a fine tail
 //! instead of tens of thousands of one-second objects.
 //!
-//! ## Config exposure ships with the C2b planner
+//! ## Read side + config exposure (wave C2b)
 //!
-//! Compaction is **gated off** and unreachable from `walrust.toml` or the CLI.
-//! Enabling it now would leave backups **unrestorable** by the shipped restore
-//! path, which cannot yet read leveled buckets. The merge engine, adapters,
-//! triggers, and safety proofs land fully tested here; the trigger wiring is
-//! guarded by an internal flag (`Replicator::set_compaction_enabled`, default
-//! false) and a `const COMPACTION_ENABLED: bool = false` in the legacy watch
-//! path. The user-facing `[compaction] enabled` knob ships with the C2b restore
-//! planner that can read the leveled layout.
+//! The C2b read side ships here: the greedy [`planner`] (newest snapshot ≤
+//! target, then the file that extends the contiguous range furthest), the
+//! layout-agnostic [`restore`] executor (bounded parallel prefetch, strict-order
+//! apply, chain linkage through [`chain_end`](hadb_changeset::physical::chain_end)),
+//! level-aware verify [`coverage`], and the level-aware prune watermark
+//! ([`prune`]). Compaction is now controlled by the **single** user knob
+//! [`CompactionSettings`] / `[compaction] enabled` (default **false** — ship-dark
+//! for version skew: an old binary cannot restore a leveled bucket). The C2a
+//! internal flags (`Replicator::set_compaction_enabled`, `const
+//! COMPACTION_ENABLED`) are gone; the config is the only control.
 //!
 //! ## Key naming is forever
 //!
@@ -115,22 +117,30 @@
 //!     fire costs `1 LIST + N ranged-GETs` at the source level. This is paid
 //!     only when merging, not on idle ticks.
 
+pub mod coverage;
 pub mod engine;
 pub mod layout;
 pub mod merge;
+pub mod planner;
+pub mod prune;
 pub mod range_layout;
+pub mod restore;
 pub mod seq_layout;
 pub mod trigger;
 
+pub use coverage::{list_merged_ranges, ranges_cover};
 pub use engine::{run_level_compaction, CompactionOutcome};
 pub use layout::{
     format_range_name, level_subpath, parse_range_name, ChangesetPageStream, CompactionLayout,
     LayoutFile, Level, SeqRange, SourceHeader, L0_DIR, LEVELS_DIR,
 };
 pub use merge::{merge_changesets, verify_merged_bytes, MergeInput, MergeResult, PeakPages};
+pub use planner::{plan_restore, PlanCandidate, PlanError, RestorePlan};
+pub use prune::{list_level_files, plan_level_prune};
 pub use range_layout::RangeLayout;
+pub use restore::{apply_plan, gather_candidates, plan_over_layout, DEFAULT_PREFETCH_DEPTH};
 pub use seq_layout::SeqLayout;
-pub use trigger::{CompactionTriggers, TriggerConfig};
+pub use trigger::{CompactionSettings, CompactionTriggers, TriggerConfig};
 
 use thiserror::Error;
 

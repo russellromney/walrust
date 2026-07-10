@@ -171,6 +171,38 @@ typo can't silently back up nothing. Set `allow_empty_globs = true` for
 genuinely optional patterns; if every glob is empty, `watch` starts and idles
 with a warning so a supervisor can boot walrust before its databases exist.
 
+## Compaction (experimental, off by default)
+
+Long-history databases accumulate tens of thousands of tiny per-second sync
+objects, which makes restore slow and buckets large. Leveled compaction folds
+old incrementals into a few coarser merged objects (minutes-grain L1, then
+hours-grain L2), so a restore is snapshot + a handful of merged objects + a fine
+seconds tail. It is **off by default**:
+
+```toml
+[compaction]
+enabled = false          # default; see the version-skew warning below
+keep_fine_window = "1h"  # never merge L0 objects younger than this
+l1_batch = 60            # L0 objects folded per L1 merge
+l2_batch = 24            # L1 objects folded per L2 merge
+```
+
+Two honest caveats, one sentence each:
+
+- **Version skew:** a leveled bucket is **not restorable by walrust binaries
+  older than this release** — they don't know the `levels/` layout exists — so
+  compaction ships dark; only enable it once every binary that might restore the
+  bucket understands levels.
+- **PITR granularity decays with age:** point-in-time restore stays second-exact
+  inside `keep_fine_window`, but a target that falls *strictly inside* an older
+  merged window fails loudly, naming the nearest restorable points on both sides,
+  rather than silently returning the wrong state.
+
+Embedders set the same knobs on `ReplicationConfig::compaction`
+(`walrust_core::compaction::CompactionSettings`); `enabled` is the single
+control (there is no separate internal gate). Run `walrust explain` to see the
+resolved values.
+
 ## Read replica
 
 ```bash

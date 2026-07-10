@@ -16,7 +16,6 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use anyhow::{Context, Result};
@@ -54,8 +53,8 @@ struct DbState {
     /// `None` = legacy behavior (walrust-owned or external `.hadbp`).
     fenced_delta_chain: Option<FencedDeltaChainState>,
     /// In-memory compaction trigger state (owned-mode `.hadbp` chain only).
-    /// `None` until seeded on the first gated compaction tick. Never touched
-    /// unless `Replicator::compaction_enabled` is set (default false).
+    /// `None` until seeded on the first compaction tick. Never touched unless
+    /// `ReplicationConfig::compaction.enabled` is set (default false).
     compaction_triggers: Option<crate::compaction::CompactionTriggers>,
 }
 
@@ -133,12 +132,13 @@ async fn maybe_compact_owned(
     name: &str,
     db: &mut DbState,
     produced_l0: bool,
+    settings: crate::compaction::CompactionSettings,
 ) -> Result<()> {
     use crate::compaction::layout::CompactionLayout;
-    use crate::compaction::{run_level_compaction, CompactionTriggers, SeqLayout, TriggerConfig};
+    use crate::compaction::{run_level_compaction, CompactionTriggers, SeqLayout};
 
     let layout = SeqLayout::new(storage.clone(), prefix, name);
-    let cfg = TriggerConfig::default();
+    let cfg = settings.trigger_config();
 
     if db.compaction_triggers.is_none() {
         // Seed from a single LIST per level, zero header reads (startup / first
@@ -200,13 +200,6 @@ pub struct Replicator {
     /// handle, which can only be derived after the Arc exists) and so
     /// `Drop` can sync-take the handle without bringing in a runtime.
     background: Mutex<Option<JoinHandle<()>>>,
-    /// Internal compaction gate (wave C2a). Default **false** and deliberately
-    /// NOT part of `ReplicationConfig`, so it is unreachable from `walrust.toml`
-    /// or the CLI. Enabling compaction before the C2b restore planner can read
-    /// leveled buckets would make backups unrestorable — see the compaction
-    /// module header. Flipped only via [`set_compaction_enabled`] for tests and
-    /// internal bring-up.
-    compaction_enabled: AtomicBool,
 }
 
 impl Drop for Replicator {
@@ -261,19 +254,10 @@ impl Replicator {
         &self.prefix
     }
 
-    /// **Internal / testing only.** Toggle the C2a compaction gate. Not wired
-    /// to any config or CLI surface: enabling compaction before the C2b restore
-    /// planner ships would make backups unrestorable by the shipped restore
-    /// path (see the compaction module header). Default is off.
-    #[doc(hidden)]
-    pub fn set_compaction_enabled(&self, on: bool) {
-        self.compaction_enabled.store(on, Ordering::SeqCst);
-    }
-
-    /// Whether the compaction gate is currently on.
-    #[doc(hidden)]
+    /// Whether leveled compaction is enabled for this replicator. Controlled by
+    /// the single `ReplicationConfig::compaction.enabled` knob (default off).
     pub fn compaction_enabled(&self) -> bool {
-        self.compaction_enabled.load(Ordering::SeqCst)
+        self.config.compaction.enabled
     }
 
     /// Create a new Replicator and start its background sync loop.
@@ -302,7 +286,6 @@ impl Replicator {
             prefix: prefix.to_string(),
             databases: Arc::new(RwLock::new(HashMap::new())),
             background: Mutex::new(None),
-            compaction_enabled: AtomicBool::new(false),
         });
 
         tracing::info!(
@@ -625,7 +608,7 @@ impl Replicator {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let seq = match sync::restore(self.storage.as_ref(), &prefix, name, output_path, None).await
+        let seq = match sync::restore(self.storage.clone(), &prefix, name, output_path, None).await
         {
             Ok(seq) => seq,
             Err(e)
@@ -891,7 +874,7 @@ impl Replicator {
 
         let mut set = JoinSet::new();
         let external_base_state = self.config.snapshot_ownership.is_external();
-        let compaction_enabled = self.compaction_enabled();
+        let compaction = self.config.compaction;
         for (name, db_state) in entries {
             let storage = self.storage.clone();
             set.spawn(async move {
@@ -914,13 +897,20 @@ impl Replicator {
                     }
                     _ => {}
                 }
-                // C2a compaction tick — piggybacks on sync activity. Gated OFF
-                // by default and unreachable from config; runs only for the
-                // owned-mode `.hadbp` chain (not external-base, not fenced
+                // Compaction tick — piggybacks on sync activity. Controlled by
+                // the single `[compaction] enabled` config knob; runs only for
+                // the owned-mode `.hadbp` chain (not external-base, not fenced
                 // delta). A failure here never disturbs the sync path.
-                if compaction_enabled && !external_base_state && s.fenced_delta_chain.is_none() {
-                    if let Err(e) =
-                        maybe_compact_owned(&storage, &prefix, &name, &mut s, produced_l0).await
+                if compaction.enabled && !external_base_state && s.fenced_delta_chain.is_none() {
+                    if let Err(e) = maybe_compact_owned(
+                        &storage,
+                        &prefix,
+                        &name,
+                        &mut s,
+                        produced_l0,
+                        compaction,
+                    )
+                    .await
                     {
                         tracing::error!("Replicator: compaction failed for '{}': {}", name, e);
                     }

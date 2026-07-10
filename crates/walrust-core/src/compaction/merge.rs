@@ -166,7 +166,9 @@ pub async fn merge_changesets(
     let mut buf = Vec::new();
     buf.extend_from_slice(b"HADBP");
     buf.push(2); // version 2 (compacted)
-    buf.push(0x80); // FLAG_COMPACTED (no other flags on a merged object)
+    let flags_off = buf.len();
+    buf.push(0x80); // FLAG_COMPACTED; the end-page-count marker bit is OR'd in
+                    // at finalize if the last source declares a DB size.
     buf.push(page_id_size as u8);
     buf.extend_from_slice(&page_size.to_be_bytes());
     buf.extend_from_slice(&out_seq.to_be_bytes());
@@ -193,11 +195,25 @@ pub async fn merge_changesets(
         })
         .collect();
 
+    // The DB size declared by the LAST source (highest seq): a walrust
+    // incremental encodes an end-page-count marker (an empty page at
+    // `end_page_count + 1`). The merged range must reconstruct the *final* DB
+    // size, so we carry the last source's declared size and emit exactly one
+    // marker for it at finalize. Intermediate sources' markers are elided
+    // (their sizes are superseded). See the module header.
+    let mut final_end_page_count: Option<u64> = None;
+    let capture_epc = |final_epc: &mut Option<u64>, order: usize, page: &PageEntry| {
+        if order == n - 1 && page.data.is_empty() {
+            *final_epc = Some(page.page_id.to_u64().saturating_sub(1));
+        }
+    };
+
     // ── Prime the frontier: one page per source ────────────────────────────
     let mut heap: BinaryHeap<HeapPage> = BinaryHeap::new();
     for (order, s) in sources.iter_mut().enumerate() {
         if let Some(page) = s.stream.next_page().await? {
             hash_source_page(&mut source_hashers[order], page_id_size, &page);
+            capture_epc(&mut final_end_page_count, order, &page);
             heap.push(HeapPage {
                 page_id: page.page_id,
                 order,
@@ -225,16 +241,20 @@ pub async fn merge_changesets(
                 } // else keep existing higher-order page (top dropped → guard--)
             }
             _ => {
-                // page_id advanced (or first): flush the old pending.
+                // page_id advanced (or first): flush the old pending. A winning
+                // **empty** page is a superseded end-page-count marker — elide
+                // it; the final marker is emitted once at finalize.
                 if let Some(p) = pending.take() {
-                    emit_page(
-                        &mut buf,
-                        &mut hasher,
-                        page_id_size,
-                        &p.page,
-                        &mut last_emitted,
-                    );
-                    page_count += 1;
+                    if !p.page.data.is_empty() {
+                        emit_page(
+                            &mut buf,
+                            &mut hasher,
+                            page_id_size,
+                            &p.page,
+                            &mut last_emitted,
+                        );
+                        page_count += 1;
+                    }
                 }
                 pending = Some(top);
             }
@@ -242,6 +262,7 @@ pub async fn merge_changesets(
         // Advance the source we just popped.
         if let Some(page) = sources[order].stream.next_page().await? {
             hash_source_page(&mut source_hashers[order], page_id_size, &page);
+            capture_epc(&mut final_end_page_count, order, &page);
             heap.push(HeapPage {
                 page_id: page.page_id,
                 order,
@@ -250,16 +271,41 @@ pub async fn merge_changesets(
             });
         }
     }
-    // Flush the final pending page.
+    // Flush the final pending page (eliding a superseded empty marker).
     if let Some(p) = pending.take() {
+        if !p.page.data.is_empty() {
+            emit_page(
+                &mut buf,
+                &mut hasher,
+                page_id_size,
+                &p.page,
+                &mut last_emitted,
+            );
+            page_count += 1;
+        }
+    }
+
+    // Emit the single canonical end-page-count marker for the final DB size, so
+    // a restore truncates/grows to exactly the last source's size. Its page id
+    // is `end_page_count + 1` (empty data), higher than every data page, so it
+    // preserves ascending emit order. The marker flag is OR'd into the header.
+    if let Some(epc) = final_end_page_count {
+        let marker = PageEntry {
+            page_id: match page_id_size {
+                PageIdSize::U32 => PageId::U32((epc + 1) as u32),
+                PageIdSize::U64 => PageId::U64(epc + 1),
+            },
+            data: Vec::new(),
+        };
         emit_page(
             &mut buf,
             &mut hasher,
             page_id_size,
-            &p.page,
+            &marker,
             &mut last_emitted,
         );
         page_count += 1;
+        buf[flags_off] |= crate::ltx::FLAG_END_PAGE_COUNT_MARKER;
     }
 
     // ── Finalize: per-source chain-ends, contiguity, output declared_end ────
