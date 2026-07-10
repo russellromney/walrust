@@ -873,6 +873,7 @@ async fn test_walrust_owned_flush_resnapshots_after_checkpoint_rollover() -> Res
     // protection). A destructive rollover can therefore only happen while walrust
     // is DOWN and the blocker is released. Simulate that downtime window, then
     // reopen: the re-anchor path is the backstop that recovers the folded gap.
+    replicator.shutdown().await;
     drop(replicator);
 
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
@@ -935,6 +936,7 @@ async fn test_rollover_observer_fires_on_walrust_owned_reanchor() -> Result<()> 
     // so a destructive rollover only occurs during a walrust-down window. Drop the
     // replicator (releasing the blocker), reset the WAL externally, then reopen so
     // the re-anchor backstop fires and emits its RolloverEvent.
+    replicator.shutdown().await;
     drop(replicator);
     conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
     write_rows(&conn, 200, 2);
@@ -1319,6 +1321,7 @@ async fn test_external_mode_reopen_derives_head_without_remote_state() {
         "external-base mode should not write remote state.json"
     );
 
+    first.shutdown().await;
     drop(first);
 
     let second = Replicator::try_new(storage.clone(), "wal/", make_external_config())
@@ -1739,6 +1742,7 @@ async fn test_walrust_owned_reopen_uses_legacy_state_json() {
         "walrust-owned mode persists wal_offset"
     );
 
+    first.shutdown().await;
     drop(first);
 
     let second = Replicator::try_new(storage.clone(), "wal/", make_config()).unwrap();
