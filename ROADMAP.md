@@ -152,6 +152,32 @@ two distinct outcomes under this stress, in this order of severity:
      prioritize this until someone does the careful, dedicated fix it
      deserves. **HIGH PRIORITY follow-up.**
 
+**Residue (e2e gap closure): gap 4 found and fixed a real E7 gap — owned-mode
+`add()` was silently incompatible with compaction.** Building
+`e2e_core_replicator_compaction_embedder_crash` (tests/production_e2e.rs) — a
+real `Replicator` embedded in a spawned child, compaction enabled via
+`ReplicationConfig`, written to continuously, SIGKILLed mid-merge activity and
+respawned twice — first hit a wall: `Replicator::add()` unconditionally calls
+`SyncState::ensure_lineage_id()`, moving the stream's changesets to the
+`{db}/lineages/{id}/...` key shape (added by the recent phase-4 delta work).
+Compaction's `SeqLayout` only reads/writes the flat, non-lineage
+`{db}/0000/...` shape, so a lineage-scoped stream was **completely invisible**
+to `maybe_compact_owned` — `compaction.enabled = true` combined with the
+normal `add()` path silently never compacted anything, forever, no error, no
+warning. The exact same class of violation as the already-fixed CLI
+shadow-mode gap (E7: a bucket the operator believes is compacting grows
+unbounded). **Fixed**: `add()`/`add_with_wal_path()` now refuse up front
+(before touching storage) when `compaction.enabled` is true, naming the
+incompatibility and pointing at `add_without_snapshot()` (which never creates
+a lineage) as the workaround — mirroring `reject_shadow_compaction`'s shape.
+Fail-on-revert proven (`add_with_compaction_enabled_refuses_to_create_a_lineage`
++ a companion test pinning that compaction-off `add()` is unaffected, both in
+`crates/walrust-core/tests/replicator_drop.rs`). The e2e itself now registers
+via `add_without_snapshot()` on every phase (relying on
+`autonomous_snapshots` + a short `snapshot_interval` for the initial base) and
+passes: L1/L2 fire, two SIGKILL/respawn cycles survive, and the library
+`restore()` API reads the compacted, crash-cycled stream row-exact.
+
 **Status:** rename `compact`→`prune` shipped. C1 (COMPACTED v2 format) shipped.
 **C2a (layout-agnostic merge engine, write side) shipped** — `CompactionLayout`
 trait + seq/range adapters, streaming k-way merge with a proven memory bound,

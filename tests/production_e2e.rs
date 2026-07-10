@@ -1379,3 +1379,283 @@ async fn e2e_cli_compaction_fires_levels_and_restore_reads_them() -> Result<()> 
 
     Ok(())
 }
+
+// ── Compaction embedder crash e2e (gap 4) ──────────────────────────────────
+
+/// Aggressive compaction settings for the embedder crash e2e. `sync_interval`
+/// is fast so the background sync/compaction loop `Replicator::new` spawns
+/// internally (see `Replicator::run_loop_weak` / `sync_all`) ticks often;
+/// `l1_batch`/`l2_batch`/`keep_fine_window` match the CLI compaction e2e's
+/// aggressive knobs so L1 and L2 fire within a short write burst.
+/// `snapshot_interval` is short (not the usual 3600s default): the child
+/// helper below deliberately registers via `add_without_snapshot` on every
+/// phase, never `add`, so the walrust-owned stream never gets a
+/// `lineage_id` (see `SyncState::ensure_lineage_id`, only called from
+/// `Replicator::add_with_wal_path`) -- compaction's `SeqLayout` only ever
+/// reads/writes the flat non-lineage `{db}/0000/{seq}.hadbp` key shape
+/// (crates/walrust-core/src/sync.rs: "Compaction only ever runs on the
+/// non-lineage owned path"), so a lineage-scoped stream is invisible to it
+/// and compaction silently never fires. With no `add()`-time snapshot, the
+/// background loop's own periodic snapshot timer must establish the first
+/// restorable base, so it needs to fire soon, not after an hour.
+fn core_compaction_replicator_config() -> walrust::walrust_core::ReplicationConfig {
+    walrust::walrust_core::ReplicationConfig {
+        sync_interval: Duration::from_millis(150),
+        snapshot_interval: Duration::from_secs(4),
+        compaction: walrust::walrust_core::compaction::CompactionSettings {
+            enabled: true,
+            keep_fine_window: Duration::ZERO,
+            l1_batch: 4,
+            l2_batch: 3,
+        },
+        ..Default::default()
+    }
+}
+
+struct CompactionSigkillHelperArgs<'a> {
+    phase: &'a str,
+    name: &'a str,
+    prefix: &'a str,
+    bucket: &'a str,
+    endpoint: Option<&'a str>,
+    db_path: &'a Path,
+    ready_path: &'a Path,
+}
+
+fn spawn_compaction_sigkill_helper(args: CompactionSigkillHelperArgs<'_>) -> Result<Child> {
+    let mut cmd = Command::new(std::env::current_exe()?);
+    cmd.arg("--exact")
+        .arg("e2e_core_replicator_compaction_embedder_crash_child")
+        .arg("--ignored")
+        .arg("--nocapture")
+        .env("WALRUST_COMPACTION_SIGKILL_PHASE", args.phase)
+        .env("WALRUST_COMPACTION_SIGKILL_NAME", args.name)
+        .env("WALRUST_COMPACTION_SIGKILL_PREFIX", args.prefix)
+        .env("WALRUST_COMPACTION_SIGKILL_BUCKET", args.bucket)
+        .env("WALRUST_COMPACTION_SIGKILL_DB", args.db_path)
+        .env("WALRUST_COMPACTION_SIGKILL_READY", args.ready_path);
+    if let Some(endpoint) = args.endpoint {
+        cmd.env("WALRUST_COMPACTION_SIGKILL_ENDPOINT", endpoint);
+    }
+    cmd.spawn()
+        .context("spawn compaction embedder SIGKILL helper")
+}
+
+/// The wave's embedder proof (gap 4): a real `Replicator` with
+/// `ReplicationConfig::compaction` enabled, embedded in a spawned child
+/// process that writes continuously. The parent SIGKILLs it mid-merge
+/// activity (confirmed via a real S3 listing, not a fixed sleep), respawns
+/// it, and repeats -- two kill/respawn cycles across three total child
+/// phases (first, second get SIGKILLed; third finishes cleanly). The parent
+/// then restores VIA THE LIBRARY API (`Replicator::restore`, not the CLI) to
+/// a fresh path with a fresh `Replicator` instance, and asserts row-exact
+/// (against the child's own persisted, on-disk ground truth -- `db_path`
+/// itself, which survives every respawn) + `integrity_check` + that levels
+/// actually fired (merged L1/L2 objects present in the bucket).
+#[test]
+fn e2e_core_replicator_compaction_embedder_crash() -> Result<()> {
+    require_s3!("e2e_core_replicator_compaction_embedder_crash");
+    let temp = TempDir::new()?;
+    let name = unique_name("core-compaction-crash");
+    let prefix = format!("e2e/{name}/");
+    let bucket = test_bucket();
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let ready_path = temp.path().join("compaction-child-ready");
+
+    let _setup = create_source_db(&db_path, 5)?;
+    let l1_prefix = format!("{prefix}{name}/levels/L1/");
+    let l2_prefix = format!("{prefix}{name}/levels/L2/");
+
+    let runtime = tokio::runtime::Runtime::new()?;
+
+    for phase in ["first", "second", "third"] {
+        let _ = std::fs::remove_file(&ready_path);
+        let mut child = spawn_compaction_sigkill_helper(CompactionSigkillHelperArgs {
+            phase,
+            name: &name,
+            prefix: &prefix,
+            bucket: &bucket,
+            endpoint: endpoint.as_deref(),
+            db_path: &db_path,
+            ready_path: &ready_path,
+        })?;
+        wait_for_file_or_child_exit(
+            &mut child,
+            &ready_path,
+            &format!("{phase} compaction helper startup"),
+        )?;
+
+        if phase == "third" {
+            // Final phase: let it finish its write burst, flush, and exit
+            // cleanly on its own -- no kill.
+            let status = child.wait()?;
+            anyhow::ensure!(
+                status.success(),
+                "third compaction embedder helper failed with {status}"
+            );
+        } else {
+            // Kill it mid-merge activity for real: poll S3 for a merged L1
+            // object rather than sleeping a fixed amount, so the SIGKILL
+            // actually lands while compaction is active, not before it has
+            // started or after the child's write burst already finished.
+            let deadline = Instant::now() + e2e_poll_deadline(60);
+            loop {
+                let l1_seen = runtime.block_on(list_keys(&l1_prefix))?;
+                if !l1_seen.is_empty() {
+                    break;
+                }
+                if let Some(status) = child.try_wait()? {
+                    anyhow::bail!("{phase} compaction helper exited early ({status}) before any L1 merge was observed");
+                }
+                anyhow::ensure!(
+                    Instant::now() < deadline,
+                    "{phase}: timed out waiting for a merged L1 object before killing"
+                );
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            stop_child(&mut child); // SIGKILL, mid-merge.
+        }
+    }
+
+    // Levels actually fired: assert merged objects exist in the bucket
+    // (checked again here, post-crash-cycle, so the assertion covers the
+    // final converged state, not just the mid-run snapshot that triggered
+    // the first kill).
+    let (l1_keys, l2_keys) = runtime.block_on(async {
+        let l1 = list_keys(&l1_prefix).await?;
+        let l2 = list_keys(&l2_prefix).await?;
+        Ok::<_, anyhow::Error>((l1, l2))
+    })?;
+    anyhow::ensure!(
+        !l1_keys.is_empty() || !l2_keys.is_empty(),
+        "compaction never produced a merged level object across the crash cycles: L1={l1_keys:?} L2={l2_keys:?}"
+    );
+
+    // Restore VIA THE LIBRARY API (not the CLI) to a fresh path, with a fresh
+    // `Replicator` instance unrelated to any of the crashed child processes.
+    runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(bucket.clone(), endpoint.as_deref()).await?;
+        let replicator = walrust::walrust_core::Replicator::new(
+            storage,
+            &prefix,
+            core_compaction_replicator_config(),
+        );
+        let restored_seq = replicator.restore(&name, &restored_path).await?;
+        anyhow::ensure!(
+            restored_seq.is_some(),
+            "library restore should find the compacted, crash-cycled stream"
+        );
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    assert_integrity_ok(&restored_path)?;
+    // Ground truth is the child's own on-disk database: `db_path` survives
+    // every respawn (same file across all three phases), so its final
+    // content after the "third" phase exits cleanly IS the persisted ground
+    // truth the task asked for.
+    assert_eq!(
+        rows(&db_path)?,
+        rows(&restored_path)?,
+        "library restore across compaction + repeated SIGKILL crashes must be row-exact"
+    );
+
+    Ok(())
+}
+
+/// Coordination-driven spawn target for the compaction embedder crash e2e --
+/// NOT a standalone test. See the doc comment on
+/// `e2e_core_replicator_sigkill_child` for why this pattern (re-exec the same
+/// test binary with `--exact ... --ignored`) is the right shape and why
+/// `#[ignore]` does not exclude it from CI: the parent
+/// `e2e_core_replicator_compaction_embedder_crash` is `require_s3!`-gated, so
+/// it runs against MinIO in CI, and it re-execs this exact function three
+/// times per run (two of which get SIGKILLed by the parent, matching the
+/// production crash scenario under test).
+///
+/// Registers with a real `Replicator` (`add` on the first phase,
+/// `add_without_snapshot` on respawns -- exactly like
+/// `e2e_core_replicator_sigkill_child`), signals readiness, then writes a
+/// continuous burst of small commits through an external, non-autocheckpoint
+/// connection so the replicator's own background sync/compaction loop has
+/// many chances to fire (aggressive `l1_batch`/`l2_batch`/`keep_fine_window`
+/// via `core_compaction_replicator_config`). The "third" phase additionally
+/// flushes explicitly before exiting cleanly, so its on-disk `db_path` state
+/// is durably synced before the parent treats it as ground truth.
+#[test]
+#[ignore = "spawn target of e2e_core_replicator_compaction_embedder_crash; \
+            runs in CI when the parent re-execs it with --ignored (see doc comment)"]
+fn e2e_core_replicator_compaction_embedder_crash_child() -> Result<()> {
+    let phase = std::env::var("WALRUST_COMPACTION_SIGKILL_PHASE")?;
+    let name = std::env::var("WALRUST_COMPACTION_SIGKILL_NAME")?;
+    let prefix = std::env::var("WALRUST_COMPACTION_SIGKILL_PREFIX")?;
+    let bucket = std::env::var("WALRUST_COMPACTION_SIGKILL_BUCKET")?;
+    let endpoint = std::env::var("WALRUST_COMPACTION_SIGKILL_ENDPOINT").ok();
+    let db_path = std::path::PathBuf::from(std::env::var("WALRUST_COMPACTION_SIGKILL_DB")?);
+    let ready_path = std::path::PathBuf::from(std::env::var("WALRUST_COMPACTION_SIGKILL_READY")?);
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(bucket, endpoint.as_deref()).await?;
+        let replicator = walrust::walrust_core::Replicator::new(
+            storage,
+            &prefix,
+            core_compaction_replicator_config(),
+        );
+        // ALWAYS add_without_snapshot, even on "first" -- see the doc comment
+        // on core_compaction_replicator_config for why: Replicator::add()
+        // unconditionally creates a lineage, which compaction cannot see.
+        // On "first" there is no saved state.json yet, so this just
+        // registers the (already 5-row) on-disk db and lets the background
+        // loop's own periodic snapshot timer take the first base snapshot.
+        replicator.add_without_snapshot(&name, &db_path).await?;
+        std::fs::write(&ready_path, b"ready")?;
+
+        // Resume row IDs from wherever the on-disk db (shared across every
+        // respawn) currently stands.
+        let mut next_id = {
+            let conn = Connection::open(&db_path)?;
+            let max_id: i64 =
+                conn.query_row("SELECT COALESCE(MAX(id), 0) FROM items", [], |r| r.get(0))?;
+            max_id + 1
+        };
+
+        let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+        // ~60 commits * 120ms ~= 7.2s of sustained writes per phase, against
+        // a 150ms background sync tick -- dozens of sync opportunities, and
+        // with l1_batch=4 several L0->L1 merges (and often L1->L2) per phase.
+        for _ in 0..60 {
+            append_rows(
+                &writer,
+                next_id,
+                next_id + 1,
+                &format!("compact-embed-{phase}"),
+            )?;
+            next_id += 2;
+            tokio::time::sleep(Duration::from_millis(120)).await;
+        }
+
+        if phase == "third" {
+            // Ensure durability before exiting cleanly: explicit flush(es)
+            // beyond whatever the background timer already picked up, so the
+            // parent's row-exact comparison against this on-disk db isn't
+            // racing an unsynced tail. (walrust's own restore then proves
+            // this durability independently, via S3, not via this flush.)
+            let _ = flush_until_frames(&replicator, &name, "third compaction helper").await;
+            let _ = replicator.flush(&name).await;
+        }
+
+        if phase != "third" {
+            // Sleep forever -- the parent SIGKILLs this process once it has
+            // observed real merge activity in S3. Reaching this point without
+            // being killed (e.g. under a very slow endpoint) is still safe:
+            // the parent's poll loop has its own deadline and will fail
+            // loudly rather than hang.
+            loop {
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+}

@@ -161,6 +161,85 @@ async fn compaction_gate_defaults_off_and_is_config_driven() {
     replicator2.shutdown().await;
 }
 
+/// E7 guard (found while building the compaction embedder crash e2e, gap 4
+/// of the compaction e2e coverage closure): `add()`/`add_with_wal_path()`
+/// unconditionally creates a walrust-owned lineage
+/// (`SyncState::ensure_lineage_id`), which moves the stream's changesets to
+/// the `{db}/lineages/{id}/...` key shape. Compaction's `SeqLayout` only
+/// ever reads/writes the flat, non-lineage `{db}/0000/...` shape, so a
+/// lineage-scoped stream is invisible to it: before this guard,
+/// `compaction.enabled = true` combined with `add()` silently never
+/// compacted anything, forever — the same "bucket grows unbounded while the
+/// operator believes it's compacting" E7 violation the CLI's
+/// `reject_shadow_compaction` already guards against for shadow-mode watch.
+/// `add()` now refuses up front, before touching storage, naming the
+/// incompatibility and pointing at `add_without_snapshot` (which never
+/// creates a lineage) as the fix.
+#[tokio::test]
+async fn add_with_compaction_enabled_refuses_to_create_a_lineage() {
+    use walrust_core::compaction::CompactionSettings;
+
+    let storage = MemStorage::new();
+    let storage_dyn: Arc<dyn StorageBackend> = storage.clone();
+    let cfg = ReplicationConfig {
+        compaction: CompactionSettings {
+            enabled: true,
+            ..Default::default()
+        },
+        ..config_for_test_walrust_owned()
+    };
+    let replicator = Replicator::try_new(storage_dyn, "test/", cfg).expect("construct replicator");
+
+    let err = replicator
+        .add(
+            "db",
+            std::path::Path::new("/nonexistent/does-not-matter.db"),
+        )
+        .await
+        .expect_err("add() with compaction enabled must refuse to create a lineage");
+    assert!(
+        err.to_string().to_lowercase().contains("lineage"),
+        "error should name the lineage incompatibility: {err}"
+    );
+    replicator.shutdown().await;
+}
+
+/// Fail-on-revert companion to the guard above: with compaction OFF (the
+/// default), `add()` must proceed PAST the new check — a naive "always
+/// refuse in walrust-owned mode" guard would break the common case. The call
+/// still fails here (no real database file exists at the fake path), but on
+/// a different error entirely (opening the checkpoint blocker), never
+/// mentioning "lineage" — proving the guard is gated on
+/// `compaction.enabled`, not overly broad.
+#[tokio::test]
+async fn add_without_compaction_is_not_blocked_by_the_lineage_guard() {
+    let storage = MemStorage::new();
+    let storage_dyn: Arc<dyn StorageBackend> = storage.clone();
+    let replicator = Replicator::try_new(storage_dyn, "test/", config_for_test_walrust_owned())
+        .expect("construct replicator");
+
+    let err = replicator
+        .add("db", std::path::Path::new("/nonexistent/does-not-matter.db"))
+        .await
+        .expect_err("add() on a nonexistent path must still fail (no real db file), just not on the lineage guard");
+    assert!(
+        !err.to_string().to_lowercase().contains("lineage"),
+        "compaction is off, so the lineage guard must not be what rejected this add(): {err}"
+    );
+    replicator.shutdown().await;
+}
+
+/// Walrust-owned counterpart to `config_for_test` (which uses
+/// `SnapshotOwnership::External` and so never reaches the lineage guard —
+/// that branch returns early via `add_without_snapshot_with_wal_path`).
+fn config_for_test_walrust_owned() -> ReplicationConfig {
+    ReplicationConfig {
+        sync_interval: Duration::from_secs(3600),
+        snapshot_interval: Duration::from_secs(3600),
+        ..Default::default()
+    }
+}
+
 #[tokio::test]
 async fn drop_releases_storage_backend() {
     let storage = MemStorage::new();
