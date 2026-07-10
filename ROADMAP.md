@@ -101,9 +101,14 @@ seam), reusing the C2b TXID PITR-decay error. Cache substitution bypasses
 `[compaction] enabled` works for the CLI too (still default false for version
 skew). Proven byte/row-exact across the seam, plus an owned-mode VACUUM-shrink
 e2e and an S3-gated real-`walrust watch` CLI e2e (L1+L2 fire, superseded L0
-deleted, restore/PITR/verify all correct). **C3b is next**: oracle
-granularity-decay extension, kill-mid-compaction drill, restore-speed bench,
-default-on.
+deleted, restore/PITR/verify all correct). The C3a adversarial review executed
+that S3 e2e for the first time and fixed three defects it exposed: `verify`'s
+snapshot-chain check was not level-aware (false gap on a compacted bucket), and
+three read consumers (`list_merged_ranges`, owned `gather_candidates`,
+`prune::list_level_files`) stopped at the first empty level — missing a populated
+L2 above a fully-promoted (empty) L1 — plus the cache-bypass was made structural.
+**C3b is next**: oracle granularity-decay extension, kill-mid-compaction drill,
+restore-speed bench, default-on.
 
 Merge many small incremental changesets into fewer, larger ones so long-history
 databases restore fast and buckets stay small. Litestream's level design is the

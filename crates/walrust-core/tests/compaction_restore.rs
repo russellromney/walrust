@@ -386,6 +386,61 @@ async fn seq_layout_crash_overlap_restores_without_double_apply() {
     assert_eq!(std::fs::read(&out).unwrap(), fx.state_at[&fx.max_seq]);
 }
 
+/// Regression: a fully-promoted lower level (empty L1 above a populated L2) must
+/// still restore. Promotion deletes the L1 sources it folds into L2, so the
+/// healthy steady state has an EMPTY L1 sitting above L2. A candidate gather that
+/// stopped at the first empty level would miss L2 and report a phantom chain gap
+/// on a perfectly restorable bucket.
+#[tokio::test]
+async fn restore_finds_l2_when_l1_is_fully_promoted_away() {
+    // 16 incrementals (seqs 2..=17) → four L1 files [2,5],[6,9],[10,13],[14,17].
+    let fx = build_fixture("promo/", "db", 16, false);
+    let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
+    for _ in 0..4 {
+        let o = run_level_compaction(&layout, 0, 4, Duration::from_secs(0), NOW)
+            .await
+            .unwrap();
+        assert_eq!(o.merged_count(), 4);
+    }
+    // Two L1→L2 merges consume ALL four L1 files: L2 [2,9] and [10,17].
+    for _ in 0..2 {
+        let o = run_level_compaction(&layout, 1, 2, Duration::from_secs(0), NOW)
+            .await
+            .unwrap();
+        assert_eq!(o.merged_count(), 2);
+    }
+
+    // The load-bearing precondition: L1 is EMPTY, L2 holds the coverage.
+    assert!(
+        fx.store
+            .list("promo/db/levels/L1/", None)
+            .await
+            .unwrap()
+            .is_empty(),
+        "L1 must be fully promoted away (empty) for this regression"
+    );
+    assert_eq!(
+        fx.store
+            .list("promo/db/levels/L2/", None)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "L2 holds the whole history in two merged objects"
+    );
+
+    // Restore-to-latest must find L2 across the empty L1 and be row/byte-exact.
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("latest.db");
+    let seq = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out, None)
+        .await
+        .expect("restore must not phantom-gap across an empty lower level");
+    assert_eq!(seq, fx.max_seq);
+    assert!(integrity_ok(&out));
+    assert_eq!(query_rows(&out), fx.rows);
+    assert_eq!(std::fs::read(&out).unwrap(), fx.state_at[&fx.max_seq]);
+}
+
 // ── Range layout: the shared planner + executor over the `.ltx` adapter ──────
 
 #[tokio::test]

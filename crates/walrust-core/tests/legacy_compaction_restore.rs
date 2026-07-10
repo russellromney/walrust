@@ -312,6 +312,43 @@ async fn legacy_pitr_to_merged_boundary_is_exact_inside_window_is_loud() {
 }
 
 #[tokio::test]
+async fn legacy_restore_rejects_a_corrupted_ltx_domain_stamp_at_the_seam() {
+    // Tamper matrix, variant 2: corrupt the merged object's LTX-domain linkage
+    // stamp (`declared_end`, the HADBP v2 header field at byte offset 40) rather
+    // than a page byte. This leaves the content checksum valid but poisons the
+    // running chain value the seam carries forward. The next object in the plan
+    // (L1 [10,13], whose `prev` is the real LTX post of seq 9) must then fail its
+    // DB-anchored `verify_chain` — proving the seam's cross-format linkage is
+    // checked in the LTX domain, not trusted. (A merge that stamped the wrong
+    // domain here would be caught by exactly this linkage.)
+    let fx = build_ltx_fixture("p/", "app", 13);
+    compact(&fx.store, &fx.prefix, &fx.db).await;
+
+    let l2_key = fx.store.list("p/app/levels/L2/", None).await.unwrap()[0].clone();
+    {
+        let mut objs = fx.store.objects.lock().unwrap();
+        let bytes = objs.get_mut(&l2_key).unwrap();
+        // Flip a byte inside the 8-byte declared_end field (offset 40..48).
+        bytes[40] ^= 0xFF;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("restored.db");
+    let err = restore_legacy_ltx(&fx.store, "p/", "app", &out, None)
+        .await
+        .expect_err("a corrupted LTX-domain stamp must break the chain at the seam");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("chain broken") || msg.contains("checksum"),
+        "error must name the linkage failure across the seam: {msg}"
+    );
+    assert!(
+        !out.exists(),
+        "a failed restore must not publish a partial DB"
+    );
+}
+
+#[tokio::test]
 async fn legacy_restore_rejects_a_tampered_merged_object_at_the_seam() {
     // Fail-on-revert for the seam's DB-anchored verification: the restore
     // executor runs `physical::verify_chain` on every merged HADBP object before

@@ -80,6 +80,20 @@ fn open_external_autocheckpoint_connection(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// A writer that never auto-checkpoints. Aggressive auto-checkpointing restarts
+/// the WAL (new salt) on nearly every commit, which walrust records as a
+/// snapshot rollover — punching a seq gap into the L0 chain per commit. That is
+/// exactly the pattern the compaction liveness rule refuses to merge across
+/// (each L0 file becomes a lone straddler), so a compaction e2e must drive
+/// **contiguous** incrementals: keep the WAL alive and let walrust's own
+/// (disabled here) checkpoint timer, not SQLite auto-checkpoint, decide snapshot
+/// cadence.
+fn open_external_no_autocheckpoint_connection(path: &Path) -> Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+    Ok(conn)
+}
+
 fn pin_read_transaction(path: &Path) -> Result<Connection> {
     let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA journal_mode=WAL; BEGIN;")?;
@@ -1229,7 +1243,13 @@ async fn e2e_cli_compaction_fires_levels_and_restore_reads_them() -> Result<()> 
     let l2_prefix = format!("{prefix}/{name}/levels/L2/");
 
     let setup = create_source_db(&db_path, 5)?;
-    let writer = open_external_autocheckpoint_connection(&db_path)?;
+    // A compaction e2e needs a **contiguous** L0 chain to fold up the levels, so
+    // the writer must not auto-checkpoint (which would restart the WAL / roll the
+    // salt and make walrust punch a snapshot seq-gap per commit — every L0 a lone
+    // straddler the liveness rule correctly refuses to merge). walrust's own
+    // snapshot/checkpoint timers are pinned to 999999s here, so the only snapshot
+    // is the on-startup base and every later sync is a chaining incremental.
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
     write_pin_frame(&setup, "cli-compaction")?;
 
     let mut child =
@@ -1238,13 +1258,21 @@ async fn e2e_cli_compaction_fires_levels_and_restore_reads_them() -> Result<()> 
 
     // Drive ~16 separate sync cycles so the L0 pool fills L1 (batch 4) three
     // times and then L2 (batch 2); one commit per >1s poll window == one L0.
+    // We track whether L1 was **ever** observed (not whether it is present at the
+    // end): the L1→L2 merge deletes its L1 sources, so at the instant L2 first
+    // appears L1 can legitimately be empty. "L1 was seen" ∧ "L2 fired" is the
+    // race-free proof that the full L0→L1→L2 cascade ran.
     let mut next_id = 100i64;
     let l2_deadline = Instant::now() + e2e_poll_deadline(90);
     let mut fired_l2 = false;
+    let mut seen_l1 = false;
     for _ in 0..24 {
         append_rows(&writer, next_id, next_id + 1, "compact")?;
         next_id += 2;
         std::thread::sleep(Duration::from_millis(1200));
+        if !list_keys(&l1_prefix).await?.is_empty() {
+            seen_l1 = true;
+        }
         if !list_keys(&l2_prefix).await?.is_empty() {
             fired_l2 = true;
             break;
@@ -1255,12 +1283,17 @@ async fn e2e_cli_compaction_fires_levels_and_restore_reads_them() -> Result<()> 
     }
     assert!(fired_l2, "L2 must fire within the deadline");
 
-    // L1 also present; the superseded L0 objects were deleted by the engine, so
-    // the L0 pool is far smaller than the ~16+ incrementals produced.
+    // The superseded L0 objects were deleted by the engine, so the L0 pool is far
+    // smaller than the ~16+ incrementals produced. L2's presence already proves
+    // L1 fired (L2 can only be built from L1 sources); `seen_l1` additionally
+    // pins that an L1 object was materialized on the wire.
     let l1 = list_keys(&l1_prefix).await?;
     let l2 = list_keys(&l2_prefix).await?;
     let l0 = list_keys(&l0_prefix).await?;
-    assert!(!l1.is_empty(), "L1 must be present: {l1:?}");
+    assert!(
+        seen_l1 || !l1.is_empty(),
+        "L1 must have fired (seen during the run or still present): {l1:?}"
+    );
     assert!(!l2.is_empty(), "L2 must be present: {l2:?}");
     assert!(
         l0.len() < 10,
@@ -1294,12 +1327,15 @@ async fn e2e_cli_compaction_fires_levels_and_restore_reads_them() -> Result<()> 
     )?;
     anyhow::ensure!(
         out.status.success(),
-        "PITR to the L2 boundary txid {l2_max} must succeed:\n{}",
+        "PITR to the L2 boundary txid {l2_max} must succeed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     assert_integrity_ok(&boundary_out)?;
 
-    // PITR strictly inside the L2 window is the loud typed decay error.
+    // PITR strictly inside the L2 window is the loud typed decay error. walrust's
+    // tracing subscriber logs to stdout (not stderr), so the typed error surfaces
+    // on stdout; assert on the combined streams so the check is stream-agnostic.
     if l2_max > l2_min + 1 {
         let inside = l2_min + 1;
         let inside_out = temp.path().join("inside.db");
@@ -1314,7 +1350,11 @@ async fn e2e_cli_compaction_fires_levels_and_restore_reads_them() -> Result<()> 
             !out.status.success(),
             "PITR inside a merged window (txid {inside}) must fail loudly"
         );
-        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stderr = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
         anyhow::ensure!(
             stderr.contains("falls inside merged window"),
             "decay error must name the merged window: {stderr}"

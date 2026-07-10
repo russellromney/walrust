@@ -51,8 +51,14 @@ pub fn ranges_cover(lo: u64, hi: u64, ranges: &[SeqRange]) -> bool {
 
 /// List the merged seq ranges present across every level ≥ 1 of a layout (the
 /// L0 raw pool is excluded — it is the fine chain, not a bridge). Used by verify
-/// and prune to reason about merged coverage. One LIST + N ranged reads per
-/// non-empty level; probing stops at the first empty level.
+/// and prune to reason about merged coverage. One LIST + N ranged reads per level.
+///
+/// Every level `1..=MAX_LEVEL_PROBE` is probed — the scan does **not** stop at the
+/// first empty level. Promotion *empties* a lower level when it folds all of its
+/// objects into the next one (an L1→L2 merge deletes its L1 sources), so the
+/// healthy steady state routinely has an empty L1 above a populated L2. Stopping
+/// at the first empty level would miss that L2 and make verify hallucinate a gap
+/// (and prune under-collect). The `MAX_LEVEL_PROBE` cap still bounds the LISTs.
 pub async fn list_merged_ranges(
     layout: &dyn CompactionLayout,
 ) -> Result<Vec<SeqRange>, CompactionError> {
@@ -60,9 +66,6 @@ pub async fn list_merged_ranges(
     let mut out = Vec::new();
     for level in 1..=MAX_LEVEL_PROBE {
         let files = layout.list_level(level).await?;
-        if files.is_empty() {
-            break;
-        }
         out.extend(files.into_iter().map(|f| f.range));
     }
     Ok(out)

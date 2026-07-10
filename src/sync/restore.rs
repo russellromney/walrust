@@ -18,6 +18,25 @@ struct CachedLegacyStorage {
     cache: Option<LocalCache>,
 }
 
+/// True if `key` addresses a compaction **level** object (`.../levels/L{n}/…`).
+///
+/// Identified **structurally** by path segments — a segment exactly `levels`
+/// immediately followed by a segment `L{digits}` — not by a bare substring. A
+/// real level object's key is always built as `{db}/levels/L{level}/{file}`
+/// (see `compaction::layout::level_subpath`), so this can never false-negative
+/// one (which would let a cached LTX be substituted for an HADBP payload — the
+/// corruption the bypass exists to prevent). It also cannot be tripped by a
+/// database name or prefix that merely contains the text "levels".
+fn is_compaction_level_key(key: &str) -> bool {
+    let segs: Vec<&str> = key.split('/').collect();
+    segs.windows(2).any(|w| {
+        w[0] == "levels"
+            && w[1].len() >= 2
+            && w[1].as_bytes()[0] == b'L'
+            && w[1][1..].bytes().all(|b| b.is_ascii_digit())
+    })
+}
+
 /// Parse the (min_txid, max_txid) interval an object KEY names.
 ///
 /// Canonical keys are `db/GEN/min-max.ltx`; the legacy flat shape `00000003.ltx`
@@ -46,8 +65,10 @@ fn cache_substitute_for_key(cache: &LocalCache, key: &str) -> Option<Vec<u8>> {
     // but its payload is **HADBP**, not LTX — substituting a cached LTX for it
     // by matching TXID range would corrupt a leveled restore. Merged objects are
     // coarse and read once, so bypassing the cache for them costs nothing;
-    // always fetch them from authoritative storage.
-    if key.contains("/levels/L") {
+    // always fetch them from authoritative storage. The match is structural (path
+    // segments, not a bare substring) so it can never false-negative a real level
+    // object nor be tripped by a db name/prefix that merely contains "levels".
+    if is_compaction_level_key(key) {
         return None;
     }
     let (min_txid, max_txid) = key_txid_range(key)?;
@@ -418,6 +439,26 @@ mod tests {
             cache_substitute_for_key(&cache, "").is_none(),
             "empty key must fall back to S3"
         );
+    }
+
+    #[test]
+    fn level_key_detection_is_structural() {
+        // Real merged level objects (built as `{db}/levels/L{n}/{file}`) are always
+        // detected, so a cached LTX can never be substituted for their HADBP bytes.
+        assert!(is_compaction_level_key("p/db/levels/L1/0002-0011.ltx"));
+        assert!(is_compaction_level_key("db/levels/L2/00-ff.ltx"));
+        assert!(is_compaction_level_key("a/b/c/db/levels/L16/x.ltx"));
+        // Normal L0 / snapshot objects are NOT level keys.
+        assert!(!is_compaction_level_key("p/db/0000/0002-0002.ltx"));
+        assert!(!is_compaction_level_key("p/db/0001/0001-0001.ltx"));
+        // Not fooled by a segment that merely contains "levels" or a bad L-suffix.
+        assert!(!is_compaction_level_key("p/mylevels/0000/x.ltx"));
+        assert!(!is_compaction_level_key("p/db/levels/Lx/x.ltx"));
+        assert!(!is_compaction_level_key("p/db/levels/L/x.ltx"));
+        assert!(!is_compaction_level_key("p/levelsL1/x.ltx"));
+        // A db name literally "levels" does not create a false level key: the
+        // following segment ("0000") is not `L{digits}`.
+        assert!(!is_compaction_level_key("p/levels/0000/0002-0002.ltx"));
     }
 
     #[tokio::test]
