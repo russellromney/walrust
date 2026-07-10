@@ -6,15 +6,17 @@
 
 > **Experimental.** walrust is under active development and contains bugs. Be careful.
 
-**Lightweight SQLite replication to S3 in Rust.**
+**Lightweight SQLite replication to S3 in Rust as a CLI or an embedded library.**
 
-Walrust continuously replicates SQLite databases to any S3-compatible storage (AWS S3, Tigris, R2, MinIO, etc.), ensuring minimal data loss on server crashes, power failures, or disk corruption.
+Walrust continuously replicates SQLite databases to any S3-compatible storage
+(AWS S3, Tigris, R2, MinIO, etc.). You get durability and read replicas without
+running an HA cluster, and keep SQLite's fast local reads and writes.
 
-This design means durability and availability without running a HA cluster, plus fast local reads and writes.
+walrust's specific goals are to be performant and memory efficient.
 
-walrust's specific goal is to be embeddable and memory efficient.
-
-Part of the [hadb](https://github.com/russellromney/hadb) ecosystem. Shared infrastructure (S3, retry, webhooks, retention) provided by [hadb-io](https://github.com/russellromney/hadb/tree/main/hadb-io).
+Part of the [hadb](https://github.com/russellromney/hadb) ecosystem. Shared
+infrastructure (S3, retry, webhooks, retention) provided by
+[hadb-io](https://github.com/russellromney/hadb/tree/main/hadb-io).
 
 ## How it works
 
@@ -47,9 +49,12 @@ Part of the [hadb](https://github.com/russellromney/hadb) ecosystem. Shared infr
 └─────────────────────────────────────┘            └──────────────────┘
 ```
 
-walrust polls the WAL, uploads new WAL frames as HADBP changesets to S3, and takes periodic snapshots. Every changeset carries a SHA-256 checksum chain, verified automatically on restore. The format is provided by [hadb-changeset](https://github.com/russellromney/hadb-changeset).
+walrust polls the WAL, uploads new frames as
+[HADBP](https://github.com/russellromney/hadb/tree/main/hadb-changeset)
+changesets, and takes periodic snapshots. See
+[Safety and design](#safety-and-design) for how this avoids corrupting data.
 
-## Quick start
+## Quick start (CLI)
 
 ```bash
 cargo install walrust
@@ -64,12 +69,82 @@ More commands:
 ```bash
 walrust restore mydb -o restored.db -b s3://my-bucket                        # restore from S3
 walrust restore mydb -o restored.db -b s3://my-bucket --point-in-time 42     # restore through TXID/sequence 42
-walrust snapshot app.db -b s3://my-bucket                  # immediate snapshot
+walrust snapshot app.db -b s3://my-bucket                  # immediate snapshot (errors if a watcher owns the DB)
 walrust verify mydb -b s3://my-bucket                      # check backup integrity
 walrust list -b s3://my-bucket                             # list backups
 walrust compact -b s3://my-bucket                          # GFS retention cleanup
 walrust explain                                            # preview resolved config
 ```
+
+## Use as a library
+
+The `walrust` crate re-exports the engine as `walrust::walrust_core`, plus an
+S3 convenience constructor.
+
+```rust
+use std::path::Path;
+use walrust::walrust_core::{Replicator, sync::ReplicationConfig};
+
+// Reads AWS_* env vars. Any hadb_storage::StorageBackend works;
+// build with `default-features = false` to skip the aws-sdk dependency.
+let storage = walrust::s3_backend_from_env("my-bucket", Some("https://fly.storage.tigris.dev")).await?;
+
+// Starts the background sync loop. Databases live under "{prefix}{name}/".
+let replicator = Replicator::new(storage, "backups/", ReplicationConfig::default());
+
+// Snapshots the database and begins continuous WAL replication.
+replicator.add("app", Path::new("app.db")).await?;
+
+// ... your app writes to app.db as normal ...
+
+replicator.flush("app").await?;                              // block until synced to S3
+replicator.restore("app", Path::new("restored.db")).await?; // verified restore
+```
+
+Notes for embedders:
+
+- Open your database in WAL mode. `walrust pragma` prints the recommended
+  settings.
+- walrust-core pins `rusqlite` (currently 0.35). Cargo allows one
+  `libsqlite3-sys` per build, so your app's rusqlite version must match.
+- `Replicator::add()` creates a small `_walrust_seq` table in the database —
+  see [Safety and design](#safety-and-design).
+
+Bindings for other languages are planned; Python bindings exist today behind
+the `python` feature.
+
+## Safety and design
+
+How replication works: walrust reads committed frames from the SQLite WAL,
+checking each frame's checksum and salt and stopping at the first torn or stale
+frame — a partial transaction never leaves the machine. Committed pages are
+packaged as an HADBP changeset whose checksum chains from the previous state of
+the database. Periodic snapshots start fresh bases. A restore takes the newest
+snapshot at or before the target and applies changesets in order, verifying the
+chain against the actual restored bytes — a missing, corrupt, or out-of-order
+changeset breaks the chain and fails the restore instead of producing a wrong
+database.
+
+What walrust promises. Every claim here is backed by a test that fails when the
+behavior breaks:
+
+- **Restores are verified or they fail loudly.** A restore is staged to a temp
+  file, chain-verified, and must pass `PRAGMA integrity_check` before it
+  replaces the output path. A gap, a missing object, or a point-in-time target
+  beyond the newest backup is a hard error.
+- **Recovery point is bounded by the sync interval** (default ~1s). Rows
+  committed inside the final un-synced window can be lost in a hard crash;
+  everything synced is restorable. A clean `flush()` before shutdown means zero
+  loss.
+- **Checkpoints can't destroy unshipped data.** walrust pins the WAL with a
+  read transaction (via the small `_walrust_seq` table it creates in each
+  watched database — the same technique Litestream uses), so an external
+  `wal_checkpoint` cannot reset the WAL mid-backup. A checkpoint while walrust
+  is stopped is detected on restart and triggers an immediate re-snapshot.
+- **Single writer, enforced.** A lock file (`.walrust-<db>.lock`) makes a
+  second watcher on the same host fail fast instead of corrupting the backup.
+- **Retention never orphans a restore point.** `compact` keeps every object a
+  retained point-in-time restore still needs.
 
 ## Configuration
 
@@ -88,11 +163,13 @@ path = "/data/app.db"
 walrust watch  # auto-discovers walrust.toml
 ```
 
-Everything else (sync intervals, retention, retry, webhooks) has sensible defaults. See `walrust explain` for the full resolved config.
+Everything else (sync intervals, retention, retry, webhooks) has sensible
+defaults. See `walrust explain` for the full resolved config.
 
-A glob (`path = "/data/*.db"`) that matches no databases is a startup error by default, so a typo does not silently back up nothing. Set `allow_empty_globs = true` at the top level to permit genuinely optional patterns; when it is set and *every* configured glob is empty, `watch` starts and idles (logging a warning) instead of exiting, so a supervisor can boot walrust before the databases it will back up exist.
-
-**Reserved table.** In walrust-owned mode (the library `Replicator`), walrust creates a small `_walrust_seq` table in each watched database and holds a read transaction that pins a live WAL frame. This is how walrust stops an external process from checkpointing the WAL out from under an in-flight backup — the same technique Litestream uses with its `_litestream_seq` table. The table holds a single counter row and is safe to ignore.
+A glob (`path = "/data/*.db"`) that matches nothing is a startup error, so a
+typo can't silently back up nothing. Set `allow_empty_globs = true` for
+genuinely optional patterns; if every glob is empty, `watch` starts and idles
+with a warning so a supervisor can boot walrust before its databases exist.
 
 ## Read replica
 
@@ -100,58 +177,61 @@ A glob (`path = "/data/*.db"`) that matches no databases is a startup error by d
 walrust replicate s3://my-bucket/app --local replica.db --interval 5s
 ```
 
-This polls S3 for new changesets and applies them to a local database. The replica is a normal SQLite file — any application can open it read-only. Combine with `walrust watch` on the primary to get a continuously updated read replica on another machine.
+This polls S3 for new changesets and applies them to a local database. The
+replica is a normal SQLite file — any application can open it read-only.
+Combine with `walrust watch` on the primary for a live read replica on another
+machine.
 
-## Testing
+## Monitoring
 
-`make basic-e2e` runs the fast `basic_e2e` drill tier: lifecycle, one PID-verified restart under load, restore row-count assertions, and compact plus point-in-time restore checks. It builds the debug binary and is intended for PR gating.
+`walrust verify` exits nonzero on real chain problems only (holes superseded by
+a later snapshot are not alarms), so it can run in cron. Webhooks cover upload
+failures, detected external checkpoints, and corruption — configure in
+`walrust.toml`.
 
-`make drill` runs the full user-drill suite with the release binary: lifecycle, restart-under-load, hostile external checkpoints, PITR including the future-TXID error case, compact-then-restore-every-retained-point, read replica convergence, and the 10-minute restart/RSS soak.
+## Performance and cost
 
-Both targets read S3-compatible storage from the environment. Local Tigris runs can use Soup:
+**Memory.** A watcher is designed to hold a bounded working set, so RSS should
+stay roughly constant as database count grows. In a single-database
+side-by-side drill, walrust and Litestream both measured ~7–10 MB RSS.
+Multi-database scaling has not been re-measured since the last major round of
+changes. Measure your own workload.
 
-```bash
-make basic-e2e
-make drill
-```
+**S3 objects.** walrust uploads a changeset per `wal-sync-interval` (default
+~1s) and does not compact incrementals, so a busy database accumulates many
+small objects between snapshots — in the drill, ~9x more objects than
+Litestream left behind over the same window. If object count or request cost
+matters, raise `wal-sync-interval`.
 
-For local MinIO or another endpoint, provide credentials and disable Soup:
+## vs Litestream
 
-```bash
-AWS_ACCESS_KEY_ID=minioadmin \
-AWS_SECRET_ACCESS_KEY=minioadmin \
-AWS_ENDPOINT_URL_S3=http://127.0.0.1:9000 \
-TIERED_TEST_BUCKET=walrust-dev \
-make basic-e2e USE_SOUP=0
-```
-
-## Memory usage
-
-walrust aims to be embeddable and memory-efficient: a single watcher holds a
-bounded working set (shadow WAL frames + the changeset being encoded), so RSS is
-roughly constant regardless of database count rather than growing with it.
-
-In recent side-by-side drills on macOS syncing small databases to Tigris S3,
-walrust and Litestream both measured **~7–10 MB RSS** and were statistically
-indistinguishable. Earlier versions of this README published a table claiming a
-large advantage (e.g. 23–31 MB vs 36 MB); that result did not reproduce and has
-been removed. Absolute numbers depend heavily on database size, allocator, and
-sync cadence — measure your own workload rather than relying on a headline
-figure.
-
-## S3 request volume
-
-walrust favors freshness over batching: the default `wal-sync-interval` is ~1s,
-so under sustained writes it issues roughly one PUT per interval per database.
-In the drills this produced on the order of **~9x more PUTs** than Litestream's
-coarser batching over the same window — a recovery-point-vs-cost tradeoff, not a
-defect. If S3 request cost matters more than a tight recovery point, raise
-`wal-sync-interval` (fewer, larger uploads) and/or lean on the snapshot
-triggers (`max-changes`, `max-interval`, `on-idle`) to control cadence.
+- **Library embedding is the point of walrust** — replication inside your Rust
+  process instead of a sidecar.
+- **The formats are not compatible.** walrust writes HADBP changesets, not
+  Litestream's LTX. Neither tool can restore the other's backups.
+- **walrust leaves more, smaller objects in the bucket** (no incremental
+  compaction — see above). Measured memory was the same in a single-database
+  drill; replication lag has not been compared.
+- **Litestream is older and more battle-tested.**
 
 ## Acknowledgments
 
-walrust is transparently inspired by and built on the ideas from [Litestream](https://litestream.io) by [Ben Johnson](https://github.com/benbjohnson). The replication format has moved from Litestream's LTX to [HADBP](https://github.com/russellromney/hadb-changeset), a shared changeset format used across the [hadb](https://github.com/russellromney/hadb) ecosystem.
+walrust is transparently inspired by and built on the ideas from
+[Litestream](https://litestream.io) by
+[Ben Johnson](https://github.com/benbjohnson), including its core safety
+technique (the pinned WAL read lock). The replication format is
+[HADBP](https://github.com/russellromney/hadb/tree/main/hadb-changeset), a
+shared changeset format used across the
+[hadb](https://github.com/russellromney/hadb) ecosystem.
+
+## Testing
+
+Three instruments run continuously: the unit/integration suite and a fast
+`basic_e2e` drill tier (real binary, kill/restart, restore row-diff, compact +
+PITR) gate every PR; the full drill suite runs nightly and files an issue on
+failure. Run them locally with `make basic-e2e` and `make drill` against any S3
+endpoint via `AWS_*` env vars (or Tigris via Soup). `ADVERSARIAL_REVIEW_2.md`
+is the findings ledger.
 
 ## License
 
