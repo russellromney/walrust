@@ -50,6 +50,64 @@ Core differentiators:
 
 ---
 
+## Compaction (next up)
+
+Merge many small incremental changesets into fewer, larger ones so long-history
+databases restore fast and buckets stay small. Litestream's level design is the
+direct inspiration (studied from its source); walrust adapts it to its own
+shape. Serves the goals in order: never corrupt data, restore fast, stay
+memory-efficient, don't spam S3.
+
+**The user this serves:** a long-term database whose snapshots are expensive
+(big file, daily/weekly snapshot interval). Without compaction, restoring means
+fetching tens of thousands of second-grain objects sequentially. With it:
+snapshot + a few hour-files + a few minute-files + a seconds tail.
+
+**Design:**
+
+- Two levels above raw sync files. L0 = raw (~1s) sync objects. L1 = minutes-
+  grain, merged from L0. L2 = hours-grain, merged from L1. Then snapshots, then
+  GFS prune — both unchanged. Config leaves room for more levels; only these
+  two get built.
+- **Count-triggered, not clock-triggered.** The watcher merges when a batch
+  fills (it already knows how many files it wrote — no LIST polling). Idle
+  database = zero compaction requests. This beats litestream's wall-clock ticks
+  for many-database and mostly-idle deployments.
+- Knobs (names speak user intent, defaults conservative):
+  `[compaction] enabled` (false in the release that ships it — see version
+  skew), `keep_fine_window = "1h"` (L0 younger than this is never merged: "I
+  can restore to the second within the last hour"), `l1_batch`, `l2_batch`.
+- **Chain linkage survives compaction** (unlike litestream, whose compacted
+  files verify individually but not as a sequence): a small HADBP extension —
+  a COMPACTED flag plus a declared end-of-range chain value copied from the
+  last source file. Linkage stays verifiable end to end; content keeps its own
+  checksum; restore still verifies pre/post-apply against actual bytes.
+  Requires a one-field, backward-compatible hadb-changeset change (we own it).
+- **Restore speed is the point.** The greedy planner (ported from litestream's
+  CalcRestorePlan: newest snapshot ≤ target, then any-level file that extends
+  the contiguous range furthest) knows the full file list upfront — so restore
+  prefetches the plan with bounded parallelism and applies strictly in order.
+- **Memory rule:** merging streams with peak memory O(page_size × sources +
+  index), never O(total bytes). Hard requirement, not an optimization.
+- **Safety invariants:** write merged file durably → verify it → only then
+  delete sources (crash between = harmless overlap; the planner tolerates
+  overlap and re-compaction is idempotent). Prune must never delete objects a
+  retained restore point needs — same E2-class rule, now level-aware. PITR
+  granularity decays with age by design; a point inside a merged window
+  restores at window grain or fails loudly — never a chain gap.
+- **Version skew is the compat risk:** old binaries restoring a compacted
+  bucket don't know levels exist. Ship restore/verify/planner support first
+  with `enabled = false`; flip the default a release later.
+
+**Order of work:** rename `compact` → `prune` first (retention expiry is
+pruning, not compaction — borg/restic precedent; frees the name). Then the
+hadb-changeset extension, then the walrust compactor + planner, then the
+state-machine oracle extension (granularity decay), kill-mid-compaction drill,
+and a bench restore-speed comparison on a long history — the "faster restore
+than litestream" claim ships as a measured number or not at all.
+
+---
+
 ## Phase Drain: Synchronous Flush for Graceful Shutdown
 
 > After: v0.7.0 (hadb-io migration) · Before: SnapshotSource trait
