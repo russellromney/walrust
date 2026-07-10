@@ -7,6 +7,7 @@ DRILL_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 drills=(
   basic-lifecycle.sh
   restart-under-load.sh
+  kill-mid-compaction.sh
   hostile-operator.sh
   pitr.sh
   prune-retained.sh
