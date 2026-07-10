@@ -129,6 +129,28 @@ fn config_for_test() -> ReplicationConfig {
 /// is released. Before the fix, the spawned task held a strong
 /// `Arc<Replicator>`, which kept `storage` alive forever — strong count
 /// would never return to 1.
+/// C2a gate contract: compaction is off by default and only the internal
+/// builder-flag setter (not any config field) can turn it on. This is what
+/// keeps compaction unreachable from `walrust.toml`/CLI until the C2b planner.
+#[tokio::test]
+async fn compaction_gate_defaults_off_and_toggles() {
+    let storage = MemStorage::new();
+    let storage_dyn: Arc<dyn StorageBackend> = storage.clone();
+    let replicator =
+        Replicator::try_new(storage_dyn, "test/", config_for_test()).expect("construct replicator");
+
+    // Default OFF — a fresh Replicator never compacts.
+    assert!(!replicator.compaction_enabled());
+
+    replicator.set_compaction_enabled(true);
+    assert!(replicator.compaction_enabled());
+
+    replicator.set_compaction_enabled(false);
+    assert!(!replicator.compaction_enabled());
+
+    replicator.shutdown().await;
+}
+
 #[tokio::test]
 async fn drop_releases_storage_backend() {
     let storage = MemStorage::new();

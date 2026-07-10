@@ -51,7 +51,24 @@ Core differentiators:
 
 ---
 
-## Compaction (next up)
+## Compaction (in progress)
+
+**Status:** rename `compact`→`prune` shipped. C1 (COMPACTED v2 format) shipped.
+**C2a (layout-agnostic merge engine, write side) shipped** — `CompactionLayout`
+trait + seq/range adapters, streaming k-way merge with a proven memory bound,
+count-based triggers with `keep_fine_window`, E2-class write→verify→delete
+ordering with idempotent crash recovery, and the merge oracle. Merged levels
+(`L≥1`) live under a dedicated `{db}/levels/L{n}/` sub-path, **not** a hex
+generation folder: the legacy layout increments its snapshot generation per
+snapshot, so a `0x0010`-based L1 would collide with the 16th snapshot's `0010/`
+folder in both directions; the non-hex `levels/` path is invisible to every
+existing discovery scanner. The engine is
+wired into both write paths but **gated off** (`compaction_enabled`, default
+false, not config-reachable) because enabling it would make backups
+unrestorable by the shipped restore path. **C2b is next**: the restore/verify
+planner that reads leveled buckets, then flip the gate and expose
+`[compaction] enabled`. C3: oracle granularity-decay extension, kill-mid-
+compaction drill, restore-speed bench.
 
 Merge many small incremental changesets into fewer, larger ones so long-history
 databases restore fast and buckets stay small. Litestream's level design is the
