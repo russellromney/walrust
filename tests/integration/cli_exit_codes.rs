@@ -137,6 +137,58 @@ fn missing_snapshot_database_exits_with_database_status() {
     );
 }
 
+/// The hidden `compact` command is a deprecated alias for `prune`. It must
+/// (a) warn on stderr exactly once, (b) NOT print that warning under `prune`,
+/// and (c) behave identically — same S3-failure exit code against an
+/// unreachable endpoint. The warning is emitted before any S3 work, so an
+/// unreachable endpoint exercises the whole alias path without real creds.
+#[test]
+fn compact_alias_warns_once_and_matches_prune_exit_code() {
+    let deprecation = "`walrust compact` is deprecated";
+
+    let run = |subcommand: &str| {
+        command_with_dummy_s3_env()
+            .arg(subcommand)
+            .arg(unique_name("alias-check"))
+            .arg("--bucket")
+            .arg("s3://walrust-cli-exit-test")
+            .arg("--endpoint")
+            .arg("http://127.0.0.1:9")
+            .output()
+            .expect("walrust command should run")
+    };
+
+    let compact = run("compact");
+    let prune = run("prune");
+
+    let compact_stderr = String::from_utf8_lossy(&compact.stderr);
+    let prune_stderr = String::from_utf8_lossy(&prune.stderr);
+
+    // (a) warns exactly once under the alias.
+    assert_eq!(
+        compact_stderr.matches(deprecation).count(),
+        1,
+        "`compact` must print the deprecation warning exactly once; stderr={compact_stderr}"
+    );
+    // (b) never warns under the preferred name.
+    assert!(
+        !prune_stderr.contains(deprecation),
+        "`prune` must not print the deprecation warning; stderr={prune_stderr}"
+    );
+    // (c) identical exit code — the alias just forwards to prune (S3 status 4
+    // against the unreachable endpoint).
+    assert_eq!(
+        compact.status.code(),
+        prune.status.code(),
+        "alias and prune must share an exit code; compact stderr={compact_stderr}; prune stderr={prune_stderr}"
+    );
+    assert_eq!(
+        prune.status.code(),
+        Some(4),
+        "prune against an unreachable endpoint should exit with S3 status; stderr={prune_stderr}"
+    );
+}
+
 #[test]
 fn unreachable_verify_endpoint_exits_with_s3_status() {
     let output = command_with_dummy_s3_env()

@@ -81,17 +81,17 @@ walrust-core = { version = "0.3.1", path = "crates/walrust-core" }
 
 # Storage substrate (trait is always available; concrete S3 impl is feature-gated).
 # hadb-* are pinned to an explicit rev on branch `feat/changeset-compacted` (adds the
-# CheckpointDetected webhook variant used by D4) for a reproducible clean-clone
+# COMPACTED version-2 changeset format used by compaction) for a reproducible clean-clone
 # build (Cargo permits only one of branch/rev, so the rev is the pin and the
 # branch is documented here). A gitignored
 # `.cargo/config.toml` `[patch]` -> `../hadb` overrides this for local dev.
-hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "b492b5bcb444df523e451aaedcbc71dcd7c0a73c" }
-hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", rev = "b492b5bcb444df523e451aaedcbc71dcd7c0a73c", optional = true }
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "9892610afb6d34441db22618c1918620dded9a03" }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", rev = "9892610afb6d34441db22618c1918620dded9a03", optional = true }
 
 # Legacy config/webhook/retention/s3 helpers. Default-features = false so
 # `walrust --no-default-features` can build without aws-sdk; the `s3` feature
 # above re-enables hadb-io's `s3` (and pulls in aws-sdk-s3 transitively).
-hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", rev = "b492b5bcb444df523e451aaedcbc71dcd7c0a73c", default-features = false }
+hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", rev = "9892610afb6d34441db22618c1918620dded9a03", default-features = false }
 
 # S3 client type (shared with hadb-io, needed for function signatures).
 aws-sdk-s3 = { version = "1", optional = true }

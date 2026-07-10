@@ -17,7 +17,7 @@ walrust = { path = ".." }
 # Storage trait — DST mock + tests implement it directly. Pinned to the same
 # hadb commit walrust uses so it resolves to exactly one copy. Rev is on branch
 # `feat/changeset-compacted` (Cargo allows only one of branch/rev).
-hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "b492b5bcb444df523e451aaedcbc71dcd7c0a73c" }
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "9892610afb6d34441db22618c1918620dded9a03" }
 
 # Property-based testing
 proptest = "1.4"

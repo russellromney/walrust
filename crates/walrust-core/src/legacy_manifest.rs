@@ -588,11 +588,11 @@ mod tests {
         let kept: Vec<_> = plan.keep.iter().map(|entry| entry.sequence).collect();
         assert!(
             kept.contains(&3),
-            "core compaction must protect the snapshot base for live incrementals"
+            "core prune must protect the snapshot base for live incrementals"
         );
         assert!(
             kept.contains(&8),
-            "core compaction must keep the latest snapshot"
+            "core prune must keep the latest snapshot"
         );
         assert!(
             plan.delete.is_empty(),
