@@ -10,6 +10,9 @@ use super::manifest::{
     discover_all_ltx_from_s3, discover_state_from_s3, is_snapshot, list_generation_files,
     GENERATION_LIVE,
 };
+use hadb_storage::StorageBackend;
+use hadb_storage_s3::S3Storage;
+use walrust_core::compaction::{list_merged_ranges, ranges_cover, RangeLayout, SeqRange};
 
 /// Verification issue found during verify
 #[derive(Debug, Clone)]
@@ -39,24 +42,33 @@ struct VerifiedLtxFile {
     post_apply_checksum: Checksum,
 }
 
-/// Detect real TXID gaps in the live (generation-0) incremental pool (E3).
+/// Detect real TXID gaps in the live (generation-0) incremental pool (E3),
+/// now **level-aware**.
 ///
 /// `live` is `(key, min_txid, max_txid)` for each gen-0 file, sorted by
-/// `min_txid`; `snapshot_maxes` is the set of full-snapshot max TXIDs. A hole
-/// between consecutive incrementals is only a real gap when no full snapshot
-/// sits at the TXID just below where the incrementals resume — otherwise that
-/// snapshot is a valid restore base that supersedes the hole. Returns
-/// `(key, expected_next, actual_min)` for each genuine gap.
+/// `min_txid`; `snapshot_maxes` is the set of full-snapshot max TXIDs;
+/// `merged_ranges` are the inclusive seq spans of the merged compaction levels
+/// (L1/L2…). A hole `[expected, min_txid-1]` between consecutive incrementals
+/// is only a real gap when **neither** bridges it:
+///   - a full snapshot sits at `min_txid - 1` (a valid restore base), **nor**
+///   - a merged level range *contiguously covers* the whole hole — i.e. the L0
+///     objects were compacted away into a coarser range, not lost.
+/// Returns `(key, expected_next, actual_min)` for each genuine gap.
 pub(crate) fn detect_live_txid_gaps(
     live: &[(String, u64, u64)],
     snapshot_maxes: &std::collections::BTreeSet<u64>,
+    merged_ranges: &[SeqRange],
 ) -> Vec<(String, u64, u64)> {
     let mut gaps = Vec::new();
     let mut expected_next: Option<u64> = None;
     for (key, min_txid, max_txid) in live {
         if let Some(expected) = expected_next {
-            if *min_txid > expected && !snapshot_maxes.contains(&(*min_txid - 1)) {
-                gaps.push((key.clone(), expected, *min_txid));
+            if *min_txid > expected {
+                let snapshot_bridges = snapshot_maxes.contains(&(*min_txid - 1));
+                let level_bridges = ranges_cover(expected, *min_txid - 1, merged_ranges);
+                if !snapshot_bridges && !level_bridges {
+                    gaps.push((key.clone(), expected, *min_txid));
+                }
             }
         }
         expected_next = Some(max_txid + 1);
@@ -240,10 +252,41 @@ mod tests {
             live("c", 99, 150), // hole at 98, bridged by snapshot(max=98)
         ];
         let snapshots: std::collections::BTreeSet<u64> = [1, 47, 98].into_iter().collect();
-        let gaps = detect_live_txid_gaps(&liveset, &snapshots);
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots, &[]);
         assert!(
             gaps.is_empty(),
             "snapshot-superseded holes must not be reported: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn e3_hole_covered_by_a_merged_level_range_is_not_a_gap() {
+        // Compaction folded L0 seqs 47..=97 into a merged L1 range. The L0 pool
+        // now jumps 2..46 → 99..150 with NO snapshot at 46/98, but the merged
+        // range [40,98] contiguously covers the hole — so it is a compaction,
+        // not a gap, and verify must be silent.
+        let liveset = vec![live("a", 2, 46), live("c", 99, 150)];
+        let snapshots: std::collections::BTreeSet<u64> = [1].into_iter().collect();
+        let merged = vec![SeqRange::new(40, 98)];
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots, &merged);
+        assert!(
+            gaps.is_empty(),
+            "a merged-range-covered L0 hole must not be a gap: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn e3_hole_no_level_covers_still_alarms() {
+        // The merged range [40,80] stops short of the resume point 99 (the hole
+        // is [47,98]); it does NOT bridge, and no snapshot does either → real gap.
+        let liveset = vec![live("a", 2, 46), live("c", 99, 150)];
+        let snapshots: std::collections::BTreeSet<u64> = [1].into_iter().collect();
+        let merged = vec![SeqRange::new(40, 80)];
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots, &merged);
+        assert_eq!(
+            gaps,
+            vec![("c".to_string(), 47, 99)],
+            "a hole no level fully covers must still alarm: {gaps:?}"
         );
     }
 
@@ -253,7 +296,7 @@ mod tests {
         // restore into 48-97 would genuinely fail — verify must still flag it.
         let liveset = vec![live("a", 2, 46), live("b", 48, 97)];
         let snapshots: std::collections::BTreeSet<u64> = [1].into_iter().collect();
-        let gaps = detect_live_txid_gaps(&liveset, &snapshots);
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots, &[]);
         assert_eq!(gaps.len(), 1, "unbridged hole must be a real gap: {gaps:?}");
         assert_eq!(gaps[0], ("b".to_string(), 47, 48));
     }
@@ -270,7 +313,7 @@ mod tests {
         // 100 (restores >= 100 use it as base).
         let liveset = vec![live("a", 2, 50), live("b", 60, 99), live("c", 101, 150)];
         let snapshots: std::collections::BTreeSet<u64> = [1, 100].into_iter().collect();
-        let gaps = detect_live_txid_gaps(&liveset, &snapshots);
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots, &[]);
         assert_eq!(
             gaps,
             vec![("b".to_string(), 51, 60)],
@@ -493,7 +536,19 @@ pub async fn verify(
         .iter()
         .map(|(key, _, min, max)| (key.clone(), *min, *max))
         .collect();
-    for (key, expected, min_txid) in detect_live_txid_gaps(&live_triples, &snapshot_maxes) {
+    // Level-aware: a hole in the L0 pool that a merged L1/L2 range covers is a
+    // *compaction*, not a gap. List the merged ranges under `{db}/levels/L*/`
+    // (HADBP objects; a header-read failure conservatively yields no bridges, so
+    // verify errs toward alarming, never toward silence).
+    let merged_ranges: Vec<SeqRange> = {
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(S3Storage::new(client.clone(), bucket_name.clone()));
+        let layout = RangeLayout::new(storage, &prefix, name);
+        list_merged_ranges(&layout).await.unwrap_or_default()
+    };
+    for (key, expected, min_txid) in
+        detect_live_txid_gaps(&live_triples, &snapshot_maxes, &merged_ranges)
+    {
         issues.push(VerifyIssue {
             filename: key,
             issue: format!(

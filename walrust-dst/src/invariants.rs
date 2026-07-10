@@ -297,14 +297,14 @@ pub fn prop_wal_batching_no_loss() -> Result<()> {
                 .unwrap();
 
                 let config = MockStorageConfig::new("test-bucket").with_seed(seed);
-                let storage = MockStorageBackend::new(config);
+                let storage = std::sync::Arc::new(MockStorageBackend::new(config));
                 let mut state = SyncState::new(db_path.clone()).unwrap();
 
                 // Initial snapshot
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                     .unwrap();
                 drop(conn);
-                testable::take_snapshot(&storage, "", &mut state)
+                testable::take_snapshot(storage.as_ref(), "", &mut state)
                     .await
                     .unwrap();
 
@@ -327,7 +327,7 @@ pub fn prop_wal_batching_no_loss() -> Result<()> {
                     drop(conn);
 
                     // Sync WAL changes
-                    let _ = testable::sync_wal(&storage, "", &mut state).await;
+                    let _ = testable::sync_wal(storage.as_ref(), "", &mut state).await;
                     batch_num += 1;
                 }
 
@@ -336,14 +336,20 @@ pub fn prop_wal_batching_no_loss() -> Result<()> {
                 conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
                     .unwrap();
                 drop(conn);
-                testable::take_snapshot(&storage, "", &mut state)
+                testable::take_snapshot(storage.as_ref(), "", &mut state)
                     .await
                     .unwrap();
 
                 // Restore and verify all writes present
-                testable::restore(&storage, "", &state.name, &restored_path, None::<&str>)
-                    .await
-                    .unwrap();
+                testable::restore(
+                    storage.as_ref(),
+                    "",
+                    &state.name,
+                    &restored_path,
+                    None::<&str>,
+                )
+                .await
+                .unwrap();
 
                 let restored_conn = Connection::open(&restored_path).unwrap();
                 let count: i64 = restored_conn
@@ -398,13 +404,13 @@ pub fn prop_production_published_delta_restore() -> Result<()> {
                 .unwrap();
                 insert_item_batch(&conn, 1, base_rows, "base").unwrap();
 
-                let storage = MockStorageBackend::new(
+                let storage = std::sync::Arc::new(MockStorageBackend::new(
                     MockStorageConfig::new("production-published-deltas").with_seed(seed),
-                );
+                ));
                 let mut state = walrust::walrust_core::sync::SyncState::new(db_path.clone())
                     .expect("core sync state");
 
-                walrust::walrust_core::sync::take_snapshot(&storage, &prefix, &mut state)
+                walrust::walrust_core::sync::take_snapshot(storage.as_ref(), &prefix, &mut state)
                     .await
                     .expect("production snapshot should publish");
 
@@ -414,10 +420,13 @@ pub fn prop_production_published_delta_restore() -> Result<()> {
                         .unwrap();
                     next_id += rows_per_batch as i64;
 
-                    let frames =
-                        walrust::walrust_core::sync::sync_wal(&storage, &prefix, &mut state)
-                            .await
-                            .expect("production WAL sync should publish");
+                    let frames = walrust::walrust_core::sync::sync_wal(
+                        storage.as_ref(),
+                        &prefix,
+                        &mut state,
+                    )
+                    .await
+                    .expect("production WAL sync should publish");
                     prop_assert!(
                         frames > 0,
                         "production sync_wal should publish frames for batch {batch}"
@@ -444,7 +453,7 @@ pub fn prop_production_published_delta_restore() -> Result<()> {
                 );
 
                 let restored_seq = walrust::walrust_core::sync::restore(
-                    &storage,
+                    storage.clone(),
                     &prefix,
                     &state.name,
                     &restored_path,

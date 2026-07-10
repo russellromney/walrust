@@ -35,6 +35,46 @@ impl Default for TriggerConfig {
     }
 }
 
+/// The single user-facing compaction control surface, shared by the config
+/// layer (`[compaction]` in `walrust.toml`) and embedders
+/// (`ReplicationConfig::compaction`). `enabled` is the **one** gate — there is
+/// no internal flag any more. Defaults ship compaction **off** (version-skew
+/// safety: an old binary cannot restore a leveled bucket).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionSettings {
+    /// Master switch. Default **false** (ship-dark).
+    pub enabled: bool,
+    /// L0 objects younger than this are never merged (fine-grain retention).
+    pub keep_fine_window: Duration,
+    /// L0 objects per L0→L1 merge.
+    pub l1_batch: usize,
+    /// L1 objects per L1→L2 merge.
+    pub l2_batch: usize,
+}
+
+impl Default for CompactionSettings {
+    fn default() -> Self {
+        let t = TriggerConfig::default();
+        Self {
+            enabled: false,
+            keep_fine_window: t.keep_fine_window,
+            l1_batch: t.l1_batch,
+            l2_batch: t.l2_batch,
+        }
+    }
+}
+
+impl CompactionSettings {
+    /// The [`TriggerConfig`] the merge engine consumes (drops `enabled`).
+    pub fn trigger_config(&self) -> TriggerConfig {
+        TriggerConfig {
+            l1_batch: self.l1_batch,
+            l2_batch: self.l2_batch,
+            keep_fine_window: self.keep_fine_window,
+        }
+    }
+}
+
 /// In-memory trigger state, maintained by the writer between the startup seed
 /// and each publish.
 #[derive(Debug, Clone)]

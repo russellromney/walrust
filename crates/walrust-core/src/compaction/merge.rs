@@ -166,7 +166,9 @@ pub async fn merge_changesets(
     let mut buf = Vec::new();
     buf.extend_from_slice(b"HADBP");
     buf.push(2); // version 2 (compacted)
-    buf.push(0x80); // FLAG_COMPACTED (no other flags on a merged object)
+    let flags_off = buf.len();
+    buf.push(0x80); // FLAG_COMPACTED; the end-page-count marker bit is OR'd in
+                    // at finalize if the last source declares a DB size.
     buf.push(page_id_size as u8);
     buf.extend_from_slice(&page_size.to_be_bytes());
     buf.extend_from_slice(&out_seq.to_be_bytes());
@@ -193,11 +195,41 @@ pub async fn merge_changesets(
         })
         .collect();
 
+    // The DB size declared by the LAST source (highest seq): a walrust
+    // incremental encodes an end-page-count marker (an empty page at
+    // `end_page_count + 1`). The merged range must reconstruct the *final* DB
+    // size, so we carry the last source's declared size and emit exactly one
+    // marker for it at finalize. Intermediate sources' markers are elided
+    // (their sizes are superseded). See the module header.
+    //
+    // **Shrink (VACUUM) across a merge boundary.** If the final size is *smaller*
+    // than an intermediate size, an intermediate source's high page (e.g. page
+    // 100) survives last-writer-wins even though the final DB truncates to, say,
+    // 50 pages. Such a page is dead in the final state, and — crucially — its
+    // page id exceeds the canonical marker (`final_epc + 1`), which would break
+    // both the strictly-ascending emit invariant and `validate_sqlite_changeset`
+    // (which rejects a data page past `end_page_count`). We therefore **drop any
+    // emitted data page whose id > final_end_page_count**: the truncation removes
+    // it anyway, so the merged object is byte-identical in effect to a fresh
+    // snapshot of the final state, and the marker stays the highest page id.
+    // Streaming order guarantees `final_end_page_count` is already known by the
+    // time any such orphan page is flushed (the last source's marker at
+    // `final_epc + 1` sorts below every orphan id, so it is read first). When the
+    // last source declares no size (`None`), there is no truncation and every
+    // page is kept.
+    let mut final_end_page_count: Option<u64> = None;
+    let capture_epc = |final_epc: &mut Option<u64>, order: usize, page: &PageEntry| {
+        if order == n - 1 && page.data.is_empty() {
+            *final_epc = Some(page.page_id.to_u64().saturating_sub(1));
+        }
+    };
+
     // ── Prime the frontier: one page per source ────────────────────────────
     let mut heap: BinaryHeap<HeapPage> = BinaryHeap::new();
     for (order, s) in sources.iter_mut().enumerate() {
         if let Some(page) = s.stream.next_page().await? {
             hash_source_page(&mut source_hashers[order], page_id_size, &page);
+            capture_epc(&mut final_end_page_count, order, &page);
             heap.push(HeapPage {
                 page_id: page.page_id,
                 order,
@@ -225,16 +257,20 @@ pub async fn merge_changesets(
                 } // else keep existing higher-order page (top dropped → guard--)
             }
             _ => {
-                // page_id advanced (or first): flush the old pending.
+                // page_id advanced (or first): flush the old pending. A winning
+                // **empty** page is a superseded end-page-count marker — elide
+                // it; the final marker is emitted once at finalize.
                 if let Some(p) = pending.take() {
-                    emit_page(
-                        &mut buf,
-                        &mut hasher,
-                        page_id_size,
-                        &p.page,
-                        &mut last_emitted,
-                    );
-                    page_count += 1;
+                    if should_emit(&p.page, final_end_page_count) {
+                        emit_page(
+                            &mut buf,
+                            &mut hasher,
+                            page_id_size,
+                            &p.page,
+                            &mut last_emitted,
+                        );
+                        page_count += 1;
+                    }
                 }
                 pending = Some(top);
             }
@@ -242,6 +278,7 @@ pub async fn merge_changesets(
         // Advance the source we just popped.
         if let Some(page) = sources[order].stream.next_page().await? {
             hash_source_page(&mut source_hashers[order], page_id_size, &page);
+            capture_epc(&mut final_end_page_count, order, &page);
             heap.push(HeapPage {
                 page_id: page.page_id,
                 order,
@@ -250,16 +287,42 @@ pub async fn merge_changesets(
             });
         }
     }
-    // Flush the final pending page.
+    // Flush the final pending page (eliding a superseded empty marker or a
+    // shrink-orphan page above the final DB size).
     if let Some(p) = pending.take() {
+        if should_emit(&p.page, final_end_page_count) {
+            emit_page(
+                &mut buf,
+                &mut hasher,
+                page_id_size,
+                &p.page,
+                &mut last_emitted,
+            );
+            page_count += 1;
+        }
+    }
+
+    // Emit the single canonical end-page-count marker for the final DB size, so
+    // a restore truncates/grows to exactly the last source's size. Its page id
+    // is `end_page_count + 1` (empty data), higher than every data page, so it
+    // preserves ascending emit order. The marker flag is OR'd into the header.
+    if let Some(epc) = final_end_page_count {
+        let marker = PageEntry {
+            page_id: match page_id_size {
+                PageIdSize::U32 => PageId::U32((epc + 1) as u32),
+                PageIdSize::U64 => PageId::U64(epc + 1),
+            },
+            data: Vec::new(),
+        };
         emit_page(
             &mut buf,
             &mut hasher,
             page_id_size,
-            &p.page,
+            &marker,
             &mut last_emitted,
         );
         page_count += 1;
+        buf[flags_off] |= crate::ltx::FLAG_END_PAGE_COUNT_MARKER;
     }
 
     // ── Finalize: per-source chain-ends, contiguity, output declared_end ────
@@ -322,6 +385,24 @@ fn hash_source_page(hasher: &mut Sha256, page_id_size: PageIdSize, page: &PageEn
     }
     hasher.update((page.data.len() as u32).to_be_bytes());
     hasher.update(&page.data);
+}
+
+/// Whether a resolved winning page should be written to the merged output.
+///
+/// Drops (a) superseded **empty** end-page-count markers — the one canonical
+/// marker is emitted at finalize — and (b) **shrink-orphan** data pages whose id
+/// exceeds the final DB size (`final_end_page_count`): the final truncation
+/// removes them, and keeping them would push a data page past the marker (an
+/// invalid changeset). A page id `== final_end_page_count` is still the last
+/// live page and is kept. When no final size is known, only empty markers drop.
+fn should_emit(page: &PageEntry, final_end_page_count: Option<u64>) -> bool {
+    if page.data.is_empty() {
+        return false;
+    }
+    match final_end_page_count {
+        Some(epc) => page.page_id.to_u64() <= epc,
+        None => true,
+    }
 }
 
 /// Emit one merged page: append to the output buffer and update the output
@@ -627,6 +708,126 @@ mod tests {
             "page 5 must come from source 3 (highest order), not source 1"
         );
         assert_eq!(chain_end(&got), chain_end(&cs3));
+    }
+
+    /// An empty end-page-count marker page (`data == []`) at `epc + 1`.
+    fn marker(epc: u64) -> PageEntry {
+        PageEntry {
+            page_id: PageId::U64(epc + 1),
+            data: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn shrink_across_merge_drops_orphan_pages_and_stays_valid() {
+        // A VACUUM-style shrink across a merge boundary: source 1 grew the DB to
+        // 100 pages (writing a high page 100), source 2 shrank it back to 50
+        // (marker epc=50) without touching page 100. Last-writer-wins would keep
+        // page 100 as an orphan whose id (100) exceeds the final marker (51),
+        // breaking ascending order + producing a changeset with a data page past
+        // end_page_count. The fix drops such orphans; the merged object must be
+        // valid, decode cleanly, carry the canonical marker as the highest page
+        // id, and truncate to 50 on restore.
+        let cs1 = PhysicalChangeset::new(
+            1,
+            0,
+            PageIdSize::U64,
+            4096,
+            vec![pg(1, 0x11, 8), pg(100, 0x99, 8), marker(100)], // epc=100
+        );
+        let cs2 = PhysicalChangeset::new(
+            2,
+            chain_end(&cs1),
+            PageIdSize::U64,
+            4096,
+            vec![pg(1, 0x22, 8), marker(50)], // shrink to 50, page 100 untouched
+        );
+        let tracker = PeakPages::new();
+        let res = merge_changesets(
+            vec![
+                source_from(&cs1, SeqRange::point(1)),
+                source_from(&cs2, SeqRange::point(2)),
+            ],
+            &tracker,
+        )
+        .await
+        .unwrap();
+
+        // Decodes cleanly: content checksum matches ⇒ pages are in canonical
+        // (ascending) order, i.e. no out-of-order orphan slipped through.
+        let got = physical::decode(&res.bytes).unwrap();
+
+        // Orphan page 100 (above the final size) is gone; page 1 (updated by the
+        // shrink source) plus the single canonical marker remain.
+        let ids: Vec<u64> = got.pages.iter().map(|p| p.page_id.to_u64()).collect();
+        assert!(
+            !ids.contains(&100),
+            "shrink orphan page 100 must be dropped: {ids:?}"
+        );
+        assert_eq!(ids, vec![1, 51], "kept page 1 + canonical marker at 51");
+        assert_eq!(res.page_count, 2);
+
+        // The marker is the highest page id and declares the final size (50).
+        assert_eq!(
+            crate::ltx::changeset_end_page_count(&got).unwrap(),
+            Some(50),
+            "merged object must declare the final (shrunk) DB size"
+        );
+        // The last-source page 1 content won (0x22, not 0x11).
+        let p1 = got.pages.iter().find(|p| p.page_id.to_u64() == 1).unwrap();
+        assert_eq!(p1.data, vec![0x22; 8]);
+        // Linkage still ends at the last source's chain_end.
+        assert_eq!(chain_end(&got), chain_end(&cs2));
+        assert_eq!(res.declared_end_checksum, chain_end(&cs2));
+
+        // A real SQLite apply/restore would truncate to 50 pages; validate the
+        // changeset shape is acceptable (no non-empty page past end_page_count).
+        assert!(
+            got.pages
+                .iter()
+                .all(|p| p.data.is_empty() || p.page_id.to_u64() <= 50),
+            "no live page may sit above the declared end_page_count"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_refuses_to_span_a_snapshot_boundary() {
+        // Invariant behind the planner's exact-start rule (`range.min == need`).
+        //
+        // A snapshot consumes its own seq (`take_snapshot`: `new_seq = seq + 1`)
+        // and the next incremental chains from the *snapshot's* checksum, not the
+        // prior incremental's — so the L0 pool's chain BREAKS at every snapshot.
+        // Here `pre` is the last incremental before a snapshot and `post` is the
+        // first after it: `post.prev_checksum` is the snapshot's chain value, not
+        // `chain_end(pre)`. A merge batch that straddles the snapshot must be
+        // rejected, which is *why* no merged range can ever begin strictly inside
+        // a snapshot span. Restore-from-snapshot@S therefore always finds an
+        // object starting exactly at `S + 1` (or `target == S`); the planner's
+        // `min == need` can never false-gap a healthy leveled bucket.
+        let pre = PhysicalChangeset::new(1, 0, PageIdSize::U64, 4096, vec![pg(0, 1, 8)]);
+        // A snapshot was taken here (its own seq, its own chain value 0x5EED).
+        let snapshot_chain: u64 = 0x5EED;
+        let post =
+            PhysicalChangeset::new(3, snapshot_chain, PageIdSize::U64, 4096, vec![pg(1, 2, 8)]);
+        assert_ne!(
+            chain_end(&pre),
+            snapshot_chain,
+            "the snapshot breaks the incremental chain"
+        );
+        let tracker = PeakPages::new();
+        let err = merge_changesets(
+            vec![
+                source_from(&pre, SeqRange::point(1)),
+                source_from(&post, SeqRange::point(3)),
+            ],
+            &tracker,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, CompactionError::NonContiguous(_)),
+            "a batch spanning a snapshot boundary must be refused, got {err:?}"
+        );
     }
 
     #[tokio::test]

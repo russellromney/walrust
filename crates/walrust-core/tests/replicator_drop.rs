@@ -129,26 +129,36 @@ fn config_for_test() -> ReplicationConfig {
 /// is released. Before the fix, the spawned task held a strong
 /// `Arc<Replicator>`, which kept `storage` alive forever — strong count
 /// would never return to 1.
-/// C2a gate contract: compaction is off by default and only the internal
-/// builder-flag setter (not any config field) can turn it on. This is what
-/// keeps compaction unreachable from `walrust.toml`/CLI until the C2b planner.
+/// C2b config contract: compaction is off by default and the **single**
+/// control is `ReplicationConfig::compaction.enabled` (the C2a internal
+/// builder-flag setter is gone). A default config never compacts; a config
+/// with `compaction.enabled = true` does.
 #[tokio::test]
-async fn compaction_gate_defaults_off_and_toggles() {
+async fn compaction_gate_defaults_off_and_is_config_driven() {
+    use walrust_core::compaction::CompactionSettings;
+
     let storage = MemStorage::new();
     let storage_dyn: Arc<dyn StorageBackend> = storage.clone();
     let replicator =
         Replicator::try_new(storage_dyn, "test/", config_for_test()).expect("construct replicator");
-
     // Default OFF — a fresh Replicator never compacts.
     assert!(!replicator.compaction_enabled());
-
-    replicator.set_compaction_enabled(true);
-    assert!(replicator.compaction_enabled());
-
-    replicator.set_compaction_enabled(false);
-    assert!(!replicator.compaction_enabled());
-
     replicator.shutdown().await;
+
+    // Enabled via config is the only way to turn it on.
+    let storage2 = MemStorage::new();
+    let storage2_dyn: Arc<dyn StorageBackend> = storage2.clone();
+    let enabled_cfg = ReplicationConfig {
+        compaction: CompactionSettings {
+            enabled: true,
+            ..Default::default()
+        },
+        ..config_for_test()
+    };
+    let replicator2 =
+        Replicator::try_new(storage2_dyn, "test/", enabled_cfg).expect("construct replicator");
+    assert!(replicator2.compaction_enabled());
+    replicator2.shutdown().await;
 }
 
 #[tokio::test]

@@ -464,6 +464,7 @@ fn resolve_watch_config(
                             .to_string(),
                         sync: sync.clone(),
                         retention: retention.clone(),
+                        compaction: cfg.compaction.to_settings(),
                     })
                     .collect()
             } else {
@@ -561,6 +562,9 @@ fn resolve_watch_config(
                         .to_string(),
                     sync: sync.clone(),
                     retention: retention.clone(),
+                    // No config file: compaction stays off (experimental knob is
+                    // config-only, not exposed as a CLI flag).
+                    compaction: walrust_core::compaction::CompactionSettings::default(),
                 })
                 .collect();
 

@@ -1947,7 +1947,7 @@ async fn test_walrust_owned_restore_uses_active_lineage_namespace() {
     replicator.flush("owned-lineage-restore").await.unwrap();
 
     let restored_seq = walrust::sync::restore(
-        storage.as_ref(),
+        storage.clone(),
         "wal/",
         "owned-lineage-restore",
         &restore_path,

@@ -65,10 +65,23 @@ folder in both directions; the non-hex `levels/` path is invisible to every
 existing discovery scanner. The engine is
 wired into both write paths but **gated off** (`compaction_enabled`, default
 false, not config-reachable) because enabling it would make backups
-unrestorable by the shipped restore path. **C2b is next**: the restore/verify
-planner that reads leveled buckets, then flip the gate and expose
-`[compaction] enabled`. C3: oracle granularity-decay extension, kill-mid-
-compaction drill, restore-speed bench.
+unrestorable by the shipped restore path.
+
+**C2b (read side + user exposure) shipped** — the greedy restore planner
+(litestream `CalcRestorePlan` shape: newest snapshot ≤ target, then the object
+that extends the contiguous range furthest, over `CompactionLayout` + snapshot
+discovery), the layout-agnostic restore executor (bounded parallel prefetch
+`queue_depth × object_size`, strict-order apply, chain linkage through
+`chain_end()`), PITR decay as a hard typed error naming the nearest restorable
+points on both sides, level-aware verify (a merged range covering an L0 hole is
+a compaction, not a gap; an uncovered hole still exits 5), the level-aware prune
+watermark (E2-class, with a fail-on-revert proof), and the single
+`[compaction] enabled` config knob (default false; the C2a internal gates are
+removed). Un-leveled buckets restore byte-identically to before. A merge-engine
+fix now preserves SQLite's end-page-count marker so merged objects apply
+cleanly. The e2e proves both layouts restore-to-latest row-exact + PITR
+boundary/inside-window + deleted-L0-tail + crash-overlap. **C3 is next**: oracle
+granularity-decay extension, kill-mid-compaction drill, restore-speed bench.
 
 Merge many small incremental changesets into fewer, larger ones so long-history
 databases restore fast and buckets stay small. Litestream's level design is the

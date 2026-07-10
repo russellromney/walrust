@@ -1,7 +1,10 @@
 use anyhow::Result;
 use chrono::Utc;
+use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
 use std::path::Path;
+use std::sync::Arc;
+use walrust_core::compaction::{list_level_files, plan_level_prune, RangeLayout};
 use walrust_core::legacy_manifest::plan_legacy_prune;
 use walrust_core::legacy_wal_sync::{checkpoint_wal_truncate, snapshot_database_to_storage};
 
@@ -70,12 +73,26 @@ pub async fn prune(
         );
     }
 
+    // Level-aware watermark prune (E2, now level-aware): the oldest surviving
+    // snapshot's seq is the earliest restorable point; merged compaction objects
+    // (under `{db}/levels/L*/`) whose whole range ends below it can never be part
+    // of a retained restore and are deletable — keeping the newest object per
+    // level and never a watermark-straddling object a retained PITR still needs.
+    let watermark = plan.keep.iter().map(|e| e.sequence).min().unwrap_or(0);
+    let level_storage: Arc<dyn StorageBackend> =
+        Arc::new(S3Storage::new(client.clone(), bucket_name.clone()));
+    let level_layout = RangeLayout::new(level_storage, &prefix, name);
+    let level_delete = list_level_files(&level_layout)
+        .await
+        .map(|files| plan_level_prune(&files, watermark))
+        .unwrap_or_default();
+
     // Print summary
     println!("Prune plan for '{}':", name);
     println!("  {}", plan.summary());
     println!();
 
-    if !plan.has_deletions() {
+    if !plan.has_deletions() && level_delete.is_empty() {
         println!("Nothing to delete - all snapshots fit retention policy.");
         return Ok(());
     }
@@ -112,6 +129,16 @@ pub async fn prune(
             format_age(now, entry.created_at)
         );
     }
+    if !level_delete.is_empty() {
+        println!(
+            "Deleting {} merged compaction object(s) below the retained watermark (TXID {}):",
+            level_delete.len(),
+            watermark
+        );
+        for f in &level_delete {
+            println!("  {} (seq range {}-{})", f.key, f.range.min, f.range.max);
+        }
+    }
     println!();
 
     if !force {
@@ -122,7 +149,8 @@ pub async fn prune(
     // Actually delete files. `e.key` is already the full S3 key from listing.
     println!("Deleting files...");
 
-    let keys_to_delete: Vec<String> = plan.delete.iter().map(|e| e.key.clone()).collect();
+    let mut keys_to_delete: Vec<String> = plan.delete.iter().map(|e| e.key.clone()).collect();
+    keys_to_delete.extend(level_delete.iter().map(|f| f.key.clone()));
 
     let deleted_count = s3::delete_objects(&client, &bucket_name, &keys_to_delete)
         .await

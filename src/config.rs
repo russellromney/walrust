@@ -38,6 +38,10 @@ pub struct Config {
     #[serde(default)]
     pub webhooks: Vec<WebhookConfig>,
 
+    /// Leveled compaction (experimental, off by default)
+    #[serde(default)]
+    pub compaction: CompactionConfig,
+
     /// Database-specific configurations
     #[serde(default)]
     pub databases: Vec<DatabaseConfig>,
@@ -180,6 +184,89 @@ impl Default for RetentionConfig {
     }
 }
 
+/// Leveled-compaction configuration (`[compaction]` in `walrust.toml`).
+///
+/// **Experimental, off by default.** Old walrust binaries cannot restore a
+/// leveled bucket, so this ships dark (`enabled = false`); flip it a release
+/// after every reader understands levels. See the README's Compaction section.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompactionConfig {
+    /// Master switch. Default false (ship-dark / version-skew safety).
+    #[serde(default)]
+    pub enabled: bool,
+    /// L0 objects younger than this are never merged ("restore to the second
+    /// within this window"). Duration string, e.g. "1h", "30m". Default "1h".
+    #[serde(default = "default_keep_fine_window")]
+    pub keep_fine_window: String,
+    /// L0 objects folded per L0→L1 merge. Default 60.
+    #[serde(default = "default_l1_batch")]
+    pub l1_batch: usize,
+    /// L1 objects folded per L1→L2 merge. Default 24.
+    #[serde(default = "default_l2_batch")]
+    pub l2_batch: usize,
+}
+
+impl Default for CompactionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            keep_fine_window: default_keep_fine_window(),
+            l1_batch: default_l1_batch(),
+            l2_batch: default_l2_batch(),
+        }
+    }
+}
+
+fn default_keep_fine_window() -> String {
+    "1h".to_string()
+}
+fn default_l1_batch() -> usize {
+    60
+}
+fn default_l2_batch() -> usize {
+    24
+}
+
+impl CompactionConfig {
+    /// Resolve into the core [`CompactionSettings`]. A malformed
+    /// `keep_fine_window` falls back to one hour.
+    pub fn to_settings(&self) -> walrust_core::compaction::CompactionSettings {
+        let keep_fine_window = parse_compaction_duration(&self.keep_fine_window)
+            .unwrap_or_else(|| std::time::Duration::from_secs(3600));
+        walrust_core::compaction::CompactionSettings {
+            enabled: self.enabled,
+            keep_fine_window,
+            l1_batch: self.l1_batch,
+            l2_batch: self.l2_batch,
+        }
+    }
+}
+
+/// Parse a compact duration string like "1h", "30m", "3600s", "500ms".
+fn parse_compaction_duration(s: &str) -> Option<std::time::Duration> {
+    let s = s.trim();
+    let (num, unit) = if let Some(v) = s.strip_suffix("ms") {
+        (v, "ms")
+    } else if let Some(v) = s.strip_suffix('s') {
+        (v, "s")
+    } else if let Some(v) = s.strip_suffix('m') {
+        (v, "m")
+    } else if let Some(v) = s.strip_suffix('h') {
+        (v, "h")
+    } else {
+        (s, "s")
+    };
+    let n: u64 = num.trim().parse().ok()?;
+    Some(match unit {
+        "ms" => std::time::Duration::from_millis(n),
+        "s" => std::time::Duration::from_secs(n),
+        "m" => std::time::Duration::from_secs(n * 60),
+        "h" => std::time::Duration::from_secs(n * 3600),
+        _ => return None,
+    })
+}
+
 fn default_hourly() -> usize {
     24
 }
@@ -241,6 +328,8 @@ pub struct ResolvedDbConfig {
     pub prefix: String,
     pub sync: SyncConfig,
     pub retention: RetentionConfig,
+    /// Resolved leveled-compaction settings (global; experimental, off by default).
+    pub compaction: walrust_core::compaction::CompactionSettings,
 }
 
 impl Config {
@@ -372,6 +461,7 @@ impl Config {
                     prefix,
                     sync,
                     retention,
+                    compaction: self.compaction.to_settings(),
                 });
             }
         }
@@ -848,5 +938,50 @@ mod tests {
         // Verify re-exported parse_duration_string is usable
         let duration = parse_duration_string("24h").unwrap();
         assert_eq!(duration.num_hours(), 24);
+    }
+
+    #[test]
+    fn test_compaction_defaults_off() {
+        let toml = r#"
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(
+            !config.compaction.enabled,
+            "compaction ships off by default"
+        );
+        let settings = config.compaction.to_settings();
+        assert!(!settings.enabled);
+        assert_eq!(
+            settings.keep_fine_window,
+            std::time::Duration::from_secs(3600)
+        );
+        assert_eq!(settings.l1_batch, 60);
+        assert_eq!(settings.l2_batch, 24);
+    }
+
+    #[test]
+    fn test_compaction_section_parses_and_resolves() {
+        let toml = r#"
+            [compaction]
+            enabled = true
+            keep_fine_window = "30m"
+            l1_batch = 12
+            l2_batch = 6
+
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(toml).unwrap();
+        assert!(config.compaction.enabled);
+        let settings = config.compaction.to_settings();
+        assert!(settings.enabled);
+        assert_eq!(
+            settings.keep_fine_window,
+            std::time::Duration::from_secs(1800)
+        );
+        assert_eq!(settings.l1_batch, 12);
+        assert_eq!(settings.l2_batch, 6);
     }
 }
