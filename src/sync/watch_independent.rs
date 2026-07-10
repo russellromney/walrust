@@ -49,6 +49,10 @@ pub async fn watch_with_independent_tasks(
 ) -> Result<()> {
     use tokio::sync::broadcast;
 
+    // Exposure-vs-read-path gap: refuse leveled compaction on the CLI layout,
+    // whose restore path cannot read leveled buckets. See `reject_cli_compaction`.
+    super::reject_cli_compaction(&databases)?;
+
     // Parse cache retention duration
     let cache_retention = if cache_config.enabled {
         match parse_duration_string(&cache_config.retention) {

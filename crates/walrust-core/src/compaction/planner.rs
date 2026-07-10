@@ -35,6 +35,23 @@
 //! litestream's contiguity rule (`MinTXID == prev.MaxTXID + 1`), generalized
 //! from one-second points to arbitrary merged ranges.
 //!
+//! ## Why the exact-start rule never false-gaps a healthy bucket
+//!
+//! The `range.min == need` rule could in principle error on a bucket that *has*
+//! coverage but whose only covering object begins before `need` — e.g. a snapshot
+//! floor at seq 4 with the only object being a merged range `[2..=9]` (starts at
+//! 2, so nothing begins at 5). **That shape is unreachable.** A snapshot consumes
+//! its own seq (`sync::take_snapshot`: `new_seq = current_seq + 1`) and the next
+//! incremental chains from the *snapshot's* checksum, not the prior incremental's
+//! — so the L0 chain breaks at every snapshot. The merge engine's contiguity
+//! check (`merge_changesets` → [`CompactionError::NonContiguous`]) then refuses to
+//! merge a batch spanning that break, so **no merged range can begin strictly
+//! inside a snapshot span**. Restore-from-snapshot@S therefore always finds an
+//! object starting exactly at `S + 1` (or `target == S`, the empty plan). Proven
+//! by `merge::tests::merge_refuses_to_span_a_snapshot_boundary`. A genuine
+//! `min != need` failure is thus always a real gap (a missing/pruned object),
+//! correctly reported as [`PlanError::ChainGap`] — not a false alarm.
+//!
 //! ## Overlap tolerance (crash leftovers), no double-apply
 //!
 //! Overlapping candidates are legal: a crash between "write merged object" and
@@ -98,7 +115,8 @@ pub enum PlanError {
          [{window_min}..={window_max}] with no finer coverage: PITR granularity \
          has decayed for history this old. Nearest restorable points are seq \
          {nearest_below} (below) and seq {nearest_above} (above); restore to one \
-         of those, or widen keep_fine_window to retain second-grain history longer"
+         of those. (Widening keep_fine_window only affects FUTURE merges — it \
+         cannot recover the second-grain points already merged into this window.)"
     )]
     PitrInsideMergedWindow {
         target: u64,

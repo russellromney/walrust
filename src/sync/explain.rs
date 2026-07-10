@@ -88,10 +88,14 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
             // Compaction (experimental, off by default)
             println!("Compaction (experimental):");
             if cfg.compaction.enabled {
-                println!("  Enabled:         yes");
+                println!("  Enabled:         yes (config)");
                 println!("  keep_fine_window: {}", cfg.compaction.keep_fine_window);
                 println!("  l1_batch:        {}", cfg.compaction.l1_batch);
                 println!("  l2_batch:        {}", cfg.compaction.l2_batch);
+                println!("  WARNING: leveled compaction is NOT yet supported by the CLI watch.");
+                println!("           The CLI restore path cannot read leveled buckets, so the");
+                println!("           watch will REFUSE to start with this enabled. Compaction is");
+                println!("           available only in library (owned) mode via the Replicator.");
                 println!("  WARNING: leveled buckets are NOT restorable by walrust binaries");
                 println!("           older than this release (version skew).");
             } else {
