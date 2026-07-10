@@ -150,6 +150,32 @@ impl Drop for Replicator {
 }
 
 impl Replicator {
+    /// Stop the background sync/snapshot task and wait until it has fully
+    /// terminated. Idempotent.
+    ///
+    /// `Drop` only *requests* cancellation (`abort()` returns before the task
+    /// has stopped), so a tick that is past its last await point can still
+    /// complete a publish after `drop` returns. Call this before opening a
+    /// second `Replicator` on the same storage prefix in the same process
+    /// (tests, hot handoff) — otherwise the old instance's final tick can
+    /// race the new instance's first publish and trip the equivocation
+    /// guard.
+    pub async fn shutdown(&self) {
+        let handle = {
+            match self.background.lock() {
+                Ok(mut guard) => guard.take(),
+                Err(_) => None,
+            }
+        };
+        if let Some(h) = handle {
+            h.abort();
+            // JoinError::is_cancelled is the expected outcome; a panic in the
+            // background task would also surface here, which we ignore for
+            // shutdown purposes (the task is gone either way).
+            let _ = h.await;
+        }
+    }
+
     /// Storage backend reference.
     pub fn storage(&self) -> &Arc<dyn StorageBackend> {
         &self.storage
