@@ -171,13 +171,14 @@ typo can't silently back up nothing. Set `allow_empty_globs = true` for
 genuinely optional patterns; if every glob is empty, `watch` starts and idles
 with a warning so a supervisor can boot walrust before its databases exist.
 
-## Compaction (experimental, off by default)
+## Compaction (off by default)
 
 Long-history databases accumulate tens of thousands of tiny per-second sync
 objects, which makes restore slow and buckets large. Leveled compaction folds
 old incrementals into a few coarser merged objects (minutes-grain L1, then
 hours-grain L2), so a restore is snapshot + a handful of merged objects + a fine
-seconds tail. It is **off by default**:
+seconds tail — measurably faster and far fewer objects fetched (see Performance
+and cost). It is **off by default**:
 
 ```toml
 [compaction]
@@ -243,9 +244,23 @@ equivalent: 182 vs 187 over a 3-minute server-side traced window. (An
 earlier claim here of "~9x more PUTs" counted objects retained, not requests
 made, and did not reproduce.) Litestream issues ~10x more LIST calls and
 periodic DELETEs from its always-on compaction; walrust keeps more, smaller
-objects between snapshots because it does not compact incrementals yet. If
+objects between snapshots when compaction is off (its default). If
 request cost matters more than a tight recovery point, raise
 `wal-sync-interval` and lean on the snapshot triggers.
+
+**Restore speed with compaction.** Leveled compaction folds a long incremental
+history into a handful of merged objects, so cold restore-to-latest fetches far
+fewer objects. Measured on a ~10,000-row history built at 1s sync to local MinIO
+(release binary, 3-run median, fresh output path each; `bench/restore-speed.sh`,
+`bench/results-20260710T141118Z`): walrust **with** compaction restored in
+**0.29 s fetching 5 objects**, versus **1.98 s fetching 242 objects** without —
+so compaction makes walrust restore **~7x faster and fetch ~48x fewer objects**
+on this history, and the gap widens as the history grows. Honest caveat: against
+litestream's own compaction, walrust-compacted fetches fewer objects (5 vs 25)
+but does **not** win wall-clock at this scale — litestream restored in 0.09 s vs
+walrust's 0.29 s, because litestream's per-object apply path is more optimized
+and walrust does more per object (LTX→HADBP decode + chain verify +
+`integrity_check`). Re-run `bench/restore-speed.sh` against your own workload.
 
 ## vs Litestream
 
@@ -254,9 +269,13 @@ request cost matters more than a tight recovery point, raise
 - **The formats are not compatible.** walrust writes HADBP changesets, not
   Litestream's LTX. Neither tool can restore the other's backups.
 - **Requests are equivalent; retention shape differs.** Same PUT volume at
-  matched sync intervals; walrust keeps more, smaller objects (no incremental
-  compaction yet), Litestream spends LISTs and DELETEs compacting. Median
-  replication lag measured slightly lower for walrust (0.57s vs 0.68s).
+  matched sync intervals; with compaction off (walrust's default) walrust keeps
+  more, smaller objects while Litestream spends LISTs and DELETEs compacting.
+  Median replication lag measured slightly lower for walrust (0.57s vs 0.68s).
+- **Leveled compaction is available (off by default).** It cuts restore-object
+  count sharply (~48x fewer on a 10k-row history) and makes walrust's own restore
+  ~7x faster; it does not yet beat Litestream's wall-clock restore at small
+  scale. See Performance and cost for the measured table.
 - **Memory measured lower and flat** (~15 MB vs ~58 MB single-db; flat vs
   ~10 MB per added database) — see Performance and cost for conditions and
   the fairness caveat.

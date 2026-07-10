@@ -51,7 +51,23 @@ Core differentiators:
 
 ---
 
-## Compaction (in progress)
+## Compaction (shipped — default off)
+
+**Status: SHIPPED behind `[compaction] enabled` (default `false`).** All five
+waves (C1 format, C2a engine, C2b planner/read-side, C3a CLI wiring, C3b proof
+layer) are merged; compaction works end to end for both the CLI and owned mode.
+The default staying `false` is a version-skew safety choice (an old binary
+cannot restore a leveled bucket); **flipping the default to `true` is a separate
+release decision** for once every binary that might restore a bucket understands
+the `levels/` layout.
+
+**Non-blocking residue** (small future items, not shipped in C3b): the C3a
+reviewer's note that the legacy L0→L1 idempotency path in
+`engine::verify_existing` re-reads the last source's full bytes to recompute
+`chain_end` (an extra bounded GET on the crash-recovery convergence path only —
+correct, just not the cheapest); and leveled compaction only ticks in the
+independent-tasks watch loop, so the default shadow loop silently ignores the
+`[compaction]` knob (documented; the drill uses `--independent-tasks`).
 
 **Status:** rename `compact`→`prune` shipped. C1 (COMPACTED v2 format) shipped.
 **C2a (layout-agnostic merge engine, write side) shipped** — `CompactionLayout`
@@ -107,8 +123,26 @@ snapshot-chain check was not level-aware (false gap on a compacted bucket), and
 three read consumers (`list_merged_ranges`, owned `gather_candidates`,
 `prune::list_level_files`) stopped at the first empty level — missing a populated
 L2 above a fully-promoted (empty) L1 — plus the cache-bypass was made structural.
-**C3b is next**: oracle granularity-decay extension, kill-mid-compaction drill,
-restore-speed bench, default-on.
+
+**C3b (the proof layer) shipped** — the guarantees are now permanent. (1) The DST
+state machine learns real compaction (`Op::Compact` drives the real merge engine
+to quiescence over the legacy bucket, then grades restores with the
+granularity-decay rules from the object listing as ground truth: latest exact,
+merged-window boundary exact, strictly-inside a loud typed decay, never a bare
+gap, never a silent wrong point — under the existing fault plans too). The
+catch-proof (neutering the seq-contiguous batch clip) makes the machine find and
+shrink a failing sequence. (2) A `kill-mid-compaction` drill SIGKILLs a real
+compacting `walrust watch` in a loop and proves restore-to-latest stays row-exact
+and the bucket converges (bounded overlap). (3) A `restore-speed` bench measures
+cold restore-to-latest for walrust-with-compaction vs walrust-without vs
+litestream — compaction makes walrust's own restore ~7x faster and fetch ~48x
+fewer objects (5 vs 242 on a 10k-row history; measured table in the README
+Performance section). **Honest gap:** walrust-compacted fetches fewer objects
+than litestream (5 vs 25) but does not yet beat its wall-clock restore at small
+scale (0.29 s vs 0.09 s) — litestream's per-object apply path is more optimized;
+closing that is future work. (4) The oracle found and this wave fixed a real product bug: restart head
+discovery was not compaction-aware. **The default stays `false`** — flipping it
+is a release decision.
 
 Merge many small incremental changesets into fewer, larger ones so long-history
 databases restore fast and buckets stay small. Litestream's level design is the
