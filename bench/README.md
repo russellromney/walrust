@@ -58,7 +58,7 @@ local MinIO (started by the script via docker). Measures:
   the known asymmetry: litestream 0.5's `replicate` runs an always-on in-band
   compaction/snapshot monitor with no off switch, so it is doing compaction
   work in the same process being measured, while walrust's `watch` does not
-  compact in-band (`walrust compact` is a separate invocation). Part of any
+  prune in-band (`walrust prune` is a separate invocation). Part of any
   RSS gap is that background work; re-measure once walrust compacts in-band.
 
 Ends with the validity check for both tools. Knobs are env vars documented

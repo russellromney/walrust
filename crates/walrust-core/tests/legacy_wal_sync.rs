@@ -288,7 +288,7 @@ async fn legacy_manual_snapshot_folds_wal_resident_rows() -> Result<()> {
     // assert every row is present — i.e. the snapshot's TXID coverage is honest and
     // does not claim commits the image lacks. (The manual `walrust snapshot`
     // command additionally runs a completeness-checked TRUNCATE fold before this —
-    // see sync::compact::snapshot — so it fails closed if a watcher pins the WAL.)
+    // see sync::prune::snapshot — so it fails closed if a watcher pins the WAL.)
     let dir = tempfile::tempdir()?;
     let db_path = dir.path().join("fold-source.db");
     {

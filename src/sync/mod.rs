@@ -1,6 +1,6 @@
 // Module declarations
-mod compact;
 pub(crate) mod manifest;
+mod prune;
 mod shadow;
 mod types;
 mod wal_sync;
@@ -16,8 +16,8 @@ mod restore;
 mod verify;
 
 // Public API re-exports
-pub use compact::{compact, snapshot};
 pub use explain::explain;
+pub use prune::{prune, snapshot};
 pub use replicate::replicate;
 pub use restore::{list, restore};
 pub use verify::verify;

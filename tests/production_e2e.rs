@@ -579,8 +579,8 @@ fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
 }
 
 #[test]
-fn e2e_compaction_during_restore_keeps_backup_restorable() -> Result<()> {
-    require_s3!("e2e_compaction_during_restore_keeps_backup_restorable");
+fn e2e_prune_during_restore_keeps_backup_restorable() -> Result<()> {
+    require_s3!("e2e_prune_during_restore_keeps_backup_restorable");
     let temp = TempDir::new()?;
     let name = unique_name("compact-race-e2e");
     let prefix = format!("e2e/{name}");
@@ -608,9 +608,9 @@ fn e2e_compaction_during_restore_keeps_backup_restorable() -> Result<()> {
         restore.arg("--endpoint").arg(endpoint);
     }
 
-    let mut compact = Command::new(env!("CARGO_BIN_EXE_walrust"));
-    compact
-        .arg("compact")
+    let mut prune = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    prune
+        .arg("prune")
         .arg(&name)
         .arg("--bucket")
         .arg(&bucket_arg)
@@ -624,22 +624,22 @@ fn e2e_compaction_during_restore_keeps_backup_restorable() -> Result<()> {
         .arg("0")
         .arg("--force");
     if let Some(endpoint) = endpoint.as_deref() {
-        compact.arg("--endpoint").arg(endpoint);
+        prune.arg("--endpoint").arg(endpoint);
     }
 
     let mut restore_child = restore.spawn().context("spawn walrust restore")?;
-    let compact_output = compact.output().context("run walrust compact")?;
+    let prune_output = prune.output().context("run walrust prune")?;
     let restore_status = restore_child.wait().context("wait walrust restore")?;
 
     anyhow::ensure!(
-        compact_output.status.success(),
-        "walrust compact failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&compact_output.stdout),
-        String::from_utf8_lossy(&compact_output.stderr)
+        prune_output.status.success(),
+        "walrust prune failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&prune_output.stdout),
+        String::from_utf8_lossy(&prune_output.stderr)
     );
     anyhow::ensure!(
         restore_status.success(),
-        "walrust restore failed during compaction"
+        "walrust restore failed during prune"
     );
 
     assert_integrity_ok(&restored_path)?;

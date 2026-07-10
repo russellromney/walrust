@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use hadb_storage_s3::S3Storage;
 use std::path::Path;
-use walrust_core::legacy_manifest::plan_legacy_compaction;
+use walrust_core::legacy_manifest::plan_legacy_prune;
 use walrust_core::legacy_wal_sync::{checkpoint_wal_truncate, snapshot_database_to_storage};
 
 use crate::errors::{classify_or_else, WalrustError};
@@ -11,7 +11,7 @@ use crate::s3::{self, create_client, parse_bucket};
 
 use super::manifest::discover_snapshots_from_s3;
 
-pub async fn compact(
+pub async fn prune(
     name: &str,
     bucket: &str,
     endpoint: Option<&str>,
@@ -24,7 +24,7 @@ pub async fn compact(
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     // Discover snapshots from the S3 listing — the production watch path never
-    // writes a manifest.json, so reading one made compact a silent no-op (F6).
+    // writes a manifest.json, so reading one made prune a silent no-op (F6).
     // The key here is the FULL S3 key (verify/restore use full keys too).
     let discovered = discover_snapshots_from_s3(&client, &bucket_name, &prefix, name)
         .await
@@ -58,20 +58,20 @@ pub async fn compact(
     let storage = S3Storage::new(client.clone(), bucket_name.clone());
     let plan_before_reachability =
         crate::retention::analyze_retention(&snapshot_entries, policy, now);
-    let plan = plan_legacy_compaction(&storage, &prefix, name, &snapshot_entries, policy, now)
+    let plan = plan_legacy_prune(&storage, &prefix, name, &snapshot_entries, policy, now)
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
     let before = plan.delete.len();
     let rescued = plan_before_reachability.delete.len().saturating_sub(before);
     if rescued > 0 {
         tracing::info!(
-            "Compaction: retained {} snapshot(s) as reachability base for the incremental chain (F7)",
+            "Prune: retained {} snapshot(s) as reachability base for the incremental chain (F7)",
             rescued
         );
     }
 
     // Print summary
-    println!("Compaction plan for '{}':", name);
+    println!("Prune plan for '{}':", name);
     println!("  {}", plan.summary());
     println!();
 
@@ -92,10 +92,10 @@ pub async fn compact(
     }
     // Declare the retained restore floor explicitly (E2): the oldest kept
     // snapshot is the earliest point-in-time that stays restorable after this
-    // compaction. Anything below it is being dropped on purpose.
+    // prune. Anything below it is being dropped on purpose.
     if let Some(floor) = plan.keep.iter().map(|e| e.sequence).min() {
         println!(
-            "Earliest restorable point-in-time after compaction: TXID {} \
+            "Earliest restorable point-in-time after pruning: TXID {} \
              (older point-in-time restores are no longer available)",
             floor
         );
@@ -130,11 +130,11 @@ pub async fn compact(
 
     tracing::info!("Deleted {} snapshot files", deleted_count);
 
-    // No manifest to update — discovery is by S3 listing, so the next compact
+    // No manifest to update — discovery is by S3 listing, so the next prune
     // run simply re-lists and sees the deletions reflected.
 
     println!(
-        "Compaction complete: deleted {} snapshots, freed {:.2} MB",
+        "Prune complete: deleted {} snapshots, freed {:.2} MB",
         deleted_count,
         plan.bytes_freed as f64 / (1024.0 * 1024.0)
     );

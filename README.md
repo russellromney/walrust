@@ -72,7 +72,7 @@ walrust restore mydb -o restored.db -b s3://my-bucket --point-in-time 42     # r
 walrust snapshot app.db -b s3://my-bucket                  # immediate snapshot (errors if a watcher owns the DB)
 walrust verify mydb -b s3://my-bucket                      # check backup integrity
 walrust list -b s3://my-bucket                             # list backups
-walrust compact -b s3://my-bucket                          # GFS retention cleanup
+walrust prune -b s3://my-bucket                            # GFS retention cleanup
 walrust explain                                            # preview resolved config
 ```
 
@@ -143,7 +143,7 @@ behavior breaks:
   is stopped is detected on restart and triggers an immediate re-snapshot.
 - **Single writer, enforced.** A lock file (`.walrust-<db>.lock`) makes a
   second watcher on the same host fail fast instead of corrupting the backup.
-- **Retention never orphans a restore point.** `compact` keeps every object a
+- **Retention never orphans a restore point.** `prune` keeps every object a
   retained point-in-time restore still needs.
 
 ## Configuration
@@ -239,7 +239,7 @@ shared changeset format used across the
 ## Testing
 
 Three instruments run continuously: the unit/integration suite and a fast
-`basic_e2e` drill tier (real binary, kill/restart, restore row-diff, compact +
+`basic_e2e` drill tier (real binary, kill/restart, restore row-diff, prune +
 PITR) gate every PR; the full drill suite runs nightly and files an issue on
 failure. Run them locally with `make basic-e2e` and `make drill` against any S3
 endpoint via `AWS_*` env vars (or Tigris via Soup). `ADVERSARIAL_REVIEW_2.md`

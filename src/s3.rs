@@ -14,7 +14,7 @@ pub struct ObjectMeta {
 
 /// HEAD an object to read its size and last-modified timestamp.
 ///
-/// Used by `compact` to build retention entries from S3 listing rather than a
+/// Used by `prune` to build retention entries from S3 listing rather than a
 /// `manifest.json` the production watch path never writes. Falls back to "now"
 /// if the backend omits `LastModified`.
 pub async fn head_object_meta(client: &Client, bucket: &str, key: &str) -> Result<ObjectMeta> {

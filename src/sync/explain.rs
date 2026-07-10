@@ -7,7 +7,7 @@ use crate::config::Config;
 /// Loads the config file and prints a human-readable summary of:
 /// - Databases being watched (resolved from config/globs)
 /// - Snapshot triggers (interval, max_changes, on_idle, on_startup)
-/// - Compaction settings if enabled
+/// - Pruning settings if enabled
 /// - Retention policy tiers
 /// - S3 bucket and endpoint
 pub fn explain(config: &Option<Config>) -> Result<()> {
@@ -67,8 +67,8 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
             );
             println!();
 
-            // Compaction Settings
-            println!("Compaction:");
+            // Pruning Settings
+            println!("Pruning:");
             if cfg.sync.compact_after_snapshot {
                 println!("  After snapshot: enabled");
             } else {
@@ -197,9 +197,9 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
                 total_snapshots
             );
             if cfg.sync.compact_after_snapshot || cfg.sync.compact_interval > 0 {
-                println!("  Automatic compaction: enabled");
+                println!("  Automatic pruning: enabled");
             } else {
-                println!("  Automatic compaction: disabled (run 'walrust compact' manually)");
+                println!("  Automatic pruning: disabled (run 'walrust prune' manually)");
             }
 
             // Cost estimation

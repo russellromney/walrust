@@ -30,7 +30,8 @@ Core differentiators:
 - `walrust snapshot` - Take immediate snapshot
 - `walrust restore` - Restore database from S3
 - `walrust list` - List backups
-- `walrust compact` - Clean up old snapshots with GFS retention
+- `walrust prune` - Clean up old snapshots with GFS retention (`compact` is a
+  deprecated hidden alias)
 - `walrust replicate` - Poll-based read replica
 - `walrust explain` - Configuration preview with cost estimation
 - `walrust verify` - Backup integrity verification with exit codes

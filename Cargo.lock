@@ -1457,7 +1457,7 @@ dependencies = [
 [[package]]
 name = "hadb-changeset"
 version = "0.4.1"
-source = "git+https://github.com/russellromney/hadb.git?rev=1100d3b615743405c676ecefa5743f2c277ea25f#1100d3b615743405c676ecefa5743f2c277ea25f"
+source = "git+https://github.com/russellromney/hadb.git?rev=b492b5bcb444df523e451aaedcbc71dcd7c0a73c#b492b5bcb444df523e451aaedcbc71dcd7c0a73c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1471,7 +1471,7 @@ dependencies = [
 [[package]]
 name = "hadb-io"
 version = "0.4.1"
-source = "git+https://github.com/russellromney/hadb.git?rev=1100d3b615743405c676ecefa5743f2c277ea25f#1100d3b615743405c676ecefa5743f2c277ea25f"
+source = "git+https://github.com/russellromney/hadb.git?rev=b492b5bcb444df523e451aaedcbc71dcd7c0a73c#b492b5bcb444df523e451aaedcbc71dcd7c0a73c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1493,7 +1493,7 @@ dependencies = [
 [[package]]
 name = "hadb-storage"
 version = "0.4.1"
-source = "git+https://github.com/russellromney/hadb.git?rev=1100d3b615743405c676ecefa5743f2c277ea25f#1100d3b615743405c676ecefa5743f2c277ea25f"
+source = "git+https://github.com/russellromney/hadb.git?rev=b492b5bcb444df523e451aaedcbc71dcd7c0a73c#b492b5bcb444df523e451aaedcbc71dcd7c0a73c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1503,7 +1503,7 @@ dependencies = [
 [[package]]
 name = "hadb-storage-s3"
 version = "0.4.1"
-source = "git+https://github.com/russellromney/hadb.git?rev=1100d3b615743405c676ecefa5743f2c277ea25f#1100d3b615743405c676ecefa5743f2c277ea25f"
+source = "git+https://github.com/russellromney/hadb.git?rev=b492b5bcb444df523e451aaedcbc71dcd7c0a73c#b492b5bcb444df523e451aaedcbc71dcd7c0a73c"
 dependencies = [
  "anyhow",
  "async-trait",

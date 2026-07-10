@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 264099c65806cb68a00faac4cde267f77642087ffb06d52d44ee7cd59f73dea3 # shrinks to ([Flush, KillRestart, Flush, Mark, KillRestart, Compact { hourly: 0, daily: 0, minimum: 1 }, RestorePit { mark_sel: 0 }, RestoreLatest], FaultPlan { transient_rate: 0.0, torn_at_bytes: None, corruption_rate: 0.0, seed: 0 })
+cc 264099c65806cb68a00faac4cde267f77642087ffb06d52d44ee7cd59f73dea3 # shrinks to ([Flush, KillRestart, Flush, Mark, KillRestart, Prune { hourly: 0, daily: 0, minimum: 1 }, RestorePit { mark_sel: 0 }, RestoreLatest], FaultPlan { transient_rate: 0.0, torn_at_bytes: None, corruption_rate: 0.0, seed: 0 })
