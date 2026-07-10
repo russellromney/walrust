@@ -1574,9 +1574,13 @@ fn e2e_core_replicator_compaction_embedder_crash() -> Result<()> {
 /// times per run (two of which get SIGKILLed by the parent, matching the
 /// production crash scenario under test).
 ///
-/// Registers with a real `Replicator` (`add` on the first phase,
-/// `add_without_snapshot` on respawns -- exactly like
-/// `e2e_core_replicator_sigkill_child`), signals readiness, then writes a
+/// Registers with a real `Replicator` via `add_without_snapshot` on EVERY
+/// phase (including the first) -- unlike `e2e_core_replicator_sigkill_child`,
+/// which can use `add` because it does not enable compaction. Here `add` is
+/// unusable: with `compaction.enabled = true` it refuses (it would create a
+/// lineage compaction cannot see), so the lineage-free `add_without_snapshot`
+/// path is the one under test (see `core_compaction_replicator_config`).
+/// After registering it signals readiness, then writes a
 /// continuous burst of small commits through an external, non-autocheckpoint
 /// connection so the replicator's own background sync/compaction loop has
 /// many chances to fire (aggressive `l1_batch`/`l2_batch`/`keep_fine_window`

@@ -42,16 +42,29 @@
 # `wal::read_frames_as_page_map_checked`'s full-WAL-replay-from-offset-0
 # chaining vs its step-by-step incremental chaining to be safely fixed; a
 # rushed change to checksum-chain code risks turning a loud failure into
-# silent corruption, which is strictly worse). NOT masked: `wait_restore_count`
-# below fails a single attempt for real when this happens. The outer wrapper
-# just below retries the WHOLE soak (fresh S3 prefix) a bounded number of
-# times specifically to avoid nightly alarm-fatigue on a known, rare,
-# already-fully-documented flake (every attempt's full failure output is still
-# printed) -- if it persists across every attempt, or a DIFFERENT failure
-# occurs, the drill still fails for real and nightly's existing
-# failed-drill-to-GitHub-issue automation tracks it. This is honesty over
-# green (matching gap 2's version-skew drill): the bug is not hidden, it is
-# given a fair, bounded, fully-logged number of chances not to reproduce.
+# silent corruption, which is strictly worse). This failure is provably
+# SAFE (loud-only, never silent-wrong): the restore chain is content-anchored
+# end to end (crates/walrust-core/src/legacy_restore.rs threads a running
+# checksum recomputed from the ACTUAL applied bytes, each object's stored
+# pre_apply is verified against it, its post against its own trailer, and
+# `integrity_check` is a final backstop), so the same root cause can only ever
+# hard-fail the restore, never return a wrong-but-Ok database. That is why
+# retrying it is acceptable at all.
+#
+# NOT masked, and SCOPED: `soak_wait_restore_or_classify` below fails a single
+# attempt for real when this happens, and CLASSIFIES it from the restore's own
+# error text. The outer wrapper retries a fresh attempt ONLY for this one exact
+# signature ("Pre-apply checksum mismatch" / "does not chain"); ANY other
+# failure -- a silent wrong-count restore, a different typed error, an
+# unexpected ERROR line, a convergence or toothless-guard failure, a brand-new
+# flaky bug -- propagates immediately and is NEVER retried, so the retry cannot
+# hide a regression or a rate/severity change in anything but this already-
+# tracked, root-caused, safe flake. Every occurrence is logged loudly; if even
+# this signature persists across every attempt the drill still fails for real
+# and nightly's existing failed-drill-to-GitHub-issue automation tracks it.
+# This is honesty over green: the bug is not hidden, and the tolerance is
+# narrow enough that a plain "retry on any nonzero" (what this used to be)
+# can no longer swallow anything else.
 #
 # Wired into `make drill` (drills/run-all.sh) AND the nightly workflow (which
 # runs `make drill`) -- unlike drills/version-skew.sh, this drill needs no
@@ -60,24 +73,48 @@
 
 set -Eeuo pipefail
 
+# Exit code an inner attempt uses to signal "I failed ONLY because of the one
+# known, root-caused, provably-SAFE (loud, never silent-wrong) deferred
+# restore-chain flake" (see the KNOWN RESIDUE comment above and the final
+# restore step below). It is the ONLY failure the outer wrapper retries. Any
+# other nonzero exit -- a different restore error, an unexpected ERROR line, a
+# convergence failure, a toothless-guard failure, a genuinely new bug that
+# happens to be flaky -- propagates immediately and is NEVER retried, so the
+# retry cannot mask a regression or a rate/severity change in anything but this
+# exact, already-tracked signature. Chosen outside sysexits.h's 64-78 range.
+SOAK_KNOWN_FLAKE_EXIT=42
+
 if [ "${WALRUST_DRILL_SOAK_RETRY_INNER:-0}" != "1" ]; then
   # Outer retry wrapper (see the KNOWN RESIDUE comment above): re-exec this
   # same script as a fully independent attempt (its own drill_setup/cleanup/
   # S3 prefix/trap lifecycle -- no state carries over between attempts) up to
-  # WALRUST_DRILL_SOAK_ATTEMPTS times. Only the documented, already-diagnosed
-  # rare race benefits from this; it does not change what a single attempt
-  # asserts or how strictly it asserts it.
+  # WALRUST_DRILL_SOAK_ATTEMPTS times. Crucially, it retries ONLY when an
+  # attempt exits with SOAK_KNOWN_FLAKE_EXIT (the one documented, diagnosed,
+  # loud-only restore-chain flake); every other failure is a real failure and
+  # exits immediately with the inner attempt's own code, unmasked. A plain
+  # "retry on any nonzero" wrapper (what this used to be) would have silently
+  # swallowed a brand-new ~50%-flaky bug or a worsening of any other assertion.
   attempts=${WALRUST_DRILL_SOAK_ATTEMPTS:-3}
   attempt=1
+  flake_hits=0
   while [ "$attempt" -le "$attempts" ]; do
-    if WALRUST_DRILL_SOAK_RETRY_INNER=1 "$0" "$@"; then
+    inner_exit=0
+    WALRUST_DRILL_SOAK_RETRY_INNER=1 "$0" "$@" || inner_exit=$?
+    if [ "$inner_exit" -eq 0 ]; then
       exit 0
     fi
-    printf '[compaction-soak] attempt %s/%s failed (full output above) -- retrying as a fresh attempt\n' \
-      "$attempt" "$attempts" >&2
+    if [ "$inner_exit" -ne "$SOAK_KNOWN_FLAKE_EXIT" ]; then
+      printf '[compaction-soak] attempt %s/%s failed with exit %s -- NOT the known deferred restore-chain flake; failing immediately (not retried, not masked)\n' \
+        "$attempt" "$attempts" "$inner_exit" >&2
+      exit "$inner_exit"
+    fi
+    flake_hits=$((flake_hits + 1))
+    printf '[compaction-soak] attempt %s/%s hit the KNOWN deferred restore-chain flake (occurrence %s; ROADMAP HIGH PRIORITY) -- retrying as a fresh attempt\n' \
+      "$attempt" "$attempts" "$flake_hits" >&2
     attempt=$((attempt + 1))
   done
-  printf '[compaction-soak] all %s attempts failed -- this is a real failure, not flakiness noise\n' "$attempts" >&2
+  printf '[compaction-soak] the known deferred restore-chain flake reproduced on ALL %s attempts -- failing the drill for real (nightly should track this; it is a real, if known, availability failure)\n' \
+    "$attempts" >&2
   exit 1
 fi
 
@@ -96,6 +133,46 @@ INDUCE_LOSS=${WALRUST_DRILL_SOAK_INDUCE_LOSS:-1}
 
 [ "$TOTAL_SECONDS" -ge "$((KILL_EVERY * 4))" ] \
   || fail "TOTAL_SECONDS=$TOTAL_SECONDS too small for KILL_EVERY=$KILL_EVERY to yield >= 4 cycles"
+
+# Restore-to-latest with the known-flake classification the retry wrapper needs.
+# Polls (like lib.sh's wait_restore_count) up to DRILL_RESTORE_TIMEOUT. On
+# success: return. On a persistent failure it decides, from the restore's own
+# error text, whether this is THE one deferred, root-caused, provably loud-only
+# restore-chain flake (see the KNOWN RESIDUE header + ROADMAP) or something
+# else:
+#   - Known signature ("Pre-apply checksum mismatch" / "does not chain"):
+#     exit SOAK_KNOWN_FLAKE_EXIT so the outer wrapper -- and ONLY that exact
+#     signature -- may retry a fresh attempt. Each occurrence is logged loudly.
+#   - Anything else (a row diff with no such error, a different typed error, a
+#     restore that never even ran): `fail` hard. This is a real, unmasked
+#     failure; the retry wrapper must never swallow it.
+# This is what stops a plain "retry on any nonzero" from hiding a regression:
+# the tolerance is scoped to one exact, already-tracked, safe signature.
+soak_wait_restore_or_classify() {
+  local name=$1
+  local expected=$2
+  local deadline=$((SECONDS + DRILL_RESTORE_TIMEOUT))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if assert_restored_count_once "$name" "$expected"; then
+      log "restore rows ok: $expected"
+      return 0
+    fi
+    sleep "$DRILL_POLL_INTERVAL"
+  done
+  local err=${DRILL_LAST_RESTORE_ERROR:-}
+  case "$err" in
+  *"Pre-apply checksum mismatch"* | *"does not chain"*)
+    log "KNOWN DEFERRED restore-chain flake reproduced (loud-only, never silent-wrong -- \
+ROADMAP HIGH PRIORITY): expected=$expected actual=${DRILL_LAST_ACTUAL:-unavailable}"
+    log "restore error was: $err"
+    exit "$SOAK_KNOWN_FLAKE_EXIT"
+    ;;
+  *)
+    fail "ROW DIFF (NOT the known restore-chain flake -- real failure, not retried): \
+expected rows=$expected actual rows=${DRILL_LAST_ACTUAL:-unavailable}; restore output: ${err:-none}"
+    ;;
+  esac
+}
 
 DRILL_COMPACTION_CONFIG=
 
@@ -294,7 +371,7 @@ merges_l2=$(level_object_count '/levels/L2/.*\.ltx$')
 # ROADMAP "Compaction (shipped — default off)" residue note for the full
 # write-up (this drill is what found it).
 DRILL_RESTORE_TIMEOUT=$((SNAPSHOT_INTERVAL * 6))
-wait_restore_count "$name" "$expected"
+soak_wait_restore_or_classify "$name" "$expected"
 
 # (2) walrust verify exits 0 on the healthy leveled bucket.
 "$WALRUST_BIN" verify "$name" --bucket "$DRILL_BUCKET_URI" --endpoint "$DRILL_ENDPOINT" \

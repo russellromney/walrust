@@ -161,58 +161,17 @@ level_snapshot_base_objects() {
     | grep -v '/0000/'
 }
 
-# lib.sh's pause_driver / driver_count are hardcoded to $DRILL_DB (every
-# other drill only ever has one database). This phase's driver targets
-# $LEVEL_DB instead, so pause_driver's stability check would silently
-# compare $DRILL_DB (static, unchanging since phase 1 finished writing to
-# it) against itself -- trivially "stable" on the first read -- and stamp a
-# stale count into $DRILL_DRIVER_COUNT that has nothing to do with the
-# leveled phase's actual driver activity. Local, $LEVEL_DB-aware
-# replacements; resume_driver/stop_driver are safe to reuse as-is (no
-# $DRILL_DB reference matters for what this phase needs from them).
-level_pause_driver() {
-  [ -n "${DRILL_DRIVER_PID:-}" ] || fail "write driver is not running"
-  touch "$DRILL_DRIVER_PAUSE"
-  local before after
-  before=$(db_count "$LEVEL_DB")
-  while :; do
-    sleep "$DRILL_POLL_INTERVAL"
-    after=$(db_count "$LEVEL_DB")
-    if [ "$after" = "$before" ]; then
-      printf '%s\n' "$after" >"$DRILL_DRIVER_COUNT"
-      return 0
-    fi
-    before=$after
-  done
-}
-
-level_driver_count() {
-  if [ -f "$DRILL_DRIVER_COUNT" ]; then
-    cat "$DRILL_DRIVER_COUNT"
-  else
-    db_count "$LEVEL_DB"
-  fi
-}
-
-level_wait_driver_count_at_least() {
-  local min=$1
-  local timeout=${2:-30}
-  local deadline=$((SECONDS + timeout))
-  local count
-  while [ "$SECONDS" -lt "$deadline" ]; do
-    count=$(db_count "$LEVEL_DB")
-    printf '%s\n' "$count" >"$DRILL_DRIVER_COUNT"
-    if [ "$count" -ge "$min" ]; then
-      return 0
-    fi
-    sleep "$DRILL_POLL_INTERVAL"
-  done
-  fail "timed out waiting for leveled-phase driver count >= $min; got $(level_driver_count)"
-}
+# This phase's driver targets $LEVEL_DB, not $DRILL_DB. lib.sh's
+# pause_driver / driver_count / wait_driver_count_at_least all take an
+# optional database-path argument (default $DRILL_DB) exactly so a
+# multi-database drill like this one can point them at the right file --
+# passing $LEVEL_DB makes the stability check sample the leveled driver
+# instead of trivially comparing the static, phase-1 $DRILL_DB against
+# itself. resume_driver/stop_driver need no such argument here.
 
 baseline_txid=$(latest_txid)
 start_driver "$LEVEL_DB" "${WALRUST_DRILL_DRIVER_INTERVAL:-0.05}" prune-level
-level_wait_driver_count_at_least 10 45
+wait_driver_count_at_least 10 45 "$LEVEL_DB"
 start_walrust_leveled "$LEVEL_DB"
 wait_for_leveled_sync_progress "$baseline_txid"
 
@@ -263,7 +222,7 @@ done
 # NEW snapshot, and record its row count at that exact, stable moment.
 baseline_snap_txid=$(level_snapshot_txids | sort -n | tail -1)
 baseline_snap_txid=${baseline_snap_txid:-0}
-level_pause_driver
+pause_driver "$LEVEL_DB"
 snap_deadline=$((SECONDS + LEVEL_SNAPSHOT_INTERVAL * 3 + 30))
 level_txid=0
 while [ "$SECONDS" -lt "$snap_deadline" ]; do
@@ -278,7 +237,7 @@ while [ "$SECONDS" -lt "$snap_deadline" ]; do
   sleep "$DRILL_POLL_INTERVAL"
 done
 [ "$level_txid" -gt 0 ] || fail "no new periodic snapshot landed in the leveled phase"
-snapshot_expected=$(level_driver_count)
+snapshot_expected=$(driver_count "$LEVEL_DB")
 printf '%s\t%s\n' "$level_txid" "$snapshot_expected" >>"$history"
 log "leveled-phase snapshot txid=$level_txid rows=$snapshot_expected"
 
@@ -288,8 +247,8 @@ log "leveled-phase snapshot txid=$level_txid rows=$snapshot_expected"
 # The watcher is still the SAME running process throughout.
 resume_driver
 sleep 3
-level_pause_driver
-level_expected=$(level_driver_count)
+pause_driver "$LEVEL_DB"
+level_expected=$(driver_count "$LEVEL_DB")
 
 # Confirm the still-running watcher has actually synced up to this exact
 # count BEFORE stopping it (matching kill-mid-compaction.sh's own ordering:

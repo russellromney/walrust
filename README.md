@@ -109,6 +109,9 @@ Notes for embedders:
   `libsqlite3-sys` per build, so your app's rusqlite version must match.
 - `Replicator::add()` creates a small `_walrust_seq` table in the database —
   see [Safety and design](#safety-and-design).
+- Enabling [compaction](#compaction-off-by-default) changes how you register a
+  database: use `add_without_snapshot()`, not `add()` (`add()` refuses with
+  compaction on). See that section for why.
 
 Bindings for other languages are planned; Python bindings exist today behind
 the `python` feature.
@@ -220,6 +223,20 @@ Embedders set the same knobs on `ReplicationConfig::compaction`
 (`walrust_core::compaction::CompactionSettings`); `enabled` is the single
 control (there is no separate internal gate). Run `walrust explain` to see the
 resolved values.
+
+**Registering an embedded database when compaction is on:** use
+`Replicator::add_without_snapshot()`, **not** `add()`. `add()` creates a
+walrust-owned *lineage* (a `{db}/lineages/{id}/…` key shape) that the compaction
+engine cannot see, so compaction would silently never fire — `add()` refuses up
+front with `compaction.enabled = true` rather than let a bucket you believe is
+compacting grow unbounded. `add_without_snapshot()` keeps the stream on the flat
+`{db}/0000/…` layout compaction reads. It skips the add-time base snapshot, so
+leave `autonomous_snapshots` on (the default) and set a `snapshot_interval` short
+enough that the background loop establishes the first restorable base promptly
+(the hour-long default leaves an early window with no base). Teaching compaction
+to fold lineage-scoped streams is future work (see ROADMAP); today the
+lineage-free `add_without_snapshot()` path is the supported way to compact an
+embedded database.
 
 ## Read replica
 

@@ -152,6 +152,55 @@ two distinct outcomes under this stress, in this order of severity:
      prioritize this until someone does the careful, dedicated fix it
      deserves. **HIGH PRIORITY follow-up.**
 
+  **Adversarial-review addendum (PR #32 review pass) — the two outcomes share
+  ONE root cause, and outcome 1 is a permanent liveness stall, not cosmetic.**
+  A fresh review re-ran the soak and read the failure paths in full:
+  - **Outcome 2 is provably SAFE (loud-only, never silent-wrong).** Restore is
+    content-anchored end to end: `legacy_restore.rs` threads a `running`
+    checksum recomputed from the ACTUAL applied bytes, verifies every object's
+    stored `pre_apply` against it and its `post` against its own trailer
+    (`legacy_ltx.rs`), and finishes with `integrity_check`. The same root cause
+    can therefore only ever HARD-FAIL a restore, never return a wrong-but-Ok
+    database (a silent-wrong variant would need a 64-bit checksum collision AND
+    an integrity_check pass). Deferring the *fix* is defensible precisely
+    because the cost is availability, not integrity — but the fix stays **HIGH
+    PRIORITY**.
+  - **Outcome 1 is the SAME root cause, observed as a compaction symptom, and
+    it is a PERMANENT liveness wedge (C3a class).** Re-running the soak, the
+    identical boundary (`source[1].prev_checksum X != source[0].chain_end Y`,
+    one fixed X/Y) errored on **every tick from t≈34s to the last log line**,
+    surviving **five** later periodic snapshots — it never self-heals, because
+    the un-pruned pre-break L0 objects stay the oldest, so `contiguous_batch`
+    (oldest-first, seq-only) re-selects the same doomed run forever and never
+    reaches the healthy post-snapshot L0. This is exactly the liveness stall
+    C3a's seq-clip was meant to end, in a shape C3a's own comment mis-classified
+    as "a genuine fork/corruption": a restart re-anchor produces a
+    seq-contiguous-but-checksum-discontinuous boundary that is neither a seq gap
+    (so the clip does not skip it) nor a genuine fork (data restores fine via
+    the snapshot that supersedes it).
+  - **Why the review did NOT "fix it in the engine."** Two engine options were
+    weighed and rejected as unsafe/too-large for this pass: (a) making the
+    compactor *skip* any NonContiguous boundary would also silently swallow a
+    GENUINE fork/corruption (losing the loud alarm the merge's own contiguity
+    check exists to raise) and would gut the C3b DST catch-proof test; (b) the
+    *correct* safe engine fix — **exclude L0 objects already superseded by the
+    newest snapshot floor from the merge-eligible set** (they are restore-dead
+    and prune-bound, so never merging them restores liveness AND still surfaces
+    a real fork ABOVE the floor as a loud NonContiguous) — needs the snapshot
+    floor plumbed into the `CompactionLayout`/engine and re-baselining of the
+    DST oracle: real design work, not a <100-line patch, and it must not turn a
+    loud failure into a silent one. **Both symptoms are best fixed at the root**
+    (make the `--independent-tasks` restart re-anchor produce a chain-continuous
+    L0 stream — e.g. persist `wal_offset`/`db_checksum` across restart or hard-
+    disable SQLite auto-checkpoint on the watched DB so the on-disk `.db` never
+    drifts from the incremental chain between syncs), which dissolves outcome 1
+    and outcome 2 together. Until then the engine's loud refusal is correct
+    (it never bridges the break), data is safe every run (proven by the drill's
+    row-exact restore + integrity_check + verify), and the drill now retries
+    ONLY outcome 2's exact signature — the NonContiguous allow-list still fails
+    hard on any OTHER ERROR line, and object-count bounds cap the wedge's blast
+    radius. **HIGH PRIORITY follow-up (same item as outcome 2).**
+
 **Residue (e2e gap closure): gap 4 found and fixed a real E7 gap — owned-mode
 `add()` was silently incompatible with compaction.** Building
 `e2e_core_replicator_compaction_embedder_crash` (tests/production_e2e.rs) — a
@@ -177,6 +226,16 @@ via `add_without_snapshot()` on every phase (relying on
 `autonomous_snapshots` + a short `snapshot_interval` for the initial base) and
 passes: L1/L2 fire, two SIGKILL/respawn cycles survive, and the library
 `restore()` API reads the compacted, crash-cycled stream row-exact.
+**Adversarial-review follow-up (PR #32):** the guard makes `add_without_snapshot()`
+the ONLY working library-mode compaction path, so the README library +
+compaction sections now say so explicitly (`add()` is documented as the primary
+embedder flow, and it refuses under compaction — the two must agree). Teaching
+compaction to fold **lineage-scoped** streams (so `add()` and compaction can
+coexist, and multi-node lineage replication can compact) is deliberate future
+work: it requires `SeqLayout` (and the planner/prune/restore seam) to understand
+the `{db}/lineages/{id}/...` key shape, which is a real feature, not a bug fix.
+Until then the lineage-free `add_without_snapshot()` path is the supported one
+and the error message names it.
 
 **Residue (e2e gap closure): gap 5 — a non-obvious retention-policy floor that
 any short-lived leveled-prune test needs to know about.** Extending
