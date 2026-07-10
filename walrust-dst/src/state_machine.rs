@@ -1132,4 +1132,42 @@ mod tests {
     fn state_machine_generated_sequences_under_faults() {
         run_state_machine_with_faults(DEFAULT_CASES).unwrap();
     }
+
+    /// E4 coverage guard. The generated sequences can only request a PITR at a
+    /// recorded `Mark`, and a Mark always names a real published boundary at or
+    /// below the discovered head — so the fuzz never asks for a point-in-time
+    /// BEYOND the newest available TXID, and the E4 future-PIT guard in
+    /// `restore_legacy_ltx` would go unexercised by this instrument. Pin it: a
+    /// far-future point-in-time must be the TYPED `RestoreNotFound`, never a
+    /// silent fall-through to the latest DB. Removing the E4 branch makes this
+    /// fail (the restore then returns Ok at the head).
+    #[test]
+    fn replay_e4_future_pit_is_typed_not_found() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let tmp = TempDir::new().unwrap();
+            let restores = TempDir::new().unwrap();
+            let mut h = Harness::new(&tmp, FaultPlan::none(0)).unwrap();
+            // Publish an initial base, then a durable incremental boundary.
+            h.durable_flush().await.unwrap();
+            h.write_txn(3).unwrap();
+            h.durable_flush().await.unwrap();
+            let head = h.state.current_txid;
+            assert!(head >= 1, "expected a published head, got {head}");
+
+            let out = restores.path().join("future_pit.db");
+            let err = h
+                .restore_to(&out, Some(head + 1000))
+                .await
+                .expect_err("a far-future PITR must be a hard error, not a silent latest restore");
+            let typed = matches!(
+                err.downcast_ref::<walrust::walrust_core::errors::WalrustError>(),
+                Some(walrust::walrust_core::errors::WalrustError::RestoreNotFound(_))
+            );
+            assert!(
+                typed,
+                "far-future PITR must be a typed RestoreNotFound, got: {err:#}"
+            );
+        });
+    }
 }
