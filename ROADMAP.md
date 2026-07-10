@@ -100,6 +100,58 @@ a short restore, and silent (no error surfaced to the operator). The README
 version-skew warning is upgraded from theoretical to confirmed with this
 citation.
 
+**Residue (e2e gap closure): a real, high-priority, PRE-EXISTING bug found by
+the gap-3 soak drill — NOT specific to compaction.** `drills/compaction-soak.sh`
+(120s, aggressive: 1s wal-sync, ~50 rows/sec, SIGKILL+restart every ~20s,
+periodic snapshot every ~15s, `[compaction] enabled` at aggressive batches) hits
+two distinct outcomes under this stress, in this order of severity:
+  1. **Common, non-data-loss** (the drill allow-lists this exact signature after
+     confirming, in every occurrence, that restore-to-latest/`integrity_check`/
+     `walrust verify` all stayed correct): the compaction engine finds a
+     seq-contiguous L0 run whose LTX-domain checksum chain is genuinely broken
+     (`CompactionError::NonContiguous`, logged at ERROR every tick forever —
+     `contiguous_batch`'s liveness skip only detects a *seq* gap, e.g. an
+     explicit snapshot's, not a checksum-domain break with no seq gap). Sources
+     are never deleted on a failed merge, so this wedges that one L0 boundary
+     (no further compaction progress past it) but never loses or corrupts data.
+  2. **Rare (~2 of 4 runs in one local sample), NOT compaction-specific, HIGHER
+     SEVERITY**: `walrust restore` itself hard-fails with a typed `Pre-apply
+     checksum mismatch ... does not chain` error and does **not** self-heal —
+     confirmed by retrying restore-to-latest across several more periodic
+     full-snapshot ticks (6x the snapshot interval) with no change. Root cause
+     is not fixed (deliberately — see below), but is narrowed to a likely
+     mismatch between two independently-computed checksum-chain baselines: (a)
+     `crates/walrust-core/src/legacy_wal_sync.rs::sync_wal_to_storage`'s
+     `pre_checksum` derivation (`db_checksum.unwrap_or_else(compute_checksum_
+     from_file)`, around line 255) and (b) the restart-time reset in
+     `src/sync/watch_independent.rs::watch_with_independent_tasks` (`wal_offset`
+     forced to `0` and `db_checksum` freshly recomputed from the on-disk `.db`
+     file, around lines 126-133) — `--independent-tasks` mode also runs no
+     periodic walrust-driven checkpoint at all (`checkpoint_interval` is wired
+     only into `src/sync/watch_shadow.rs`, dead here), so a restart's "replay
+     the whole WAL from offset 0, chain from a freshly recomputed whole-file
+     checksum" path needs to be *provably* equivalent to the normal
+     step-by-step incremental chaining in `wal::read_frames_as_page_map_checked`
+     for every WAL state, and under this drill's stress that equivalence
+     appears to break down. **Deliberately not fixed here**: this is
+     correctness-critical checksum-chain code that has already been through
+     multiple careful adversarial-review passes (see the WAL-checksum-endianness
+     and racing-checkpoint history earlier in this doc); a rushed fix risks
+     turning a loud, safe failure into silent corruption, which would be
+     strictly worse. `drills/compaction-soak.sh` is wired into `make drill` and
+     nightly anyway (as the task required) with the bug **not masked**: a single
+     attempt still fails for real when it hits outcome 2 (full output printed).
+     To keep the nightly gate actionable rather than alarm-fatigued on a
+     ~50%-per-run-observed rare flake, the drill's outer layer retries the
+     WHOLE soak (fresh S3 prefix, independent process, no shared state) up to
+     `WALRUST_DRILL_SOAK_ATTEMPTS` (default 3) times; every attempt's failure
+     is logged in full either way, and exhausting all attempts (or hitting a
+     genuinely different error, which is never silently retried past) still
+     fails the drill for real and files/updates a GitHub issue via the
+     existing drill-nightly automation — the correct, honest way to track and
+     prioritize this until someone does the careful, dedicated fix it
+     deserves. **HIGH PRIORITY follow-up.**
+
 **Status:** rename `compact`→`prune` shipped. C1 (COMPACTED v2 format) shipped.
 **C2a (layout-agnostic merge engine, write side) shipped** — `CompactionLayout`
 trait + seq/range adapters, streaming k-way merge with a proven memory bound,
