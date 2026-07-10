@@ -77,12 +77,22 @@ pub struct SyncConfig {
     #[serde(default = "default_on_startup")]
     pub on_startup: bool,
 
-    /// Run compaction after each snapshot
-    #[serde(default)]
+    /// Run retention pruning after each snapshot.
+    ///
+    /// Preferred TOML key: `prune_after_snapshot`. The legacy
+    /// `compact_after_snapshot` spelling is still accepted (retention expiry is
+    /// pruning, not compaction).
+    #[serde(
+        default,
+        rename = "prune_after_snapshot",
+        alias = "compact_after_snapshot"
+    )]
     pub compact_after_snapshot: bool,
 
-    /// Compaction interval in seconds (0 = disabled)
-    #[serde(default)]
+    /// Retention pruning interval in seconds (0 = disabled).
+    ///
+    /// Preferred TOML key: `prune_interval`; legacy `compact_interval` accepted.
+    #[serde(default, rename = "prune_interval", alias = "compact_interval")]
     pub compact_interval: u64,
 
     /// Checkpoint interval in seconds (default: 60)
@@ -541,6 +551,35 @@ mod tests {
         assert_eq!(config.retention.daily, 7);
         assert_eq!(config.retention.weekly, 12);
         assert_eq!(config.retention.monthly, 12);
+    }
+
+    #[test]
+    fn test_prune_keys_preferred_and_compact_alias_accepted() {
+        // Preferred `prune_*` spelling parses.
+        let prune_toml = r#"
+            [sync]
+            prune_after_snapshot = true
+            prune_interval = 4242
+
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(prune_toml).unwrap();
+        assert!(config.sync.compact_after_snapshot);
+        assert_eq!(config.sync.compact_interval, 4242);
+
+        // Legacy `compact_*` spelling still accepted via serde alias.
+        let compact_toml = r#"
+            [sync]
+            compact_after_snapshot = true
+            compact_interval = 99
+
+            [[databases]]
+            path = "/data/test.db"
+        "#;
+        let config: Config = toml::from_str(compact_toml).unwrap();
+        assert!(config.sync.compact_after_snapshot);
+        assert_eq!(config.sync.compact_interval, 99);
     }
 
     #[test]

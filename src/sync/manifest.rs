@@ -26,7 +26,7 @@ fn s3_storage(client: &aws_sdk_s3::Client, bucket: &str) -> S3Storage {
 /// Returns `(key, generation, min_txid, max_txid)` for every file that
 /// [`is_snapshot`] classifies as a snapshot, across the live generation and all
 /// snapshot generations up to the highest present. Mirrors how `verify` and
-/// `restore` discover state so `compact` no longer depends on a `manifest.json`
+/// `restore` discover state so `prune` no longer depends on a `manifest.json`
 /// the production watch path never writes (F6).
 pub(crate) async fn discover_snapshots_from_s3(
     client: &aws_sdk_s3::Client,

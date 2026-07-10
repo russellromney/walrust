@@ -2,7 +2,7 @@ use anyhow::Result;
 use chrono::Utc;
 use hadb_storage_s3::S3Storage;
 use std::sync::Arc;
-use walrust_core::legacy_manifest::plan_legacy_compaction;
+use walrust_core::legacy_manifest::plan_legacy_prune;
 use walrust_core::legacy_shadow;
 #[cfg(test)]
 use walrust_core::legacy_shadow::ShadowEncodeResult;
@@ -190,8 +190,8 @@ pub(crate) async fn sync_shadow_concurrent_with_retry(
     .await
 }
 
-/// Internal compaction for watch mode (non-interactive, always force)
-pub(crate) async fn run_compaction(
+/// Internal retention pruning for watch mode (non-interactive, always force)
+pub(crate) async fn run_prune(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
@@ -223,26 +223,26 @@ pub(crate) async fn run_compaction(
     let storage = S3Storage::new(client.clone(), bucket.to_string());
     let plan_before_reachability =
         crate::retention::analyze_retention(&snapshot_entries, policy, now);
-    let plan = plan_legacy_compaction(&storage, prefix, name, &snapshot_entries, policy, now)
+    let plan = plan_legacy_prune(&storage, prefix, name, &snapshot_entries, policy, now)
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
     let before = plan.delete.len();
     let rescued = plan_before_reachability.delete.len().saturating_sub(before);
     if rescued > 0 {
         tracing::info!(
-            "{}: compaction retained {} snapshot(s) as reachability base for the incremental chain",
+            "{}: pruning retained {} snapshot(s) as reachability base for the incremental chain",
             name,
             rescued
         );
     }
 
     if !plan.has_deletions() {
-        tracing::debug!("Compaction for {}: nothing to delete", name);
+        tracing::debug!("Pruning for {}: nothing to delete", name);
         return Ok(());
     }
 
     tracing::info!(
-        "Compacting {}: deleting {} snapshots, keeping {}",
+        "Pruning {}: deleting {} snapshots, keeping {}",
         name,
         plan.delete.len(),
         plan.keep.len()
@@ -255,7 +255,7 @@ pub(crate) async fn run_compaction(
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     tracing::info!(
-        "Compaction complete for {}: deleted {} snapshots, freed {:.2} MB",
+        "Prune complete for {}: deleted {} snapshots, freed {:.2} MB",
         name,
         deleted_count,
         plan.bytes_freed as f64 / (1024.0 * 1024.0)
@@ -378,12 +378,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_watch_auto_compaction_uses_listing_without_manifest() {
+    async fn test_watch_auto_prune_uses_listing_without_manifest() {
         if std::env::var("AWS_ENDPOINT_URL_S3").is_err()
             && std::env::var("AWS_ENDPOINT_URL").is_err()
             && std::env::var("AWS_ACCESS_KEY_ID").is_err()
         {
-            eprintln!("SKIP test_watch_auto_compaction_uses_listing_without_manifest: no S3 endpoint/credentials configured");
+            eprintln!("SKIP test_watch_auto_prune_uses_listing_without_manifest: no S3 endpoint/credentials configured");
             return;
         }
         let (bucket_arg, endpoint) = test_bucket_config();
@@ -403,13 +403,13 @@ mod tests {
         }
 
         let policy = RetentionPolicy::new(0, 0, 0, 0);
-        run_compaction(&client, &bucket, &prefix, &name, &policy)
+        run_prune(&client, &bucket, &prefix, &name, &policy)
             .await
             .unwrap();
 
         assert!(
             !s3::exists(&client, &bucket, &delete_middle).await.unwrap(),
-            "watch auto-compaction must delete eligible listing-discovered snapshots even without manifest.json"
+            "watch auto-pruning must delete eligible listing-discovered snapshots even without manifest.json"
         );
         assert!(s3::exists(&client, &bucket, &keep_old).await.unwrap());
         assert!(s3::exists(&client, &bucket, &keep_latest).await.unwrap());

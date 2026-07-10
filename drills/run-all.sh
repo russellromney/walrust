@@ -9,7 +9,7 @@ drills=(
   restart-under-load.sh
   hostile-operator.sh
   pitr.sh
-  compact-retained.sh
+  prune-retained.sh
   read-replica.sh
   soak.sh
 )

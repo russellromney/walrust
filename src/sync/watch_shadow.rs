@@ -29,7 +29,7 @@ use walrust_core::legacy_shadow_watch::{
 };
 
 use super::shadow::{
-    run_compaction, sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry,
+    run_prune, sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry,
 };
 use super::types::{DbState, Manifest, ShadowDbState, ShadowSyncInput, TriggerState};
 use super::verify::validate_backup_integrity;
@@ -952,24 +952,24 @@ pub async fn watch_with_shadow(
                     }
                 }
 
-                // Run compaction after snapshots if enabled
+                // Run retention pruning after snapshots if enabled
                 if global_sync.compact_after_snapshot {
                     if let Some(ref policy) = compact_policy {
                         for state in db_states.values() {
-                            if let Err(e) = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await {
-                                tracing::error!("Failed to compact {}: {}", state.name, e);
+                            if let Err(e) = run_prune(&client, &bucket_name, &prefix, &state.name, policy).await {
+                                tracing::error!("Failed to prune {}: {}", state.name, e);
                             }
                         }
                     }
                 }
             }
 
-            // Compaction timer
+            // Pruning timer
             _ = compact_timer.tick(), if global_sync.compact_interval > 0 => {
                 if let Some(ref policy) = compact_policy {
                     for state in db_states.values() {
-                        if let Err(e) = run_compaction(&client, &bucket_name, &prefix, &state.name, policy).await {
-                            tracing::error!("Failed to compact {}: {}", state.name, e);
+                        if let Err(e) = run_prune(&client, &bucket_name, &prefix, &state.name, policy).await {
+                            tracing::error!("Failed to prune {}: {}", state.name, e);
                         }
                     }
                 }

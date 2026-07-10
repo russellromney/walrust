@@ -84,11 +84,11 @@ enum Commands {
         #[arg(long)]
         on_startup: Option<bool>,
 
-        /// Run compaction after each snapshot
+        /// Run retention pruning after each snapshot (legacy flag name)
         #[arg(long)]
         compact_after_snapshot: bool,
 
-        /// Compaction interval in seconds (0 = disabled)
+        /// Retention pruning interval in seconds (0 = disabled, legacy flag name)
         #[arg(long)]
         compact_interval: Option<u64>,
 
@@ -257,7 +257,43 @@ enum Commands {
         endpoint: Option<String>,
     },
 
-    /// Compact old snapshots using retention policy (GFS rotation)
+    /// Prune old snapshots using retention policy (GFS rotation)
+    Prune {
+        /// Database name (as registered in S3)
+        name: String,
+
+        /// S3 bucket
+        #[arg(short, long)]
+        bucket: String,
+
+        /// S3 endpoint URL
+        #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
+        endpoint: Option<String>,
+
+        /// Number of hourly snapshots to keep (default: 24)
+        #[arg(long, default_value = "24")]
+        hourly: usize,
+
+        /// Number of daily snapshots to keep (default: 7)
+        #[arg(long, default_value = "7")]
+        daily: usize,
+
+        /// Number of weekly snapshots to keep (default: 12)
+        #[arg(long, default_value = "12")]
+        weekly: usize,
+
+        /// Number of monthly snapshots to keep (default: 12)
+        #[arg(long, default_value = "12")]
+        monthly: usize,
+
+        /// Actually delete files (default: dry-run only)
+        #[arg(long)]
+        force: bool,
+    },
+
+    /// Deprecated alias for `prune` (retention expiry is pruning, not
+    /// compaction). Kept working but hidden; prints a deprecation warning.
+    #[command(hide = true)]
     Compact {
         /// Database name (as registered in S3)
         name: String,
@@ -311,7 +347,7 @@ enum Commands {
 
     /// Show what the current configuration will do without executing
     ///
-    /// Displays a summary of: S3 storage settings, snapshot triggers, compaction policy,
+    /// Displays a summary of: S3 storage settings, snapshot triggers, pruning policy,
     /// retention tiers, and resolved database paths with any per-database overrides.
     Explain,
 
@@ -880,7 +916,7 @@ async fn run() -> Result<()> {
         } => {
             sync::snapshot(&database, &bucket, endpoint.as_deref()).await?;
         }
-        Commands::Compact {
+        Commands::Prune {
             name,
             bucket,
             endpoint,
@@ -891,7 +927,24 @@ async fn run() -> Result<()> {
             force,
         } => {
             let policy = retention::RetentionPolicy::new(hourly, daily, weekly, monthly);
-            sync::compact(&name, &bucket, endpoint.as_deref(), &policy, force).await?;
+            sync::prune(&name, &bucket, endpoint.as_deref(), &policy, force).await?;
+        }
+
+        Commands::Compact {
+            name,
+            bucket,
+            endpoint,
+            hourly,
+            daily,
+            weekly,
+            monthly,
+            force,
+        } => {
+            eprintln!(
+                "warning: `walrust compact` is deprecated and will be removed; use `walrust prune` instead"
+            );
+            let policy = retention::RetentionPolicy::new(hourly, daily, weekly, monthly);
+            sync::prune(&name, &bucket, endpoint.as_deref(), &policy, force).await?;
         }
 
         Commands::Replicate {

@@ -9,6 +9,6 @@ commit new ones as they are found.
 model-based state-machine harness; run with
 `cargo test -p walrust-dst state_machine`). Its first pinned seed is the
 shrunk E2 catch-proof sequence: with the bridge-snapshot rescue disabled in
-`walrust-core::legacy_manifest::plan_legacy_compaction`, compaction deletes a
+`walrust-core::legacy_manifest::plan_legacy_prune`, pruning deletes a
 load-bearing middle snapshot and point-in-time restore fails on
 "restore incremental gap". With the rescue intact the seed passes.

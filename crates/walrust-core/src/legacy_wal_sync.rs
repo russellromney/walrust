@@ -566,7 +566,7 @@ pub async fn snapshot_database_to_storage(
     // fold is neither possible nor required here. The manual `walrust snapshot`
     // command (which has no shadow to carry incrementals) performs its own
     // completeness-checked TRUNCATE fold before calling this (see
-    // `sync::compact::snapshot`).
+    // `sync::prune::snapshot`).
     checkpoint_wal_passive(database).await?;
 
     let page_size = get_page_size(database).await?;

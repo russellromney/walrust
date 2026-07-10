@@ -4,7 +4,7 @@
 //! ([`crate::properties`] / [`crate::invariants`]) and the user-drill harness.
 //! Where those check hand-written sequences, this instrument lets proptest
 //! GENERATE the sequences: a `Vec<Op>` of writes, flushes, snapshots,
-//! checkpoints, kill/restarts, PITR marks, compactions and restores, plus an
+//! checkpoints, kill/restarts, PITR marks, prunes and restores, plus an
 //! optional deterministic fault plan. The machine drives the REAL walrust
 //! engine through that sequence and grades every restore against an
 //! independent model oracle. Interleavings nobody thought to write by hand get
@@ -15,8 +15,8 @@
 //!
 //! The machine runs the production CLI engine surface — the legacy Litestream
 //! LTX object layout, which is the layout both real criticals (the E1
-//! restart-under-load halt and the E2 compact-vs-PITR foreclosure) lived in,
-//! and the only layout where publish, restore, AND compaction are all product
+//! restart-under-load halt and the E2 prune-vs-PITR foreclosure) lived in,
+//! and the only layout where publish, restore, AND pruning are all product
 //! code on `&dyn StorageBackend` (so the DST mock can sit underneath):
 //!
 //! - `WriteTxn`  -> commits rows through a real `rusqlite` connection (one
@@ -42,7 +42,7 @@
 //!   class: restart under load with in-memory cursors lost.
 //! - `Mark`      -> records a PITR point `(txid, committed row-set)` at a
 //!   flushed incremental boundary.
-//! - `Compact { policy }` -> `legacy_manifest::plan_legacy_compaction` — the
+//! - `Prune { policy }` -> `legacy_manifest::plan_legacy_prune` — the
 //!   REAL retention planner, including the F7 chain-base rescue and the E2
 //!   bridge-snapshot rescue — then deletes exactly the keys the plan says.
 //! - `RestoreLatest` / `RestorePit` -> `legacy_restore::restore_legacy_ltx`:
@@ -76,11 +76,11 @@
 //!   the planner is the code under test). A target M is reachable iff a
 //!   surviving snapshot S* <= M exists and every published boundary in
 //!   (S*, M] is an incremental. Incrementals are never deleted; the only
-//!   holes compaction can punch are deleted-snapshot TXIDs, and each deletion
-//!   is loudly declared by the compact op's plan.
+//!   holes pruning can punch are deleted-snapshot TXIDs, and each deletion
+//!   is loudly declared by the prune op's plan.
 //!   - reachable(M): restore must return `Ok(M)` with EXACTLY the mark's
 //!     recorded rows. Any shortfall, gap error, or row diff is a failure —
-//!     "compact must preserve retained points" (the E2 fix). With the
+//!     "prune must preserve retained points" (the E2 fix). With the
 //!     product intact a mark on an incremental boundary is ALWAYS reachable,
 //!     because the E2 bridge rescue keeps every snapshot bridging a hole
 //!     that surviving incrementals depend on.
@@ -122,7 +122,7 @@
 //!
 //! # Determinism
 //!
-//! Everything is seeded through proptest. No wall-clock: compaction
+//! Everything is seeded through proptest. No wall-clock: pruning
 //! timestamps are synthetic (a fixed epoch, all entries in one hourly bucket,
 //! so the deletion set depends only on sequence order + policy — and the
 //! one-bucket shape is exactly the middle-pruning shape E2 needs). No real
@@ -143,7 +143,7 @@ use tempfile::TempDir;
 
 use walrust::retention::{RetentionPolicy, SnapshotEntry};
 use walrust::walrust_core::legacy_manifest::{
-    discover_legacy_snapshots, discover_legacy_state, plan_legacy_compaction,
+    discover_legacy_snapshots, discover_legacy_state, plan_legacy_prune,
 };
 use walrust::walrust_core::legacy_restore::restore_legacy_ltx;
 use walrust::walrust_core::legacy_wal_sync::{
@@ -153,14 +153,14 @@ use walrust::walrust_core::legacy_wal_sync::{
 
 use crate::mock_storage::{MockStorageBackend, MockStorageConfig, StorageFault};
 
-/// Fixed epoch for deterministic compaction timestamps (no wall-clock).
+/// Fixed epoch for deterministic pruning timestamps (no wall-clock).
 const FIXED_NOW_UNIX: i64 = 1_700_000_000;
 /// Bounded retry budgets for transient injected faults. "Transient faults
 /// eventually recover" is enforced as: an exhausted budget IS a property
 /// failure. Budgets are sized so exhaustion under the generated max rate
 /// (0.05/storage-op) is astronomically unlikely — a false alarm would drown
 /// real signal. Durable ops (flush/snapshot) make <= ~4 storage calls per
-/// attempt; bulk ops (compact, restore, discovery) make one call per
+/// attempt; bulk ops (prune, restore, discovery) make one call per
 /// generation/object, up to ~100 per attempt on long sequences, hence the
 /// much larger budget (attempts are in-memory and sub-millisecond).
 const TRANSIENT_RETRIES: u32 = 40;
@@ -187,8 +187,8 @@ pub enum Op {
     KillRestart,
     /// Record a PITR point: (current TXID, current committed row-set).
     Mark,
-    /// Run retention/compaction with a generated GFS policy.
-    Compact { hourly: u8, daily: u8, minimum: u8 },
+    /// Run retention pruning with a generated GFS policy.
+    Prune { hourly: u8, daily: u8, minimum: u8 },
     /// Restore latest to a fresh path and CHECK against the model.
     RestoreLatest,
     /// Restore a recorded mark to a fresh path and CHECK against the model.
@@ -259,7 +259,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         2 => Just(Op::Checkpoint),
         3 => Just(Op::KillRestart),
         3 => Just(Op::Mark),
-        2 => (0u8..=3, 0u8..=3, 1u8..=2).prop_map(|(hourly, daily, minimum)| Op::Compact {
+        2 => (0u8..=3, 0u8..=3, 1u8..=2).prop_map(|(hourly, daily, minimum)| Op::Prune {
             hourly,
             daily,
             minimum
@@ -281,7 +281,7 @@ fn scenario_strategy(with_faults: bool) -> impl Strategy<Value = (Vec<Op>, Fault
             0u8..3u8,
         )
             // Transient rates are per STORAGE OPERATION. Bulk product calls
-            // (restore, compaction discovery) issue up to ~100 storage ops,
+            // (restore, pruning discovery) issue up to ~100 storage ops,
             // so rates above ~5% stop modeling transient noise and start
             // modeling an outage no bounded retry can cross.
             .prop_map(|(seed, t, torn, c)| FaultPlan {
@@ -322,7 +322,7 @@ struct Mark {
 /// The independent model. It grades the engine; it does not mirror it. All it
 /// knows is which rows were committed, which prefix the engine confirmed, at
 /// which TXID boundaries it confirmed them, and which snapshot deletions the
-/// compact op loudly declared.
+/// prune op loudly declared.
 #[derive(Debug, Default)]
 struct Model {
     /// Every committed row id, in commit order.
@@ -338,7 +338,7 @@ struct Model {
     /// Exact committed row-prefix length at every engine-confirmed durable
     /// TXID boundary. Restores may only ever land on these boundaries.
     boundary_rows: BTreeMap<u64, usize>,
-    /// TXIDs of snapshots a Compact op deleted — the LOUD declaration that
+    /// TXIDs of snapshots a Prune op deleted — the LOUD declaration that
     /// PITR exactly at those TXIDs may cleanly fall back to an earlier
     /// boundary. (The E2 rescue keeps every bridge the chain needs; these are
     /// only the legitimately prunable, non-load-bearing snapshots.)
@@ -366,7 +366,7 @@ impl Model {
 
     /// Model-side reachability of a point-in-time, computed ONLY from the
     /// model's own event log (published boundaries, which of them were
-    /// snapshots, and which snapshots compaction loudly deleted) — it does not
+    /// snapshots, and which snapshots pruning loudly deleted) — it does not
     /// consult the planner. A target M is reachable iff a SURVIVING snapshot
     /// S* <= M exists and every boundary in (S*, M] is an incremental:
     /// incrementals are never deleted, and a snapshot boundary inside that
@@ -665,16 +665,16 @@ impl Harness {
         Ok(())
     }
 
-    /// Run the REAL compaction planner (policy + F7 base rescue + E2 bridge
+    /// Run the REAL prune planner (policy + F7 base rescue + E2 bridge
     /// rescue) and delete exactly the keys it plans. Timestamps are synthetic
     /// and deterministic: all snapshots land in one hourly bucket so the
     /// policy prunes middles — the exact shape the bridge rescue protects.
-    async fn compact(&mut self, hourly: u8, daily: u8, minimum: u8) -> Result<()> {
+    async fn prune(&mut self, hourly: u8, daily: u8, minimum: u8) -> Result<()> {
         // The whole op is retried on transient faults: discovery, planning and
         // deletion are all idempotent (the plan is recomputed over survivors).
         let mut attempt = 0;
         loop {
-            match self.compact_once(hourly, daily, minimum).await {
+            match self.prune_once(hourly, daily, minimum).await {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     if self.faults.has_transient()
@@ -690,7 +690,7 @@ impl Harness {
         }
     }
 
-    async fn compact_once(&mut self, hourly: u8, daily: u8, minimum: u8) -> Result<()> {
+    async fn prune_once(&mut self, hourly: u8, daily: u8, minimum: u8) -> Result<()> {
         use hadb_storage::StorageBackend;
 
         let discovered = discover_legacy_snapshots(&self.storage, &self.prefix, &self.name).await?;
@@ -726,7 +726,7 @@ impl Harness {
             minimum: minimum as usize,
         };
 
-        let plan = plan_legacy_compaction(
+        let plan = plan_legacy_prune(
             &self.storage,
             &self.prefix,
             &self.name,
@@ -830,7 +830,7 @@ impl Harness {
                     mark.txid
                 );
                 // A reachable mark must be restored exactly; only a mark whose
-                // point compaction LOUDLY foreclosed (deleted-snapshot holes)
+                // point pruning LOUDLY foreclosed (deleted-snapshot holes)
                 // may cleanly fall back to an earlier boundary.
                 if final_txid < mark.txid && reachable {
                     anyhow::bail!(
@@ -888,9 +888,9 @@ impl Harness {
                     return Ok(()); // Torn/corrupt objects may fail loudly.
                 }
                 // The ONLY acceptable loud outcome is the typed RestoreNotFound
-                // for a point compaction legitimately foreclosed (no surviving
+                // for a point pruning legitimately foreclosed (no surviving
                 // base at or below it — declared by the deletions). A chain-gap
-                // or checksum error is NEVER acceptable: compaction deletes
+                // or checksum error is NEVER acceptable: pruning deletes
                 // only snapshots, always keeps the latest, and the F7 + E2
                 // rescues keep the chain base and every load-bearing bridge
                 // snapshot — a reachable mark that errors is the E2 class.
@@ -903,7 +903,7 @@ impl Harness {
                 }
                 Err(anyhow::anyhow!(
                     "op[{op_index}] RestorePit(txid {}) FAILED ({}; reachable={reachable}; \
-                     surviving snapshots {:?}, deleted {:?}): compaction must keep every \
+                     surviving snapshots {:?}, deleted {:?}): pruning must keep every \
                      reachable marked point restorable — E2: {e:#}",
                     mark.txid,
                     if typed_not_found {
@@ -985,13 +985,13 @@ async fn run_case(ops: &[Op], faults: FaultPlan) -> Result<()> {
                 let r = h.mark().await;
                 guard_durable(&faults, r, i, "Mark")?;
             }
-            Op::Compact {
+            Op::Prune {
                 hourly,
                 daily,
                 minimum,
             } => {
-                let r = h.compact(*hourly, *daily, *minimum).await;
-                guard_durable(&faults, r, i, "Compact")?;
+                let r = h.prune(*hourly, *daily, *minimum).await;
+                guard_durable(&faults, r, i, "Prune")?;
             }
             Op::RestoreLatest => {
                 let out = restores.path().join(format!("latest_{i}.db"));
@@ -1080,7 +1080,7 @@ mod tests {
 
     /// The first shrunk sequence this instrument surfaced while its oracle was
     /// being calibrated (a legitimate foreclosure: the Mark's flush published
-    /// a rollover snapshot, compaction pruned it as non-load-bearing, and PITR
+    /// a rollover snapshot, pruning pruned it as non-load-bearing, and PITR
     /// correctly failed with the typed RestoreNotFound). Kept as a pinned
     /// regression replay for the oracle's foreclosure semantics.
     #[test]
@@ -1090,7 +1090,7 @@ mod tests {
             Op::KillRestart,
             Op::Mark,
             Op::KillRestart,
-            Op::Compact {
+            Op::Prune {
                 hourly: 0,
                 daily: 0,
                 minimum: 1,
@@ -1102,7 +1102,7 @@ mod tests {
     }
 
     /// The shrunk E2 catch-proof sequence. With the bridge-snapshot rescue in
-    /// `plan_legacy_compaction` disabled, this exact sequence makes compaction
+    /// `plan_legacy_prune` disabled, this exact sequence makes pruning
     /// delete the bridge snapshots the retained chain depends on and PITR
     /// fails with "restore incremental gap" — the instrument found and shrank
     /// it within a 256-case run. With the rescue intact it passes; if the
@@ -1117,7 +1117,7 @@ mod tests {
             Op::Flush,
             Op::Mark,
             Op::KillRestart,
-            Op::Compact {
+            Op::Prune {
                 hourly: 0,
                 daily: 0,
                 minimum: 1,

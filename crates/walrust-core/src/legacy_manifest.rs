@@ -338,7 +338,7 @@ pub async fn discover_all_legacy_ltx(
 /// snapshot base for retained live incrementals. This planner keeps the latest
 /// snapshot overall and also rescues the latest snapshot before the earliest
 /// live incremental from deletion.
-pub async fn plan_legacy_compaction(
+pub async fn plan_legacy_prune(
     storage: &dyn StorageBackend,
     prefix: &str,
     db_name: &str,
@@ -581,18 +581,18 @@ mod tests {
             minimum: 1,
         };
 
-        let plan = plan_legacy_compaction(&storage, "backups", "app", &snapshots, &policy, now)
+        let plan = plan_legacy_prune(&storage, "backups", "app", &snapshots, &policy, now)
             .await
             .unwrap();
 
         let kept: Vec<_> = plan.keep.iter().map(|entry| entry.sequence).collect();
         assert!(
             kept.contains(&3),
-            "core compaction must protect the snapshot base for live incrementals"
+            "core prune must protect the snapshot base for live incrementals"
         );
         assert!(
             kept.contains(&8),
-            "core compaction must keep the latest snapshot"
+            "core prune must keep the latest snapshot"
         );
         assert!(
             plan.delete.is_empty(),
@@ -658,7 +658,7 @@ mod tests {
             minimum: 1,
         };
 
-        let plan = plan_legacy_compaction(&storage, "backups", "app", &snapshots, &policy, now)
+        let plan = plan_legacy_prune(&storage, "backups", "app", &snapshots, &policy, now)
             .await
             .unwrap();
 

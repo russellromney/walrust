@@ -515,9 +515,9 @@ first_incremental_key() {
   s3_list_prefix "$DRILL_RUN_PREFIX/" | awk '/\/0000\/.*\.ltx$/ { print; exit }'
 }
 
-run_compact() {
+run_prune() {
   local name=$1
-  "$WALRUST_BIN" compact "$name" \
+  "$WALRUST_BIN" prune "$name" \
     --bucket "$DRILL_BUCKET_URI" \
     --endpoint "$DRILL_ENDPOINT" \
     --hourly "${WALRUST_DRILL_RETAIN_HOURLY:-2}" \

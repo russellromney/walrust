@@ -23,15 +23,15 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 
 # Storage substrate (trait)
-hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "1100d3b615743405c676ecefa5743f2c277ea25f" }
+hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "9892610afb6d34441db22618c1918620dded9a03" }
 
 # Legacy retry/checksum helpers; replaced in step i.
 # default-features off so consumers can build walrust-core with no AWS deps;
 # the outer walrust crate's `s3` feature re-enables hadb-io/s3.
-hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", rev = "1100d3b615743405c676ecefa5743f2c277ea25f", default-features = false }
+hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", rev = "9892610afb6d34441db22618c1918620dded9a03", default-features = false }
 
 # HADBP changeset format
-hadb-changeset = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-changeset", rev = "1100d3b615743405c676ecefa5743f2c277ea25f" }
+hadb-changeset = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-changeset", rev = "9892610afb6d34441db22618c1918620dded9a03" }
 
 # Legacy Litestream-derived LTX format used by the root CLI migration path.
 litepages = "0.1.0"
@@ -66,4 +66,4 @@ thiserror = "1"
 [dev-dependencies]
 tempfile = "3"
 # Integration tests use the S3 impl directly for compile-time usability checks.
-hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", rev = "1100d3b615743405c676ecefa5743f2c277ea25f" }
+hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", rev = "9892610afb6d34441db22618c1918620dded9a03" }

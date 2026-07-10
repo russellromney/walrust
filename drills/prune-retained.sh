@@ -18,11 +18,11 @@ for rows in 4 4 4 4; do
   printf '%s\t%s\n' "$txid" "$count" >>"$history"
 done
 
-run_compact "$name" >"$DRILL_WORKDIR/compact.out" 2>&1
+run_prune "$name" >"$DRILL_WORKDIR/prune.out" 2>&1
 
 retained="$DRILL_WORKDIR/retained-txids.txt"
 snapshot_txids >"$retained"
-[ -s "$retained" ] || fail "compact left no retained snapshots"
+[ -s "$retained" ] || fail "prune left no retained snapshots"
 
 while read -r txid; do
   expected=$(awk -F '\t' -v txid="$txid" '$1 == txid { print $2; found = 1 } END { if (!found) exit 1 }' "$history") \
@@ -30,4 +30,4 @@ while read -r txid; do
   wait_restore_count "$name" "$expected" --point-in-time "$txid"
 done <"$retained"
 
-log "PASS compact retained txids=$(tr '\n' ' ' <"$retained")"
+log "PASS prune retained txids=$(tr '\n' ' ' <"$retained")"

@@ -12,6 +12,6 @@ run_one() {
 
 WALRUST_DRILL_RESTART_CYCLES=1 run_one basic-lifecycle.sh
 WALRUST_DRILL_RESTART_CYCLES=1 run_one restart-under-load.sh
-run_one compact-retained.sh
+run_one prune-retained.sh
 
 printf '[basic_e2e] PASS\n' >&2
