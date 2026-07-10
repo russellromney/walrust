@@ -109,6 +109,9 @@ Notes for embedders:
   `libsqlite3-sys` per build, so your app's rusqlite version must match.
 - `Replicator::add()` creates a small `_walrust_seq` table in the database —
   see [Safety and design](#safety-and-design).
+- Enabling [compaction](#compaction-off-by-default) changes how you register a
+  database: use `add_without_snapshot()`, not `add()` (`add()` refuses with
+  compaction on). See that section for why.
 
 Bindings for other languages are planned; Python bindings exist today behind
 the `python` feature.
@@ -198,10 +201,19 @@ silently ignore the knob and let the bucket grow).
 
 Two honest caveats, one sentence each:
 
-- **Version skew:** a leveled bucket is **not restorable by walrust binaries
-  older than this release** — they don't know the `levels/` layout exists — so
-  compaction ships dark; only enable it once every binary that might restore the
-  bucket understands levels.
+- **Version skew (empirically confirmed, not theoretical):** a leveled bucket
+  is **not restorable by walrust binaries older than this release** — they
+  don't know the `levels/` layout exists — so compaction ships dark; only
+  enable it once every binary that might restore the bucket understands
+  levels. `drills/version-skew.sh` (manual/`make drill-version-skew` only)
+  builds a real leveled bucket and runs a real pre-compaction `walrust
+  restore` (crates.io `0.5.1`) against it. Observed outcome: **exit 0** — no
+  error reported to the operator — producing a **corrupt database**
+  (`PRAGMA integrity_check` fails with `btreeInitPage() returns error code
+  11` on the pages that existed only inside the merged-and-deleted range).
+  That is worse than a short restore: silent corruption with a success exit
+  code. This is the confirmed hazard the `enabled = false` default exists to
+  prevent.
 - **PITR granularity decays with age:** point-in-time restore stays second-exact
   inside `keep_fine_window`, but a target that falls *strictly inside* an older
   merged window fails loudly, naming the nearest restorable points on both sides,
@@ -211,6 +223,20 @@ Embedders set the same knobs on `ReplicationConfig::compaction`
 (`walrust_core::compaction::CompactionSettings`); `enabled` is the single
 control (there is no separate internal gate). Run `walrust explain` to see the
 resolved values.
+
+**Registering an embedded database when compaction is on:** use
+`Replicator::add_without_snapshot()`, **not** `add()`. `add()` creates a
+walrust-owned *lineage* (a `{db}/lineages/{id}/…` key shape) that the compaction
+engine cannot see, so compaction would silently never fire — `add()` refuses up
+front with `compaction.enabled = true` rather than let a bucket you believe is
+compacting grow unbounded. `add_without_snapshot()` keeps the stream on the flat
+`{db}/0000/…` layout compaction reads. It skips the add-time base snapshot, so
+leave `autonomous_snapshots` on (the default) and set a `snapshot_interval` short
+enough that the background loop establishes the first restorable base promptly
+(the hour-long default leaves an early window with no base). Teaching compaction
+to fold lineage-scoped streams is future work (see ROADMAP); today the
+lineage-free `add_without_snapshot()` path is the supported way to compact an
+embedded database.
 
 ## Read replica
 
@@ -222,6 +248,12 @@ This polls S3 for new changesets and applies them to a local database. The
 replica is a normal SQLite file — any application can open it read-only.
 Combine with `walrust watch` on the primary for a live read replica on another
 machine.
+
+`replicate` does not read `levels/` — it only tails the flat incremental pool.
+If compaction prunes a tail the replica hasn't applied yet, the replica
+re-bootstraps from the newest snapshot (same handler as any other chain gap),
+converging automatically at the cost of a full snapshot download; a shorter
+`keep_fine_window` gives the replica more slack before that happens.
 
 ## Monitoring
 

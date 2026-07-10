@@ -1,4 +1,4 @@
-.PHONY: build release test basic-e2e drill clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-multidb help
+.PHONY: build release test basic-e2e drill drill-version-skew clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-multidb help
 
 SOUP_PROJECT ?= turbolite
 SOUP_ENV ?= development
@@ -44,6 +44,13 @@ basic-e2e: build
 
 drill: release
 	$(TEST_RUNNER) sh -c '$(TEST_ENV); WALRUST_BIN="$$(pwd)/target/release/walrust" drills/run-all.sh'
+
+# Version-skew drill: empirically characterizes an old walrust binary restoring
+# a leveled bucket. MANUAL ONLY -- deliberately not part of `make drill` / the
+# nightly workflow, because obtaining the old binary needs crates.io network
+# access (flaky in CI) and can fall back to an expensive from-source build.
+drill-version-skew: release
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); WALRUST_BIN="$$(pwd)/target/release/walrust" drills/version-skew.sh'
 
 # Run micro-benchmarks (cargo bench)
 bench:
@@ -127,6 +134,7 @@ help:
 	@echo "    make test-verbose   - Run tests with output"
 	@echo "    make basic-e2e      - Run the fast basic_e2e drill tier"
 	@echo "    make drill          - Run the full drill suite"
+	@echo "    make drill-version-skew - Manual-only: old binary vs a leveled bucket"
 	@echo ""
 	@echo "  Benchmark:"
 	@echo "    make bench          - Run micro-benchmarks (cargo bench)"

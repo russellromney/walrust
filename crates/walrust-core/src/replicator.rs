@@ -345,6 +345,31 @@ impl Replicator {
                 .await;
         }
 
+        // Fail loudly (E7, same shape as the CLI's `reject_shadow_compaction`)
+        // rather than silently no-op: `add()` unconditionally creates a
+        // walrust-owned lineage (`SyncState::ensure_lineage_id`, just below),
+        // which moves this stream's changesets to the
+        // `{db}/lineages/{id}/...` key shape. Compaction's `SeqLayout` only
+        // ever reads/writes the flat, non-lineage `{db}/0000/...` shape (see
+        // the compaction module docs: "Compaction only ever runs on the
+        // non-lineage owned path"), so a lineage-scoped stream is invisible
+        // to it -- `compaction.enabled = true` would silently never compact,
+        // letting a bucket the caller believes is compacting grow unbounded.
+        // Use `add_without_snapshot` on a fresh database instead (with
+        // `autonomous_snapshots` on and a short `snapshot_interval` so the
+        // background loop's own periodic timer establishes the initial base,
+        // since this path is what skips taking one at add-time).
+        if self.config.compaction.enabled {
+            anyhow::bail!(
+                "Replicator::add(): cannot add '{}' with [compaction] enabled = true -- add() \
+                 creates a walrust-owned lineage, whose key shape compaction cannot see, so it \
+                 would silently never compact. Use add_without_snapshot() on a fresh database \
+                 instead (autonomous_snapshots on, a short snapshot_interval) to keep \
+                 compaction reachable, or set compaction.enabled = false for this Replicator.",
+                name
+            );
+        }
+
         let prefix = self.prefix.clone();
         sync::ensure_no_saved_state(self.storage.as_ref(), &prefix, name).await?;
 

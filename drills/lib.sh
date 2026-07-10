@@ -207,11 +207,16 @@ db_count() {
   sqlite3 "$1" ".timeout 5000" "SELECT COUNT(*) FROM items;"
 }
 
+# Report the write driver's committed row count. Takes an optional database
+# path (default $DRILL_DB) so a drill running more than one database can ask
+# about a specific one -- every single-database drill omits the argument and
+# gets the historical behavior unchanged.
 driver_count() {
+  local db=${1:-$DRILL_DB}
   if [ -f "$DRILL_DRIVER_COUNT" ]; then
     cat "$DRILL_DRIVER_COUNT"
   else
-    db_count "$DRILL_DB"
+    db_count "$db"
   fi
 }
 
@@ -257,7 +262,13 @@ PY
   log "write driver pid=$DRILL_DRIVER_PID"
 }
 
+# Pause the write driver and wait until its committed row count is stable.
+# Takes an optional database path (default $DRILL_DB): a drill whose driver
+# targets a second database passes that path so the stability check samples the
+# right file, instead of trivially comparing an unrelated, already-static
+# $DRILL_DB against itself.
 pause_driver() {
+  local db=${1:-$DRILL_DB}
   [ -n "${DRILL_DRIVER_PID:-}" ] || fail "write driver is not running"
   touch "$DRILL_DRIVER_PAUSE"
   # Wait until the driver stops committing, polling the authoritative committed
@@ -267,10 +278,10 @@ pause_driver() {
   # held one more committed row, producing an off-by-one restore mismatch.
   local before
   local after
-  before=$(db_count "$DRILL_DB")
+  before=$(db_count "$db")
   while :; do
     sleep "$DRILL_POLL_INTERVAL"
-    after=$(db_count "$DRILL_DB")
+    after=$(db_count "$db")
     if [ "$after" = "$before" ]; then
       printf '%s\n' "$after" >"$DRILL_DRIVER_COUNT"
       return 0
@@ -456,20 +467,24 @@ wait_restore_count_at_least() {
   fail "ROW DIFF: restore never reached >= $min for $name; last actual rows=${DRILL_LAST_ACTUAL:-unavailable}; restore output: ${DRILL_LAST_RESTORE_ERROR:-none}"
 }
 
+# Wait until the write driver has committed at least `min` rows. Takes an
+# optional database path (default $DRILL_DB) as the third argument so a
+# multi-database drill can poll the correct one.
 wait_driver_count_at_least() {
   local min=$1
   local timeout=${2:-30}
+  local db=${3:-$DRILL_DB}
   local deadline=$((SECONDS + timeout))
   local count
   while [ "$SECONDS" -lt "$deadline" ]; do
-    count=$(db_count "$DRILL_DB")
+    count=$(db_count "$db")
     printf '%s\n' "$count" >"$DRILL_DRIVER_COUNT"
     if [ "$count" -ge "$min" ]; then
       return 0
     fi
     sleep "$DRILL_POLL_INTERVAL"
   done
-  fail "timed out waiting for driver count >= $min; got $(driver_count)"
+  fail "timed out waiting for driver count >= $min; got $(driver_count "$db")"
 }
 
 latest_txid() {

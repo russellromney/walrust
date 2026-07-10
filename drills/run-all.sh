@@ -13,6 +13,7 @@ drills=(
   prune-retained.sh
   read-replica.sh
   soak.sh
+  compaction-soak.sh
 )
 
 for drill in "${drills[@]}"; do

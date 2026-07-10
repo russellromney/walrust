@@ -229,7 +229,10 @@ jobs:
           PY
 
       - name: Shellcheck drills
-        run: shellcheck drills/*.sh
+        # SC2119 (info) fires on every argless call of a function with optional
+        # args — lib.sh helpers intentionally default to $DRILL_DB when called
+        # bare, so this code is excluded rather than annotating every call site.
+        run: shellcheck -e SC2119 drills/*.sh
 
       - name: basic_e2e
         run: make basic-e2e USE_SOUP=0
