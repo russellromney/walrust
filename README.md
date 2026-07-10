@@ -191,17 +191,25 @@ failures, detected external checkpoints, and corruption — configure in
 
 ## Performance and cost
 
-**Memory.** A watcher is designed to hold a bounded working set, so RSS should
-stay roughly constant as database count grows. In a single-database
-side-by-side drill, walrust and Litestream both measured ~7–10 MB RSS.
-Multi-database scaling has not been re-measured since the last major round of
-changes. Measure your own workload.
+**Memory.** A watcher holds a bounded working set, so RSS stays roughly
+constant as database count grows. Measured with matched knobs (1s sync on
+both tools, local MinIO; `bench/results-20260710T*`): walrust ~15 MB median
+RSS vs Litestream 0.5.2 ~58 MB on a single database; scaling 1→10 databases,
+walrust ~15→~20 MB vs Litestream ~53→~143 MB. Part of the gap has an honest
+explanation: Litestream's `replicate` does its compaction and snapshot work
+in-process, and walrust does not compact incrementals yet — we will
+re-measure when it does. Numbers move with workload, tool version, and
+knobs: run `bench/compare-litestream.sh` and `bench/multidb-rss.sh` (see
+`bench/README.md`) against your own workload.
 
-**S3 objects.** walrust uploads a changeset per `wal-sync-interval` (default
-~1s) and does not compact incrementals, so a busy database accumulates many
-small objects between snapshots — in the drill, ~9x more objects than
-Litestream left behind over the same window. If object count or request cost
-matters, raise `wal-sync-interval`.
+**S3 requests and objects.** At the same 1s sync interval, PUT volume is
+equivalent: 182 vs 187 over a 3-minute server-side traced window. (An
+earlier claim here of "~9x more PUTs" counted objects retained, not requests
+made, and did not reproduce.) Litestream issues ~10x more LIST calls and
+periodic DELETEs from its always-on compaction; walrust keeps more, smaller
+objects between snapshots because it does not compact incrementals yet. If
+request cost matters more than a tight recovery point, raise
+`wal-sync-interval` and lean on the snapshot triggers.
 
 ## vs Litestream
 
@@ -209,9 +217,13 @@ matters, raise `wal-sync-interval`.
   process instead of a sidecar.
 - **The formats are not compatible.** walrust writes HADBP changesets, not
   Litestream's LTX. Neither tool can restore the other's backups.
-- **walrust leaves more, smaller objects in the bucket** (no incremental
-  compaction — see above). Measured memory was the same in a single-database
-  drill; replication lag has not been compared.
+- **Requests are equivalent; retention shape differs.** Same PUT volume at
+  matched sync intervals; walrust keeps more, smaller objects (no incremental
+  compaction yet), Litestream spends LISTs and DELETEs compacting. Median
+  replication lag measured slightly lower for walrust (0.57s vs 0.68s).
+- **Memory measured lower and flat** (~15 MB vs ~58 MB single-db; flat vs
+  ~10 MB per added database) — see Performance and cost for conditions and
+  the fairness caveat.
 - **Litestream is older and more battle-tested.**
 
 ## Acknowledgments

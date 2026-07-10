@@ -121,10 +121,6 @@ uuid = { version = "1", features = ["v4"] }
 brunch = "0.5"
 tower = "0.5"
 
-[[example]]
-name = "profile_rss"
-path = "bench/profile_rss.rs"
-
 [[bench]]
 name = "benchmarks"
 harness = false

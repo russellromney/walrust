@@ -1,4 +1,4 @@
-.PHONY: build release test basic-e2e drill clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-realworld help
+.PHONY: build release test basic-e2e drill clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-multidb help
 
 SOUP_PROJECT ?= turbolite
 SOUP_ENV ?= development
@@ -49,13 +49,14 @@ drill: release
 bench:
 	cargo bench
 
-# Run comparison benchmark (walrust vs litestream)
+# Head-to-head vs litestream: request counts, replication lag, RSS.
+# Self-contained (starts its own MinIO via docker); see bench/README.md.
 bench-compare: release
-	uv run bench/compare.py
+	WALRUST_BIN="$$(pwd)/target/release/walrust" bench/compare-litestream.sh
 
-# Run real-world benchmarks (sync latency, restore, multi-DB)
-bench-realworld: release
-	uv run bench/realworld.py
+# Multi-database RSS scaling (constant vs linear in db count).
+bench-multidb: release
+	WALRUST_BIN="$$(pwd)/target/release/walrust" bench/multidb-rss.sh
 
 # Clean build artifacts
 clean:
@@ -129,8 +130,8 @@ help:
 	@echo ""
 	@echo "  Benchmark:"
 	@echo "    make bench          - Run micro-benchmarks (cargo bench)"
-	@echo "    make bench-compare  - Compare walrust vs litestream (memory/CPU)"
-	@echo "    make bench-realworld - Real-world benchmarks (sync latency, restore, multi-DB)"
+	@echo "    make bench-compare  - Head-to-head vs litestream (requests, lag, RSS)"
+	@echo "    make bench-multidb  - Multi-database RSS scaling (walrust vs litestream)"
 	@echo ""
 	@echo "  Code Quality:"
 	@echo "    make check        - Check for errors"

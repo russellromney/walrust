@@ -1,0 +1,96 @@
+name: bench
+
+# Measurement only: manual dispatch, never cron, never PR gating.
+# See bench/README.md for the drills-vs-bench contract.
+on:
+  workflow_dispatch:
+    inputs:
+      duration:
+        description: "compare-litestream measurement window (seconds)"
+        required: false
+        default: "300"
+      db_counts:
+        description: "multidb-rss database counts (space-separated)"
+        required: false
+        default: "1 10 50"
+      shapes:
+        description: "multidb-rss load shapes (subset of: idle steady bursty)"
+        required: false
+        default: "steady"
+
+env:
+  CARGO_TERM_COLOR: always
+  AWS_ACCESS_KEY_ID: minioadmin
+  AWS_SECRET_ACCESS_KEY: minioadmin
+  AWS_REGION: us-east-1
+
+jobs:
+  bench:
+    name: compare-litestream + multidb-rss
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build walrust (release)
+        env:
+          RUSTC_WRAPPER: sccache
+        run: cargo build --release
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3
+
+      # Same litestream version ci.yml pins for the drills.
+      - name: Install Litestream
+        run: |
+          curl -fsSL -o litestream.tar.gz \
+            https://github.com/benbjohnson/litestream/releases/download/v0.5.14/litestream-0.5.14-linux-x86_64.tar.gz
+          tar -xzf litestream.tar.gz
+          sudo mv litestream /usr/local/bin/
+          litestream version
+
+      # The bench scripts start their own MinIO container (+ mc trace
+      # sidecar for request auditing) via docker, same as CI's drills do.
+      - name: Run compare-litestream
+        env:
+          WALRUST_BIN: ${{ github.workspace }}/target/release/walrust
+          BENCH_DURATION_SECONDS: ${{ github.event.inputs.duration }}
+        run: bench/compare-litestream.sh
+
+      - name: Run multidb-rss
+        env:
+          WALRUST_BIN: ${{ github.workspace }}/target/release/walrust
+          BENCH_DB_COUNTS: ${{ github.event.inputs.db_counts }}
+          BENCH_SHAPES: ${{ github.event.inputs.shapes }}
+        run: bench/multidb-rss.sh
+
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-results
+          path: bench/results-*
+          retention-days: 90
+          if-no-files-found: warn
