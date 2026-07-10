@@ -99,12 +99,25 @@ snapshot + a few hour-files + a few minute-files + a seconds tail.
   bucket don't know levels exist. Ship restore/verify/planner support first
   with `enabled = false`; flip the default a release later.
 
+**Built once, for both layouts.** The CLI already uses walrust-core everywhere;
+what remains split is two storage layouts inside the core (the litestream-
+heritage `min-max.ltx` range layout and the owned-mode one-object-per-seq
+layout). Compaction is written once in walrust-core against a thin layout
+trait (list-at-level / read / write-ranged / delete), with both layouts as
+small adapters — the merge engine, triggers, planner, and safety proofs are
+shared. Never give one layout a capability the other lacks; that is the
+dual-tree disease that caused half the original findings.
+
+(Separate future item: assess unifying the two layouts entirely. Bucket
+migration risk keeps it out of this wave, but the split itself is debt.)
+
 **Order of work:** rename `compact` → `prune` first (retention expiry is
 pruning, not compaction — borg/restic precedent; frees the name). Then the
-hadb-changeset extension, then the walrust compactor + planner, then the
-state-machine oracle extension (granularity decay), kill-mid-compaction drill,
-and a bench restore-speed comparison on a long history — the "faster restore
-than litestream" claim ships as a measured number or not at all.
+hadb-changeset extension, then the layout-agnostic compactor + planner in
+walrust-core with both layout adapters, then the state-machine oracle
+extension (granularity decay), kill-mid-compaction drill, and a bench
+restore-speed comparison on a long history — the "faster restore than
+litestream" claim ships as a measured number or not at all.
 
 ---
 
