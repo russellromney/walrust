@@ -187,14 +187,12 @@ l1_batch = 60            # L0 objects folded per L1 merge
 l2_batch = 24            # L1 objects folded per L2 merge
 ```
 
-Three honest caveats, one sentence each:
+Compaction works in **both** the `walrust` CLI (`walrust watch` compacts,
+`walrust restore` / `verify` read the leveled bucket across the LTX→HADBP seam)
+and **library / owned mode** via the `Replicator`.
 
-- **CLI watch is not wired yet — library mode only:** the `walrust` **CLI
-  restore path cannot read leveled buckets**, so the CLI watch (`walrust watch`)
-  **refuses to start** with `[compaction] enabled = true` rather than write a
-  bucket it could not restore; leveled compaction is currently available only in
-  **library / owned mode** via the `Replicator` (whose restore path *is* wired to
-  the planner).
+Two honest caveats, one sentence each:
+
 - **Version skew:** a leveled bucket is **not restorable by walrust binaries
   older than this release** — they don't know the `levels/` layout exists — so
   compaction ships dark; only enable it once every binary that might restore the

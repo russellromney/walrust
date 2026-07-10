@@ -450,3 +450,135 @@ async fn prefetch_concurrency_1_vs_4_byte_identical() {
     );
     assert_eq!(outputs[0], fx.state_at[&fx.max_seq]);
 }
+
+// ── Owned-mode VACUUM (shrink) across a merge boundary (C3a scope 3) ─────────
+
+/// Build a real SQLite history that GROWS to many pages, then **VACUUMs**
+/// (shrinks) mid-history, then grows again — as owned-mode HADBP objects. The
+/// snapshot is seq 1; seqs 2..=14 are incrementals, with the VACUUM at seq 4 so
+/// the `[2,5]` L0→L1 merge (and the `[2,9]` L2 merge) span the shrink and must
+/// exercise the orphan-page elision (a pre-shrink high page dropped above the
+/// final DB size).
+fn build_vacuum_fixture(prefix: &str, db: &str) -> Fixture {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("ground.db");
+    let store = MemStore::new();
+
+    let conn = Connection::open(&db_path).unwrap();
+    conn.execute_batch(
+        "PRAGMA page_size=4096; PRAGMA journal_mode=DELETE; PRAGMA auto_vacuum=NONE; \
+         CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);",
+    )
+    .unwrap();
+    // Grow to many pages: 400 fat rows (~200 bytes each ≈ 80 KB ≈ 20 pages).
+    let fat = "x".repeat(200);
+    for i in 0..400 {
+        conn.execute(
+            "INSERT INTO t(id, v) VALUES (?, ?)",
+            (i, format!("{fat}-{i}")),
+        )
+        .unwrap();
+    }
+    conn.cache_flush().unwrap();
+    drop(conn);
+
+    let mut state_at = HashMap::new();
+    let v1 = std::fs::read(&db_path).unwrap();
+    state_at.insert(1u64, v1.clone());
+    let big_pages = v1.len() / PS as usize;
+    assert!(big_pages > 10, "snapshot must span many pages: {big_pages}");
+
+    let snap = ltx::encode_snapshot_with_checksum(&db_path, PS, 1, 0).unwrap();
+    futures_put(&store, &snapshot_key(prefix, db, 1), &snap.bytes);
+    let mut prev = snap.checksum;
+    let mut prev_bytes = v1;
+
+    let conn = Connection::open(&db_path).unwrap();
+    for seq in 2..=14u64 {
+        if seq == 4 {
+            // The shrink: delete almost everything, then VACUUM to compact the
+            // file down to a couple of pages.
+            conn.execute("DELETE FROM t WHERE id >= 5", []).unwrap();
+            conn.execute("VACUUM", []).unwrap();
+        } else {
+            let id = 1000 + seq as i64;
+            conn.execute(
+                "INSERT INTO t(id, v) VALUES (?, ?)",
+                (id, format!("row-{seq}")),
+            )
+            .unwrap();
+            conn.execute("UPDATE t SET v = ? WHERE id = 0", (format!("touch-{seq}"),))
+                .unwrap();
+        }
+        conn.cache_flush().unwrap();
+        let new_bytes = std::fs::read(&db_path).unwrap();
+
+        let pages = diff_pages(&prev_bytes, &new_bytes, PS as usize);
+        assert!(!pages.is_empty(), "seq {seq} must change at least one page");
+        let end_page_count = (new_bytes.len() / PS as usize) as u64;
+        let (bytes, checksum) =
+            ltx::encode_wal_changes_with_end_page_count(&pages, PS, seq, prev, end_page_count)
+                .unwrap();
+        futures_put(&store, &l0_seq_key(prefix, db, seq), &bytes);
+
+        state_at.insert(seq, new_bytes.clone());
+        prev = checksum;
+        prev_bytes = new_bytes;
+    }
+    // The shrink really shrank the file below the snapshot size.
+    assert!(
+        state_at[&4].len() < state_at[&1].len(),
+        "VACUUM at seq 4 must shrink the DB (was {} now {})",
+        state_at[&1].len(),
+        state_at[&4].len()
+    );
+    let rows: Vec<(i64, String)> = query_rows(&db_path);
+    drop(conn);
+
+    Fixture {
+        store,
+        prefix: prefix.to_string(),
+        db: db.to_string(),
+        state_at,
+        rows,
+        max_seq: 14,
+    }
+}
+
+#[tokio::test]
+async fn owned_vacuum_shrink_merges_and_restores_row_exact() {
+    let fx = build_vacuum_fixture("vac/", "db");
+    let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
+    // Merges [2,5],[6,9],[10,13] then L2 [2,9] all span/cross the seq-4 shrink.
+    compact_to_l1_l2(&layout).await;
+
+    // The superseded fine tail is gone; the merged objects carry the shrink.
+    let l0 = fx.store.list("vac/db/0000/", None).await.unwrap();
+    assert_eq!(l0.len(), 1, "only the fine tail seq 14 remains: {l0:?}");
+
+    let dir = tempfile::tempdir().unwrap();
+
+    // Restore-to-latest through the shrink-spanning merged objects: byte- and
+    // row-exact vs ground truth + integrity. This is the orphan-page elision
+    // fix exercised under real SQLite VACUUM behavior.
+    let out = dir.path().join("latest.db");
+    let seq = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out, None)
+        .await
+        .unwrap();
+    assert_eq!(seq, fx.max_seq);
+    assert!(integrity_ok(&out), "restored DB passes integrity_check");
+    assert_eq!(query_rows(&out), fx.rows, "restore-to-latest is row-exact");
+    assert_eq!(
+        std::fs::read(&out).unwrap(),
+        fx.state_at[&fx.max_seq],
+        "restore-to-latest is byte-exact across the VACUUM"
+    );
+
+    // PITR to the L2 boundary (seq 9, post-shrink) restores exactly too.
+    let out9 = dir.path().join("at9.db");
+    walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out9, Some("9"))
+        .await
+        .unwrap();
+    assert!(integrity_ok(&out9));
+    assert_eq!(std::fs::read(&out9).unwrap(), fx.state_at[&9]);
+}

@@ -1112,3 +1112,230 @@ fn e2e_core_replicator_sigkill_child() -> Result<()> {
         }
     })
 }
+
+// ── Compaction CLI e2e (wave C3a): watch compacts, restore/verify read levels ─
+
+/// Write a `walrust.toml` enabling leveled compaction with tiny batches and a
+/// zero keep-fine window, so L1 and L2 fire within a short test.
+fn write_compaction_config(path: &Path) -> Result<()> {
+    std::fs::write(
+        path,
+        "[compaction]\n\
+         enabled = true\n\
+         keep_fine_window = \"0s\"\n\
+         l1_batch = 4\n\
+         l2_batch = 2\n",
+    )?;
+    Ok(())
+}
+
+fn spawn_cli_watch_compaction(
+    db_path: &Path,
+    config_path: &Path,
+    bucket_arg: &str,
+    endpoint: Option<&str>,
+) -> Result<Child> {
+    let mut watch = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    watch
+        .arg("--config")
+        .arg(config_path)
+        .arg("watch")
+        .arg(db_path)
+        .arg("--bucket")
+        .arg(bucket_arg)
+        .arg("--independent-tasks")
+        .arg("--snapshot-interval")
+        .arg("999999")
+        .arg("--wal-sync-interval")
+        .arg("1")
+        .arg("--checkpoint-interval")
+        .arg("999999")
+        .arg("--on-startup")
+        .arg("true")
+        .arg("--no-metrics")
+        .arg("--no-cache");
+    if let Some(endpoint) = endpoint {
+        watch.arg("--endpoint").arg(endpoint);
+    }
+    watch
+        .spawn()
+        .context("spawn walrust watch (compaction, independent)")
+}
+
+async fn list_keys(prefix: &str) -> Result<Vec<String>> {
+    let storage = walrust::s3_backend_from_env(test_bucket(), test_endpoint().as_deref()).await?;
+    hadb_storage::StorageBackend::list(storage.as_ref(), prefix, None).await
+}
+
+/// Parse `{min:016x}-{max:016x}.ltx` (a merged level object) from a full key.
+fn parse_level_range(key: &str) -> Option<(u64, u64)> {
+    let filename = key.rsplit('/').next()?;
+    let stem = filename.strip_suffix(".ltx")?;
+    let (lo, hi) = stem.split_once('-')?;
+    Some((
+        u64::from_str_radix(lo, 16).ok()?,
+        u64::from_str_radix(hi, 16).ok()?,
+    ))
+}
+
+/// Run `walrust restore --point-in-time <pit>` and return the process output
+/// (so callers can assert on both success and a typed failure message).
+fn run_cli_restore_pit_output(
+    name: &str,
+    bucket_arg: &str,
+    endpoint: Option<&str>,
+    restored_path: &Path,
+    pit: u64,
+) -> Result<std::process::Output> {
+    let mut restore = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    restore
+        .arg("restore")
+        .arg(name)
+        .arg("--output")
+        .arg(restored_path)
+        .arg("--bucket")
+        .arg(bucket_arg)
+        .arg("--point-in-time")
+        .arg(pit.to_string());
+    if let Some(endpoint) = endpoint {
+        restore.arg("--endpoint").arg(endpoint);
+    }
+    restore
+        .output()
+        .context("run walrust restore --point-in-time")
+}
+
+/// The wave's CLI proof: a real `walrust watch` with `[compaction] enabled`
+/// fires L1 and L2, deletes the superseded L0 tail, and the leveled bucket is
+/// then fully readable — restore-to-latest is row-exact + integrity-clean,
+/// PITR to a merged boundary succeeds, PITR strictly inside a merged window is a
+/// loud decay error, and `walrust verify` exits 0.
+#[tokio::test]
+async fn e2e_cli_compaction_fires_levels_and_restore_reads_them() -> Result<()> {
+    require_s3!("e2e_cli_compaction_fires_levels_and_restore_reads_them");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-compaction");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let config_path = temp.path().join("walrust.toml");
+    write_compaction_config(&config_path)?;
+
+    // Object key roots (db name == file stem == `name`).
+    let l0_prefix = format!("{prefix}/{name}/0000/");
+    let l1_prefix = format!("{prefix}/{name}/levels/L1/");
+    let l2_prefix = format!("{prefix}/{name}/levels/L2/");
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "cli-compaction")?;
+
+    let mut child =
+        spawn_cli_watch_compaction(&db_path, &config_path, &bucket_arg, endpoint.as_deref())?;
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Drive ~16 separate sync cycles so the L0 pool fills L1 (batch 4) three
+    // times and then L2 (batch 2); one commit per >1s poll window == one L0.
+    let mut next_id = 100i64;
+    let l2_deadline = Instant::now() + e2e_poll_deadline(90);
+    let mut fired_l2 = false;
+    for _ in 0..24 {
+        append_rows(&writer, next_id, next_id + 1, "compact")?;
+        next_id += 2;
+        std::thread::sleep(Duration::from_millis(1200));
+        if !list_keys(&l2_prefix).await?.is_empty() {
+            fired_l2 = true;
+            break;
+        }
+        if Instant::now() >= l2_deadline {
+            break;
+        }
+    }
+    assert!(fired_l2, "L2 must fire within the deadline");
+
+    // L1 also present; the superseded L0 objects were deleted by the engine, so
+    // the L0 pool is far smaller than the ~16+ incrementals produced.
+    let l1 = list_keys(&l1_prefix).await?;
+    let l2 = list_keys(&l2_prefix).await?;
+    let l0 = list_keys(&l0_prefix).await?;
+    assert!(!l1.is_empty(), "L1 must be present: {l1:?}");
+    assert!(!l2.is_empty(), "L2 must be present: {l2:?}");
+    assert!(
+        l0.len() < 10,
+        "superseded L0 objects must be deleted (found {}): {l0:?}",
+        l0.len()
+    );
+
+    // Restore-to-latest reads across the LTX→HADBP seam: row-exact + integrity.
+    // Settle so the periodic 1s sync uploads the final committed state, then stop
+    // driving and poll restore until the rows match.
+    std::thread::sleep(Duration::from_secs(3));
+    let expected_rows = rows(&db_path)?;
+    stop_child(&mut child);
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected_rows,
+    )?;
+
+    // PITR to the L2 window boundary (its max txid) restores cleanly.
+    let (l2_min, l2_max) = parse_level_range(&l2[0]).context("parse L2 range")?;
+    let boundary_out = temp.path().join("boundary.db");
+    let out = run_cli_restore_pit_output(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &boundary_out,
+        l2_max,
+    )?;
+    anyhow::ensure!(
+        out.status.success(),
+        "PITR to the L2 boundary txid {l2_max} must succeed:\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_integrity_ok(&boundary_out)?;
+
+    // PITR strictly inside the L2 window is the loud typed decay error.
+    if l2_max > l2_min + 1 {
+        let inside = l2_min + 1;
+        let inside_out = temp.path().join("inside.db");
+        let out = run_cli_restore_pit_output(
+            &name,
+            &bucket_arg,
+            endpoint.as_deref(),
+            &inside_out,
+            inside,
+        )?;
+        anyhow::ensure!(
+            !out.status.success(),
+            "PITR inside a merged window (txid {inside}) must fail loudly"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        anyhow::ensure!(
+            stderr.contains("falls inside merged window"),
+            "decay error must name the merged window: {stderr}"
+        );
+        anyhow::ensure!(
+            !inside_out.exists(),
+            "a failed PITR must not publish a partial database"
+        );
+    }
+
+    // verify exits 0 on the healthy leveled bucket.
+    let mut verify = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    verify
+        .arg("verify")
+        .arg(&name)
+        .arg("--bucket")
+        .arg(&bucket_arg);
+    if let Some(endpoint) = endpoint.as_deref() {
+        verify.arg("--endpoint").arg(endpoint);
+    }
+    run_cmd(verify, "walrust verify")?;
+
+    Ok(())
+}

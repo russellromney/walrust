@@ -39,6 +39,17 @@ fn key_txid_range(key: &str) -> Option<(u64, u64)> {
 /// failure returns `None` so the caller falls back to authoritative remote
 /// storage instead of trusting an ambiguous local copy.
 fn cache_substitute_for_key(cache: &LocalCache, key: &str) -> Option<Vec<u8>> {
+    // Cache substitution is bypassed for compaction **level** objects (C3a
+    // decision). The restore cache (B13) is an LTX-by-TXID store keyed on the
+    // `(min, max)` TXID range; a merged level object lives at `{db}/levels/L*/`
+    // with a `{min}-{max}.ltx` name that `key_txid_range` would happily parse,
+    // but its payload is **HADBP**, not LTX — substituting a cached LTX for it
+    // by matching TXID range would corrupt a leveled restore. Merged objects are
+    // coarse and read once, so bypassing the cache for them costs nothing;
+    // always fetch them from authoritative storage.
+    if key.contains("/levels/L") {
+        return None;
+    }
     let (min_txid, max_txid) = key_txid_range(key)?;
     if !cache.has_txid(max_txid) {
         return None;

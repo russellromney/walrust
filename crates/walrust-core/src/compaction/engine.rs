@@ -3,8 +3,10 @@
 //! One `run_level_compaction` call performs at most one merge at one level with
 //! the E2-class ordering:
 //!
-//! 1. **Select** the oldest `batch` eligible sources (L0 honours
-//!    `keep_fine_window`; higher levels take all).
+//! 1. **Select** the oldest eligible sources (L0 honours `keep_fine_window`;
+//!    higher levels take all), clipped to a seq-contiguous run of up to `batch`
+//!    files so a batch never straddles a snapshot chain-break (liveness; see
+//!    [`contiguous_batch`]).
 //! 2. **Idempotency / crash recovery**: if a merged object already covers this
 //!    exact range at the target level (a crash between write and delete), verify
 //!    it and — if sound — skip the merge and just finish deleting the sources.
@@ -84,7 +86,31 @@ pub async fn run_level_compaction(
     if eligible < batch {
         return Ok(CompactionOutcome::NoOp);
     }
-    let sources: Vec<LayoutFile> = all.into_iter().take(batch).collect();
+    // Clip the batch to a **seq-contiguous** run within the eligible window
+    // (liveness, wave C3a). The oldest `batch` files can straddle a snapshot
+    // chain-break: a snapshot consumes its own seq (`take_snapshot`: `new_seq =
+    // seq + 1`) and the next incremental chains from the snapshot's checksum, so
+    // the L0 chain breaks and there is a seq gap at that boundary. A fixed
+    // `take(batch)` across such a break makes `merge_changesets` return
+    // `NonContiguous` on **every tick, forever** (the batch never changes). We
+    // instead merge the contiguous prefix run (clipped at the first seq gap,
+    // capped at `batch`); if the prefix is a lone straddler we skip past it to
+    // the next run. Seq contiguity (`max + 1 == next.min`) is exactly the chain
+    // contiguity the planner relies on and the merge re-checks, and it is read
+    // straight from the listing (no header reads). A residual `NonContiguous`
+    // after clipping would mean a genuine fork/corruption, not a liveness bug —
+    // and is then a correct loud error.
+    let ranges: Vec<(u64, u64)> = all[..eligible]
+        .iter()
+        .map(|f| (f.range.min, f.range.max))
+        .collect();
+    let Some((start, len)) = contiguous_batch(&ranges, batch) else {
+        // Nothing mergeable this tick: the eligible window is only lone files
+        // separated by chain-breaks (e.g. a snapshot per incremental). No error,
+        // no progress — the fine points simply stay restorable at this level.
+        return Ok(CompactionOutcome::NoOp);
+    };
+    let sources: Vec<LayoutFile> = all[start..start + len].to_vec();
     let range = SeqRange::new(
         sources.first().unwrap().range.min,
         sources.last().unwrap().range.max,
@@ -158,6 +184,43 @@ pub async fn run_level_compaction(
         merged_count: sources.len(),
         output,
     })
+}
+
+/// Select a seq-contiguous run to merge from the eligible window.
+///
+/// `ranges` are the `(min, max)` seq spans of the eligible files at a level,
+/// sorted ascending (as [`CompactionLayout::list_level`] returns). Returns
+/// `Some((start, len))` — merge `ranges[start..start + len]` — or `None` when no
+/// run is worth merging this tick.
+///
+/// Rules (see the call site for the liveness rationale):
+/// - Walk from the oldest file. A **run** is a maximal seq-contiguous span
+///   (`ranges[i].1 + 1 == ranges[i + 1].0`), capped at `batch` files.
+/// - Merge the **first** run of length `>= 2` (the contiguous prefix normally;
+///   the next run if the prefix is a lone straddler skipped past a chain-break).
+/// - `batch == 1` keeps the "fold every single file up a level" semantics: it
+///   merges the oldest single file (a 1-source merge is always contiguous).
+/// - `None` when only lone files separated by breaks remain (nothing to do).
+fn contiguous_batch(ranges: &[(u64, u64)], batch: usize) -> Option<(usize, usize)> {
+    if batch == 0 || ranges.is_empty() {
+        return None;
+    }
+    let n = ranges.len();
+    let mut i = 0;
+    while i < n {
+        // Extend a contiguous run from `i`, capped at `batch` files.
+        let mut j = i;
+        while j + 1 < n && ranges[j].1 + 1 == ranges[j + 1].0 && (j - i + 1) < batch {
+            j += 1;
+        }
+        let run_len = j - i + 1;
+        if run_len >= 2 || batch == 1 {
+            return Some((i, run_len));
+        }
+        // A lone straddler at `i` (a chain-break follows). Skip to the next run.
+        i = j + 1;
+    }
+    None
 }
 
 /// Look for a merged object at `level` covering exactly `range`.
@@ -244,4 +307,60 @@ async fn verify_existing(
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contiguous_batch;
+
+    #[test]
+    fn full_contiguous_prefix_capped_at_batch() {
+        // Five contiguous files, batch 4 → merge the oldest 4.
+        let r = [(2, 2), (3, 3), (4, 4), (5, 5), (6, 6)];
+        assert_eq!(contiguous_batch(&r, 4), Some((0, 4)));
+    }
+
+    #[test]
+    fn contiguous_ranges_not_just_points() {
+        // Multi-seq incrementals (legacy [min,max]) chain by max+1 == next.min.
+        let r = [(2, 5), (6, 9), (10, 13)];
+        assert_eq!(contiguous_batch(&r, 2), Some((0, 2)));
+    }
+
+    #[test]
+    fn short_prefix_merges_even_below_batch() {
+        // Prefix run [2,3,4] then a break (gap at 5, snapshot). batch 4 → merge
+        // the 3-file prefix rather than erroring across the break.
+        let r = [(2, 2), (3, 3), (4, 4), (6, 6), (7, 7)];
+        assert_eq!(contiguous_batch(&r, 4), Some((0, 3)));
+    }
+
+    #[test]
+    fn leading_singleton_straddler_is_skipped_to_next_run() {
+        // Oldest file [1] is alone (gap at 2 = snapshot); the next run [3,4,5,6]
+        // is merged. The lone [1] stays a fine point (restore reads it at L0).
+        let r = [(1, 1), (3, 3), (4, 4), (5, 5), (6, 6)];
+        assert_eq!(contiguous_batch(&r, 4), Some((1, 4)));
+    }
+
+    #[test]
+    fn all_singletons_separated_by_breaks_is_noop() {
+        // Snapshot per incremental: nothing is safely mergeable (batch >= 2).
+        let r = [(1, 1), (3, 3), (5, 5), (7, 7)];
+        assert_eq!(contiguous_batch(&r, 4), None);
+    }
+
+    #[test]
+    fn batch_one_folds_the_oldest_single_file() {
+        // batch == 1 preserves the "merge every file up a level" cascade; a
+        // 1-source merge can never be NonContiguous.
+        let r = [(1, 1), (3, 3)];
+        assert_eq!(contiguous_batch(&r, 1), Some((0, 1)));
+    }
+
+    #[test]
+    fn empty_or_zero_batch_is_noop() {
+        assert_eq!(contiguous_batch(&[], 4), None);
+        assert_eq!(contiguous_batch(&[(1, 1)], 0), None);
+    }
 }
