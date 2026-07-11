@@ -1,6 +1,6 @@
 [package]
 name = "walrust"
-version = "0.5.2"
+version = "0.7.0"
 edition = "2021"
 description = "Lightweight SQLite WAL sync to S3/Tigris"
 authors = ["Russell Romney <russellromney@gmail.com>"]
@@ -77,21 +77,19 @@ hmac = "0.12"
 hex = "0.4"
 
 # Core library (embeddable sync primitives)
-walrust-core = { version = "0.3.1", path = "crates/walrust-core" }
+walrust-core = { version = "0.7.0", path = "crates/walrust-core" }
 
 # Storage substrate (trait is always available; concrete S3 impl is feature-gated).
-# hadb-* are pinned to an explicit rev on branch `feat/changeset-compacted` (adds the
-# COMPACTED version-2 changeset format used by compaction) for a reproducible clean-clone
-# build (Cargo permits only one of branch/rev, so the rev is the pin and the
-# branch is documented here). A gitignored
-# `.cargo/config.toml` `[patch]` -> `../hadb` overrides this for local dev.
-hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "9892610afb6d34441db22618c1918620dded9a03" }
-hadb-storage-s3 = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage-s3", rev = "9892610afb6d34441db22618c1918620dded9a03", optional = true }
+# hadb-* are crates.io version deps (0.5.0 adds the COMPACTED version-2 changeset
+# format used by compaction). For local dev before hadb 0.5.0 is published, a
+# gitignored `.cargo/config.toml` `[patch.crates-io]` -> `../hadb` resolves these.
+hadb-storage = { version = "0.5.0" }
+hadb-storage-s3 = { version = "0.5.0", optional = true }
 
 # Legacy config/webhook/retention/s3 helpers. Default-features = false so
 # `walrust --no-default-features` can build without aws-sdk; the `s3` feature
 # above re-enables hadb-io's `s3` (and pulls in aws-sdk-s3 transitively).
-hadb-io = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-io", rev = "9892610afb6d34441db22618c1918620dded9a03", default-features = false }
+hadb-io = { version = "0.5.0", default-features = false }
 
 # S3 client type (shared with hadb-io, needed for function signatures).
 aws-sdk-s3 = { version = "1", optional = true }
