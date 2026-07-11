@@ -1167,6 +1167,7 @@ async fn ensure_database_in_wal_mode(db_path: &Path, db_name: &str) -> Result<()
     let db_path = db_path.to_path_buf();
     let mode = tokio::task::spawn_blocking(move || -> Result<String> {
         let conn = rusqlite::Connection::open(&db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         Ok(mode)
     })
@@ -2403,6 +2404,8 @@ pub async fn restore_with_snapshot_source(
 fn verify_sqlite_integrity(path: &Path) -> Result<()> {
     let conn = rusqlite::Connection::open(path)
         .map_err(|e| anyhow!("failed to open restored database for integrity_check: {e}"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| anyhow!("failed to set busy_timeout on restored database: {e}"))?;
     let result: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(|e| anyhow!("failed to run integrity_check on restored database: {e}"))?;
@@ -3662,6 +3665,57 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM data", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 10);
+    }
+
+    /// The journal-mode probe must ride out transient lock contention instead
+    /// of failing fast with SQLITE_BUSY. An external writer holding an
+    /// exclusive rollback-mode lock makes a bare (no busy_timeout) probe fail
+    /// immediately with "database is locked"; the probe used by the sync path
+    /// sets a 5s busy_timeout, so it waits the lock out and reports the real
+    /// journal mode.
+    #[tokio::test]
+    async fn test_wal_mode_probe_survives_transient_exclusive_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("busy-probe.db");
+
+        // Rollback-mode DB with a live EXCLUSIVE lock: readers get SQLITE_BUSY.
+        let locker = rusqlite::Connection::open(&db_path).unwrap();
+        locker
+            .execute_batch(
+                "PRAGMA journal_mode=DELETE;
+                 CREATE TABLE t (x INTEGER);
+                 BEGIN EXCLUSIVE;
+                 INSERT INTO t VALUES (1);",
+            )
+            .unwrap();
+
+        // Prove the contention is live: a bare probe (the pre-fix behavior,
+        // no busy_timeout) fails fast instead of waiting.
+        let bare = rusqlite::Connection::open(&db_path).unwrap();
+        let bare_result = bare.query_row("PRAGMA journal_mode", [], |row| row.get::<_, String>(0));
+        assert!(
+            bare_result.is_err(),
+            "bare no-timeout probe should fail fast under an exclusive lock, got: {bare_result:?}"
+        );
+        drop(bare);
+
+        // Release the lock well within the probe's 5s busy_timeout.
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            locker.execute_batch("COMMIT;").unwrap();
+        });
+
+        // The fixed probe waits out the lock and reports the real journal mode
+        // (delete), rather than surfacing "database is locked".
+        let err = ensure_database_in_wal_mode(&db_path, "busy-probe")
+            .await
+            .expect_err("delete-mode database must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("journal_mode is 'delete'"),
+            "probe must survive the transient lock and report the real journal mode, got: {msg}"
+        );
+        releaser.join().unwrap();
     }
 
     #[tokio::test]
