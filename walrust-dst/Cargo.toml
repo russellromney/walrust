@@ -14,10 +14,10 @@ path = "src/main.rs"
 # Walrust (path dependency for testing)
 walrust = { path = ".." }
 
-# Storage trait — DST mock + tests implement it directly. Pinned to the same
-# hadb commit walrust uses so it resolves to exactly one copy. Rev is on branch
-# `feat/changeset-compacted` (Cargo allows only one of branch/rev).
-hadb-storage = { git = "https://github.com/russellromney/hadb.git", version = "0.4.0", package = "hadb-storage", rev = "9892610afb6d34441db22618c1918620dded9a03" }
+# Storage trait — DST mock + tests implement it directly. crates.io version dep
+# (0.5.0); resolves to the same single copy walrust uses. Before hadb 0.5.0 is
+# published, the gitignored `.cargo/config.toml` `[patch.crates-io]` resolves it.
+hadb-storage = { version = "0.5.0" }
 
 # Property-based testing
 proptest = "1.4"
