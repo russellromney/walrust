@@ -82,10 +82,17 @@ pub async fn prune(
     let level_storage: Arc<dyn StorageBackend> =
         Arc::new(S3Storage::new(client.clone(), bucket_name.clone()));
     let level_layout = RangeLayout::new(level_storage, &prefix, name);
-    let level_delete = list_level_files(&level_layout)
+    // E10 sibling (fail-loud, not fail-silent): this DELETION plan must come
+    // from a complete levels listing. Swallowing a failed LIST with
+    // `unwrap_or_default()` silently skipped the level prune and misreported
+    // "Nothing to delete" — a decision made from a defaulted view. The
+    // direction was at least conservative (nothing extra deleted), but a
+    // persistent LIST failure would leak level objects forever without a word.
+    // Propagate instead; the operator retries the prune.
+    let level_files = list_level_files(&level_layout)
         .await
-        .map(|files| plan_level_prune(&files, watermark))
-        .unwrap_or_default();
+        .map_err(|e| classify_or_else(anyhow::Error::from(e), WalrustError::s3))?;
+    let level_delete = plan_level_prune(&level_files, watermark);
 
     // Print summary
     println!("Prune plan for '{}':", name);

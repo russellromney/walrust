@@ -2125,3 +2125,42 @@ restore engine over the mock bucket under a seeded transient-fault plan.
   cause, not touched by this fix; filed as a separate follow-up.
 
 - **Status:** Fixed.
+
+- **Adversarial review (PR #36).** Propagation path verified end-to-end: the
+  DST's `restore_to` retry classifies by the rendered chain (`{err:#}` contains
+  `Service unavailable (injected)`), and the bare `.await?` preserves the chain
+  untouched, so the transient is retried and resolves to the typed decay
+  outcome. In production the LIST error is already typed `WalrustError::S3` at
+  the storage adapter, and `classify_or_else(e, WalrustError::restore)` at the
+  CLI boundary preserves an existing typed error — no double-wrapped
+  "restore error: restore error:", exit code 4 (S3) as a transport failure
+  should. The review then swept the workspace for the same class (a listing /
+  transport error swallowed into a default that feeds a CLASSIFICATION or
+  DELETION decision) and found the MODERN `sync::restore` had the bug twice:
+  - the `leveled` check (`list_merged_ranges(..).await.unwrap_or_default()`):
+    a transient levels LIST classified a compacted bucket as un-leveled and
+    walked the linear path off the deleted L0 tail — a bogus non-typed
+    "incremental gap" (or, with L0 fully folded, a SILENT short restore to the
+    snapshot seq);
+  - the decay refinement (`discover_latest_snapshot_in_namespace(..).ok()`):
+    the exact E10 collapse, byte-for-byte the same "restore chain gap" message,
+    in the modern path.
+  Both fixed by propagation; proven test-first in
+  `crates/walrust-core/tests/compaction_restore.rs`
+  (`leveled_check_transient_list_failure_propagates_not_misread_as_unleveled`,
+  `decay_refinement_transient_list_failure_propagates_not_bare_gap` — both fail
+  with the pre-fix code, reproducing the misclassifications above). Also fixed
+  `src/sync/prune.rs` level-prune planning, which swallowed a failed levels
+  LIST into an empty DELETION plan and misreported "Nothing to delete"
+  (conservative direction, but a persistent LIST failure would silently leak
+  level objects forever). Cleared as safe: `src/sync/verify.rs`'s two
+  `list_merged_ranges(..).unwrap_or_default()` uses (deliberate, documented
+  fail-toward-alarming in a non-destructive report path — a transient can only
+  cause a false alarm, never silence), and the `Option`-default sites
+  (`wal.rs` chain_seed, `shadow.rs` file_stem, `main.rs` cache config).
+  Noted as a follow-up, not fixed here: `src/sync/watch_shadow.rs` treats ANY
+  manifest GET failure (transient included) and any manifest parse failure as
+  "fresh database, txid 0" at startup; durable local shadow progress overrides
+  it when present and publishes are `put_if_absent`-guarded (fail-loud, not
+  silent fork), but the startup classification is the same shape and deserves
+  its own pass.

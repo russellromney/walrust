@@ -637,3 +637,150 @@ async fn owned_vacuum_shrink_merges_and_restores_row_exact() {
     assert!(integrity_ok(&out9));
     assert_eq!(std::fs::read(&out9).unwrap(), fx.state_at[&9]);
 }
+
+// ── E10 siblings (H8 class): restore must not CLASSIFY from a listing that
+//    silently defaulted on a transient fault ──────────────────────────────────
+//
+// PR #36 fixed the legacy restore's gap-vs-decay classifier, which swallowed a
+// transient snapshot LIST with `unwrap_or_default()` and mis-classified a
+// foreclosed PITR as a bare chain gap. The MODERN `sync::restore` had the same
+// bug in two places:
+//
+//   1. the `leveled` check (`list_merged_ranges(..).unwrap_or_default()`): a
+//      transient levels LIST read as "un-leveled bucket", sending the restore
+//      down the linear L0 path of a bucket whose fine tail compaction already
+//      deleted — a loud bogus "incremental gap" (or, with L0 fully folded, a
+//      SILENT short restore to the snapshot seq);
+//   2. the decay-refinement discovery (`.ok().flatten()`): a transient snapshot
+//      LIST read as "no later snapshot absorbs the target", collapsing the
+//      typed `PitrInsideSnapshotSpan` / RestoreNotFound outcome into a bare,
+//      non-typed gap — and rewriting the transient into a non-transient message
+//      that no retry wrapper will re-attempt.
+//
+// Both tests fail with the pre-fix code (revert the `?`s in `sync::restore` to
+// see the exact misclassifications above).
+
+/// Delegating store that injects a transient failure into targeted LIST calls.
+struct FaultyListStore {
+    inner: Arc<MemStore>,
+    /// Fail LISTs whose prefix contains this fragment...
+    fail_fragment: &'static str,
+    /// ...starting from the Nth matching call (1-based).
+    fail_from_occurrence: usize,
+    matching_calls: Mutex<usize>,
+}
+
+#[async_trait]
+impl StorageBackend for FaultyListStore {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.inner.get(key).await
+    }
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.inner.put(key, data).await
+    }
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.inner.delete(key).await
+    }
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        if prefix.contains(self.fail_fragment) {
+            let mut n = self.matching_calls.lock().unwrap();
+            *n += 1;
+            if *n >= self.fail_from_occurrence {
+                anyhow::bail!("Storage error: Service unavailable (injected)");
+            }
+        }
+        self.inner.list(prefix, after).await
+    }
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        self.inner.put_if_absent(key, data).await
+    }
+    async fn put_if_match(&self, key: &str, data: &[u8], etag: &str) -> Result<CasResult> {
+        self.inner.put_if_match(key, data, etag).await
+    }
+}
+
+/// Sibling 1: a transient LIST during the `leveled` check must PROPAGATE (so a
+/// retry wrapper sees the transient), not silently classify a compacted bucket
+/// as un-leveled and walk the linear path off the deleted L0 tail.
+#[tokio::test]
+async fn leveled_check_transient_list_failure_propagates_not_misread_as_unleveled() {
+    let fx = build_fixture("e10a/", "db", 13, false); // seqs 1..=14
+    let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
+    compact_to_l1_l2(&layout).await; // L0 2..=13 deleted; only seq 14 remains
+
+    let store = Arc::new(FaultyListStore {
+        inner: fx.store.clone(),
+        fail_fragment: "/levels/",
+        fail_from_occurrence: 1,
+        matching_calls: Mutex::new(0),
+    });
+
+    let dir = tempfile::tempdir().unwrap();
+    let out = dir.path().join("latest.db");
+    let err = walrust_core::sync::restore(store, &fx.prefix, &fx.db, &out, None)
+        .await
+        .expect_err("a failed levels LIST must not silently classify the bucket as un-leveled");
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("Service unavailable (injected)"),
+        "the transient LIST failure must survive propagation (retry classification \
+         depends on it), got: {chain}"
+    );
+    assert!(
+        !chain.contains("incremental gap"),
+        "must not be misclassified as a linear-path incremental gap: {chain}"
+    );
+    assert!(!out.exists(), "no partial output on a failed restore");
+}
+
+/// Sibling 2: a transient snapshot LIST during the decay refinement must
+/// PROPAGATE, not read as "no later snapshot absorbs the target" and collapse
+/// the typed RestoreNotFound decay outcome into a bare, non-retryable gap.
+#[tokio::test]
+async fn decay_refinement_transient_list_failure_propagates_not_bare_gap() {
+    let fx = build_fixture("e10b/", "db", 13, false); // seqs 1..=14
+    let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
+    compact_to_l1_l2(&layout).await;
+
+    // Prune-like foreclosure: the merged L2 [2,9] is gone, and a LATER full
+    // snapshot (seq 20; content never read on this path) absorbs the target.
+    let l2_keys = fx.store.list("e10b/db/levels/L2/", None).await.unwrap();
+    assert_eq!(l2_keys.len(), 1);
+    fx.store.delete(&l2_keys[0]).await.unwrap();
+    futures_put(&fx.store, &snapshot_key(&fx.prefix, &fx.db, 20), b"");
+
+    // Baseline (no fault): PITR to seq 5 (inside the foreclosed [2,9] span) is
+    // the TYPED decay outcome — RestoreNotFound — not a bare gap.
+    let dir = tempfile::tempdir().unwrap();
+    let out5 = dir.path().join("at5.db");
+    let err = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out5, Some("5"))
+        .await
+        .expect_err("seq 5 is foreclosed");
+    assert!(
+        err.chain().any(|c| matches!(
+            c.downcast_ref::<walrust_core::errors::WalrustError>(),
+            Some(walrust_core::errors::WalrustError::RestoreNotFound(_))
+        )),
+        "foreclosed PITR must be the typed decay outcome, got: {err:#}"
+    );
+
+    // Under a transient fault on the refinement's snapshot LIST (the SECOND
+    // list of the snapshot namespace; the first is the base-snapshot pick), the
+    // transient must propagate — not collapse into a bare gap.
+    let store = Arc::new(FaultyListStore {
+        inner: fx.store.clone(),
+        fail_fragment: "/0001/",
+        fail_from_occurrence: 2,
+        matching_calls: Mutex::new(0),
+    });
+    let out5b = dir.path().join("at5b.db");
+    let err = walrust_core::sync::restore(store, &fx.prefix, &fx.db, &out5b, Some("5"))
+        .await
+        .expect_err("seq 5 is foreclosed and the refinement LIST fails");
+    let chain = format!("{err:#}");
+    assert!(
+        chain.contains("Service unavailable (injected)"),
+        "the transient LIST failure must survive propagation (retry classification \
+         depends on it), got: {chain}"
+    );
+}
