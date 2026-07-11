@@ -24,7 +24,7 @@
 
 use std::time::Duration;
 
-use hadb_changeset::physical::{self, chain_end};
+use hadb_changeset::physical::{self, chain_end, PhysicalChangeset};
 
 use super::layout::{CompactionLayout, LayoutFile, Level, SeqRange};
 use super::merge::{merge_changesets, verify_merged_bytes, MergeInput, PeakPages};
@@ -89,13 +89,15 @@ pub async fn run_level_compaction(
     // `OverlappingExisting`. (C2a believed partial overlap unreachable from
     // crash shapes; the DST fault sweep proved it reachable via this
     // interrupted delete.) Finish the interrupted deletion instead: delete the
-    // leftover sources subset-covered by a SOUND merged object (deletion-only
-    // convergence), so re-runs converge rather than collide. This never touches
-    // the FULL crash-recovery set (survivors that still tile a merged object
-    // exactly — left to step 2's strong `verify_existing`), never deletes
-    // against an unsound covering object (that stays a re-merge via step 2), and
-    // leaves the loud `OverlappingExisting` intact for a genuinely foreign
-    // overlap. `target_files` is reused by step 2's exact-range lookup below.
+    // leftover sources subset-covered by a SOUND merged object with matching
+    // boundary chain evidence (deletion-only convergence), so re-runs converge
+    // rather than collide. This never touches the FULL crash-recovery set
+    // (survivors that still tile a merged object exactly — left to step 2's
+    // strong `verify_existing`), never deletes against an unsound covering
+    // object (that stays a re-merge via step 2), never deletes a boundary
+    // object whose chain linkage does not match the cover's, and leaves the
+    // loud `OverlappingExisting` intact for a genuinely foreign overlap.
+    // `target_files` is reused by step 2's exact-range lookup below.
     let target_files = layout.list_level(target_level).await?;
     if let Some(converged) = converge_interrupted_delete(layout, &target_files, &all).await? {
         return Ok(converged);
@@ -295,14 +297,55 @@ fn range_subset(a: SeqRange, b: SeqRange) -> bool {
 /// leftovers and report a deletion-only convergence. Returns `None` when there
 /// is nothing to converge, so the normal merge path proceeds unchanged.
 ///
-/// Two guards keep this from ever weakening the C2a exact-range semantics:
+/// Three guards keep this from ever weakening the C2a exact-range semantics:
 ///  - a merged object still fully tiled by present sources (the untouched
 ///    crash-recovery set) is SKIPPED here and left to step 2's strong
 ///    `verify_existing`; only a strict/gappy subset — proof a sibling was
 ///    already deleted — is treated as an interrupted-delete leftover;
 ///  - a covering object that does not verify sound (torn/corrupt) is SKIPPED, so
 ///    its sources are preserved and it is re-merged via step 2, never deleted
-///    against.
+///    against — but a *storage* failure while checking is NOT unsoundness and
+///    propagates, so a transient stays retryable instead of decaying into a
+///    non-retryable `OverlappingExisting` at batch selection;
+///  - **endpoint chain evidence**: a leftover sitting at the cover's `min`
+///    (resp. `max`) must carry the cover's exact `prev_checksum` (resp.
+///    `chain_end`). The merge stamps those values from its first/last input, so
+///    a genuine leftover always matches; a foreign object at an endpoint does
+///    not, is never deleted, and surfaces as the loud `OverlappingExisting`.
+///
+/// ## Why "range-subset of a sound cover" implies "content superseded"
+///
+/// Range containment plus cover soundness alone does not *logically* imply the
+/// cover's content reflects the source — that needs the system's invariants.
+/// Under them, every reachable subset leftover IS an input (or a re-merge of
+/// inputs) of its cover:
+///
+/// 1. **Objects are immutable once published.** L0 publishes are CAS
+///    (`put_if_absent`) and merged objects are written once by the single
+///    compactor; no live key is ever rewritten. A present source therefore
+///    holds exactly the bytes the merge that produced the cover read.
+/// 2. **Seq monotonicity.** The single writer (flock) discovers its head at
+///    startup as the max over L0 seqs, snapshot generations AND `levels/L*/`
+///    coverage (`discover_legacy_state` folds merged level ranges — pinned by
+///    `discover_head_reflects_merged_level_coverage`), and a resumed stream
+///    re-anchors with a snapshot that consumes its own seq. So no new L0 is
+///    ever created at a seq ≤ an existing cover's `max`.
+/// 3. **Batch tiling.** A cover `[a,b]` is only created from a batch that tiles
+///    `[a,b]` exactly: the level listing is sorted by `(min, max)` and
+///    [`contiguous_batch`] takes a greedy `max + 1 == next.min` run, so an
+///    extra same-level file inside `[a,b]` would sit between two run members in
+///    the listing and break the chain — the run `[a,b]` could never form.
+///    Hence at merge time every same-level file with range ⊆ `[a,b]` was an
+///    input, and by (2) none can appear later — except one produced by a
+///    *lower*-level merge of such leftovers (the cascade case), whose content
+///    is a fold of inputs-of-inputs and is therefore also reflected.
+/// 4. The one divergent shape outside these invariants is a **second
+///    concurrent writer** (single-writer violated across hosts) republishing
+///    into a seq key that compaction vacated — a fork artifact. The endpoint
+///    chain evidence catches every such fork run that touches a cover endpoint
+///    loudly instead of silently deleting it; an interior-only fork artifact
+///    requires the foreign writer to die within a vacated hole without ever
+///    reaching an endpoint, and is out of scope by the single-writer invariant.
 async fn converge_interrupted_delete(
     layout: &dyn CompactionLayout,
     target_files: &[LayoutFile],
@@ -327,12 +370,31 @@ async fn converge_interrupted_delete(
         if tiles_exactly(&subs, m.range) {
             continue;
         }
-        // Never delete redundant sources against an unsound covering object.
-        if verify_covers(layout, m).await.is_err() {
+        // Never delete redundant sources against an unsound covering object —
+        // but only genuine unsoundness (torn/corrupt/wrong shape) may skip. A
+        // storage failure here is a read problem, not evidence about the
+        // object; swallowing it would turn a retryable transient into a
+        // non-retryable OverlappingExisting at batch selection (the E11 class
+        // all over again), so it propagates.
+        let cover_cs = match verify_covers(layout, m).await {
+            Ok(cs) => cs,
+            Err(e @ CompactionError::Storage(_)) => return Err(e),
+            Err(_unsound) => continue,
+        };
+        // Endpoint chain evidence: a leftover on the cover's boundary must
+        // chain exactly like the cover's first/last input. Mismatch means this
+        // is NOT an interrupted-delete leftover — preserve it and stay loud.
+        if !endpoint_chain_evidence(layout, m, &cover_cs, &subs).await? {
             continue;
         }
         cover.get_or_insert_with(|| m.clone());
-        deletable.extend(subs.into_iter().cloned());
+        for s in subs {
+            // A source can be subset of several covers; delete (and count) it
+            // once.
+            if !deletable.iter().any(|d| d.key == s.key) {
+                deletable.push(s.clone());
+            }
+        }
     }
     if deletable.is_empty() {
         return Ok(None);
@@ -343,6 +405,56 @@ async fn converge_interrupted_delete(
         merged_count: count,
         output: cover.expect("deletable non-empty implies a covering object"),
     }))
+}
+
+/// Chain evidence tying boundary leftovers to their cover (see the proof on
+/// [`converge_interrupted_delete`]). The merge stamps a cover's `prev_checksum`
+/// from its FIRST input and its `chain_end` (declared end) from its LAST input,
+/// so a genuine leftover at `cover.range.min` / `cover.range.max` always
+/// matches; a foreign (fork-artifact) object at an endpoint does not. Interior
+/// leftovers carry no independently checkable linkage (their chain values are
+/// folded inside the cover) — they are covered by the invariant proof instead.
+/// Returns `Ok(false)` on a mismatch (caller preserves the sources and lets the
+/// state stay loud); storage/decode failures propagate.
+async fn endpoint_chain_evidence(
+    layout: &dyn CompactionLayout,
+    cover: &LayoutFile,
+    cover_cs: &PhysicalChangeset,
+    subs: &[&LayoutFile],
+) -> Result<bool, CompactionError> {
+    for s in subs {
+        if s.range.min == cover.range.min {
+            let h = layout.read_header(s).await?;
+            if h.prev_checksum != cover_cs.header.prev_checksum {
+                return Ok(false);
+            }
+        }
+        if s.range.max == cover.range.max
+            && source_chain_end(layout, s).await? != chain_end(cover_cs)
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// Authoritative `chain_end()` of a source: its declared end when the header
+/// carries one (COMPACTED / LTX sources), else one bounded object read (a
+/// normal HADBP source's chain end is its trailer content checksum).
+async fn source_chain_end(
+    layout: &dyn CompactionLayout,
+    s: &LayoutFile,
+) -> Result<u64, CompactionError> {
+    let h = layout.read_header(s).await?;
+    if let Some(end) = h.declared_end_checksum {
+        return Ok(end);
+    }
+    let bytes = layout.read_bytes(s).await?;
+    let cs = physical::decode(&bytes).map_err(|e| CompactionError::Decode {
+        key: s.key.clone(),
+        source: e,
+    })?;
+    Ok(chain_end(&cs))
 }
 
 /// Whether the covered `subs` tile `range` exactly: sorted seq-contiguous,
@@ -362,14 +474,14 @@ fn tiles_exactly(subs: &[&LayoutFile], range: SeqRange) -> bool {
 /// subset-sources against: it reads back, decodes (content checksum — catches a
 /// torn or corrupt object), is `COMPACTED`, and carries pages. Unlike
 /// [`verify_existing`] this does NOT tie the object to a specific source batch's
-/// endpoints (the leftovers are a strict subset, so those endpoints legitimately
-/// differ) — but a decodeable, non-empty COMPACTED object durably folds the
-/// seqs it spans, so a source whose whole seq range sits inside it is redundant
-/// and safe to drop.
+/// endpoints (the leftovers are a strict subset, so the batch endpoints
+/// legitimately differ) — the boundary linkage that IS checkable is enforced
+/// separately by [`endpoint_chain_evidence`]. Returns the decoded changeset so
+/// the caller can do that without a second read.
 async fn verify_covers(
     layout: &dyn CompactionLayout,
     covering: &LayoutFile,
-) -> Result<(), CompactionError> {
+) -> Result<PhysicalChangeset, CompactionError> {
     let bytes = layout.read_bytes(covering).await?;
     let cs = physical::decode(&bytes).map_err(|e| CompactionError::Decode {
         key: covering.key.clone(),
@@ -385,7 +497,7 @@ async fn verify_covers(
             "covering object has no pages".into(),
         ));
     }
-    Ok(())
+    Ok(cs)
 }
 
 /// Verify an existing merged object fully covers the source batch: it decodes
