@@ -3632,6 +3632,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "aws-sdk-s3",
+ "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "axum",
  "brunch",
  "chrono",

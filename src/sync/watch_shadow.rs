@@ -387,16 +387,32 @@ pub async fn watch_with_shadow(
         let name = db_config.prefix.clone();
         let wal_path = db_path.with_extension("db-wal");
 
-        // Check for existing state in S3 (manifest.json)
+        // Check for existing state in S3 (manifest.json).
+        //
+        // H8 cousin (PR #36 review): a TRANSIENT manifest fetch failure — or a
+        // present-but-unparseable manifest — must NOT be silently read as "fresh
+        // database, txid 0". That default is safe ONLY for a genuine not-found; a
+        // transient (or a corrupt manifest) that defaults to fresh lets a replica
+        // adopt a fresh identity over existing remote state. Durable local shadow
+        // progress overrides this seed when present, and publishes are CAS-guarded
+        // (so the worst case is a loud CAS failure, not a silent fork) — but on a
+        // fresh host with no local progress a transient would still misclassify.
+        // Only a CONFIRMED not-found starts fresh; every other fetch/parse error
+        // propagates so startup fails loudly and is retried against a complete
+        // view. See `seed_state_from_manifest_fetch`. Not-found is classified
+        // from the TYPED SDK error (`s3::download_error_is_not_found`), never
+        // by matching message strings — free text like a DNS "host not found"
+        // must not read as a missing manifest and silently start fresh.
         let manifest_key = format!("{}{}/manifest.json", prefix, name);
-        let (mut current_txid, manifest_checksum) =
-            match s3::download_bytes(&client, &bucket_name, &manifest_key).await {
-                Ok(data) => {
-                    let manifest: Manifest = serde_json::from_slice(&data).unwrap_or_default();
-                    (manifest.current_txid, manifest.last_checksum)
-                }
-                Err(_) => (0, None),
-            };
+        let (mut current_txid, manifest_checksum) = match seed_state_from_manifest_fetch(
+            s3::download_bytes(&client, &bucket_name, &manifest_key).await,
+            s3::download_error_is_not_found,
+        )
+        .with_context(|| format!("{}: seeding startup state from manifest.json", name))?
+        {
+            ManifestSeed::Fresh => (0, None),
+            ManifestSeed::Seeded { txid, checksum } => (txid, checksum),
+        };
 
         // Get initial checksum: from manifest if available, otherwise compute from db
         let mut db_checksum = match manifest_checksum {
@@ -1120,6 +1136,50 @@ pub async fn watch_with_shadow(
     Ok(())
 }
 
+/// How startup state is seeded from the remote `manifest.json`.
+#[derive(Debug, PartialEq, Eq)]
+enum ManifestSeed {
+    /// No remote manifest exists: a brand-new database starts fresh at txid 0.
+    Fresh,
+    /// Seeded from an existing remote manifest.
+    Seeded { txid: u64, checksum: Option<u64> },
+}
+
+/// Decide how to seed startup state from a manifest FETCH result, enforcing the
+/// H8-cousin policy: a transient (or otherwise non-not-found) fetch failure, and
+/// a present-but-unparseable manifest, must NOT silently start fresh.
+///
+/// - `Ok(bytes)`: parse the manifest. A parse failure PROPAGATES (a corrupt or
+///   truncated manifest over existing remote state must be loud, never fresh).
+/// - `Err(e)` that `is_not_found` confirms: a genuine missing manifest → `Fresh`.
+/// - any other `Err(e)`: PROPAGATE. A transient/ambiguous failure never defaults
+///   to a fresh txid-0 database.
+///
+/// Pure and independent of S3 so both directions are unit-tested without a live
+/// backend.
+fn seed_state_from_manifest_fetch(
+    fetch: Result<Vec<u8>>,
+    is_not_found: impl Fn(&anyhow::Error) -> bool,
+) -> Result<ManifestSeed> {
+    match fetch {
+        Ok(data) => {
+            let manifest: Manifest = serde_json::from_slice(&data).context(
+                "manifest.json present but unparseable; refusing to start fresh over existing \
+                 remote state",
+            )?;
+            Ok(ManifestSeed::Seeded {
+                txid: manifest.current_txid,
+                checksum: manifest.last_checksum,
+            })
+        }
+        Err(e) if is_not_found(&e) => Ok(ManifestSeed::Fresh),
+        Err(e) => Err(e.context(
+            "manifest fetch failed and is not a confirmed not-found; refusing to default to a \
+             fresh txid-0 database (a transient must be retried, not adopted as fresh)",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1127,6 +1187,122 @@ mod tests {
     use rusqlite::Connection;
     use std::io::{Read, Write};
     use tempfile::TempDir;
+
+    // ── H8 cousin: manifest-fetch seeding never silently starts fresh ────────
+
+    /// Build the anyhow error `s3::download_bytes` produces for a genuine
+    /// missing object: the typed SDK `NoSuchKey` service error.
+    fn typed_no_such_key() -> anyhow::Error {
+        use aws_sdk_s3::error::SdkError;
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+        use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+        use aws_smithy_runtime_api::http::StatusCode;
+        use aws_smithy_types::body::SdkBody;
+        let err = GetObjectError::NoSuchKey(aws_sdk_s3::types::error::NoSuchKey::builder().build());
+        let raw = HttpResponse::new(StatusCode::try_from(404u16).unwrap(), SdkBody::empty());
+        anyhow::Error::new(SdkError::service_error(err, raw))
+    }
+
+    /// A genuine (typed) not-found seeds a fresh txid-0 database (correct:
+    /// brand-new DB).
+    #[test]
+    fn manifest_not_found_starts_fresh() {
+        let seed = seed_state_from_manifest_fetch(
+            Err(typed_no_such_key()),
+            s3::download_error_is_not_found,
+        )
+        .expect("a confirmed not-found must seed fresh, not error");
+        assert_eq!(seed, ManifestSeed::Fresh);
+    }
+
+    /// A TRANSIENT fetch failure must NOT silently start fresh — it propagates.
+    /// This is the swallow-shape the harden closes: reverting it (defaulting to
+    /// `(0, None)` on any error) would return `Fresh` here.
+    #[test]
+    fn manifest_transient_fetch_does_not_start_fresh() {
+        let err = seed_state_from_manifest_fetch(
+            Err(anyhow!("Service unavailable (injected); dispatch failure")),
+            s3::download_error_is_not_found,
+        )
+        .expect_err("a transient fetch failure must propagate, never seed fresh");
+        assert!(
+            format!("{err:#}").contains("refusing to default to a fresh"),
+            "got: {err:#}"
+        );
+    }
+
+    /// A present-but-unparseable manifest must be loud, never a silent fresh
+    /// start over existing remote state.
+    #[test]
+    fn manifest_corrupt_parse_does_not_start_fresh() {
+        let err = seed_state_from_manifest_fetch(
+            Ok(b"{ this is not valid json".to_vec()),
+            s3::download_error_is_not_found,
+        )
+        .expect_err("a corrupt manifest must propagate, never seed fresh");
+        assert!(format!("{err:#}").contains("unparseable"), "got: {err:#}");
+    }
+
+    /// A valid remote manifest seeds the recorded txid + checksum.
+    #[test]
+    fn manifest_present_seeds_recorded_state() {
+        let manifest = Manifest {
+            name: "db".into(),
+            current_txid: 42,
+            page_size: 4096,
+            files: Vec::new(),
+            last_checksum: Some(0xDEAD_BEEF),
+        };
+        let bytes = serde_json::to_vec(&manifest).unwrap();
+        let seed =
+            seed_state_from_manifest_fetch(Ok(bytes), s3::download_error_is_not_found).unwrap();
+        assert_eq!(
+            seed,
+            ManifestSeed::Seeded {
+                txid: 42,
+                checksum: Some(0xDEAD_BEEF)
+            }
+        );
+    }
+
+    /// The not-found classifier is TYPED, not string-matched: only the SDK's
+    /// `NoSuchKey`/404 service error classifies as not-found. Free text that
+    /// merely *mentions* not-found signatures (a DNS "host not found", a proxy
+    /// body with "404", the SDK error message quoted in a wrapper) must NOT —
+    /// otherwise a transient would misread as a missing manifest and silently
+    /// start fresh, the exact bug this hardening closes.
+    #[test]
+    fn not_found_classifier_is_typed_not_string_matched() {
+        use aws_sdk_s3::error::SdkError;
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+
+        // The real typed shape → not-found (also when wrapped with context).
+        assert!(s3::download_error_is_not_found(&typed_no_such_key()));
+        assert!(s3::download_error_is_not_found(
+            &typed_no_such_key().context("fetching manifest.json")
+        ));
+
+        // A typed TIMEOUT is not not-found even though it is an SDK error.
+        let timeout: SdkError<GetObjectError> = SdkError::timeout_error("timed out");
+        assert!(!s3::download_error_is_not_found(&anyhow::Error::new(
+            timeout
+        )));
+
+        // Free-text errors carrying not-found-looking words are NOT not-found.
+        for msg in [
+            "NoSuchKey: The specified key does not exist",
+            "Object not found: prefix/db/manifest.json",
+            "service error, HTTP status: 404",
+            "dns error: host not found",
+            "Service unavailable (injected)",
+            "connection reset by peer",
+        ] {
+            assert!(
+                !s3::download_error_is_not_found(&anyhow!("{msg}")),
+                "free-text {msg:?} must not classify as not-found"
+            );
+        }
+    }
 
     fn create_real_wal_db() -> (TempDir, PathBuf, Connection) {
         let temp = TempDir::new().unwrap();

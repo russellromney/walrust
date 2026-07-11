@@ -2164,3 +2164,197 @@ restore engine over the mock bucket under a seeded transient-fault plan.
   it when present and publishes are `put_if_absent`-guarded (fail-loud, not
   silent fork), but the startup classification is the same shape and deserves
   its own pass.
+
+## E11 — Mid-merge transient fault leaves a partial merged-overlap that a later batch collides with (`OverlappingExisting`)
+
+Found by the DST compaction fault phase
+(`compaction_state_machine_generated_sequences_under_faults`) during the E10
+sibling sweep (originally seed 477981; re-reproduced here at seed 699302). The
+suite drives the REAL leveled-compaction merge engine over the mock bucket under
+a seeded transient-fault plan and grades every restore.
+
+- **Repro (deterministic, pinned):** the shrunk case
+  `[Flush, RestoreLatest, Mark, Mark, Mark, RestoreLatest,
+  Compact { l1_batch: 2, l2_batch: 2, keep_fine_secs: 0 }, RestoreLatest]`,
+  `transient_rate: 0.02`, `seed: 699302` → `op[6] Compact failed on a
+  transient-only fault plan … compaction: unexpected overlapping merged object at
+  target level: target range 0000000000000004-0000000000000005 overlaps existing
+  merged object …/levels/L1/0000000000000002-0000000000000004`. The overlap is a
+  CROSS (existing `[2,4]` vs target `[4,5]`), not a clean subset/superset.
+  Reproduced on `main` in a `PROPTEST_CASES=4096` sweep (hit every run);
+  `PROPTEST_CASES=256` was too small to surface it (low-frequency). Both the
+  distilled replay (`replay_e11_interrupted_delete_partial_overlap_converges`)
+  and the corpus line are pinned in `walrust-dst/proptest-regressions/state_machine.txt`.
+
+- **Root cause (adjudicated: a reachable partial-overlap the C2a review believed
+  unreachable — the interrupted, non-atomic source-deletion).** The C2a merge is
+  write-durably → read-back verify → **delete sources**. `layout.delete` maps to
+  `StorageBackend::delete_many`, whose default (hadb-storage) is a **serial,
+  per-object loop** — NOT atomic. A transient injected error mid-loop drops a
+  strict PREFIX of a merged batch's sources and leaves the rest alive, then
+  returns the transient. The whole `Compact` pass retries; the survivors are a
+  strict subset of the already-written, verified merged object but no longer
+  reconstitute it. The next `contiguous_batch` mixes a survivor with a fresh
+  source and computes a target range that **crosses** the existing merged
+  object. `find_existing_merged` refuses any non-exact overlap with the loud
+  `CompactionError::OverlappingExisting` — correct by the C2a decision, which
+  believed a partial overlap unreachable from crash shapes. The DST proved it
+  reachable via the interrupted delete. Because the plan was transient-only, the
+  retry budget cannot absorb a non-transient overlap error, so the case failed
+  loudly. (Concretely in the repro: seqs 2,3,4 merged to `L1 [2,4]`; the delete
+  dropped seq 2 then hit a transient, leaving survivors {3,4}; the retry's
+  batch-2 selection targeted `[4,5]`, crossing `[2,4]`.)
+
+- **Fix (`crates/walrust-core/src/compaction/engine.rs`):** class (a) — PREVENT
+  the partial-overlap state by converging the interrupted delete before batch
+  selection. A new `converge_interrupted_delete` step, run at the top of
+  `run_level_compaction`, deletes any source whose seq range is a strict subset
+  of a **sound** merged object at the target level (a leftover of the interrupted
+  deletion) as a deletion-only convergence (`ConvergedExistingDeletion`), so
+  re-runs converge instead of colliding. Two guards keep C2a exact-range
+  semantics fully intact:
+  - a merged object still **tiled exactly** by present sources (the untouched
+    full crash-recovery set, no sibling deleted) is left to step 2's strong
+    `verify_existing` — only a strict/gappy subset is treated as a leftover;
+  - a covering object that does not `verify_covers` (read-back + `physical::decode`
+    content-checksum + COMPACTED + non-empty — catches torn/corrupt) is skipped,
+    so its sources are preserved and it is re-merged via step 2, never deleted
+    against.
+  The loud `OverlappingExisting` **survives for genuinely foreign objects**: once
+  the explained subset-covered leftovers are drained, any residual non-exact
+  overlap is not an interrupted-delete leftover (no present source sits inside
+  it), so it stays a loud alarm. `find_existing_merged` was also made a pure
+  function over the already-listed target files (the target level is listed once
+  per run and reused), no behavior change.
+
+- **Proving tests (fail-on-revert):**
+  - `walrust-dst` `state_machine::tests::replay_e11_interrupted_delete_partial_overlap_converges`
+    — deterministic replay of seed 699302; fails with the exact "overlapping
+    merged object" pre-fix, converges post-fix.
+  - `walrust-core` `compaction_engine::interrupted_delete_leftover_subset_converges_not_loud_error`
+    — distilled engine-level proof: an interrupted-delete state (survivors {2,3,4}
+    under merged `[1,4]` + fresh {5}) converges (drops the leftovers) instead of
+    raising `OverlappingExisting`.
+  - `walrust-core` `compaction_engine::interrupted_delete_does_not_drop_leftovers_against_torn_cover`
+    — the soundness gate: a torn covering object is NOT converged against; the
+    leftovers are preserved and the state stays a loud error.
+  - Unchanged and still green (exact-range semantics preserved):
+    `revert_proof_crash_between_write_and_delete_converges` (full set → step 2
+    strong verify), `partial_overlap_existing_merged_is_loud_error` (a
+    reconstituting re-seed stays loud), `revert_proof_readback_failure_preserves_sources`,
+    `revert_proof_non_contiguous_sources_rejected`, and the C2a merge oracle.
+  - Sweep: `compaction_state_machine_generated_sequences_under_faults` green at
+    `PROPTEST_CASES=256` twice consecutively and at `4096` (the count that
+    reliably reproduced pre-fix). Full `walrust-dst` bin 79/79;
+    `walrust-core --lib` 288; `compaction_engine` 13; `compaction_restore` 8;
+    `legacy_compaction_restore` 4.
+
+- **Status:** Fixed.
+
+- **Part 2 adjudication — the H8 cousin in `src/sync/watch_shadow.rs`
+  (hardened, not just documented).** PR #36's E10 review flagged that watch-shadow
+  startup treats ANY `manifest.json` GET failure — transient included — AND any
+  parse failure as "fresh database, txid 0". This is the same swallow-shape as
+  E10: a classification/identity decision (is this a brand-new DB, or an existing
+  one?) made from an incomplete view. The existing mitigations (durable local
+  shadow progress overrides the seed when present; publishes are CAS-guarded so
+  the worst case is a loud CAS failure, not a silent fork) prevent silent
+  data-loss/fork, but they do NOT make it unreachable as a bug: on a **fresh host
+  with no local progress** (a replica migrated to a new machine / wiped state
+  dir) while the remote manifest exists, a transient GET would misclassify as
+  fresh and the replica adopts a fresh identity — mitigated to a loud CAS failure
+  at first publish rather than corrected. A present-but-**corrupt** manifest is
+  worse: it silently becomes fresh. Adjudicated as a real, if low-severity, bug
+  of the swallow class → **hardened** (not documented-away). The seed decision is
+  now a pure `seed_state_from_manifest_fetch`: a CONFIRMED not-found seeds fresh
+  (correct for a brand-new DB); a parse failure and any non-not-found fetch error
+  **propagate** so startup fails loudly and is retried against a complete view.
+  Not-found is classified from the **typed** SDK error
+  (`s3::download_error_is_not_found`: the `NoSuchKey` service error, or a
+  service response with HTTP status 404), never by message-string matching; an
+  unrecognised error is treated as NOT-not-found and propagated (fail-safe toward
+  a loud retry, never a silent fresh start). Both directions are unit-tested
+  (`manifest_not_found_starts_fresh`, `manifest_transient_fetch_does_not_start_fresh`,
+  `manifest_corrupt_parse_does_not_start_fresh`, `manifest_present_seeds_recorded_state`,
+  `not_found_classifier_is_typed_not_string_matched`). Reverting the harden
+  (defaulting to `(0, None)` on any error) makes the transient test return
+  `Fresh` and fail.
+
+### PR #37 adversarial review (fresh-eyes) — three findings, all fixed
+
+The review attacked the DELETE criterion itself: "range strict-subset of a
+merged object + that object passes `verify_covers`" does not *logically* prove
+the cover's CONTENT reflects the source — soundness is not supersession.
+
+- **Adjudication of content-supersession (the headline).** Enumerating the
+  reachable bucket states under the system's invariants shows every reachable
+  subset leftover IS content-superseded, with one boundary caveat now checked:
+  1. objects are immutable once published (L0 publishes are CAS
+     `put_if_absent`; merged objects are written once by the single
+     compactor), so a present source holds exactly the bytes the merge read;
+  2. seq monotonicity — head discovery folds `levels/L*/` coverage
+     (`discover_head_reflects_merged_level_coverage`) and a resumed stream
+     re-anchors with a snapshot consuming its own seq — means no new L0 ever
+     lands at a seq ≤ an existing cover's max;
+  3. a cover `[a,b]` only forms from a greedy seq-contiguous run over the
+     `(min,max)`-sorted listing, which cannot skip an interleaved file, so at
+     merge time every same-level file inside `[a,b]` was an input; recursively,
+     a later lower-level re-merge of leftovers is a fold of inputs-of-inputs.
+  The one divergent shape is OUTSIDE the invariants: a second concurrent
+  writer (cross-host, flock is per-host) republishing into a seq key that
+  compaction vacated — a fork artifact that is subset-by-range but not
+  content-reflected. Verdict: **strengthen rather than trust the proof's
+  scope.** The convergence now also requires **endpoint chain evidence**: a
+  leftover at the cover's `min`/`max` must carry the cover's exact
+  `prev_checksum`/`chain_end` (the merge stamps those from its first/last
+  input, so genuine leftovers always match; the checks add no reads beyond
+  one header/object read per boundary leftover). A fork run touching either
+  endpoint is now preserved and stays the loud `OverlappingExisting`;
+  interior-only fork artifacts remain covered (only) by the single-writer
+  invariant, documented in the proof comment on `converge_interrupted_delete`.
+  Invariant test (nearest reachable approximation of the unreachable state):
+  `foreign_endpoint_subset_is_preserved_not_converged` (fail-on-revert:
+  dropping the evidence gate silently deletes the foreign object).
+- **A transient cover read decayed into a non-retryable loud error (real bug,
+  DST-reachable).** `verify_covers(...).is_err()` treated a TRANSIENT storage
+  failure on the cover GET as "unsound, skip"; batch selection then collided
+  with the cover and returned `OverlappingExisting` — non-retryable on a
+  transient-only plan: the E11 failure class reintroduced one GET deeper
+  (needs two coordinated transients, the same order of rarity as E11 itself —
+  a 4096-count sweep would eventually hit it). Fixed: `CompactionError::Storage`
+  propagates (retryable); only genuine unsoundness (decode / not-COMPACTED /
+  empty) skips to the loud path. Fail-on-revert:
+  `transient_cover_read_stays_retryable_not_loud` (reverting yields exactly
+  `OverlappingExisting` on `[2,3]` vs `[1,4]`).
+- **Double-delete/double-count under two overlapping covers.** A source subset
+  of two overlapping sound covers was pushed into the deletable set twice.
+  The engine never writes overlapping same-level covers, but the convergence
+  must stay correct if one exists (operator-restored object). Deduped by key;
+  `leftover_subset_of_two_overlapping_covers_converges_once`.
+- **Attack-shape coverage added** (all green, all deletion-only semantics):
+  arbitrary NON-prefix leftover subsets — a parallel `delete_many` leaves
+  gappy survivors, and the convergence must not depend on the serial-loop
+  prefix shape (`interrupted_delete_arbitrary_subset_leftovers_converge`,
+  survivors {1,2,4} exercising min-edge/interior/max-edge at once);
+  leftovers from TWO different interrupted merges under two covers in one
+  pass (`interrupted_deletes_from_two_merges_converge_together`); and the
+  convergence's own deletion interrupted mid-loop — state never worse (cover,
+  fresh sources untouched; strictly fewer leftovers), re-run converges,
+  third run a quiet NoOp (`interrupted_convergence_deletion_reconverges`).
+- **Part 2 re-verdict:** the string-signature classifier was itself the
+  swallow-shape inverted — `"not found"` free text (a DNS "host not found", a
+  proxy body mentioning 404, an SDK message quoted by a wrapper) would
+  misclassify a TRANSIENT as a missing manifest and silently start fresh, the
+  exact bug being fixed. Replaced with the typed
+  `s3::download_error_is_not_found` above;
+  `not_found_classifier_is_typed_not_string_matched` pins that
+  not-found-looking free text no longer classifies.
+- **Re-proofs on the fixed branch:** compaction fault sweep green at
+  `PROPTEST_CASES=256` (×2) and `4096`; full `walrust-dst` 79/79;
+  `walrust-core --lib` 288; `compaction_engine` 19 (13 + 6 new);
+  watch-shadow unit tests 12. Reverting `converge_interrupted_delete`
+  reproduces the exact pinned failure (`target range
+  0000000000000004-0000000000000005 overlaps existing merged object
+  …/levels/L1/0000000000000002-0000000000000004`); the four C2a revert-proof
+  tests are byte-identical to `main` (verified: the test-file diff is purely
+  additive).
