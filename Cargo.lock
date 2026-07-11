@@ -1456,8 +1456,9 @@ dependencies = [
 
 [[package]]
 name = "hadb-changeset"
-version = "0.4.1"
-source = "git+https://github.com/russellromney/hadb.git?rev=9892610afb6d34441db22618c1918620dded9a03#9892610afb6d34441db22618c1918620dded9a03"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "780fa479606d1df7701753a3e26a3f071313e1cfad0d08df0ab446603f9ef66a"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1470,8 +1471,9 @@ dependencies = [
 
 [[package]]
 name = "hadb-io"
-version = "0.4.1"
-source = "git+https://github.com/russellromney/hadb.git?rev=9892610afb6d34441db22618c1918620dded9a03#9892610afb6d34441db22618c1918620dded9a03"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da5a4adfdd30f9d8c4213e222485c8fe7e1f11b4d602646fa714a91135a7409b"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1492,8 +1494,9 @@ dependencies = [
 
 [[package]]
 name = "hadb-storage"
-version = "0.4.1"
-source = "git+https://github.com/russellromney/hadb.git?rev=9892610afb6d34441db22618c1918620dded9a03#9892610afb6d34441db22618c1918620dded9a03"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f6425032a3270f9c632825aff38cc733bf52cb2102e993a65961f9cc8cd9c44"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1502,8 +1505,9 @@ dependencies = [
 
 [[package]]
 name = "hadb-storage-s3"
-version = "0.4.1"
-source = "git+https://github.com/russellromney/hadb.git?rev=9892610afb6d34441db22618c1918620dded9a03#9892610afb6d34441db22618c1918620dded9a03"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ce042836f5aba9034c7370ea21f28aed37d04953a2b5c69da9bed68de2ef5a8c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3627,7 +3631,7 @@ dependencies = [
 
 [[package]]
 name = "walrust"
-version = "0.5.2"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3668,7 +3672,7 @@ dependencies = [
 
 [[package]]
 name = "walrust-core"
-version = "0.3.1"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "async-trait",
