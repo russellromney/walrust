@@ -2269,11 +2269,92 @@ a seeded transient-fault plan and grades every restore.
   now a pure `seed_state_from_manifest_fetch`: a CONFIRMED not-found seeds fresh
   (correct for a brand-new DB); a parse failure and any non-not-found fetch error
   **propagate** so startup fails loudly and is retried against a complete view.
-  Not-found is classified conservatively (`manifest_fetch_is_not_found`): only
-  recognised signatures (`NoSuchKey`, `not found`, 404) start fresh; an
+  Not-found is classified from the **typed** SDK error
+  (`s3::download_error_is_not_found`: the `NoSuchKey` service error, or a
+  service response with HTTP status 404), never by message-string matching; an
   unrecognised error is treated as NOT-not-found and propagated (fail-safe toward
   a loud retry, never a silent fresh start). Both directions are unit-tested
   (`manifest_not_found_starts_fresh`, `manifest_transient_fetch_does_not_start_fresh`,
   `manifest_corrupt_parse_does_not_start_fresh`, `manifest_present_seeds_recorded_state`,
-  `not_found_classifier_is_conservative`). Reverting the harden (defaulting to
-  `(0, None)` on any error) makes the transient test return `Fresh` and fail.
+  `not_found_classifier_is_typed_not_string_matched`). Reverting the harden
+  (defaulting to `(0, None)` on any error) makes the transient test return
+  `Fresh` and fail.
+
+### PR #37 adversarial review (fresh-eyes) — three findings, all fixed
+
+The review attacked the DELETE criterion itself: "range strict-subset of a
+merged object + that object passes `verify_covers`" does not *logically* prove
+the cover's CONTENT reflects the source — soundness is not supersession.
+
+- **Adjudication of content-supersession (the headline).** Enumerating the
+  reachable bucket states under the system's invariants shows every reachable
+  subset leftover IS content-superseded, with one boundary caveat now checked:
+  1. objects are immutable once published (L0 publishes are CAS
+     `put_if_absent`; merged objects are written once by the single
+     compactor), so a present source holds exactly the bytes the merge read;
+  2. seq monotonicity — head discovery folds `levels/L*/` coverage
+     (`discover_head_reflects_merged_level_coverage`) and a resumed stream
+     re-anchors with a snapshot consuming its own seq — means no new L0 ever
+     lands at a seq ≤ an existing cover's max;
+  3. a cover `[a,b]` only forms from a greedy seq-contiguous run over the
+     `(min,max)`-sorted listing, which cannot skip an interleaved file, so at
+     merge time every same-level file inside `[a,b]` was an input; recursively,
+     a later lower-level re-merge of leftovers is a fold of inputs-of-inputs.
+  The one divergent shape is OUTSIDE the invariants: a second concurrent
+  writer (cross-host, flock is per-host) republishing into a seq key that
+  compaction vacated — a fork artifact that is subset-by-range but not
+  content-reflected. Verdict: **strengthen rather than trust the proof's
+  scope.** The convergence now also requires **endpoint chain evidence**: a
+  leftover at the cover's `min`/`max` must carry the cover's exact
+  `prev_checksum`/`chain_end` (the merge stamps those from its first/last
+  input, so genuine leftovers always match; the checks add no reads beyond
+  one header/object read per boundary leftover). A fork run touching either
+  endpoint is now preserved and stays the loud `OverlappingExisting`;
+  interior-only fork artifacts remain covered (only) by the single-writer
+  invariant, documented in the proof comment on `converge_interrupted_delete`.
+  Invariant test (nearest reachable approximation of the unreachable state):
+  `foreign_endpoint_subset_is_preserved_not_converged` (fail-on-revert:
+  dropping the evidence gate silently deletes the foreign object).
+- **A transient cover read decayed into a non-retryable loud error (real bug,
+  DST-reachable).** `verify_covers(...).is_err()` treated a TRANSIENT storage
+  failure on the cover GET as "unsound, skip"; batch selection then collided
+  with the cover and returned `OverlappingExisting` — non-retryable on a
+  transient-only plan: the E11 failure class reintroduced one GET deeper
+  (needs two coordinated transients, the same order of rarity as E11 itself —
+  a 4096-count sweep would eventually hit it). Fixed: `CompactionError::Storage`
+  propagates (retryable); only genuine unsoundness (decode / not-COMPACTED /
+  empty) skips to the loud path. Fail-on-revert:
+  `transient_cover_read_stays_retryable_not_loud` (reverting yields exactly
+  `OverlappingExisting` on `[2,3]` vs `[1,4]`).
+- **Double-delete/double-count under two overlapping covers.** A source subset
+  of two overlapping sound covers was pushed into the deletable set twice.
+  The engine never writes overlapping same-level covers, but the convergence
+  must stay correct if one exists (operator-restored object). Deduped by key;
+  `leftover_subset_of_two_overlapping_covers_converges_once`.
+- **Attack-shape coverage added** (all green, all deletion-only semantics):
+  arbitrary NON-prefix leftover subsets — a parallel `delete_many` leaves
+  gappy survivors, and the convergence must not depend on the serial-loop
+  prefix shape (`interrupted_delete_arbitrary_subset_leftovers_converge`,
+  survivors {1,2,4} exercising min-edge/interior/max-edge at once);
+  leftovers from TWO different interrupted merges under two covers in one
+  pass (`interrupted_deletes_from_two_merges_converge_together`); and the
+  convergence's own deletion interrupted mid-loop — state never worse (cover,
+  fresh sources untouched; strictly fewer leftovers), re-run converges,
+  third run a quiet NoOp (`interrupted_convergence_deletion_reconverges`).
+- **Part 2 re-verdict:** the string-signature classifier was itself the
+  swallow-shape inverted — `"not found"` free text (a DNS "host not found", a
+  proxy body mentioning 404, an SDK message quoted by a wrapper) would
+  misclassify a TRANSIENT as a missing manifest and silently start fresh, the
+  exact bug being fixed. Replaced with the typed
+  `s3::download_error_is_not_found` above;
+  `not_found_classifier_is_typed_not_string_matched` pins that
+  not-found-looking free text no longer classifies.
+- **Re-proofs on the fixed branch:** compaction fault sweep green at
+  `PROPTEST_CASES=256` (×2) and `4096`; full `walrust-dst` 79/79;
+  `walrust-core --lib` 288; `compaction_engine` 19 (13 + 6 new);
+  watch-shadow unit tests 12. Reverting `converge_interrupted_delete`
+  reproduces the exact pinned failure (`target range
+  0000000000000004-0000000000000005 overlaps existing merged object
+  …/levels/L1/0000000000000002-0000000000000004`); the four C2a revert-proof
+  tests are byte-identical to `main` (verified: the test-file diff is purely
+  additive).
