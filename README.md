@@ -142,8 +142,26 @@ behavior breaks:
 - **Checkpoints can't destroy unshipped data.** walrust pins the WAL with a
   read transaction (via the small `_walrust_seq` table it creates in each
   watched database — the same technique Litestream uses), so an external
-  `wal_checkpoint` cannot reset the WAL mid-backup. A checkpoint while walrust
-  is stopped is detected on restart and triggers an immediate re-snapshot.
+  `wal_checkpoint` cannot reset the WAL mid-backup. If the database *was*
+  checkpointed while walrust was stopped, those pages live only in the `.db`
+  file (not the WAL), so restart re-anchors from the current `.db` — see below.
+- **Restart re-anchors with a full snapshot (`--independent-tasks`).** On every
+  restart against an existing stream, walrust re-anchors by uploading a fresh
+  full snapshot of the current `.db`, not by resuming an incremental. This is a
+  deliberate cost/safety trade, and it happens on *clean* restarts too (deploys,
+  host reboots), not just crashes. Why unconditional: the in-memory checksum
+  chain that an incremental would resume from is not reconstructible from the
+  on-disk `.db` (the chain is a running page-hash; the `.db` only yields a
+  whole-file hash, a different space), and — the decisive reason — if SQLite
+  checkpointed and truncated the WAL for pages walrust had not yet shipped, only
+  a snapshot of the live `.db` captures them; resuming an incremental from the
+  (now-truncated) WAL would silently drop them. walrust cannot cheaply tell that
+  safe case from the lossy one at startup, so it always takes the safe path.
+  **Cost:** each restart uploads ~one DB's worth of data and delays replication
+  of new writes until the snapshot finishes — cost scales with DB size (a 10 GB
+  database re-ships ~10 GB and stalls startup for tens of seconds to minutes on
+  every restart). A persisted local chain cursor to skip the snapshot on a
+  provably-clean restart is possible future work (see ROADMAP).
 - **Single writer, enforced.** A lock file (`.walrust-<db>.lock`) makes a
   second watcher on the same host fail fast instead of corrupting the backup.
 - **Retention never orphans a restore point.** `prune` keeps every object a

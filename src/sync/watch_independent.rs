@@ -23,7 +23,10 @@ use hadb_storage_s3::S3Storage;
 use super::manifest::discover_state_from_s3;
 use super::types::{CacheState, DbState, DbTaskState, SyncInput, TriggerState};
 use super::verify::validate_backup_integrity;
-use super::wal_sync::{do_sync, sync_wal_concurrent_with_retry, take_snapshot_with_retry};
+use super::wal_sync::{
+    anchor_stream_on_startup_with_retry, do_sync, sync_wal_concurrent_with_retry,
+    take_snapshot_with_retry,
+};
 
 /// Watch databases using independent per-DB tasks for maximum concurrency
 ///
@@ -147,25 +150,63 @@ pub async fn watch_with_independent_tasks(
         let wal_exists = wal_path.exists();
         tracing::debug!("{}: WAL exists = {}", name, wal_exists);
 
-        let (wal_offset, wal_generation, current_txid, db_checksum) = if wal_exists {
+        let mut db_state = DbState {
+            name: name.clone(),
+            db_path: db_path.clone(),
+            wal_path: wal_path.clone(),
+            wal_offset,
+            wal_generation,
+            current_txid,
+            last_snapshot: None,
+            db_checksum,
+            wal_salt: None,
+            wal_checksum_chain: None,
+        };
+
+        if current_txid > 0 {
+            // RESUME against an existing stream (restart/redeploy). The in-memory
+            // checksum-chain cursor is gone, so resuming with an incremental would
+            // publish a seq-adjacent but chain-DISCONTINUOUS L0 at the boundary
+            // (the "restart re-anchor seam"): restore-to-latest then hard-fails its
+            // pre-apply chain check across the seam, and compaction's
+            // `contiguous_batch` selects a seq-contiguous batch spanning the break
+            // that the merge refuses forever (a liveness wedge). Re-anchor with a
+            // fresh snapshot instead: it consumes its own seq (a clean GAP past
+            // every stale pre-crash L0), is a self-consistent base, and every
+            // post-restart incremental chains from it. See
+            // `legacy_wal_sync::anchor_stream_on_startup`.
+            if let Err(e) = anchor_stream_on_startup_with_retry(
+                Arc::clone(&client),
+                bucket_name.clone(),
+                prefix.clone(),
+                &mut db_state,
+                retry_policy.clone(),
+                Arc::clone(&webhook_sender),
+            )
+            .await
+            {
+                tracing::warn!(
+                    "{}: Startup re-anchor snapshot failed (will retry on changes): {}",
+                    name,
+                    e
+                );
+            } else {
+                tracing::info!(
+                    "{}: Re-anchored resumed stream with a fresh snapshot (TXID {})",
+                    name,
+                    db_state.current_txid
+                );
+            }
+        } else if wal_exists {
+            // FRESH stream: the initial sync publishes the base snapshot at TXID 1.
             tracing::debug!(
                 "{}: Starting initial sync (offset={}, gen={}, txid={})",
                 name,
-                wal_offset,
-                wal_generation,
-                current_txid
+                db_state.wal_offset,
+                db_state.wal_generation,
+                db_state.current_txid
             );
-            let input = SyncInput {
-                db_path: db_path.clone(),
-                name: name.clone(),
-                wal_path: wal_path.clone(),
-                wal_offset,
-                wal_generation,
-                current_txid,
-                db_checksum,
-                wal_salt: None,
-                wal_checksum_chain: None,
-            };
+            let input = SyncInput::from(&db_state);
             match sync_wal_concurrent_with_retry(
                 Arc::clone(&client),
                 bucket_name.clone(),
@@ -193,12 +234,10 @@ pub async fn watch_with_independent_tasks(
                     } else {
                         tracing::debug!("{}: Initial sync returned 0 frames", name);
                     }
-                    (
-                        result.new_wal_offset,
-                        result.new_wal_generation,
-                        result.new_current_txid,
-                        result.new_db_checksum,
-                    )
+                    db_state.wal_offset = result.new_wal_offset;
+                    db_state.wal_generation = result.new_wal_generation;
+                    db_state.current_txid = result.new_current_txid;
+                    db_state.db_checksum = result.new_db_checksum;
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -206,28 +245,15 @@ pub async fn watch_with_independent_tasks(
                         name,
                         e
                     );
-                    (wal_offset, wal_generation, current_txid, db_checksum)
                 }
             }
         } else {
             tracing::debug!("{}: No WAL file found, skipping initial sync", name);
-            (wal_offset, wal_generation, current_txid, db_checksum)
-        };
+        }
 
-        // Create task state with potentially updated values from initial sync
+        // Create task state with potentially updated values from the startup anchor
         let task_state = DbTaskState {
-            db_state: DbState {
-                name: name.clone(),
-                db_path: db_path.clone(),
-                wal_path: wal_path.clone(),
-                wal_offset,
-                wal_generation,
-                current_txid,
-                last_snapshot: None,
-                db_checksum,
-                wal_salt: None,
-                wal_checksum_chain: None,
-            },
+            db_state,
             trigger_state: TriggerState::default(),
             sync_config: db_config.sync.clone(),
             compaction: db_config.compaction,

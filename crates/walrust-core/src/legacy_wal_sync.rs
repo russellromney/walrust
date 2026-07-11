@@ -96,6 +96,59 @@ pub async fn sync_watched_db_once_to_storage(
     Ok(output)
 }
 
+/// Startup (re-)anchor for a watched stream, chosen by whether remote state
+/// already exists.
+///
+/// A watch process discovers `current_txid` from the object listing before it
+/// starts syncing. Two cases:
+///
+/// - **Fresh stream** (`current_txid == 0`, nothing published yet): the initial
+///   sync creates the base snapshot at TXID 1 (the `current_txid == 0` branch of
+///   [`sync_wal_to_storage`]). Nothing to re-anchor against.
+///
+/// - **Resume** (`current_txid > 0`, a restart/redeploy against an existing
+///   stream): publish a fresh re-anchor **snapshot** rather than resuming with an
+///   incremental. This is the fix for the restart re-anchor seam.
+///
+///   On an ungraceful restart the in-memory checksum-chain cursor is lost, so the
+///   first post-restart incremental would chain from `db_checksum` recomputed off
+///   the on-disk `.db` file — a value that does **not** equal the last pre-crash
+///   L0's `chain_end` (SQLite may not have checkpointed the WAL, and the resumed
+///   read restarts at `wal_offset == 0` re-reading the whole WAL). That produces
+///   an L0 object that is **seq/TXID-adjacent** to the last pre-crash L0 but
+///   **chain-discontinuous** at the boundary — the "seam". Two failures follow
+///   from a seam: restore-to-latest walks the seq-adjacent L0s across the break
+///   and hard-fails its pre-apply chain check ("does not chain"), and
+///   `contiguous_batch` selects a seq-contiguous batch spanning the break that
+///   the merge then refuses (`NonContiguous`) forever (a liveness wedge, since the
+///   pre-seam files stay oldest).
+///
+///   Re-anchoring with a snapshot dissolves both: a snapshot consumes its own seq
+///   (`take_snapshot_to_storage`: `new_current_txid = current_txid + 1`), so the
+///   next incremental starts strictly **past** every stale pre-crash L0 — a seq
+///   GAP at the boundary, exactly the shape `contiguous_batch` already skips and
+///   the restore planner floors at. The snapshot is a fresh, self-consistent base
+///   (`compute_checksum_from_file` of the freshly passive-checkpointed file), and
+///   post-restart incrementals chain from it. The pre-seam L0s stay below the
+///   floor, superseded — never planned across, never merged across.
+///
+///   This mirrors the DST state machine's `KillRestart` op, which already models
+///   the restart as an eager re-anchor snapshot; the seam existed because the
+///   production `--independent-tasks` startup skipped it.
+pub async fn anchor_stream_on_startup(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut WatchedDbState,
+) -> Result<SyncOutput> {
+    if state.current_txid > 0 {
+        let output = take_snapshot_to_storage(storage, prefix, SyncInput::from(&*state)).await?;
+        apply_sync_output_to_watched_state(state, &output);
+        Ok(output)
+    } else {
+        sync_watched_db_once_to_storage(storage, prefix, state).await
+    }
+}
+
 pub async fn sync_watched_db_once_to_cache(
     state: &mut WatchedDbState,
     cache: &Arc<LocalCache>,

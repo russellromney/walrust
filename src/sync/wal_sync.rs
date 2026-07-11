@@ -84,6 +84,84 @@ pub(crate) async fn sync_wal_concurrent_with_retry(
     }
 }
 
+/// Startup (re-)anchor for a watched stream, with the same bounded transient
+/// retry + webhook notification the sync/snapshot paths use.
+///
+/// Delegates the decision (fresh base vs resume re-anchor snapshot) to
+/// [`walrust_core::legacy_wal_sync::anchor_stream_on_startup`] so the production
+/// `--independent-tasks` startup and the regression suites exercise the exact
+/// same re-anchor logic. See that function's docs for why a resume MUST publish
+/// a snapshot (the restart chain seam).
+pub(crate) async fn anchor_stream_on_startup_with_retry(
+    client: Arc<aws_sdk_s3::Client>,
+    bucket: String,
+    prefix: String,
+    state: &mut DbState,
+    retry_policy: RetryPolicy,
+    webhook_sender: Arc<WebhookSender>,
+) -> Result<()> {
+    let db_name = state.name.clone();
+    let mut watched = WatchedDbState::from(&*state);
+    let mut attempts = 0u32;
+
+    loop {
+        attempts += 1;
+        let storage = S3Storage::new((*client).clone(), bucket.clone());
+        match walrust_core::legacy_wal_sync::anchor_stream_on_startup(
+            &storage,
+            &prefix,
+            &mut watched,
+        )
+        .await
+        {
+            Ok(_) => {
+                state.apply_watched_state(&watched);
+                return Ok(());
+            }
+            Err(e) => {
+                let error_kind = classify_error(&e);
+                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
+
+                if error_kind == ErrorKind::AuthError {
+                    tracing::error!(
+                        "{}: Authentication error during startup anchor: {}",
+                        db_name,
+                        e
+                    );
+                    webhook_sender
+                        .notify_auth_failure(&db_name, &e.to_string())
+                        .await;
+                    return Err(e);
+                }
+
+                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
+                    tracing::error!(
+                        "{}: Startup anchor failed after {} attempts: {}",
+                        db_name,
+                        attempts,
+                        e
+                    );
+                    webhook_sender
+                        .notify_upload_failed(&db_name, &e.to_string(), attempts)
+                        .await;
+                    return Err(e);
+                }
+
+                let delay = retry_policy.calculate_delay(attempts - 1);
+                tracing::warn!(
+                    "{}: Startup anchor attempt {}/{} failed, retrying in {:?}: {}",
+                    db_name,
+                    attempts,
+                    retry_policy.config().max_retries + 1,
+                    delay,
+                    e
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
 // ============================================================================
 // Independent per-DB task for concurrent sync
 // ============================================================================

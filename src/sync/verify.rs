@@ -43,16 +43,27 @@ struct VerifiedLtxFile {
 }
 
 /// Detect real TXID gaps in the live (generation-0) incremental pool (E3),
-/// now **level-aware**.
+/// now **level- and snapshot-supersession-aware**.
 ///
 /// `live` is `(key, min_txid, max_txid)` for each gen-0 file, sorted by
 /// `min_txid`; `snapshot_maxes` is the set of full-snapshot max TXIDs;
 /// `merged_ranges` are the inclusive seq spans of the merged compaction levels
-/// (L1/L2…). A hole `[expected, min_txid-1]` between consecutive incrementals
-/// is only a real gap when **neither** bridges it:
-///   - a full snapshot sits at `min_txid - 1` (a valid restore base), **nor**
-///   - a merged level range *contiguously covers* the whole hole — i.e. the L0
-///     objects were compacted away into a coarser range, not lost.
+/// (L1/L2…). A hole `[expected, hole_end]` (`hole_end = min_txid - 1`) between
+/// consecutive incrementals is bridged — not a gap — when a restore path covers
+/// it. A full snapshot at TXID `S` supersedes **every** TXID `<= S` (it is a
+/// complete restore base), so only the part of the hole ABOVE the newest
+/// snapshot inside it must be covered by merged level ranges:
+///   - a snapshot inside the hole at `S`, with the remaining suffix
+///     `[S+1, hole_end]` contiguously covered by level ranges (a snapshot
+///     exactly at `hole_end` leaves nothing to cover — the classic
+///     "snapshot consumes its own TXID" single-hole shape); **or**
+///   - with no snapshot inside the hole, level ranges contiguously covering
+///     all of it (the L0 objects were compacted away, not lost).
+/// The combined shape arises routinely from the restart re-anchor: the startup
+/// snapshot consumes the TXID at the hole's START and compaction then folds the
+/// post-restart L0s into levels — snapshot at `expected`, levels covering
+/// `[expected+1, hole_end]` (proven healthy by the row-exact soak restore; see
+/// `e3_reanchor_snapshot_plus_levels_bridge_is_not_a_gap`).
 /// Returns `(key, expected_next, actual_min)` for each genuine gap.
 pub(crate) fn detect_live_txid_gaps(
     live: &[(String, u64, u64)],
@@ -64,9 +75,17 @@ pub(crate) fn detect_live_txid_gaps(
     for (key, min_txid, max_txid) in live {
         if let Some(expected) = expected_next {
             if *min_txid > expected {
-                let snapshot_bridges = snapshot_maxes.contains(&(*min_txid - 1));
-                let level_bridges = ranges_cover(expected, *min_txid - 1, merged_ranges);
-                if !snapshot_bridges && !level_bridges {
+                let hole_end = *min_txid - 1;
+                // Newest full snapshot inside the hole supersedes everything at
+                // or below it; only the suffix above it needs level coverage.
+                // (Checking just the newest is equivalent to trying all: a
+                // higher snapshot leaves a smaller suffix, and `ranges_cover`
+                // tolerates ranges starting below `lo`.)
+                let bridged = match snapshot_maxes.range(expected..=hole_end).next_back() {
+                    Some(&s) => ranges_cover(s + 1, hole_end, merged_ranges),
+                    None => ranges_cover(expected, hole_end, merged_ranges),
+                };
+                if !bridged {
                     gaps.push((key.clone(), expected, *min_txid));
                 }
             }
@@ -326,6 +345,52 @@ mod tests {
         let gaps = detect_live_txid_gaps(&liveset, &snapshots, &[]);
         assert_eq!(gaps.len(), 1, "unbridged hole must be a real gap: {gaps:?}");
         assert_eq!(gaps[0], ("b".to_string(), 47, 48));
+    }
+
+    #[test]
+    fn e3_reanchor_snapshot_plus_levels_bridge_is_not_a_gap() {
+        // The restart re-anchor shape, pinned verbatim from a live soak run
+        // (fail-on-revert for the snapshot-supersession rule). After a
+        // kill/restart the startup re-anchor snapshot consumes the TXID at the
+        // START of the hole (48), the first post-restart incremental (49-98)
+        // chains from it, and compaction then folds that incremental into a
+        // merged level and deletes it. The surviving gen-0 pool jumps
+        // 40..47 → 99..102: the hole [48, 98] is bridged by snapshot(48) +
+        // level [49, 98] COMBINED — neither alone (the snapshot is not at the
+        // hole's end; the levels do not cover the snapshot-consumed 48). The
+        // bucket is healthy (the soak's restore-to-latest is row-exact), so
+        // verify must be silent. A second periodic snapshot inside the same
+        // hole (58) must not confuse the rule.
+        let liveset = vec![live("a", 40, 47), live("b", 99, 102)];
+        let snapshots: std::collections::BTreeSet<u64> = [1, 48, 58].into_iter().collect();
+        let merged = vec![SeqRange::new(49, 98)];
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots, &merged);
+        assert!(
+            gaps.is_empty(),
+            "a re-anchor-snapshot + level-covered hole must not be a gap: {gaps:?}"
+        );
+        // The same hole with the level coverage stopping short of the hole's
+        // end is NOT restorable above the folded range → still a real gap.
+        let short = vec![SeqRange::new(49, 80)];
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots, &short);
+        assert_eq!(
+            gaps,
+            vec![("b".to_string(), 48, 99)],
+            "a partially-covered re-anchor hole must still alarm"
+        );
+        // Adversarial: a REAL missing range sits ABOVE the newest in-hole
+        // snapshot (58) and BELOW where level coverage resumes — snapshot(58),
+        // then [59, 69] uncovered, then levels [70, 98]. The suffix above the
+        // superseding snapshot is not contiguously covered from 59, so this is
+        // NOT restorable and MUST still alarm (supersession only excuses the
+        // prefix at/below the snapshot, never an interior hole above it).
+        let interior_hole = vec![SeqRange::new(70, 98)];
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots, &interior_hole);
+        assert_eq!(
+            gaps,
+            vec![("b".to_string(), 48, 99)],
+            "a hole above the newest in-hole snapshot but below level coverage must still alarm"
+        );
     }
 
     #[test]
