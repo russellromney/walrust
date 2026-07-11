@@ -1846,4 +1846,225 @@ mod tests {
         rt.block_on(run_case(&ops, FaultPlan::none(0), true))
             .unwrap();
     }
+
+    // ── Restart re-anchor seam regression (HIGH PRIORITY, PR #32 review) ─────
+    //
+    // These two tests reproduce the production restart seam DETERMINISTICALLY
+    // and pin BOTH of its symptoms as fail-on-revert guards for the shared
+    // startup re-anchor decision, `legacy_wal_sync::anchor_stream_on_startup`.
+    //
+    // Unlike `Harness::kill_restart` (which models the CORRECT eager-snapshot
+    // restart the DST always assumed), these drive the SAME
+    // `anchor_stream_on_startup` the production `--independent-tasks` watch loop
+    // now calls on startup. Revert its resume branch (snapshot -> incremental)
+    // and the restart publishes a seq-adjacent, chain-DISCONTINUOUS L0 at the
+    // boundary: `reanchor_restart_restore_survives_the_chain_seam` then fails
+    // with "Pre-apply checksum mismatch ... does not chain", and
+    // `reanchor_restart_compaction_does_not_wedge_on_the_seam` then fails with
+    // `CompactionError::NonContiguous`.
+    use walrust::walrust_core::legacy_ltx::compute_checksum_from_file;
+    use walrust::walrust_core::legacy_wal_sync::anchor_stream_on_startup;
+
+    /// A bucket whose gen-0 L0 stream spans a kill/restart boundary, produced by
+    /// driving the real engine + the production startup re-anchor.
+    struct SeamWorld {
+        storage: MockStorageBackend,
+        prefix: String,
+        name: String,
+        expected: Vec<i64>,
+        _conn: Connection, // keeps the WAL alive across the whole sequence
+        _tmp: TempDir,
+    }
+
+    fn seam_insert_rows(conn: &Connection, n: usize, next_id: &mut i64, expected: &mut Vec<i64>) {
+        conn.execute_batch("BEGIN IMMEDIATE;").unwrap();
+        for _ in 0..n {
+            let id = *next_id;
+            conn.execute(
+                "INSERT INTO items (id, value) VALUES (?1, ?2)",
+                rusqlite::params![id, format!("v-{id}")],
+            )
+            .unwrap();
+            expected.push(id);
+            *next_id += 1;
+        }
+        conn.execute_batch("COMMIT;").unwrap();
+    }
+
+    async fn drive_kill_restart_seam() -> SeamWorld {
+        let tmp = TempDir::new().unwrap();
+        let db_path = tmp.path().join("seam.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             PRAGMA page_size=4096;
+             CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .unwrap();
+
+        let name = "seam".to_string();
+        let prefix = "sm/".to_string();
+        let storage = MockStorageBackend::new(MockStorageConfig::new("seam"));
+        let wal_path = db_path.with_extension("db-wal");
+        let mut state = WatchedDbState {
+            db_path: db_path.clone(),
+            name: name.clone(),
+            wal_path: wal_path.clone(),
+            wal_offset: 0,
+            wal_generation: 0,
+            current_txid: 0,
+            db_checksum: None,
+            wal_salt: None,
+            wal_checksum_chain: None,
+        };
+
+        let mut next_id = 1i64;
+        let mut expected: Vec<i64> = Vec::new();
+
+        // Initial base publish (the production initial sync at txid 0).
+        sync_watched_db_once_to_storage(&storage, &prefix, &mut state)
+            .await
+            .unwrap();
+
+        // One PRE-restart incremental. The WAL is never checkpointed, so the
+        // on-disk `.db` file stays behind the chain tip — that is exactly what
+        // makes the recomputed restart checksum diverge from the last L0's
+        // chain_end and forge the seam on the reverted (incremental) resume path.
+        seam_insert_rows(&conn, 3, &mut next_id, &mut expected);
+        sync_watched_db_once_to_storage(&storage, &prefix, &mut state)
+            .await
+            .unwrap();
+
+        // KILL/RESTART: rebuild state exactly as `watch_independent` startup does
+        // (rediscover the head from the listing, reset the WAL cursor, recompute
+        // the checksum from the `.db` FILE), then run the PRODUCTION re-anchor.
+        let (current_txid, _gen) = discover_legacy_state(&storage, &prefix, &name)
+            .await
+            .unwrap();
+        let db_checksum = compute_checksum_from_file(&db_path)
+            .ok()
+            .map(|c| c.into_inner());
+        state = WatchedDbState {
+            db_path: db_path.clone(),
+            name: name.clone(),
+            wal_path,
+            wal_offset: 0,
+            wal_generation: 0,
+            current_txid,
+            db_checksum,
+            wal_salt: None,
+            wal_checksum_chain: None,
+        };
+        anchor_stream_on_startup(&storage, &prefix, &mut state)
+            .await
+            .unwrap();
+
+        // Two POST-restart incrementals: these MUST chain from the re-anchor.
+        seam_insert_rows(&conn, 3, &mut next_id, &mut expected);
+        sync_watched_db_once_to_storage(&storage, &prefix, &mut state)
+            .await
+            .unwrap();
+        seam_insert_rows(&conn, 3, &mut next_id, &mut expected);
+        sync_watched_db_once_to_storage(&storage, &prefix, &mut state)
+            .await
+            .unwrap();
+
+        SeamWorld {
+            storage,
+            prefix,
+            name,
+            expected,
+            _conn: conn,
+            _tmp: tmp,
+        }
+    }
+
+    fn seam_restored_ids(path: &Path) -> Vec<i64> {
+        let conn = Connection::open(path).unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok", "restored db failed integrity_check");
+        let ids = conn
+            .prepare("SELECT id FROM items ORDER BY id")
+            .unwrap()
+            .query_map([], |r| r.get::<_, i64>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        ids
+    }
+
+    /// Symptom 2 (restore): restore-to-latest must walk the post-restart chain
+    /// without hitting the "does not chain" seam. Fail-on-revert of
+    /// `anchor_stream_on_startup`'s resume branch.
+    #[test]
+    fn reanchor_restart_restore_survives_the_chain_seam() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let world = drive_kill_restart_seam().await;
+            let out_dir = TempDir::new().unwrap();
+            let out = out_dir.path().join("restored.db");
+            restore_legacy_ltx(&world.storage, &world.prefix, &world.name, &out, None)
+                .await
+                .expect(
+                    "restore-to-latest must survive a kill/restart seam — reverting \
+                     anchor_stream_on_startup (snapshot -> incremental) reproduces \
+                     'Pre-apply checksum mismatch ... does not chain'",
+                );
+            assert_eq!(
+                seam_restored_ids(&out),
+                world.expected,
+                "restored rows must exactly match every committed row across the seam"
+            );
+        });
+    }
+
+    /// Symptom 1 (compaction): the leveled merge engine must not wedge on the
+    /// seam. On the reverted (incremental) resume the oldest seq-contiguous L0
+    /// run straddles the chain break and `run_level_compaction` returns
+    /// `NonContiguous` forever; with the re-anchor snapshot the boundary is a
+    /// clean seq gap and every merge stays within one chain.
+    #[test]
+    fn reanchor_restart_compaction_does_not_wedge_on_the_seam() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let world = drive_kill_restart_seam().await;
+            let layout =
+                RangeLayout::new(Arc::new(world.storage.clone()), &world.prefix, &world.name);
+            // Drain L0->L1 (and L1->L2) to quiescence with batch 2 / keep_fine 0.
+            for _ in 0..64 {
+                let mut progressed = false;
+                for level in [0u32, 1] {
+                    match run_level_compaction(
+                        &layout,
+                        level,
+                        2,
+                        Duration::from_secs(0),
+                        COMPACTION_NOW_MS,
+                    )
+                    .await
+                    {
+                        Ok(o) => progressed |= o.merged_count() > 0,
+                        Err(e) => panic!(
+                            "compaction wedged on the restart seam — reverting \
+                             anchor_stream_on_startup reproduces CompactionError::NonContiguous \
+                             at level {level}: {e}"
+                        ),
+                    }
+                }
+                if !progressed {
+                    break;
+                }
+            }
+            // The compacted, seam-crossing bucket must still restore row-exact.
+            let out_dir = TempDir::new().unwrap();
+            let out = out_dir.path().join("restored.db");
+            restore_legacy_ltx(&world.storage, &world.prefix, &world.name, &out, None)
+                .await
+                .expect("restore after compaction must stay row-exact");
+            assert_eq!(seam_restored_ids(&out), world.expected);
+        });
+    }
 }

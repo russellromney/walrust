@@ -27,96 +27,22 @@
 # the loop: the row-diff guard above must have real teeth, not just pass by
 # accident.
 #
-# KNOWN RESIDUE (found by this drill, NOT compaction-specific, high priority
-# -- see ROADMAP "Compaction (shipped — default off)"): under this exact
-# stress pattern, restore-to-latest can occasionally (observed ~2 of 4 runs
-# in one local sample) hard-fail with a typed "Pre-apply checksum mismatch
-# ... does not chain" error that does NOT self-heal even given many more
-# minutes and several more periodic-snapshot ticks. Root-caused to a likely
-# mismatch between two independent checksum-chaining code paths in
-# crates/walrust-core/src/legacy_wal_sync.rs::sync_wal_to_storage (the
-# `pre_checksum` derivation around line 255) and the restart-time
-# `db_checksum`/`wal_offset=0` reset in
-# src/sync/watch_independent.rs::watch_with_independent_tasks (around lines
-# 126-133) -- NOT fixed here (needs careful, dedicated study of
-# `wal::read_frames_as_page_map_checked`'s full-WAL-replay-from-offset-0
-# chaining vs its step-by-step incremental chaining to be safely fixed; a
-# rushed change to checksum-chain code risks turning a loud failure into
-# silent corruption, which is strictly worse). This failure is provably
-# SAFE (loud-only, never silent-wrong): the restore chain is content-anchored
-# end to end (crates/walrust-core/src/legacy_restore.rs threads a running
-# checksum recomputed from the ACTUAL applied bytes, each object's stored
-# pre_apply is verified against it, its post against its own trailer, and
-# `integrity_check` is a final backstop), so the same root cause can only ever
-# hard-fail the restore, never return a wrong-but-Ok database. That is why
-# retrying it is acceptable at all.
-#
-# NOT masked, and SCOPED: `soak_wait_restore_or_classify` below fails a single
-# attempt for real when this happens, and CLASSIFIES it from the restore's own
-# error text. The outer wrapper retries a fresh attempt ONLY for this one exact
-# signature ("Pre-apply checksum mismatch" / "does not chain"); ANY other
-# failure -- a silent wrong-count restore, a different typed error, an
-# unexpected ERROR line, a convergence or toothless-guard failure, a brand-new
-# flaky bug -- propagates immediately and is NEVER retried, so the retry cannot
-# hide a regression or a rate/severity change in anything but this already-
-# tracked, root-caused, safe flake. Every occurrence is logged loudly; if even
-# this signature persists across every attempt the drill still fails for real
-# and nightly's existing failed-drill-to-GitHub-issue automation tracks it.
-# This is honesty over green: the bug is not hidden, and the tolerance is
-# narrow enough that a plain "retry on any nonzero" (what this used to be)
-# can no longer swallow anything else.
+# The restart re-anchor seam that this drill originally exposed (a
+# seq-contiguous but checksum-DIScontinuous L0 boundary after a kill/restart,
+# which flaked restore-to-latest with "Pre-apply checksum mismatch ... does not
+# chain" AND permanently wedged compaction with CompactionError::NonContiguous)
+# is FIXED at the root: `--independent-tasks` startup now re-anchors a resumed
+# stream with a fresh snapshot (walrust_core::legacy_wal_sync::
+# anchor_stream_on_startup), so post-restart L0s never sit seq-adjacent to a
+# chain-incompatible predecessor. This drill therefore runs UN-crutched: a
+# single attempt, restore failures fail hard (no classify/retry), and ANY
+# ERROR-level log line fails the drill (no NonContiguous allow-list).
 #
 # Wired into `make drill` (drills/run-all.sh) AND the nightly workflow (which
 # runs `make drill`) -- unlike drills/version-skew.sh, this drill needs no
-# network beyond the S3 endpoint already required by every other drill, so a
-# 2-minute (up to ~3x on a retried flake) addition to the nightly run is cheap.
+# network beyond the S3 endpoint already required by every other drill.
 
 set -Eeuo pipefail
-
-# Exit code an inner attempt uses to signal "I failed ONLY because of the one
-# known, root-caused, provably-SAFE (loud, never silent-wrong) deferred
-# restore-chain flake" (see the KNOWN RESIDUE comment above and the final
-# restore step below). It is the ONLY failure the outer wrapper retries. Any
-# other nonzero exit -- a different restore error, an unexpected ERROR line, a
-# convergence failure, a toothless-guard failure, a genuinely new bug that
-# happens to be flaky -- propagates immediately and is NEVER retried, so the
-# retry cannot mask a regression or a rate/severity change in anything but this
-# exact, already-tracked signature. Chosen outside sysexits.h's 64-78 range.
-SOAK_KNOWN_FLAKE_EXIT=42
-
-if [ "${WALRUST_DRILL_SOAK_RETRY_INNER:-0}" != "1" ]; then
-  # Outer retry wrapper (see the KNOWN RESIDUE comment above): re-exec this
-  # same script as a fully independent attempt (its own drill_setup/cleanup/
-  # S3 prefix/trap lifecycle -- no state carries over between attempts) up to
-  # WALRUST_DRILL_SOAK_ATTEMPTS times. Crucially, it retries ONLY when an
-  # attempt exits with SOAK_KNOWN_FLAKE_EXIT (the one documented, diagnosed,
-  # loud-only restore-chain flake); every other failure is a real failure and
-  # exits immediately with the inner attempt's own code, unmasked. A plain
-  # "retry on any nonzero" wrapper (what this used to be) would have silently
-  # swallowed a brand-new ~50%-flaky bug or a worsening of any other assertion.
-  attempts=${WALRUST_DRILL_SOAK_ATTEMPTS:-3}
-  attempt=1
-  flake_hits=0
-  while [ "$attempt" -le "$attempts" ]; do
-    inner_exit=0
-    WALRUST_DRILL_SOAK_RETRY_INNER=1 "$0" "$@" || inner_exit=$?
-    if [ "$inner_exit" -eq 0 ]; then
-      exit 0
-    fi
-    if [ "$inner_exit" -ne "$SOAK_KNOWN_FLAKE_EXIT" ]; then
-      printf '[compaction-soak] attempt %s/%s failed with exit %s -- NOT the known deferred restore-chain flake; failing immediately (not retried, not masked)\n' \
-        "$attempt" "$attempts" "$inner_exit" >&2
-      exit "$inner_exit"
-    fi
-    flake_hits=$((flake_hits + 1))
-    printf '[compaction-soak] attempt %s/%s hit the KNOWN deferred restore-chain flake (occurrence %s; ROADMAP HIGH PRIORITY) -- retrying as a fresh attempt\n' \
-      "$attempt" "$attempts" "$flake_hits" >&2
-    attempt=$((attempt + 1))
-  done
-  printf '[compaction-soak] the known deferred restore-chain flake reproduced on ALL %s attempts -- failing the drill for real (nightly should track this; it is a real, if known, availability failure)\n' \
-    "$attempts" >&2
-  exit 1
-fi
 
 # shellcheck source=drills/lib.sh
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
@@ -134,21 +60,12 @@ INDUCE_LOSS=${WALRUST_DRILL_SOAK_INDUCE_LOSS:-1}
 [ "$TOTAL_SECONDS" -ge "$((KILL_EVERY * 4))" ] \
   || fail "TOTAL_SECONDS=$TOTAL_SECONDS too small for KILL_EVERY=$KILL_EVERY to yield >= 4 cycles"
 
-# Restore-to-latest with the known-flake classification the retry wrapper needs.
-# Polls (like lib.sh's wait_restore_count) up to DRILL_RESTORE_TIMEOUT. On
-# success: return. On a persistent failure it decides, from the restore's own
-# error text, whether this is THE one deferred, root-caused, provably loud-only
-# restore-chain flake (see the KNOWN RESIDUE header + ROADMAP) or something
-# else:
-#   - Known signature ("Pre-apply checksum mismatch" / "does not chain"):
-#     exit SOAK_KNOWN_FLAKE_EXIT so the outer wrapper -- and ONLY that exact
-#     signature -- may retry a fresh attempt. Each occurrence is logged loudly.
-#   - Anything else (a row diff with no such error, a different typed error, a
-#     restore that never even ran): `fail` hard. This is a real, unmasked
-#     failure; the retry wrapper must never swallow it.
-# This is what stops a plain "retry on any nonzero" from hiding a regression:
-# the tolerance is scoped to one exact, already-tracked, safe signature.
-soak_wait_restore_or_classify() {
+# Restore-to-latest, polled up to DRILL_RESTORE_TIMEOUT. Any persistent failure
+# -- a row diff, a chain error, a restore that never ran -- fails the drill hard.
+# The restart re-anchor seam that used to make this flake is fixed at the root
+# (see the header), so there is no classify/retry crutch: a "does not chain"
+# here now means a genuine regression and MUST fail loudly.
+soak_wait_restore() {
   local name=$1
   local expected=$2
   local deadline=$((SECONDS + DRILL_RESTORE_TIMEOUT))
@@ -159,19 +76,8 @@ soak_wait_restore_or_classify() {
     fi
     sleep "$DRILL_POLL_INTERVAL"
   done
-  local err=${DRILL_LAST_RESTORE_ERROR:-}
-  case "$err" in
-  *"Pre-apply checksum mismatch"* | *"does not chain"*)
-    log "KNOWN DEFERRED restore-chain flake reproduced (loud-only, never silent-wrong -- \
-ROADMAP HIGH PRIORITY): expected=$expected actual=${DRILL_LAST_ACTUAL:-unavailable}"
-    log "restore error was: $err"
-    exit "$SOAK_KNOWN_FLAKE_EXIT"
-    ;;
-  *)
-    fail "ROW DIFF (NOT the known restore-chain flake -- real failure, not retried): \
-expected rows=$expected actual rows=${DRILL_LAST_ACTUAL:-unavailable}; restore output: ${err:-none}"
-    ;;
-  esac
+  fail "restore-to-latest failed: expected rows=$expected \
+actual rows=${DRILL_LAST_ACTUAL:-unavailable}; restore output: ${DRILL_LAST_RESTORE_ERROR:-none}"
 }
 
 DRILL_COMPACTION_CONFIG=
@@ -264,45 +170,22 @@ assert_bucket_converged() {
 # ERROR-level log scan across the WHOLE soak (every restart cycle appended to
 # one file). A kill mid-write is expected to surface at most benign,
 # non-ERROR reconnection chatter on the next startup (INFO/WARN); a real,
-# UNEXPECTED ERROR line here means something broke silently during the churn.
-#
-# One EXACT, already-triaged signature is allow-listed (ROADMAP "Compaction
-# (shipped — default off)" residue, found by this exact drill): under this
-# soak's aggressive knobs, `--independent-tasks` mode runs no periodic
-# walrust-driven checkpoint at all (`checkpoint_interval` is wired only into
-# the shadow watch loop, src/sync/watch_shadow.rs — dead in independent-tasks
-# mode), so the only checkpoint pressure is SQLite's own uncoordinated
-# default auto-checkpoint. When that fires at an inconvenient moment relative
-# to a SIGKILL, the sync path can re-anchor with a seq-contiguous but
-# checksum-DIScontinuous L0 boundary — a case `contiguous_batch`'s
-# seq-gap-only liveness skip does not detect (only an explicit snapshot's seq
-# gap is skipped today), so the compactor retries and logs
-# `CompactionError::NonContiguous` on that exact boundary every tick.
-# CONFIRMED NOT a data-loss bug: write-verify-delete ordering means sources
-# are never deleted on a failed merge, so restore-to-latest, integrity_check,
-# and `walrust verify` all stayed correct in every run that produced this
-# signature — the assertions above already prove that for THIS run. Any
-# ERROR line that does NOT match this one signature still fails the drill
-# hard; a real regression is not masked by this allowance.
+# UNEXPECTED ERROR line here means something broke during the churn. With the
+# restart re-anchor seam fixed at the root, there is NO allow-list: the old
+# `CompactionError::NonContiguous` residue can no longer occur, so ANY
+# ERROR-level line fails the drill hard.
 assert_no_unexpected_errors() {
-  local errors known unknown
+  local errors count
   errors="$DRILL_WORKDIR/errors.log"
   grep 'ERROR' "$DRILL_WORKDIR/walrust.log" >"$errors" 2>/dev/null || true
-  known=$(grep -cE 'compaction: sources are not a contiguous chain' "$errors" 2>/dev/null || true)
-  known=${known:-0}
-  unknown=$(grep -vE 'compaction: sources are not a contiguous chain' "$errors" 2>/dev/null | grep -c 'ERROR' || true)
-  unknown=${unknown:-0}
-  if [ "$unknown" -gt 0 ]; then
-    log "UNEXPECTED ERROR-level log lines ($unknown), not the known residue signature:"
-    grep -vE 'compaction: sources are not a contiguous chain' "$errors" | grep 'ERROR' >&2
-    fail "SOAK LOG: $unknown unexpected ERROR-level line(s) during the soak — see $DRILL_WORKDIR/walrust.log"
+  count=$(grep -c 'ERROR' "$errors" 2>/dev/null || true)
+  count=${count:-0}
+  if [ "$count" -gt 0 ]; then
+    log "UNEXPECTED ERROR-level log lines ($count):"
+    cat "$errors" >&2
+    fail "SOAK LOG: $count ERROR-level line(s) during the soak — see $DRILL_WORKDIR/walrust.log"
   fi
-  if [ "$known" -gt 0 ]; then
-    log "log scan: $known known-residue NonContiguous ERROR line(s) (see comment above), 0 unexpected — \
-data safety already proven by the row-exact restore + integrity_check + verify above"
-  else
-    log "log scan clean: 0 ERROR-level lines across $kills_done kill/restart cycles"
-  fi
+  log "log scan clean: 0 ERROR-level lines across $kills_done kill/restart cycles"
 }
 
 drill_setup
@@ -355,23 +238,12 @@ merges_l2=$(level_object_count '/levels/L2/.*\.ltx$')
 
 # (1) Restore-to-latest row-exact + integrity + exit 0.
 #
-# Generous timeout, deliberately: the watcher (still running at this point,
-# not yet stopped) keeps ticking its own periodic snapshot timer every
-# SNAPSHOT_INTERVAL seconds regardless of the paused driver. This soak's
-# combination of a fast writer, frequent SIGKILLs, and a short snapshot
-# cadence can — rarely — hit a pre-existing race in the independent-tasks
-# restart path (NOT specific to compaction; a plain `walrust restore` can hit
-# it too) where a snapshot/incremental pair lands with a genuinely broken
-# checksum chain link ("Pre-apply checksum mismatch ... does not chain").
-# The documented recovery for a checkpoint-race chain break elsewhere in this
-# codebase is a fresh re-anchoring snapshot; giving the still-running watcher
-# several more of its own periodic snapshot ticks (rather than the default
-# 45s window) is that same recovery, not a weakened assertion — if the chain
-# is genuinely, permanently broken this still fails loudly for real. See the
-# ROADMAP "Compaction (shipped — default off)" residue note for the full
-# write-up (this drill is what found it).
+# The still-running watcher keeps ticking its periodic snapshot timer; a couple
+# of snapshot cadences of headroom lets an in-flight restart re-anchor land
+# before we assert. With the seam fixed at the root, restore-to-latest must
+# succeed row-exact -- any failure fails the drill for real.
 DRILL_RESTORE_TIMEOUT=$((SNAPSHOT_INTERVAL * 6))
-soak_wait_restore_or_classify "$name" "$expected"
+soak_wait_restore "$name" "$expected"
 
 # (2) walrust verify exits 0 on the healthy leveled bucket.
 "$WALRUST_BIN" verify "$name" --bucket "$DRILL_BUCKET_URI" --endpoint "$DRILL_ENDPOINT" \
