@@ -120,6 +120,11 @@ mimalloc = { version = "0.1", default-features = false }
 uuid = { version = "1", features = ["v4"] }
 brunch = "0.5"
 tower = "0.5"
+# Construct typed AWS SDK errors in unit tests (the not-found classifier in
+# `sync::watch_shadow` is typed, not string-matched). Already in the lockfile
+# transitively via aws-sdk-s3.
+aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"
 
 [[bench]]
 name = "benchmarks"

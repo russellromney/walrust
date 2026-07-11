@@ -399,11 +399,14 @@ pub async fn watch_with_shadow(
         // fresh host with no local progress a transient would still misclassify.
         // Only a CONFIRMED not-found starts fresh; every other fetch/parse error
         // propagates so startup fails loudly and is retried against a complete
-        // view. See `seed_state_from_manifest_fetch`.
+        // view. See `seed_state_from_manifest_fetch`. Not-found is classified
+        // from the TYPED SDK error (`s3::download_error_is_not_found`), never
+        // by matching message strings — free text like a DNS "host not found"
+        // must not read as a missing manifest and silently start fresh.
         let manifest_key = format!("{}{}/manifest.json", prefix, name);
         let (mut current_txid, manifest_checksum) = match seed_state_from_manifest_fetch(
             s3::download_bytes(&client, &bucket_name, &manifest_key).await,
-            manifest_fetch_is_not_found,
+            s3::download_error_is_not_found,
         )
         .with_context(|| format!("{}: seeding startup state from manifest.json", name))?
         {
@@ -1177,23 +1180,6 @@ fn seed_state_from_manifest_fetch(
     }
 }
 
-/// Whether a manifest fetch error is a CONFIRMED object-not-found (a brand-new
-/// database with no remote manifest) rather than a transient/ambiguous failure.
-///
-/// Conservative by construction: it returns `true` ONLY for recognised
-/// not-found signatures, so an unrecognised error is treated as NOT-not-found
-/// and propagated — the fail-safe direction (a loud startup that a supervisor
-/// retries, never a silent fresh start over existing remote state).
-fn manifest_fetch_is_not_found(err: &anyhow::Error) -> bool {
-    let msg = format!("{err:#}").to_ascii_lowercase();
-    msg.contains("nosuchkey")
-        || msg.contains("no such key")
-        || msg.contains("not found")
-        || msg.contains("notfound")
-        || msg.contains("status: 404")
-        || msg.contains("(404)")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1204,12 +1190,26 @@ mod tests {
 
     // ── H8 cousin: manifest-fetch seeding never silently starts fresh ────────
 
-    /// A genuine not-found seeds a fresh txid-0 database (correct: brand-new DB).
+    /// Build the anyhow error `s3::download_bytes` produces for a genuine
+    /// missing object: the typed SDK `NoSuchKey` service error.
+    fn typed_no_such_key() -> anyhow::Error {
+        use aws_sdk_s3::error::SdkError;
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+        use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+        use aws_smithy_runtime_api::http::StatusCode;
+        use aws_smithy_types::body::SdkBody;
+        let err = GetObjectError::NoSuchKey(aws_sdk_s3::types::error::NoSuchKey::builder().build());
+        let raw = HttpResponse::new(StatusCode::try_from(404u16).unwrap(), SdkBody::empty());
+        anyhow::Error::new(SdkError::service_error(err, raw))
+    }
+
+    /// A genuine (typed) not-found seeds a fresh txid-0 database (correct:
+    /// brand-new DB).
     #[test]
     fn manifest_not_found_starts_fresh() {
         let seed = seed_state_from_manifest_fetch(
-            Err(anyhow!("Object not found: prefix/db/manifest.json")),
-            manifest_fetch_is_not_found,
+            Err(typed_no_such_key()),
+            s3::download_error_is_not_found,
         )
         .expect("a confirmed not-found must seed fresh, not error");
         assert_eq!(seed, ManifestSeed::Fresh);
@@ -1222,7 +1222,7 @@ mod tests {
     fn manifest_transient_fetch_does_not_start_fresh() {
         let err = seed_state_from_manifest_fetch(
             Err(anyhow!("Service unavailable (injected); dispatch failure")),
-            manifest_fetch_is_not_found,
+            s3::download_error_is_not_found,
         )
         .expect_err("a transient fetch failure must propagate, never seed fresh");
         assert!(
@@ -1237,7 +1237,7 @@ mod tests {
     fn manifest_corrupt_parse_does_not_start_fresh() {
         let err = seed_state_from_manifest_fetch(
             Ok(b"{ this is not valid json".to_vec()),
-            manifest_fetch_is_not_found,
+            s3::download_error_is_not_found,
         )
         .expect_err("a corrupt manifest must propagate, never seed fresh");
         assert!(format!("{err:#}").contains("unparseable"), "got: {err:#}");
@@ -1254,7 +1254,8 @@ mod tests {
             last_checksum: Some(0xDEAD_BEEF),
         };
         let bytes = serde_json::to_vec(&manifest).unwrap();
-        let seed = seed_state_from_manifest_fetch(Ok(bytes), manifest_fetch_is_not_found).unwrap();
+        let seed =
+            seed_state_from_manifest_fetch(Ok(bytes), s3::download_error_is_not_found).unwrap();
         assert_eq!(
             seed,
             ManifestSeed::Seeded {
@@ -1264,24 +1265,43 @@ mod tests {
         );
     }
 
-    /// The not-found classifier is conservative: recognised not-found signatures
-    /// are `true`; a transient / ambiguous error is `false` (propagated).
+    /// The not-found classifier is TYPED, not string-matched: only the SDK's
+    /// `NoSuchKey`/404 service error classifies as not-found. Free text that
+    /// merely *mentions* not-found signatures (a DNS "host not found", a proxy
+    /// body with "404", the SDK error message quoted in a wrapper) must NOT —
+    /// otherwise a transient would misread as a missing manifest and silently
+    /// start fresh, the exact bug this hardening closes.
     #[test]
-    fn not_found_classifier_is_conservative() {
-        assert!(manifest_fetch_is_not_found(&anyhow!(
-            "NoSuchKey: The specified key does not exist"
+    fn not_found_classifier_is_typed_not_string_matched() {
+        use aws_sdk_s3::error::SdkError;
+        use aws_sdk_s3::operation::get_object::GetObjectError;
+
+        // The real typed shape → not-found (also when wrapped with context).
+        assert!(s3::download_error_is_not_found(&typed_no_such_key()));
+        assert!(s3::download_error_is_not_found(
+            &typed_no_such_key().context("fetching manifest.json")
+        ));
+
+        // A typed TIMEOUT is not not-found even though it is an SDK error.
+        let timeout: SdkError<GetObjectError> = SdkError::timeout_error("timed out");
+        assert!(!s3::download_error_is_not_found(&anyhow::Error::new(
+            timeout
         )));
-        assert!(manifest_fetch_is_not_found(&anyhow!("Object not found: k")));
-        assert!(manifest_fetch_is_not_found(&anyhow!(
-            "service error, HTTP status: 404"
-        )));
-        assert!(!manifest_fetch_is_not_found(&anyhow!(
-            "Service unavailable (injected)"
-        )));
-        assert!(!manifest_fetch_is_not_found(&anyhow!(
-            "connection reset by peer"
-        )));
-        assert!(!manifest_fetch_is_not_found(&anyhow!("timed out")));
+
+        // Free-text errors carrying not-found-looking words are NOT not-found.
+        for msg in [
+            "NoSuchKey: The specified key does not exist",
+            "Object not found: prefix/db/manifest.json",
+            "service error, HTTP status: 404",
+            "dns error: host not found",
+            "Service unavailable (injected)",
+            "connection reset by peer",
+        ] {
+            assert!(
+                !s3::download_error_is_not_found(&anyhow!("{msg}")),
+                "free-text {msg:?} must not classify as not-found"
+            );
+        }
     }
 
     fn create_real_wal_db() -> (TempDir, PathBuf, Connection) {
