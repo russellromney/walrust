@@ -1599,6 +1599,77 @@ mod tests {
         run_state_machine_with_faults(DEFAULT_CASES).unwrap();
     }
 
+    /// E10 fail-on-revert (deterministic, distilled from the two fault-suite
+    /// shrinks — seed 8666 and seed 439865 — both pinned in
+    /// `proptest-regressions/state_machine.txt`).
+    ///
+    /// The shape: prune legitimately forecloses a marked point by deleting the
+    /// snapshot at its boundary while a LATER full snapshot survives (a snapshot
+    /// is the ultimate compaction — the absorbed history is restorable only at
+    /// the snapshot's own boundary). A PITR to the foreclosed point must surface
+    /// the TYPED decay outcome (`RestoreNotFound` / `PitrInsideSnapshotSpan`) or
+    /// a clean floor — NEVER a bare, non-typed chain gap.
+    ///
+    /// `restore_legacy_ltx` classifies gap-vs-decay by re-listing snapshots. That
+    /// LIST used to be swallowed with `unwrap_or_default()`: under a transient
+    /// fault it silently returned no snapshots, so "a later snapshot absorbs the
+    /// target" read false, the typed decay error collapsed into a loud chain gap,
+    /// and — because the transient had been rewritten into a non-transient
+    /// message — the restore was never retried. With the LIST error propagated,
+    /// the transient rides the restore's own retry and the point resolves to the
+    /// typed outcome. Reverting the propagation makes these two replays fail with
+    /// the exact "restore chain gap" the oracle forbids.
+    #[test]
+    fn replay_e10_foreclosed_mark_under_transient_list_fault() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // seed 8666
+        let ops = vec![
+            Op::RestoreLatest,
+            Op::RestoreLatest,
+            Op::KillRestart,
+            Op::Mark,
+            Op::KillRestart,
+            Op::Prune {
+                hourly: 0,
+                daily: 0,
+                minimum: 2,
+            },
+            Op::RestoreLatest,
+            Op::RestorePit { mark_sel: 0 },
+            Op::RestoreLatest,
+        ];
+        let faults = FaultPlan {
+            transient_rate: 0.05,
+            torn_at_bytes: None,
+            corruption_rate: 0.0,
+            seed: 8666,
+        };
+        rt.block_on(run_case(&ops, faults, false)).unwrap();
+
+        // seed 439865 (the second shape surfaced by post-merge main CI)
+        let ops = vec![
+            Op::Snapshot,
+            Op::Mark,
+            Op::WriteTxn { rows: 1 },
+            Op::Flush,
+            Op::Prune {
+                hourly: 0,
+                daily: 0,
+                minimum: 2,
+            },
+            Op::RestorePit { mark_sel: 0 },
+            Op::RestoreLatest,
+        ];
+        let faults = FaultPlan {
+            transient_rate: 0.05,
+            torn_at_bytes: None,
+            corruption_rate: 0.0,
+            seed: 439865,
+        };
+        rt.block_on(run_case(&ops, faults, false)).unwrap();
+    }
+
     /// E4 coverage guard. The generated sequences can only request a PITR at a
     /// recorded `Mark`, and a Mark always names a real published boundary at or
     /// below the discovered head — so the fuzz never asks for a point-in-time

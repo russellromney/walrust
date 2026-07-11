@@ -2170,11 +2170,17 @@ pub async fn restore(
     // executor applies the plan (bounded prefetch, strict-order apply, chain
     // linkage through `chain_end`). An un-leveled bucket takes the original
     // linear path below, byte-identically.
+    //
+    // E10 sibling: this leveled-vs-linear CLASSIFICATION requires a complete
+    // levels listing. Swallowing a transient LIST with `unwrap_or_default()`
+    // read a compacted bucket as un-leveled and walked the linear path off the
+    // deleted L0 tail — a bogus "incremental gap" (or, with L0 fully folded, a
+    // SILENT short restore to the snapshot seq). Propagate instead, so the
+    // transient stays visibly transient and the caller can retry.
     let leveled = if lineage_id.is_none() {
         let layout = crate::compaction::SeqLayout::new(storage.clone(), prefix, db_name);
         !crate::compaction::list_merged_ranges(&layout)
-            .await
-            .unwrap_or_default()
+            .await?
             .is_empty()
     } else {
         false
@@ -2204,6 +2210,13 @@ pub async fn restore(
                 // Same decay refinement as the legacy path: a later full
                 // snapshot absorbing the target is granularity decay, not a
                 // missing object.
+                //
+                // E10 sibling: same rule as `legacy_restore` — classifying
+                // gap-vs-decay REQUIRES a complete snapshot listing. Swallowing
+                // a transient LIST here (`.ok()`) read as "no later snapshot
+                // absorbs the target", collapsing the typed RestoreNotFound
+                // decay outcome into a bare gap whose message no retry wrapper
+                // recognizes as transient. Propagate instead.
                 let later: Vec<u64> = discover_latest_snapshot_in_namespace(
                     storage_ref,
                     prefix,
@@ -2211,9 +2224,7 @@ pub async fn restore(
                     lineage_id.as_deref(),
                     ChangesetKind::Physical,
                 )
-                .await
-                .ok()
-                .flatten()
+                .await?
                 .map(|s| s.seq)
                 .into_iter()
                 .filter(|m| *m > snapshot.seq)

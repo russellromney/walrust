@@ -2051,3 +2051,116 @@ adversarial review of that PR.
   TXID. Pinned it with `replay_e4_future_pit_is_typed_not_found`
   (`walrust-dst/src/state_machine.rs`), verified test-first (fails with the E4
   branch reverted — the restore then silently returns `Ok` at the head).
+
+## E10 — Prune-foreclosed PITR crashes with a bare chain gap when a transient LIST hits restore's decay classifier
+
+Found by the DST fault phase (`state_machine_generated_sequences_under_faults`)
+during PR #34 review, and again on post-merge `main` CI with a second shape. The
+suite is `walrust-dst`'s legacy state machine driving the REAL prune planner and
+restore engine over the mock bucket under a seeded transient-fault plan.
+
+- **Repro (both pinned in `walrust-dst/proptest-regressions/state_machine.txt`):**
+  - seed 8666: `[RestoreLatest, RestoreLatest, KillRestart, Mark, KillRestart,
+    Prune { minimum: 2 }, RestoreLatest, RestorePit(mark 0), RestoreLatest]`,
+    `transient_rate: 0.05` → `op[7] RestorePit(txid 3) FAILED (NON-typed error,
+    e.g. a chain gap; reachable=false; surviving snapshots {1,2,3,4}, deleted
+    {2,3}): … restore chain gap: no backup object continues the chain at seq 2;
+    the nearest restorable point at or below the target is seq 1`.
+  - seed 439865 (post-merge `main` CI run 29142314079): `[Snapshot, Mark,
+    WriteTxn { rows: 1 }, Flush, Prune { minimum: 2 }, RestorePit(mark 0),
+    RestoreLatest]`, `transient_rate: 0.05` → `op[5] RestorePit(txid 2) FAILED
+    (… reachable=false; surviving snapshots {1,2,3}, deleted {2}): … restore
+    chain gap: no backup object continues the chain at seq 2; nearest restorable
+    point at or below the target is seq 1`.
+  - The failure is nondeterministic per run (fresh proptest cases each run), so
+    `main` CI was intermittently red on this bug.
+
+- **Root cause (adjudicated (b): a decision made from a listing that silently
+  defaulted to empty on a transient fault — NOT (a) a prune protected-set hole).**
+  Both shapes are the SAME cause. Each `KillRestart`/`Snapshot` re-anchors with a
+  full-DB base snapshot in a fresh generation, so a marked point can sit on a
+  snapshot boundary (e.g. the mark at txid 12/2). Prune LEGITIMATELY forecloses
+  such a point per retention: it deletes the snapshot at the mark's boundary while
+  a LATER full snapshot survives (a full snapshot is the ultimate compaction — the
+  history it absorbs is restorable only at the snapshot's own boundary). That
+  foreclosure is by design and is meant to surface as the TYPED decay outcome
+  `PlanError::PitrInsideSnapshotSpan` → `WalrustError::RestoreNotFound`, which the
+  oracle accepts for an unreachable mark. `restore_legacy_ltx` decides gap-vs-decay
+  by re-listing snapshots (`discover_legacy_snapshots`) and asking whether a later
+  snapshot absorbs the target. That LIST was swallowed with `.unwrap_or_default()`:
+  under a transient fault it returned an EMPTY snapshot set, so "a later snapshot
+  absorbs the target" read false, the typed decay error collapsed into a bare,
+  non-typed `PlanError::ChainGap` (`WalrustError::restore`), and — because the
+  transient had been rewritten into a non-transient message — the caller's retry
+  wrapper never re-ran the restore. A destructive-looking classification decision
+  (is this point recoverable-at-a-coarser-grain, or a genuine gap?) was made from
+  an incomplete view. Confirmed directly by instrumenting the error path: the
+  failing replay prints `disc_ok=false disc_len=Err(Service unavailable
+  (injected))`, while every passing case prints `disc_ok=true`.
+
+- **Fix (`crates/walrust-core/src/legacy_restore.rs`):** propagate the
+  `discover_legacy_snapshots` error in restore's gap-refinement path (`.await?`
+  instead of `.await.unwrap_or_default()`). A transient LIST now surfaces as the
+  transient it is, so the caller retries the whole restore against a complete
+  listing and the point resolves to the typed decay outcome; a genuine LIST
+  failure aborts loudly instead of masquerading as a chain gap. Destructive /
+  irreversible-classification operations must never decide from a listing that
+  could be incomplete.
+
+- **Proving tests (fail-on-revert):**
+  - `walrust-dst` `state_machine::tests::replay_e10_foreclosed_mark_under_transient_list_fault`
+    — deterministic replay of BOTH seeds (8666, 439865). Reverting the `.await?`
+    to `.await.unwrap_or_default()` reproduces the exact "restore chain gap" the
+    oracle forbids (verified).
+  - The two corpus lines are pinned permanently in
+    `walrust-dst/proptest-regressions/state_machine.txt`.
+
+- **Sibling sweep.** `PROPTEST_CASES=256` full fault phase run multiple times:
+  the E10 class (`state_machine_generated_sequences_under_faults`) is green every
+  run. The sweep separately surfaced an UNRELATED pre-existing bug in the
+  compaction merge engine (`compaction_state_machine_generated_sequences_under_faults`,
+  seed 477981: a transient fault during a merge leaves a merged object, and a
+  later `Compact` plans an overlapping target range —
+  `CompactionError::OverlappingExisting`). Different subsystem, different root
+  cause, not touched by this fix; filed as a separate follow-up.
+
+- **Status:** Fixed.
+
+- **Adversarial review (PR #36).** Propagation path verified end-to-end: the
+  DST's `restore_to` retry classifies by the rendered chain (`{err:#}` contains
+  `Service unavailable (injected)`), and the bare `.await?` preserves the chain
+  untouched, so the transient is retried and resolves to the typed decay
+  outcome. In production the LIST error is already typed `WalrustError::S3` at
+  the storage adapter, and `classify_or_else(e, WalrustError::restore)` at the
+  CLI boundary preserves an existing typed error — no double-wrapped
+  "restore error: restore error:", exit code 4 (S3) as a transport failure
+  should. The review then swept the workspace for the same class (a listing /
+  transport error swallowed into a default that feeds a CLASSIFICATION or
+  DELETION decision) and found the MODERN `sync::restore` had the bug twice:
+  - the `leveled` check (`list_merged_ranges(..).await.unwrap_or_default()`):
+    a transient levels LIST classified a compacted bucket as un-leveled and
+    walked the linear path off the deleted L0 tail — a bogus non-typed
+    "incremental gap" (or, with L0 fully folded, a SILENT short restore to the
+    snapshot seq);
+  - the decay refinement (`discover_latest_snapshot_in_namespace(..).ok()`):
+    the exact E10 collapse, byte-for-byte the same "restore chain gap" message,
+    in the modern path.
+  Both fixed by propagation; proven test-first in
+  `crates/walrust-core/tests/compaction_restore.rs`
+  (`leveled_check_transient_list_failure_propagates_not_misread_as_unleveled`,
+  `decay_refinement_transient_list_failure_propagates_not_bare_gap` — both fail
+  with the pre-fix code, reproducing the misclassifications above). Also fixed
+  `src/sync/prune.rs` level-prune planning, which swallowed a failed levels
+  LIST into an empty DELETION plan and misreported "Nothing to delete"
+  (conservative direction, but a persistent LIST failure would silently leak
+  level objects forever). Cleared as safe: `src/sync/verify.rs`'s two
+  `list_merged_ranges(..).unwrap_or_default()` uses (deliberate, documented
+  fail-toward-alarming in a non-destructive report path — a transient can only
+  cause a false alarm, never silence), and the `Option`-default sites
+  (`wal.rs` chain_seed, `shadow.rs` file_stem, `main.rs` cache config).
+  Noted as a follow-up, not fixed here: `src/sync/watch_shadow.rs` treats ANY
+  manifest GET failure (transient included) and any manifest parse failure as
+  "fresh database, txid 0" at startup; durable local shadow progress overrides
+  it when present and publishes are `put_if_absent`-guarded (fail-loud, not
+  silent fork), but the startup classification is the same shape and deserves
+  its own pass.
