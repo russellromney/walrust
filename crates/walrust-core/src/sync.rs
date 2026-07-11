@@ -1167,6 +1167,7 @@ async fn ensure_database_in_wal_mode(db_path: &Path, db_name: &str) -> Result<()
     let db_path = db_path.to_path_buf();
     let mode = tokio::task::spawn_blocking(move || -> Result<String> {
         let conn = rusqlite::Connection::open(&db_path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
         let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
         Ok(mode)
     })
@@ -2403,6 +2404,8 @@ pub async fn restore_with_snapshot_source(
 fn verify_sqlite_integrity(path: &Path) -> Result<()> {
     let conn = rusqlite::Connection::open(path)
         .map_err(|e| anyhow!("failed to open restored database for integrity_check: {e}"))?;
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(|e| anyhow!("failed to set busy_timeout on restored database: {e}"))?;
     let result: String = conn
         .query_row("PRAGMA integrity_check", [], |row| row.get(0))
         .map_err(|e| anyhow!("failed to run integrity_check on restored database: {e}"))?;
