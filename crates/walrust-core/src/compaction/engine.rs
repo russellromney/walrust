@@ -77,6 +77,30 @@ pub async fn run_level_compaction(
 
     // ── 1. Select eligible sources ─────────────────────────────────────────
     let all = layout.list_level(source_level).await?;
+
+    // ── 1a. Converge an interrupted source-deletion (E11) ──────────────────
+    // Source-deletion is per-object and NOT atomic (`delete` walks the keys one
+    // at a time), so a fault mid-delete can drop a strict subset of a merged
+    // batch's sources and leave the rest. Those survivors are already folded
+    // into a written, verified merged object at the target level, but no longer
+    // reconstitute it; a later `contiguous_batch` that mixes such a survivor
+    // with a fresh source computes a target range that CROSSES that object — a
+    // partial overlap the exact-range recovery (step 2) rightly refuses with
+    // `OverlappingExisting`. (C2a believed partial overlap unreachable from
+    // crash shapes; the DST fault sweep proved it reachable via this
+    // interrupted delete.) Finish the interrupted deletion instead: delete the
+    // leftover sources subset-covered by a SOUND merged object (deletion-only
+    // convergence), so re-runs converge rather than collide. This never touches
+    // the FULL crash-recovery set (survivors that still tile a merged object
+    // exactly — left to step 2's strong `verify_existing`), never deletes
+    // against an unsound covering object (that stays a re-merge via step 2), and
+    // leaves the loud `OverlappingExisting` intact for a genuinely foreign
+    // overlap. `target_files` is reused by step 2's exact-range lookup below.
+    let target_files = layout.list_level(target_level).await?;
+    if let Some(converged) = converge_interrupted_delete(layout, &target_files, &all).await? {
+        return Ok(converged);
+    }
+
     let eligible = if source_level == 0 {
         let ts: Vec<i64> = all.iter().map(|f| f.last_modified_ms).collect();
         eligible_prefix_len(&ts, now_ms, keep_fine_window)
@@ -117,7 +141,7 @@ pub async fn run_level_compaction(
     );
 
     // ── 2. Idempotency / crash recovery ────────────────────────────────────
-    if let Some(existing) = find_existing_merged(layout, target_level, range).await? {
+    if let Some(existing) = find_existing_merged(&target_files, range)? {
         match verify_existing(layout, &existing, &sources).await {
             Ok(()) => {
                 layout.delete(&sources).await?;
@@ -223,25 +247,27 @@ fn contiguous_batch(ranges: &[(u64, u64)], batch: usize) -> Option<(usize, usize
     None
 }
 
-/// Look for a merged object at `level` covering exactly `range`.
+/// Look for a merged object covering exactly `range` among the already-listed
+/// `target_files` at the target level.
 ///
 /// Convergence is **exact-range only**. If the level instead holds an object
-/// whose range *overlaps* the target (a subset/superset from a prior run with a
-/// different batch, or otherwise inconsistent state), that is not idempotent
-/// convergence — it is a loud [`CompactionError::OverlappingExisting`]. We must
-/// not merge into an overlapping level (it would strand an orphan the restore
-/// planner could not reconcile), and we cannot assume it is safe to delete
-/// (it may cover seqs outside this batch).
-async fn find_existing_merged(
-    layout: &dyn CompactionLayout,
-    level: Level,
+/// whose range *overlaps* the target but is not an exact match, that is not
+/// idempotent convergence — it is a loud [`CompactionError::OverlappingExisting`].
+/// We must not merge into an overlapping level (it would strand an orphan the
+/// restore planner could not reconcile), and we cannot assume it is safe to
+/// delete (it may cover seqs outside this batch). The one overlap shape that IS
+/// explained — an interrupted source-deletion whose leftovers are subset-covered
+/// by a sound merged object — is already drained by
+/// [`converge_interrupted_delete`] before selection, so by the time we get here
+/// any residual non-exact overlap is genuinely foreign and stays loud.
+fn find_existing_merged(
+    target_files: &[LayoutFile],
     range: SeqRange,
 ) -> Result<Option<LayoutFile>, CompactionError> {
-    let files = layout.list_level(level).await?;
     let mut exact = None;
-    for f in files {
+    for f in target_files {
         if f.range == range {
-            exact = Some(f);
+            exact = Some(f.clone());
         } else if ranges_overlap(f.range, range) {
             return Err(CompactionError::OverlappingExisting(format!(
                 "target range {:016x}-{:016x} overlaps existing merged object {} \
@@ -256,6 +282,110 @@ async fn find_existing_merged(
 /// Inclusive seq ranges overlap iff each starts at or before the other ends.
 fn ranges_overlap(a: SeqRange, b: SeqRange) -> bool {
     a.min <= b.max && b.min <= a.max
+}
+
+/// Whether `a` is fully contained within `b` (inclusive).
+fn range_subset(a: SeqRange, b: SeqRange) -> bool {
+    b.min <= a.min && a.max <= b.max
+}
+
+/// Finish an interrupted source-deletion (E11): if any source at the source
+/// level is a subset-covered leftover of a **sound** merged object at the target
+/// level (a survivor of a non-atomic delete that was cut short), delete those
+/// leftovers and report a deletion-only convergence. Returns `None` when there
+/// is nothing to converge, so the normal merge path proceeds unchanged.
+///
+/// Two guards keep this from ever weakening the C2a exact-range semantics:
+///  - a merged object still fully tiled by present sources (the untouched
+///    crash-recovery set) is SKIPPED here and left to step 2's strong
+///    `verify_existing`; only a strict/gappy subset — proof a sibling was
+///    already deleted — is treated as an interrupted-delete leftover;
+///  - a covering object that does not verify sound (torn/corrupt) is SKIPPED, so
+///    its sources are preserved and it is re-merged via step 2, never deleted
+///    against.
+async fn converge_interrupted_delete(
+    layout: &dyn CompactionLayout,
+    target_files: &[LayoutFile],
+    sources: &[LayoutFile],
+) -> Result<Option<CompactionOutcome>, CompactionError> {
+    if sources.is_empty() || target_files.is_empty() {
+        return Ok(None);
+    }
+    let mut deletable: Vec<LayoutFile> = Vec::new();
+    let mut cover: Option<LayoutFile> = None;
+    for m in target_files {
+        // Present sources fully covered by this merged object.
+        let subs: Vec<&LayoutFile> = sources
+            .iter()
+            .filter(|s| range_subset(s.range, m.range))
+            .collect();
+        if subs.is_empty() {
+            continue;
+        }
+        // The full crash-recovery set (survivors still tile `m` exactly, no
+        // sibling deleted) is C2a's domain — leave it to step 2.
+        if tiles_exactly(&subs, m.range) {
+            continue;
+        }
+        // Never delete redundant sources against an unsound covering object.
+        if verify_covers(layout, m).await.is_err() {
+            continue;
+        }
+        cover.get_or_insert_with(|| m.clone());
+        deletable.extend(subs.into_iter().cloned());
+    }
+    if deletable.is_empty() {
+        return Ok(None);
+    }
+    let count = deletable.len();
+    layout.delete(&deletable).await?;
+    Ok(Some(CompactionOutcome::ConvergedExistingDeletion {
+        merged_count: count,
+        output: cover.expect("deletable non-empty implies a covering object"),
+    }))
+}
+
+/// Whether the covered `subs` tile `range` exactly: sorted seq-contiguous,
+/// starting at `range.min`, ending at `range.max`, with no gaps or overlaps.
+/// True means these sources are the untouched full source set of the merged
+/// object (no sibling deleted yet) — the C2a crash-recovery case.
+fn tiles_exactly(subs: &[&LayoutFile], range: SeqRange) -> bool {
+    let mut s: Vec<&LayoutFile> = subs.to_vec();
+    s.sort_by_key(|f| (f.range.min, f.range.max));
+    if s.first().unwrap().range.min != range.min || s.last().unwrap().range.max != range.max {
+        return false;
+    }
+    s.windows(2).all(|w| w[0].range.max + 1 == w[1].range.min)
+}
+
+/// Verify a covering merged object is sound enough to delete redundant
+/// subset-sources against: it reads back, decodes (content checksum — catches a
+/// torn or corrupt object), is `COMPACTED`, and carries pages. Unlike
+/// [`verify_existing`] this does NOT tie the object to a specific source batch's
+/// endpoints (the leftovers are a strict subset, so those endpoints legitimately
+/// differ) — but a decodeable, non-empty COMPACTED object durably folds the
+/// seqs it spans, so a source whose whole seq range sits inside it is redundant
+/// and safe to drop.
+async fn verify_covers(
+    layout: &dyn CompactionLayout,
+    covering: &LayoutFile,
+) -> Result<(), CompactionError> {
+    let bytes = layout.read_bytes(covering).await?;
+    let cs = physical::decode(&bytes).map_err(|e| CompactionError::Decode {
+        key: covering.key.clone(),
+        source: e,
+    })?;
+    if !cs.is_compacted() {
+        return Err(CompactionError::VerificationFailed(
+            "covering object not COMPACTED".into(),
+        ));
+    }
+    if cs.pages.is_empty() {
+        return Err(CompactionError::VerificationFailed(
+            "covering object has no pages".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Verify an existing merged object fully covers the source batch: it decodes

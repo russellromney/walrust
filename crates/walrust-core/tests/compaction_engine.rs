@@ -611,6 +611,126 @@ async fn partial_overlap_existing_merged_is_loud_error() {
     assert_eq!(store.list("p/db/levels/L1/", None).await.unwrap().len(), 1);
 }
 
+// ── E11: interrupted-delete leftovers converge, they do not collide ──────────
+
+/// A transient fault mid `delete_many` (a serial, non-atomic per-object loop)
+/// leaves a STRICT SUBSET of a merged batch's sources alive. Those survivors are
+/// folded into the written, verified merged object but no longer reconstitute
+/// it; a later batch that mixes a survivor with a fresh source would compute a
+/// CROSSING target range that step 2 loudly refuses. The engine must instead
+/// converge the interrupted delete — drop the redundant subset-covered leftovers
+/// (deletion-only) — so re-runs converge rather than raise `OverlappingExisting`.
+///
+/// **Fail-on-revert:** without `converge_interrupted_delete` the batch-4 run
+/// below selects the survivors {2,3,4} plus fresh {5}, targets range [2,5], and
+/// `find_existing_merged` returns `OverlappingExisting` against the existing
+/// [1,4] — the exact E11 failure. (The FULL crash-recovery set, where the
+/// survivors still tile the merged object, stays on step 2's strong verify — see
+/// `revert_proof_crash_between_write_and_delete_converges`; a reconstituting
+/// re-seed stays loud — see `partial_overlap_existing_merged_is_loud_error`.)
+#[tokio::test]
+async fn interrupted_delete_leftover_subset_converges_not_loud_error() {
+    let store = MemStore::new();
+    let chain = make_chain(1, 5, 0); // seqs 1..=5, one contiguous chain
+    for c in &chain[..4] {
+        put_l0_seq(&store, "p/", "db", c).await; // seqs 1,2,3,4 at L0
+    }
+    let layout = SeqLayout::new(store.clone(), "p/", "db");
+
+    // Merge seqs 1..=4 → L1 [1-4]; sources 1..=4 deleted.
+    let first = run_level_compaction(&layout, 0, 4, Duration::from_secs(0), NOW)
+        .await
+        .unwrap();
+    assert_eq!(first.merged_count(), 4);
+    let l1 = store.list("p/db/levels/L1/", None).await.unwrap();
+    assert_eq!(l1.len(), 1);
+    let merged_key = l1[0].clone();
+    let merged_bytes = store.get(&merged_key).await.unwrap().unwrap();
+
+    // Interrupted delete: seq 1 was deleted, seqs 2,3,4 survived, and a fresh
+    // seq 5 has since landed at L0.
+    for c in &chain[1..4] {
+        put_l0_seq(&store, "p/", "db", c).await; // re-seed the survivors 2,3,4
+    }
+    put_l0_seq(&store, "p/", "db", &chain[4]).await; // fresh seq 5
+    assert_eq!(store.list("p/db/0000/", None).await.unwrap().len(), 4);
+
+    // Batch-4 run: converge the interrupted delete (drop 2,3,4), leaving only
+    // the fresh seq 5. NO OverlappingExisting, nothing re-merged.
+    let converged = run_level_compaction(&layout, 0, 4, Duration::from_secs(0), NOW)
+        .await
+        .expect("interrupted-delete leftovers must converge, not raise OverlappingExisting");
+    assert!(
+        matches!(
+            converged,
+            CompactionOutcome::ConvergedExistingDeletion { .. }
+        ),
+        "expected deletion-only convergence, got {converged:?}"
+    );
+    assert_eq!(
+        converged.merged_count(),
+        3,
+        "the three subset-covered leftovers 2,3,4 were dropped"
+    );
+
+    // The merged object is byte-identical (untouched); only fresh seq 5 remains.
+    assert_eq!(store.get(&merged_key).await.unwrap().unwrap(), merged_bytes);
+    let l0_after = store.list("p/db/0000/", None).await.unwrap();
+    assert_eq!(l0_after.len(), 1, "only fresh seq 5 remains: {l0_after:?}");
+    assert!(l0_after[0].ends_with(&format!("{:016x}.hadbp", 5u64)));
+    assert_eq!(store.list("p/db/levels/L1/", None).await.unwrap().len(), 1);
+}
+
+/// The convergence never deletes redundant sources against an UNSOUND covering
+/// object: if the merged object that covers the leftovers is torn/corrupt,
+/// `verify_covers` fails, the leftovers are preserved, and the state stays a loud
+/// error rather than silently dropping coverage-bearing sources. This pins the
+/// soundness gate on the deletion-only convergence.
+#[tokio::test]
+async fn interrupted_delete_does_not_drop_leftovers_against_torn_cover() {
+    let store = MemStore::new();
+    let chain = make_chain(1, 5, 0);
+    for c in &chain[..4] {
+        put_l0_seq(&store, "p/", "db", c).await;
+    }
+    let layout = SeqLayout::new(store.clone(), "p/", "db");
+
+    // Merge 1..=4 → L1 [1-4]; capture the merged key.
+    let first = run_level_compaction(&layout, 0, 4, Duration::from_secs(0), NOW)
+        .await
+        .unwrap();
+    assert_eq!(first.merged_count(), 4);
+    let l1 = store.list("p/db/levels/L1/", None).await.unwrap();
+    let merged_key = l1[0].clone();
+
+    // Corrupt the covering object's page content on disk so its content
+    // checksum no longer verifies (a real torn/silently-corrupt merged object).
+    let mut bad = store.get(&merged_key).await.unwrap().unwrap();
+    let mid = bad.len() / 2;
+    bad[mid] ^= 0xFF;
+    store.put(&merged_key, &bad).await.unwrap();
+
+    // Re-seed the survivors + a fresh source (the interrupted-delete state).
+    for c in &chain[1..4] {
+        put_l0_seq(&store, "p/", "db", c).await;
+    }
+    put_l0_seq(&store, "p/", "db", &chain[4]).await;
+    assert_eq!(store.list("p/db/0000/", None).await.unwrap().len(), 4);
+
+    // The covering object fails `verify_covers` (decode/content-checksum), so
+    // the leftovers are NOT dropped against it; the state stays a loud error
+    // rather than silently losing coverage.
+    let err = run_level_compaction(&layout, 0, 4, Duration::from_secs(0), NOW)
+        .await
+        .expect_err("must not converge against an unsound covering object");
+    assert!(
+        matches!(err, CompactionError::OverlappingExisting(_)),
+        "torn cover must not be converged against; leftovers stay a loud error, got {err:?}"
+    );
+    // The survivors are UNTOUCHED (never deleted against an unverified object).
+    assert_eq!(store.list("p/db/0000/", None).await.unwrap().len(), 4);
+}
+
 // ── Liveness (C3a): batch selection clips at snapshot chain-breaks ───────────
 
 /// A fixed-size L0 batch straddling a snapshot chain-break must NOT stall on

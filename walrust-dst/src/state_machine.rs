@@ -1878,6 +1878,57 @@ mod tests {
             .unwrap();
     }
 
+    /// E11 fail-on-revert: a transient fault mid source-deletion leaves a
+    /// PARTIAL merged-overlap that a later batch collides with.
+    ///
+    /// The compaction fault phase found this shrunk sequence (seed 699302,
+    /// `transient_rate: 0.02`) and it is also pinned in
+    /// `proptest-regressions/state_machine.txt`. Under the deterministic fault
+    /// schedule a `Compact` merges an L0 run into a `levels/L1/` object, then a
+    /// transient error fires PART-WAY through the per-object source deletion
+    /// (`delete_many` is a serial, non-atomic loop): a strict subset of the
+    /// batch's sources survives. The whole `Compact` pass retries; the next
+    /// `contiguous_batch` mixes those survivors with a fresh source and computes
+    /// a target range that CROSSES the already-written merged object — a partial
+    /// overlap the exact-range recovery loudly refused with
+    /// `CompactionError::OverlappingExisting` (observed as target range `[4,5]`
+    /// crossing existing `[2,4]`). Because the plan was transient-only, the retry
+    /// budget cannot absorb a non-transient overlap error, so `guard_durable`
+    /// failed the case.
+    ///
+    /// The fix (`compaction::engine`) converges the interrupted delete: an L0
+    /// source whose seq range is a strict subset of a sound merged object at the
+    /// target level (a leftover from the interrupted deletion) is finished off by
+    /// a deletion-only convergence BEFORE batch selection, so the crossing range
+    /// never forms and re-runs converge instead of colliding. Reverting that
+    /// convergence makes this replay fail with the exact "overlapping merged
+    /// object" the oracle forbids.
+    #[test]
+    fn replay_e11_interrupted_delete_partial_overlap_converges() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let ops = vec![
+            Op::Flush,
+            Op::RestoreLatest,
+            Op::Mark,
+            Op::Mark,
+            Op::Mark,
+            Op::RestoreLatest,
+            Op::Compact {
+                l1_batch: 2,
+                l2_batch: 2,
+                keep_fine_secs: 0,
+            },
+            Op::RestoreLatest,
+        ];
+        let faults = FaultPlan {
+            transient_rate: 0.02,
+            torn_at_bytes: None,
+            corruption_rate: 0.0,
+            seed: 699302,
+        };
+        rt.block_on(run_case(&ops, faults, true)).unwrap();
+    }
+
     /// Catch-proof anchor (fail-on-revert for the C3a seq-contiguous batch
     /// clipping — a real compaction protection). A `Snapshot` between flushes
     /// breaks the L0 chain (the snapshot consumes its own seq and the next
