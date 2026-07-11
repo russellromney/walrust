@@ -267,10 +267,23 @@ pub async fn restore_legacy_ltx(
             // A gap here may be granularity decay rather than a missing object:
             // a LATER full snapshot absorbs the target (snapshot = ultimate
             // compaction). Name both neighbors instead of reporting a bare gap.
+            //
+            // E10: classifying a chain gap as decay vs. a genuinely missing
+            // object REQUIRES a complete snapshot listing. Under faults this
+            // LIST can fail transiently; swallowing it with `unwrap_or_default()`
+            // silently degraded the typed `PitrInsideSnapshotSpan`
+            // (RestoreNotFound) outcome into a bare, non-typed chain gap — a
+            // decision made from an incomplete view. A missing snapshot > floor
+            // then read as "no later snapshot absorbs the target", so a
+            // legitimately-foreclosed PITR (its boundary pruned, a later full
+            // snapshot still present) surfaced as a loud gap instead of the clean
+            // typed decay error, and the transient never got retried because it
+            // had been rewritten into a non-transient message. Propagate the LIST
+            // error so the caller retries the whole restore against a complete
+            // listing, rather than mis-classifying from a truncated one.
             let later: Vec<u64> =
                 crate::legacy_manifest::discover_legacy_snapshots(storage, prefix, db_name)
-                    .await
-                    .unwrap_or_default()
+                    .await?
                     .iter()
                     .map(|s| s.max_txid)
                     .filter(|m| *m > floor)
