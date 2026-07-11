@@ -378,6 +378,19 @@ mod tests {
             vec![("b".to_string(), 48, 99)],
             "a partially-covered re-anchor hole must still alarm"
         );
+        // Adversarial: a REAL missing range sits ABOVE the newest in-hole
+        // snapshot (58) and BELOW where level coverage resumes — snapshot(58),
+        // then [59, 69] uncovered, then levels [70, 98]. The suffix above the
+        // superseding snapshot is not contiguously covered from 59, so this is
+        // NOT restorable and MUST still alarm (supersession only excuses the
+        // prefix at/below the snapshot, never an interior hole above it).
+        let interior_hole = vec![SeqRange::new(70, 98)];
+        let gaps = detect_live_txid_gaps(&liveset, &snapshots, &interior_hole);
+        assert_eq!(
+            gaps,
+            vec![("b".to_string(), 48, 99)],
+            "a hole above the newest in-hole snapshot but below level coverage must still alarm"
+        );
     }
 
     #[test]

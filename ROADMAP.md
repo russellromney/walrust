@@ -142,6 +142,41 @@ re-anchor shape — snapshot at a hole's start, levels covering the rest — is 
 longer a false exit-5 alarm, while unbridged holes still alarm
 (`e3_reanchor_snapshot_plus_levels_bridge_is_not_a_gap`).
 
+**Known cost of the fix (documented, not conditioned): a full snapshot on every
+restart.** The re-anchor is *unconditional* for `current_txid > 0` — it fires on
+clean restarts (deploys, host reboots) as well as crashes. Conditioning it
+("resume incrementally when the stream verifiably chains, snapshot only when it
+does not") was evaluated and rejected as not cheaply/safely decidable at
+startup:
+- The chain cursor an incremental resumes from is the in-memory *running*
+  page-hash (`chain_checksum`: `SHA256(prev || pgno || page || …)`). The only
+  value cheaply derivable from the restarted process is `compute_checksum_from_file`
+  (a whole-`.db` SHA), a *different* hash space — and snapshots even VACUUM the
+  image first, reordering pages — so the resume point can never be verified equal
+  to the head object's `chain_end` from the `.db` alone.
+- Seeding the next incremental from the head object's `chain_end` (read from S3)
+  *would* chain, but it has a silent **data-loss** hole: if SQLite checkpointed
+  and truncated the WAL for pages walrust had not yet shipped while it was down,
+  those pages survive only in the live `.db`; a `wal_offset == 0` re-read no
+  longer sees them, so an incremental resume would drop them from the stream.
+  Only a snapshot of the current `.db` captures them. Startup cannot cheaply
+  distinguish "clean, nothing truncated" from "truncated unshipped pages"
+  (the same in-memory state that would tell it is gone), so it always takes the
+  safe path. This mirrors the existing WAL-rollover handler, which already
+  publishes a snapshot rather than chain across a WAL discontinuity.
+- **Cost math:** the re-anchor uploads ~one DB's worth of bytes and blocks
+  replication of new writes until it completes. For a 10 GB database restarted
+  routinely (e.g. per deploy), that is ~10 GB re-shipped and tens of seconds to
+  minutes of startup stall *per restart*, plus storage churn until prune/compaction
+  reclaims the superseded objects. The drills mask this with tiny DBs (soak runs
+  are a few thousand rows), so it does not show up as a drill regression — it is a
+  production cost that grows with DB size. A durable local chain-cursor sidecar
+  (persist `wal_offset` + salt + running chain-hash on each sync; on restart,
+  resume incrementally only when the sidecar still matches the live WAL header and
+  `.db`, else snapshot) would let a provably-clean restart skip the snapshot; it
+  is deferred as its own change (needs durability + host-move handling + DST
+  modeling of its own).
+
 **Residue (e2e gap closure): gap 4 found and fixed a real E7 gap — owned-mode
 `add()` was silently incompatible with compaction.** Building
 `e2e_core_replicator_compaction_embedder_crash` (tests/production_e2e.rs) — a
