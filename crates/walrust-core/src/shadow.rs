@@ -94,6 +94,17 @@ pub struct ShadowWal {
     /// and `wal_salt` hold defaults; the first real header seeds them without
     /// being mistaken for a checkpoint rollover (B5).
     header_seeded: bool,
+    /// Set when `copy_frames` observed an event that requires the stream to be
+    /// re-anchored with a fresh snapshot instead of chaining incrementals: the
+    /// live WAL vanished / went zero-length / read back with an all-zero header
+    /// after a header had been observed — SQLite's last-close checkpoint on an
+    /// ephemeral-connection writer (DF1). The checkpoint folded pages into the
+    /// `.db` that may never have been copied to the shadow; only a fresh
+    /// snapshot provably captures them. Consumed via `take_reanchor_pending`;
+    /// the consumer must publish an eager snapshot, exactly like the D3
+    /// downtime-checkpoint path. (A plain mid-run salt roll does NOT set this:
+    /// that is the routine own-checkpoint shape, already copied + synced.)
+    reanchor_pending: bool,
 }
 
 /// A segment file in the shadow WAL
@@ -117,12 +128,21 @@ impl ShadowWal {
         // Create shadow directory if it doesn't exist
         fs::create_dir_all(&shadow_dir).await?;
 
-        // Read current WAL header to get page size and salt
+        // Read current WAL header to get page size and salt. Missing, zero-
+        // length, and zeroed-header WALs are all legal lifecycle states at
+        // construction time (last-close checkpoint, ephemeral-connection
+        // writers — DF1); only a nonzero garbage magic errors.
         let wal_path = db_path.with_extension("db-wal");
-        let (page_size, salt1, salt2, header_seeded) = match wal::read_header(&wal_path).await? {
-            Some(header) => (header.page_size, header.salt1, header.salt2, true),
-            None => (4096, 0, 0, false), // Defaults until a WAL header appears (B5)
-        };
+        let (page_size, salt1, salt2, header_seeded) =
+            match wal::read_header_classified(&wal_path).await? {
+                wal::WalHeaderRead::Valid(header) => {
+                    (header.page_size, header.salt1, header.salt2, true)
+                }
+                // Defaults until a WAL header appears (B5)
+                wal::WalHeaderRead::Missing
+                | wal::WalHeaderRead::TooShort
+                | wal::WalHeaderRead::Zeroed => (4096, 0, 0, false),
+            };
 
         // Find highest existing generation
         let generation = Self::find_latest_generation(&shadow_dir)
@@ -159,6 +179,7 @@ impl ShadowWal {
             wal_salt: (salt1, salt2),
             wal_chain: None,
             header_seeded,
+            reanchor_pending: false,
         })
     }
 
@@ -279,22 +300,58 @@ impl ShadowWal {
         Ok(())
     }
 
+    /// The live WAL vanished / zeroed out from under an established read cursor
+    /// (DF1): SQLite's last-close checkpoint folded every frame into the main
+    /// `.db` file, deleted the WAL, and the next ephemeral writer will recreate
+    /// it with a fresh salt. Roll the shadow to a new generation (the old WAL's
+    /// frames can never legally continue) and flag the stream for an eager
+    /// snapshot re-anchor — the `.db` file now holds pages the shadow may never
+    /// have copied, and only a fresh snapshot captures them (same reasoning as
+    /// the D3 downtime-checkpoint and WAL-rollover paths).
+    fn begin_vanished_wal_reanchor(&mut self, observed: &str) {
+        tracing::warn!(
+            "{}: live WAL {} after frames had been observed — SQLite last-close \
+             checkpoint (ephemeral-connection writer) deleted/recreated the WAL; \
+             starting shadow generation {} and re-anchoring with a fresh snapshot",
+            self.db_path.display(),
+            observed,
+            self.generation + 1
+        );
+        self.generation += 1;
+        self.segment_index = 0;
+        self.segment_offset = 0;
+        self.wal_chain = None;
+        // The next real header is a fresh initialization (B5 seeding), not a
+        // second rollover.
+        self.header_seeded = false;
+        self.reanchor_pending = true;
+    }
+
     /// Copy new WAL frames to the shadow WAL
     ///
     /// Returns the number of frames copied
     pub async fn copy_frames(&mut self, offset: u64) -> Result<(Vec<ParsedFrame>, u64)> {
         let wal_path = self.db_path.with_extension("db-wal");
 
-        // Check if WAL exists
-        if !wal_path.exists() {
-            Self::ensure_database_in_wal_mode(&self.db_path).await?;
-            return Ok((Vec::new(), offset));
-        }
-
-        // Read WAL header to check for checkpoint (salt change)
-        let header = match wal::read_header(&wal_path).await? {
-            Some(h) => h,
-            None => {
+        // Read + classify the WAL header. Missing / zero-length / zeroed-header
+        // are legal lifecycle states of an ephemeral-connection writer (DF1),
+        // never process death; a NONZERO garbage magic still errors loudly here.
+        let header = match wal::read_header_classified(&wal_path).await? {
+            wal::WalHeaderRead::Valid(h) => h,
+            observed @ (wal::WalHeaderRead::Missing
+            | wal::WalHeaderRead::TooShort
+            | wal::WalHeaderRead::Zeroed) => {
+                let observed = match observed {
+                    wal::WalHeaderRead::Missing => "missing",
+                    wal::WalHeaderRead::TooShort => "zero-length/truncated",
+                    _ => "zeroed (header read back all-zero, magic 0x0)",
+                };
+                if self.header_seeded {
+                    self.begin_vanished_wal_reanchor(observed);
+                    return Ok((Vec::new(), 0));
+                }
+                // No WAL ever observed: the normal idle state of a database
+                // with nothing to replicate yet.
                 Self::ensure_database_in_wal_mode(&self.db_path).await?;
                 return Ok((Vec::new(), offset));
             }
@@ -330,18 +387,47 @@ impl ShadowWal {
             effective_offset = 0;
             // New generation: re-seed the checksum chain from the WAL header.
             self.wal_chain = None;
+            // NOTE (DF1 adjacency): a mid-run salt roll is the ROUTINE shape —
+            // the shadow's own checkpoint path copies + durably syncs every
+            // frame before it lets the WAL restart, so no re-anchor is needed
+            // here. The vanish/zeroed lifecycle above is different: there the
+            // fold cannot be proven to have been preceded by a complete copy,
+            // so it flags an eager snapshot re-anchor.
         }
 
         // Read new frames from the active WAL through the CHECKED reader so torn
         // or stale (salt-mismatched) frames never enter the shadow (B4). The
         // running chain is carried across incremental reads within this process.
-        let (frames, new_offset, _max_db_size, out_chain) = wal::read_frames_as_pages_checked(
+        let read_result = wal::read_frames_as_pages_checked(
             &wal_path,
             header.page_size,
             effective_offset,
             self.wal_chain,
         )
-        .await?;
+        .await;
+        let (frames, new_offset, _max_db_size, out_chain) = match read_result {
+            Ok(result) => result,
+            Err(read_err) => {
+                // The read raced the last-close delete/recreate window (DF1):
+                // if the WAL is no longer the one whose header we just
+                // validated (gone, zeroed, or already re-created with a new
+                // salt), the parsed bytes are untrustworthy AND the event is
+                // the legal lifecycle state — re-anchor instead of dying. If
+                // the same WAL is still there, the failure is genuine.
+                let raced = match wal::read_header_classified(&wal_path).await {
+                    Ok(wal::WalHeaderRead::Valid(now)) => (now.salt1, now.salt2) != current_salt,
+                    Ok(_) => true,
+                    Err(_) => false,
+                };
+                if raced {
+                    self.begin_vanished_wal_reanchor(
+                        "reset while its frames were being read (frame read failed)",
+                    );
+                    return Ok((Vec::new(), 0));
+                }
+                return Err(read_err);
+            }
+        };
         self.wal_chain = out_chain;
 
         if frames.is_empty() {
@@ -635,6 +721,17 @@ impl ShadowWal {
         self.wal_chain
     }
 
+    /// Consume the pending re-anchor flag (DF1). Returns `true` when
+    /// `copy_frames` observed a WAL delete/recreate lifecycle event since the
+    /// last consumption. The caller MUST react
+    /// by publishing an eager snapshot — the same re-anchor the D3
+    /// downtime-checkpoint startup path performs — and resetting its WAL copy
+    /// cursor to 0; the `.db` file may hold checkpoint-folded pages the shadow
+    /// never copied.
+    pub fn take_reanchor_pending(&mut self) -> bool {
+        std::mem::take(&mut self.reanchor_pending)
+    }
+
     /// Restore the live-WAL read cursor after a process restart (B4). Seeding
     /// the persisted salt + running chain lets the next `copy_frames` resume
     /// from the persisted offset with full per-frame checksum validation and
@@ -694,6 +791,7 @@ mod tests {
                 wal_salt: (0, 0),
                 wal_chain: None,
                 header_seeded: false,
+                reanchor_pending: false,
             };
             shadow
                 .current_segment_path()
@@ -950,6 +1048,187 @@ mod tests {
             healed, oracle_res,
             "healed shadow must decode the same unique pages and TXID range as a \
              clean copy (healed_seg_len={healed_len}, oracle_seg_len={oracle_len})"
+        );
+    }
+
+    // ── DF1: ephemeral-connection writer WAL delete/recreate lifecycle ──────
+    //
+    // SQLite deletes the WAL when the last connection on a WAL database closes
+    // and recreates it on the next write. A writer that opens one connection
+    // per INSERT (shell scripts, cron jobs) cycles the WAL through missing /
+    // zero-length / zeroed-header states routinely. The 2026-07-11 dogfooding
+    // run of the published 0.7.0 binary died on exactly this:
+    // "ERROR Shadow copy failed: Invalid WAL magic number: 0x0" → process exit.
+
+    /// Open → write → close, one connection per statement — the exact writer
+    /// shape every prior drill missed (they all held one long-lived connection).
+    fn ephemeral_exec(db_path: &Path, sql: &str) {
+        let conn = Connection::open(db_path).unwrap();
+        conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        conn.execute_batch(sql).unwrap();
+        // conn drops here: if it is the last connection, SQLite checkpoints
+        // and deletes the WAL (the DF1 lifecycle).
+    }
+
+    /// Build a real DB via ephemeral connections and a ShadowWal that has
+    /// observed its WAL (seeded header + copied frames).
+    async fn df1_seeded_shadow(dir: &tempfile::TempDir) -> (PathBuf, ShadowWal, u64) {
+        let db_path = dir.path().join("ephemeral.db");
+        ephemeral_exec(&db_path, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);");
+        ephemeral_exec(&db_path, "INSERT INTO t (v) VALUES ('a');");
+
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        // The blocker connection keeps the DB open now, so further ephemeral
+        // closes no longer delete the WAL; write one more row and copy.
+        ephemeral_exec(&db_path, "INSERT INTO t (v) VALUES ('b');");
+        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
+        assert!(!frames.is_empty(), "setup must observe real WAL frames");
+        assert!(shadow.wal_read_salt().is_some(), "header must be seeded");
+        assert!(
+            !shadow.take_reanchor_pending(),
+            "setup must not leave a re-anchor pending"
+        );
+        (db_path, shadow, offset)
+    }
+
+    /// THE DF1 repro: the WAL read back with an all-zero header (magic 0x0),
+    /// the transient state of SQLite's last-close checkpoint + recreate. The
+    /// shadow copy must treat it as a re-anchor trigger — generation roll +
+    /// pending eager snapshot — never an error (which killed the watch process).
+    /// Revert-proof: with the fix disabled, `copy_frames` here returns
+    /// Err("Invalid WAL magic number: 0x0") and this test fails.
+    #[tokio::test]
+    async fn df1_zeroed_wal_header_reanchors_instead_of_dying() {
+        let dir = tempdir().unwrap();
+        let (db_path, mut shadow, offset) = df1_seeded_shadow(&dir).await;
+        let generation_before = shadow.generation();
+
+        // Drive the exact interleaving: between ticks, the WAL header region is
+        // zeroed (delete/recreate midpoint observed by the dogfooding run).
+        let wal_path = db_path.with_extension("db-wal");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0u8; 32]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let (frames, new_offset) = shadow
+            .copy_frames(offset)
+            .await
+            .expect("a zeroed WAL header is a legal lifecycle state, not process death");
+        assert!(frames.is_empty(), "no frames can come from a zeroed WAL");
+        assert_eq!(new_offset, 0, "the read cursor must reset for the new WAL");
+        assert!(
+            shadow.generation() > generation_before,
+            "the dead WAL's generation must be rolled"
+        );
+        assert!(
+            shadow.take_reanchor_pending(),
+            "a zeroed WAL must flag an eager snapshot re-anchor"
+        );
+    }
+
+    /// The unlinked-WAL variant of the same lifecycle: the file is gone
+    /// entirely. Pre-fix code returned Ok silently with NO re-anchor — the
+    /// folded-but-never-copied frames would be missing from the stream until
+    /// the next periodic snapshot (a silent-loss window). Revert-proof: with
+    /// the fix disabled the re-anchor flag stays false and this test fails.
+    #[tokio::test]
+    async fn df1_missing_wal_after_observed_frames_reanchors() {
+        let dir = tempdir().unwrap();
+        let (db_path, mut shadow, offset) = df1_seeded_shadow(&dir).await;
+        let generation_before = shadow.generation();
+
+        // SQLite's last-close checkpoint removes the WAL and its shm together.
+        std::fs::remove_file(db_path.with_extension("db-wal")).unwrap();
+        std::fs::remove_file(db_path.with_extension("db-shm")).unwrap();
+
+        let (frames, new_offset) = shadow
+            .copy_frames(offset)
+            .await
+            .expect("a missing WAL is a legal lifecycle state");
+        assert!(frames.is_empty());
+        assert_eq!(new_offset, 0);
+        assert!(shadow.generation() > generation_before);
+        assert!(
+            shadow.take_reanchor_pending(),
+            "a WAL that vanished mid-stream must flag an eager snapshot re-anchor"
+        );
+
+        // Self-quiescing: the read cursor is unseeded again, so while the WAL
+        // stays missing further ticks take the quiet idle branch — one
+        // lifecycle event, one re-anchor, no storm. (The recreate-and-continue
+        // leg runs cross-process in the DF1 e2e,
+        // e2e_cli_watch_survives_ephemeral_connection_writer; an in-process
+        // unlink leaves SQLite's cached shm pointing at the dead WAL, so no
+        // further SQLite I/O is possible here.)
+        assert!(
+            shadow.wal_read_salt().is_none(),
+            "the re-anchor must clear the seeded header so no second re-anchor can fire"
+        );
+    }
+
+    /// A fresh start (no WAL observed before this process's own blocker wrote
+    /// one) is initialization, not a re-anchor: no flag, no generation roll.
+    /// Guards against a re-anchor snapshot storm on freshly-watched databases.
+    #[tokio::test]
+    async fn df1_fresh_start_does_not_reanchor() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("idle.db");
+        ephemeral_exec(&db_path, "CREATE TABLE t (id INTEGER PRIMARY KEY);");
+        // The ephemeral close deleted the WAL; ShadowWal starts unseeded (its
+        // own checkpoint-blocker write then recreates the WAL fresh).
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        assert!(shadow.wal_read_salt().is_none(), "setup: no WAL observed");
+
+        let (_frames, _offset) = shadow.copy_frames(0).await.unwrap();
+        assert_eq!(
+            shadow.generation(),
+            0,
+            "first header observation is B5 seeding, not a rollover"
+        );
+        assert!(
+            !shadow.take_reanchor_pending(),
+            "a fresh start must not trigger re-anchor snapshots"
+        );
+    }
+
+    /// Corruption pin: a NONZERO garbage magic is NOT the lifecycle state and
+    /// must keep failing loudly. The DF1 fix must not have widened into
+    /// swallowing real corruption.
+    #[tokio::test]
+    async fn df1_nonzero_garbage_wal_magic_still_fails_loudly() {
+        let dir = tempdir().unwrap();
+        let (db_path, mut shadow, offset) = df1_seeded_shadow(&dir).await;
+
+        let wal_path = db_path.with_extension("db-wal");
+        {
+            use std::io::{Seek, SeekFrom, Write};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&0xDEAD_BEEFu32.to_be_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let err = shadow
+            .copy_frames(offset)
+            .await
+            .expect_err("garbage WAL magic must stay a loud error");
+        assert!(
+            err.to_string().contains("Invalid WAL magic"),
+            "got: {err}"
+        );
+        assert!(
+            !shadow.take_reanchor_pending(),
+            "corruption must not be blurred into the re-anchor lifecycle path"
         );
     }
 

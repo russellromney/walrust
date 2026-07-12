@@ -600,6 +600,148 @@ fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     Ok(())
 }
 
+/// DF1: one connection per statement — the writer shape (shell scripts, cron
+/// jobs, `sqlite3` CLI invocations) that killed the published 0.7.0 binary.
+/// Every close is a candidate last-close: when no other connection is open,
+/// SQLite checkpoints and DELETES the WAL; the next write recreates it.
+fn df1_ephemeral_exec(db_path: &Path, sql: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    conn.execute_batch(sql)?;
+    Ok(())
+}
+
+/// Spawn `walrust watch` (default shadow mode) tuned so its checkpoint path
+/// cycles the blocker every ~2s: with an ephemeral-connection writer, each
+/// cycle's last-close deletes and recreates the live WAL — the DF1 lifecycle —
+/// many times per minute. stdout/stderr go to `log_path` for post-mortem.
+fn spawn_cli_watch_df1(
+    db_path: &Path,
+    bucket_arg: &str,
+    endpoint: Option<&str>,
+    log_path: &Path,
+) -> Result<Child> {
+    let log = std::fs::File::create(log_path)?;
+    let log_err = log.try_clone()?;
+    let mut watch = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    watch
+        .arg("watch")
+        .arg(db_path)
+        .arg("--bucket")
+        .arg(bucket_arg)
+        .arg("--snapshot-interval")
+        .arg("999999")
+        .arg("--wal-sync-interval")
+        .arg("1")
+        .arg("--checkpoint-interval")
+        .arg("2")
+        .arg("--min-checkpoint-pages")
+        .arg("1")
+        .arg("--on-startup")
+        .arg("true")
+        .arg("--no-metrics")
+        .arg("--no-cache")
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+    if let Some(endpoint) = endpoint {
+        watch.arg("--endpoint").arg(endpoint);
+    }
+    watch.spawn().context("spawn walrust watch (df1)")
+}
+
+fn df1_log_tail(log_path: &Path) -> String {
+    let log = std::fs::read_to_string(log_path).unwrap_or_default();
+    let lines: Vec<&str> = log.lines().collect();
+    let start = lines.len().saturating_sub(30);
+    lines[start..].join("\n")
+}
+
+/// DF1 e2e — the user journey that died on 2026-07-11: default shadow-mode
+/// `walrust watch` against live S3 with an ephemeral-connection writer (one
+/// connection per INSERT). The run crossed several WAL checkpoint/unlink
+/// cycles and the watch process exited with
+/// "Shadow copy failed: Invalid WAL magic number: 0x0". Forever after: the
+/// process must survive this workload for the whole run, and a restore at the
+/// end must be row-exact with integrity_check ok. (The periodic snapshot timer
+/// is parked at 999999s so survival cannot be credited to it.)
+#[test]
+fn e2e_cli_watch_survives_ephemeral_connection_writer() -> Result<()> {
+    require_s3!("e2e_cli_watch_survives_ephemeral_connection_writer");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-df1-e2e");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+
+    // Seed the database the same way it will be written: ephemerally. The WAL
+    // is already deleted again by the time watch starts.
+    df1_ephemeral_exec(
+        &db_path,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+    )?;
+    df1_ephemeral_exec(&db_path, "INSERT INTO items (id, value) VALUES (1, 'base-1');")?;
+
+    let mut child = spawn_cli_watch_df1(&db_path, &bucket_arg, endpoint.as_deref(), &log_path)?;
+    wait_for_shadow_blocker(&db_path, &mut child)?;
+
+    // ~25s of ephemeral writes across ~12 checkpoint/unlink cycles. The 0.7.0
+    // binary died ~3 minutes into a 2s-cadence version of exactly this loop;
+    // the fast checkpoint knobs above compress the same number of WAL
+    // delete/recreate cycles into a test-sized window.
+    for id in 2..=35i64 {
+        df1_ephemeral_exec(
+            &db_path,
+            &format!("INSERT INTO items (id, value) VALUES ({id}, 'eph-{id}');"),
+        )?;
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "DF1 regression: watch process died mid-run with {status} at row {id}\n\
+                 --- watch log tail ---\n{}",
+                df1_log_tail(&log_path)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(700));
+    }
+
+    // Let the final sync ticks (and any eager re-anchor snapshot) land.
+    std::thread::sleep(Duration::from_secs(5));
+
+    if let Some(status) = child.try_wait()? {
+        anyhow::bail!(
+            "DF1 regression: watch process died after the write loop with {status}\n\
+             --- watch log tail ---\n{}",
+            df1_log_tail(&log_path)
+        );
+    }
+
+    let expected_rows = rows(&db_path)?;
+    anyhow::ensure!(
+        expected_rows.len() == 35,
+        "test setup: all 35 ephemeral writes must have committed"
+    );
+    let restore_result = wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected_rows,
+    );
+    stop_child(&mut child);
+    if let Err(e) = restore_result {
+        anyhow::bail!(
+            "restore after ephemeral-writer run was not row-exact: {e:#}\n\
+             --- watch log tail ---\n{}",
+            df1_log_tail(&log_path)
+        );
+    }
+    assert_integrity_ok(&restored_path)?;
+
+    Ok(())
+}
+
 #[test]
 fn e2e_prune_during_restore_keeps_backup_restorable() -> Result<()> {
     require_s3!("e2e_prune_during_restore_keeps_backup_restorable");

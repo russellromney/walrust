@@ -277,6 +277,145 @@ async fn legacy_manual_snapshot_is_owned_by_core() -> Result<()> {
     Ok(())
 }
 
+// ── DF1: ephemeral-connection writer WAL lifecycle in the independent
+//    (direct, `--independent-tasks --no-cache`) sync path ─────────────────────
+//
+// SQLite deletes the WAL when the last connection closes and recreates it on
+// the next write; the recreate transits through a zeroed header. Pre-fix,
+// `sync_wal_to_storage` read that header, errored "Invalid WAL magic number:
+// 0x0", and the watch task died after retries (same kill class as the shadow
+// mode DF1 death). It must instead re-anchor with a rollover snapshot — the
+// exact reaction the existing salt/size-rollover branch takes.
+
+/// Build a WAL DB via ephemeral connections (open → write → close each time),
+/// leaving all rows folded into the main `.db` and NO live WAL, then plant a
+/// fake WAL in the requested transient state.
+fn ephemeral_db_with_planted_wal(
+    dir: &tempfile::TempDir,
+    wal_bytes: &[u8],
+) -> Result<(std::path::PathBuf, (u32, u32))> {
+    let db_path = dir.path().join("ephemeral.db");
+    for sql in [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);",
+        "INSERT INTO t (v) VALUES ('a');",
+        "INSERT INTO t (v) VALUES ('b');",
+    ] {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.execute_batch(sql)?;
+        // Last-close checkpoint folds + deletes the WAL here.
+    }
+    let wal_path = db_path.with_extension("db-wal");
+    assert!(
+        !wal_path.exists(),
+        "setup: SQLite's last-close checkpoint must have deleted the WAL"
+    );
+    std::fs::write(&wal_path, wal_bytes)?;
+    // A previously-observed salt, as a resumed stream would carry.
+    Ok((db_path, (0xAAAA_BBBB, 0xCCCC_DDDD)))
+}
+
+fn established_input(db_path: &std::path::Path, wal_salt: (u32, u32)) -> SyncInput {
+    SyncInput {
+        db_path: db_path.to_path_buf(),
+        name: "app".to_string(),
+        wal_path: db_path.with_extension("db-wal"),
+        wal_offset: 4096 + 32,
+        wal_generation: 1,
+        current_txid: 3,
+        db_checksum: Some(0x1234_5678),
+        wal_salt: Some(wal_salt),
+        wal_checksum_chain: Some((7, 9)),
+    }
+}
+
+/// THE DF1 repro for independent mode: a zeroed WAL header over an established
+/// stream must publish a rollover re-anchor snapshot and continue — never
+/// error. Revert-proof: with the fix disabled this returns
+/// Err("Invalid WAL magic number: 0x0") and the test fails.
+#[tokio::test]
+async fn df1_independent_sync_zeroed_wal_header_reanchors_with_rollover_snapshot() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    // 64 zero bytes: a full-but-zeroed header region (the observed transient).
+    let (db_path, salt) = ephemeral_db_with_planted_wal(&dir, &[0u8; 64])?;
+    let storage = MemoryStorage::default();
+    let input = established_input(&db_path, salt);
+
+    let output = sync_wal_to_storage(&storage, "backups", input)
+        .await
+        .expect("a zeroed WAL header is a legal lifecycle state, not a sync failure");
+
+    assert!(
+        output.checkpoint_detected,
+        "the re-anchor must be reported as a checkpoint/rollover event"
+    );
+    assert_eq!(output.new_wal_offset, 0, "the WAL cursor must reset");
+    assert_eq!(output.new_current_txid, 4, "the snapshot consumes its own txid");
+
+    // The re-anchor snapshot must exist and contain the folded rows.
+    let key = build_ltx_key("backups", "app", 1, 1, 4);
+    let bytes = storage
+        .get(&key)
+        .await?
+        .expect("rollover re-anchor snapshot object must be published");
+    let restored = dir.path().join("restored.db");
+    walrust_core::legacy_ltx::decode_to_db(std::io::Cursor::new(bytes), &restored)?;
+    let conn = rusqlite::Connection::open(&restored)?;
+    let count: i64 = conn.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))?;
+    assert_eq!(
+        count, 2,
+        "the re-anchor snapshot must carry the checkpoint-folded rows"
+    );
+    Ok(())
+}
+
+/// Corruption pin for independent mode: NONZERO garbage magic must keep
+/// failing loudly — the DF1 fix must not have widened into swallowing it.
+#[tokio::test]
+async fn df1_independent_sync_garbage_wal_magic_still_fails_loudly() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut garbage = vec![0u8; 64];
+    garbage[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+    let (db_path, salt) = ephemeral_db_with_planted_wal(&dir, &garbage)?;
+    let storage = MemoryStorage::default();
+    let input = established_input(&db_path, salt);
+
+    let err = match sync_wal_to_storage(&storage, "backups", input).await {
+        Ok(_) => panic!("garbage WAL magic must stay a loud error"),
+        Err(e) => e,
+    };
+    assert!(
+        err.to_string().contains("Invalid WAL magic"),
+        "got: {err}"
+    );
+    let keys = storage.list("backups", None).await?;
+    assert!(
+        keys.is_empty(),
+        "no object may be published off a corrupt WAL read: {keys:?}"
+    );
+    Ok(())
+}
+
+/// A MISSING WAL over an established stream stays the quiet no-op it always
+/// was (the existing salt/size-rollover branch re-anchors as soon as the
+/// recreated WAL appears — proven by the B6 reset e2e). Pins that DF1 did not
+/// change this shape.
+#[tokio::test]
+async fn df1_independent_sync_missing_wal_stays_noop() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (db_path, salt) = ephemeral_db_with_planted_wal(&dir, &[0u8; 64])?;
+    std::fs::remove_file(db_path.with_extension("db-wal"))?;
+    let storage = MemoryStorage::default();
+    let input = established_input(&db_path, salt);
+
+    let output = sync_wal_to_storage(&storage, "backups", input).await?;
+    assert_eq!(output.frame_count, 0);
+    assert!(!output.checkpoint_detected);
+    let keys = storage.list("backups", None).await?;
+    assert!(keys.is_empty(), "a missing WAL publishes nothing: {keys:?}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn legacy_manual_snapshot_folds_wal_resident_rows() -> Result<()> {
     // B10 regression guard: a snapshot must include WAL-resident commits in the

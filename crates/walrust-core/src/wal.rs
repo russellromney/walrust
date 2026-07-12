@@ -196,17 +196,45 @@ pub fn verify_frame_checksum(
     }
 }
 
-/// Read WAL header
-pub async fn read_header(path: &Path) -> Result<Option<WalHeader>> {
+/// Classification of a live WAL header read (DF1).
+///
+/// SQLite deletes the WAL file when the last connection on a WAL database
+/// closes (after a final checkpoint) and recreates it on the next write. An
+/// ephemeral-connection writer (shell scripts, cron jobs — one connection per
+/// statement) therefore cycles the WAL through missing → zero-length →
+/// zeroed-header → valid states as a matter of routine. Watch-side readers must
+/// treat the first three as a *legal lifecycle state* (the checkpoint folded
+/// everything into the main `.db` file, so a fresh snapshot re-anchors the
+/// stream), while a NONZERO garbage magic stays a loud error — that is
+/// corruption territory, not a lifecycle state.
+#[derive(Debug)]
+pub enum WalHeaderRead {
+    /// No WAL file exists at the path.
+    Missing,
+    /// The file exists but is shorter than the 32-byte header (e.g. just
+    /// created, or truncated by `wal_checkpoint(TRUNCATE)`).
+    TooShort,
+    /// A full 32-byte header is present but every byte is zero — the transient
+    /// state observed while SQLite deletes/recreates the WAL (last-close
+    /// checkpoint). Distinct from garbage: all-zeroes is the known-benign shape.
+    Zeroed,
+    /// A valid WAL header.
+    Valid(WalHeader),
+}
+
+/// Read and classify the WAL header. Errors only on I/O failures and on a
+/// nonzero invalid magic (genuine corruption); every legal lifecycle state maps
+/// to a non-error variant. See [`WalHeaderRead`].
+pub async fn read_header_classified(path: &Path) -> Result<WalHeaderRead> {
     let mut file = match File::open(path).await {
         Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(WalHeaderRead::Missing),
         Err(e) => return Err(e.into()),
     };
 
     let metadata = file.metadata().await?;
     if metadata.len() < WAL_HEADER_SIZE {
-        return Ok(None);
+        return Ok(WalHeaderRead::TooShort);
     }
 
     let mut buf = [0u8; 32];
@@ -215,11 +243,14 @@ pub async fn read_header(path: &Path) -> Result<Option<WalHeader>> {
     let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
 
     // Check magic number (0x377F0682 or 0x377F0683)
-    if magic != 0x377F0682 && magic != 0x377F0683 {
+    if magic != WAL_MAGIC_LE && magic != WAL_MAGIC_BE {
+        if buf.iter().all(|&b| b == 0) {
+            return Ok(WalHeaderRead::Zeroed);
+        }
         return Err(anyhow!("Invalid WAL magic number: {:#x}", magic));
     }
 
-    Ok(Some(WalHeader {
+    Ok(WalHeaderRead::Valid(WalHeader {
         magic,
         format_version: u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]),
         page_size: u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]),
@@ -229,6 +260,21 @@ pub async fn read_header(path: &Path) -> Result<Option<WalHeader>> {
         checksum1: u32::from_be_bytes([buf[24], buf[25], buf[26], buf[27]]),
         checksum2: u32::from_be_bytes([buf[28], buf[29], buf[30], buf[31]]),
     }))
+}
+
+/// Read WAL header
+///
+/// Missing/too-short files read as `Ok(None)`. An all-zeroes header keeps the
+/// historical strict behavior here (an "Invalid WAL magic number: 0x0" error)
+/// for callers that have not opted into lifecycle-aware handling; use
+/// [`read_header_classified`] on watch-side live-WAL paths where the zeroed
+/// state is a legal transient (DF1).
+pub async fn read_header(path: &Path) -> Result<Option<WalHeader>> {
+    match read_header_classified(path).await? {
+        WalHeaderRead::Missing | WalHeaderRead::TooShort => Ok(None),
+        WalHeaderRead::Zeroed => Err(anyhow!("Invalid WAL magic number: 0x0")),
+        WalHeaderRead::Valid(header) => Ok(Some(header)),
+    }
 }
 
 /// Read WAL frames starting from offset, returns (frames_data, new_offset, frame_count)
@@ -1694,6 +1740,78 @@ mod tests {
         let result = read_header(&path).await;
         assert!(result.is_err());
         assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid WAL magic"));
+
+        tokio::fs::remove_file(&path).await.ok();
+    }
+
+    // ── DF1: lifecycle classification of live-WAL header states ─────────────
+
+    #[tokio::test]
+    async fn df1_read_header_classified_maps_lifecycle_states() {
+        // Missing file.
+        let missing = PathBuf::from("/tmp/nonexistent-wal-file.db-wal");
+        assert!(matches!(
+            read_header_classified(&missing).await.unwrap(),
+            WalHeaderRead::Missing
+        ));
+
+        // Shorter than a header (post-TRUNCATE / just-created).
+        let short = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
+        tokio::fs::write(&short, &[0u8; 20]).await.unwrap();
+        assert!(matches!(
+            read_header_classified(&short).await.unwrap(),
+            WalHeaderRead::TooShort
+        ));
+        tokio::fs::remove_file(&short).await.ok();
+
+        // All-zero header: the exact transient the DF1 dogfooding run observed
+        // ("Invalid WAL magic number: 0x0") while SQLite deleted/recreated the
+        // WAL on an ephemeral-connection writer. A legal lifecycle state, NOT
+        // an error.
+        let zeroed = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
+        tokio::fs::write(&zeroed, &[0u8; 64]).await.unwrap();
+        assert!(matches!(
+            read_header_classified(&zeroed).await.unwrap(),
+            WalHeaderRead::Zeroed
+        ));
+        tokio::fs::remove_file(&zeroed).await.ok();
+
+        // Valid header.
+        let valid = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let mut header = [0u8; 32];
+        header[0..4].copy_from_slice(&WAL_MAGIC_LE.to_be_bytes());
+        header[8..12].copy_from_slice(&4096u32.to_be_bytes());
+        tokio::fs::write(&valid, &header).await.unwrap();
+        assert!(matches!(
+            read_header_classified(&valid).await.unwrap(),
+            WalHeaderRead::Valid(h) if h.page_size == 4096
+        ));
+        tokio::fs::remove_file(&valid).await.ok();
+    }
+
+    #[tokio::test]
+    async fn df1_read_header_classified_nonzero_garbage_magic_still_fails_loudly() {
+        // Corruption pin: a NONZERO invalid magic is genuine corruption, never
+        // a lifecycle state. The DF1 fix must not have widened into swallowing
+        // it — both the classified and the plain reader must error.
+        let path = PathBuf::from(format!("/tmp/walrust-test-{}.db-wal", uuid::Uuid::new_v4()));
+        let mut header = [0u8; 32];
+        header[0..4].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        tokio::fs::write(&path, &header).await.unwrap();
+
+        let classified = read_header_classified(&path).await;
+        assert!(
+            classified
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid WAL magic"),
+            "nonzero garbage magic must stay a loud error in the classified reader"
+        );
+        let plain = read_header(&path).await;
+        assert!(plain
             .unwrap_err()
             .to_string()
             .contains("Invalid WAL magic"));
