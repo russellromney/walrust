@@ -50,7 +50,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   preservation of the winner, transient preflight retry, and the
   snapshot-upload/state-save crash window. Added the same mixed-workload
   restore/resume/restore path against live S3-compatible storage. A revoked
-  lease is rejected before storage access or `SyncState` mutation.
+  lease is rejected before storage access or `SyncState` mutation, and lease
+  expiry during the final state PUT is detected before the API can return
+  success while leaving the published snapshot/state recoverable. Lease
+  validity is also checked inside every retried snapshot and state PUT attempt,
+  so retry backoff cannot silently outlive the caller's lease.
 
 ## [0.7.0] - 2026-07-10
 

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Result;
@@ -26,6 +26,30 @@ struct RevokedLease;
 impl OwnedResumeLease for RevokedLease {
     fn ensure_held(&self) -> Result<()> {
         anyhow::bail!("owned resume lease is not held")
+    }
+}
+
+struct ExpiringLease {
+    checks: AtomicUsize,
+    fail_on_check: usize,
+}
+
+impl ExpiringLease {
+    fn new(fail_on_check: usize) -> Self {
+        Self {
+            checks: AtomicUsize::new(0),
+            fail_on_check,
+        }
+    }
+}
+
+impl OwnedResumeLease for ExpiringLease {
+    fn ensure_held(&self) -> Result<()> {
+        let check = self.checks.fetch_add(1, Ordering::SeqCst) + 1;
+        if check == self.fail_on_check {
+            anyhow::bail!("owned resume lease expired at check {check}");
+        }
+        Ok(())
     }
 }
 
@@ -460,6 +484,58 @@ async fn public_owned_resume_requires_held_lease_before_storage_access() {
     assert_eq!(storage.keys(), keys_before);
     assert_eq!(resumed.current_seq, 0);
     assert!(resumed.db_checksum.is_none());
+}
+
+#[tokio::test]
+async fn public_owned_resume_detects_lease_loss_during_state_persistence() {
+    let storage = Arc::new(MemStorage::default());
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_path = source_dir.path().join("lease-expiry.db");
+    let (_writer, _state) = seed_owned_history(&storage, &source_path, "lease-expiry", false).await;
+    let restore_dir = tempfile::tempdir().unwrap();
+    let restore_path = restore_dir.path().join("lease-expiry.db");
+    let restored = restore(storage.clone(), "wal/", "lease-expiry", &restore_path, None)
+        .await
+        .unwrap();
+    let mut resumed = SyncState::new(restore_path).unwrap();
+    resumed.name = "lease-expiry".to_string();
+    // Checks: entry, after remote preflight, inside snapshot upload, after
+    // snapshot upload, inside state persistence, and after persistence. Expire
+    // on the last one.
+    let lease = ExpiringLease::new(6);
+
+    let err = resume_owned_after_restore(
+        &*storage,
+        "wal/",
+        &mut resumed,
+        &restored,
+        &lease,
+        &no_retry(),
+    )
+    .await
+    .expect_err("lease loss during final state PUT must not return success");
+    assert!(err.to_string().contains("expired at check 6"), "{err}");
+    assert_eq!(resumed.current_seq, 3);
+    assert!(storage
+        .keys()
+        .contains(&"wal/lease-expiry/0001/0000000000000003.hadbp".to_string()));
+    let saved: serde_json::Value = serde_json::from_slice(
+        &storage
+            .get("wal/lease-expiry/state.json")
+            .await
+            .unwrap()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(saved["current_seq"], 3);
+
+    let verify_dir = tempfile::tempdir().unwrap();
+    let verify_path = verify_dir.path().join("lease-expiry.db");
+    let recovered = restore(storage, "wal/", "lease-expiry", &verify_path, None)
+        .await
+        .unwrap();
+    assert_eq!(recovered.seq(), 3);
+    assert_integrity(&verify_path);
 }
 
 #[tokio::test]

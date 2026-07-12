@@ -2482,7 +2482,9 @@ pub async fn resume_owned_after_restore(
     state.db_checksum = Some(restored.checksum);
     state.lineage_id = restored.lineage_id.clone();
 
-    if let Err(error) = take_snapshot_with_retry(storage, prefix, state, retry_policy).await {
+    if let Err(error) =
+        take_snapshot_with_retry_guarded(storage, prefix, state, retry_policy, Some(lease)).await
+    {
         *state = original;
         return Err(error);
     }
@@ -2494,9 +2496,13 @@ pub async fn resume_owned_after_restore(
         .execute_with_context("save resumed walrust-owned state", || {
             let key = state_key.clone();
             let data = Arc::clone(&state_data);
-            async move { storage.put(&key, data.as_slice()).await }
+            async move {
+                lease.ensure_held()?;
+                storage.put(&key, data.as_slice()).await
+            }
         })
-        .await
+        .await?;
+    lease.ensure_held()
 }
 
 /// Restore using an external snapshot source (e.g., turbolite page groups).
@@ -2622,6 +2628,16 @@ pub async fn take_snapshot_with_retry(
     state: &mut SyncState,
     retry_policy: &RetryPolicy,
 ) -> Result<()> {
+    take_snapshot_with_retry_guarded(storage, prefix, state, retry_policy, None).await
+}
+
+async fn take_snapshot_with_retry_guarded(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+    retry_policy: &RetryPolicy,
+    lease: Option<&dyn OwnedResumeLease>,
+) -> Result<()> {
     let timestamp = Utc::now();
     release_checkpoint_blocker(state).await?;
     checkpoint_wal(&state.db_path).await?;
@@ -2656,6 +2672,9 @@ pub async fn take_snapshot_with_retry(
             let key = upload_key.clone();
             let name = upload_name.clone();
             async move {
+                if let Some(lease) = lease {
+                    lease.ensure_held()?;
+                }
                 put_changeset_if_absent(
                     storage,
                     &key,
