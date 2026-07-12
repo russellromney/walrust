@@ -62,8 +62,32 @@ fail() {
 dump_diagnostics() {
   set +e
   if [ -n "${WATCH_LOG:-}" ] && [ -f "${WATCH_LOG:-}" ]; then
-    printf '[%s] --- last 60 lines of %s ---\n' "$DRILL_NAME" "$WATCH_LOG" >&2
-    tail -n 60 "$WATCH_LOG" >&2
+    printf '[%s] --- last 200 lines of %s ---\n' "$DRILL_NAME" "$WATCH_LOG" >&2
+    tail -n 200 "$WATCH_LOG" >&2
+  fi
+  for db in "${MACHINE1:-/nonexistent}/app.db" "${MACHINE2:-/nonexistent}/app.db"; do
+    if [ -f "$db" ]; then
+      printf '[%s] --- local db state: %s ---\n' "$DRILL_NAME" "$db" >&2
+      sqlite3 "$db" ".timeout 5000" "PRAGMA journal_mode; SELECT COUNT(*) FROM items;" >&2
+      wal="$db-wal"
+      if [ -f "$wal" ]; then
+        printf '[%s] wal header bytes: ' "$DRILL_NAME" >&2
+        head -c 32 "$wal" | od -A d -t x1 | head -3 >&2
+      fi
+      shadow_dir=$(dirname "$db")/.walrust-app
+      if [ -d "$shadow_dir" ]; then
+        printf '[%s] --- shadow dir %s ---\n' "$DRILL_NAME" "$shadow_dir" >&2
+        ls -la "$shadow_dir" >&2
+        if [ -f "$shadow_dir/progress.json" ]; then
+          cat "$shadow_dir/progress.json" >&2
+          echo >&2
+        fi
+      fi
+    fi
+  done
+  if command -v lsof >/dev/null 2>&1 && [ -n "${MACHINE1:-}" ]; then
+    printf '[%s] --- open handles on machine dbs ---\n' "$DRILL_NAME" >&2
+    lsof +D "${MACHINE1:-/nonexistent}" 2>/dev/null | head -20 >&2
   fi
   for f in "${WORK:-/nonexistent}"/restore1.log "${WORK:-/nonexistent}"/restore-latest.log; do
     if [ -f "$f" ]; then
