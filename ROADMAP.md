@@ -69,6 +69,8 @@ Order of work (each lands as its own PR through the normal gate):
    and proves current code restores them row-exact (latest + PITR). Every
    future version must pass it: buckets written today restore forever. Cheap
    now, impossible to create retroactively.
+   **DONE** — `tests/fixtures/format-stability/` (cli-v0.7.0 + owned-v0.7.0 +
+   `generate.sh`), proven by `tests/format_stability.rs`; see CHANGELOG.
 2. **Fresh-user drill.** DONE — `drills/fresh-user.sh` (nightly + dispatchable
    via `.github/workflows/fresh-user.yml`; locally `make drill-fresh-user`);
    five README findings fixed in the same PR, no product bugs found (see
