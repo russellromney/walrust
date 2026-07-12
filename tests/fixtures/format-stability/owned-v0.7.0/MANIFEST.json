@@ -1,0 +1,103 @@
+{
+  "checksum_definition": "SHA-256 over the concatenation of '{id}|{value}\\n' for SELECT id, value FROM items ORDER BY id",
+  "config": {
+    "compaction": {
+      "enabled": true,
+      "keep_fine_window": "0s",
+      "l1_batch": 4,
+      "l2_batch": 3
+    },
+    "mode": "library owned-mode (add_without_snapshot + autonomous_snapshots)",
+    "pitr_semantics": "seq/TXID of an autonomous snapshot taken while writes were quiesced",
+    "stage1_snapshot_interval_s": 4,
+    "stage2_snapshot_interval_s": 3600,
+    "sync_interval_ms": 200
+  },
+  "db_name": "fixtureowned",
+  "fixture": "owned-v0.7.0",
+  "generator": {
+    "artifact": "registry walrust-core crate (throwaway scratch generator, no path/git deps, no [patch])",
+    "dependency": "walrust-core = \"=0.7.0\" (crates.io)",
+    "hadb": "=0.5.0",
+    "version": "0.7.0"
+  },
+  "latest": {
+    "row_count": 146,
+    "rows_sha256": "0053b5307d1fe02597d493c3519d92752443eb1b7753067096000fe0f89bcf61"
+  },
+  "objects": [
+    {
+      "key": "fixtureowned/0000/0000000000000009.hadbp",
+      "size": 4160
+    },
+    {
+      "key": "fixtureowned/0000/0000000000000013.hadbp",
+      "size": 4160
+    },
+    {
+      "key": "fixtureowned/0000/0000000000000014.hadbp",
+      "size": 8264
+    },
+    {
+      "key": "fixtureowned/0000/0000000000000015.hadbp",
+      "size": 4160
+    },
+    {
+      "key": "fixtureowned/0000/0000000000000016.hadbp",
+      "size": 4160
+    },
+    {
+      "key": "fixtureowned/0000/0000000000000017.hadbp",
+      "size": 4160
+    },
+    {
+      "key": "fixtureowned/0000/0000000000000018.hadbp",
+      "size": 4160
+    },
+    {
+      "key": "fixtureowned/0000/0000000000000019.hadbp",
+      "size": 4160
+    },
+    {
+      "key": "fixtureowned/0000/000000000000001a.hadbp",
+      "size": 4160
+    },
+    {
+      "key": "fixtureowned/0000/000000000000001b.hadbp",
+      "size": 4160
+    },
+    {
+      "key": "fixtureowned/0001/000000000000000a.hadbp",
+      "size": 12360
+    },
+    {
+      "key": "fixtureowned/0001/000000000000000e.hadbp",
+      "size": 12360
+    },
+    {
+      "key": "fixtureowned/0001/0000000000000012.hadbp",
+      "size": 12360
+    },
+    {
+      "key": "fixtureowned/levels/L1/000000000000000b-000000000000000d.hadbp",
+      "size": 8272
+    },
+    {
+      "key": "fixtureowned/levels/L1/000000000000000f-0000000000000011.hadbp",
+      "size": 8272
+    },
+    {
+      "key": "fixtureowned/levels/L2/0000000000000001-0000000000000008.hadbp",
+      "size": 12376
+    },
+    {
+      "key": "fixtureowned/state.json",
+      "size": 249
+    }
+  ],
+  "pitr": {
+    "row_count": 130,
+    "rows_sha256": "2a5386b3dd33254733d6a01cd228b77e8f8596802b1a3ad4674d0f5acfeef6b5",
+    "txid": 18
+  }
+}
