@@ -103,6 +103,25 @@ Order of work (each lands as its own PR through the normal gate):
    RSS/lag report. Credential rotation mid-run belongs here: fail loudly,
    recover cleanly, never wedge silently.
 
+### Dogfooding findings (open)
+
+- **DF1 — shadow watch DIES on an ephemeral-connection writer (WAL
+  unlink/recreate race).** Found 2026-07-11 by a 10-minute live-Tigris
+  laptop-test run of the published 0.7.0 binary, default shadow `walrust
+  watch`, writer = `sqlite3` CLI one connection per INSERT every 2s. When the
+  last connection on a WAL database closes, SQLite checkpoints and DELETES the
+  WAL file; the next write recreates it. ~3 minutes in, the shadow copy read
+  the WAL in its transient zeroed state and the process exited:
+  `ERROR notes: Shadow copy failed: Invalid WAL magic number: 0x0` (twice,
+  then death). Loud, but wrong reaction: an ephemeral-connection writer (shell
+  scripts, cron jobs) is normal user behavior, and this is the same event
+  class as the downtime-checkpoint / rollover races walrust already survives
+  by re-anchoring. Watch should treat invalid-magic/zero-length WAL as a
+  re-anchor trigger (loud WARN + snapshot re-anchor, like the salt-mismatch
+  path), never process death. Drills never caught it because every drill
+  driver holds one long-lived connection. Needs: repro test with an
+  ephemeral-connection writer, the re-anchor fix, and a revert-proof test.
+
 ---
 
 ## Compaction (shipped — default off)
