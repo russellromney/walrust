@@ -297,7 +297,10 @@ installed=0
 while [ "$attempt" -le "$INSTALL_RETRIES" ]; do
   # cwd is outside any cargo workspace so no local .cargo/config.toml or
   # [patch] section can influence dependency resolution.
-  if (cd "$WORK" && cargo install walrust --locked --root "$PREFIX_DIR") >"$install_log" 2>&1; then
+  # --color never: the version-parse below reads this log, and CI exports
+  # CARGO_TERM_COLOR=always, which would thread ANSI escapes through the
+  # "Installed package" line.
+  if (cd "$WORK" && cargo install walrust --locked --color never --root "$PREFIX_DIR") >"$install_log" 2>&1; then
     installed=1
     break
   fi
@@ -317,8 +320,11 @@ export PATH="$PREFIX_DIR/bin:$PATH"
 resolved=$(command -v walrust) || fail "walrust not on PATH after install"
 [ "$resolved" = "$PREFIX_DIR/bin/walrust" ] \
   || fail "walrust resolved to $resolved, expected $PREFIX_DIR/bin/walrust — a non-crates.io binary is shadowing the drill"
+# Strip any ANSI escapes before parsing, belt-and-braces alongside
+# --color never above.
 # shellcheck disable=SC2016  # the backticks are literal text in cargo's output
-installed_version=$(sed -nE 's/.*Installed package `walrust v([0-9][^`]*)`.*/\1/p' "$install_log" | tail -n 1)
+installed_version=$(sed -e $'s/\x1b\\[[0-9;]*m//g' "$install_log" \
+  | sed -nE 's/.*Installed package `walrust v([0-9][^`]*)`.*/\1/p' | tail -n 1)
 [ -n "$installed_version" ] || fail "could not parse installed version from $install_log"
 reported_version=$(walrust --version | awk '{print $2}')
 [ "$reported_version" = "$installed_version" ] \
