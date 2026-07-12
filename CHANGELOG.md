@@ -56,6 +56,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validity is also checked inside every retried snapshot and state PUT attempt,
   so retry backoff cannot silently outlive the caller's lease.
 
+### Removed
+- Removed the adversarial-review ledgers (`ADVERSARIAL_REVIEW.md`, `ADVERSARIAL_REVIEW_2.md`) — dev artifacts, fully resolved except three residuals now tracked as R1–R3 in ROADMAP.md's "Residual risk register" (multi-writer lease out of scope by design; cross-generation cache collision backstopped by restore chain checksums; rollover truncate-before-put publish window, adjudicated not silent loss). Full ledgers remain in git history.
+
 ## [0.7.0] - 2026-07-10
 
 ### Added

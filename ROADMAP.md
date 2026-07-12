@@ -14,16 +14,15 @@ Core differentiators:
 
 ## Current Capabilities (v0.6.0)
 
-> **Review history.** After the first adversarial review (F1–F15,
-> ADVERSARIAL_REVIEW.md), a second review (ADVERSARIAL_REVIEW_2.md) found
-> additional silent-data-loss and silent-restore-corruption paths. Those were
-> worked through in phased fix waves (Phase 0 foundations through Phase 4
-> single-engine convergence), each gated by revert-proven tests and CI E2E
+> **Review history.** Two full adversarial reviews (F1–F15, then A/B/D/E
+> findings) found and fixed silent-data-loss and silent-restore-corruption
+> paths across phased fix waves, each gated by revert-proven tests and CI E2E
 > round-trips with an external autocheckpointing writer. The dual src/ and
 > walrust-core trees are now one engine (the source of half the original
-> findings). A set of residuals remains open and is tracked, per item with
-> risk/trigger/suggested fix, in the DEFERRED register at the bottom of
-> ADVERSARIAL_REVIEW_2.md. The "Experimental" warning stands.
+> findings). The full ledgers (every fixed finding named its proving test)
+> lived in `ADVERSARIAL_REVIEW*.md`, removed 2026-07-11 — see git history and
+> CHANGELOG.md. Still-open residuals moved to the "Residual risk register"
+> section below. The "Experimental" warning stands.
 
 **Core features that work:**
 - `walrust watch` - Watch and sync multiple databases
@@ -502,6 +501,36 @@ at replay cursor N, apply delta objects with seq > N."
 
 walrust is Rust-specific. For cross-language composability (Python/Node/Go SDKs), rename to
 walsync. The Rust crate stays walsync-core, packages are walsync-python, walsync-node, etc.
+
+## Residual risk register
+
+Carried over from the adversarial-review ledgers (`ADVERSARIAL_REVIEW.md` /
+`ADVERSARIAL_REVIEW_2.md`, removed 2026-07-11; the full ledgers live in git
+history). Everything not listed here was fixed with a revert-proof test. The
+rule stands: nothing vanishes silently — update this register when touching
+anything it covers.
+
+- **R1 (was D1) — no multi-writer lease, by design.** walrust is
+  single-writer. A second writer fails loudly on CAS collision; the local
+  `PublishIntent` authorship proof is a durability fence, not a distributed
+  lease. A true lease/epoch token belongs in an external coordinator (the
+  hadb internal-lease-store work), not in walrust.
+- **R2 (was D6) — cross-generation same-(min,max) cache collision.**
+  Theoretically possible; backstopped by restore's `pre/post_apply` checksums
+  (computed from actual DB bytes), which catch a wrong-lineage substitution
+  downstream. Trigger: two generations producing an identical `(min,max)`
+  range while the local cache is warm. Suggested fix: bind the cache key to
+  lineage/etag.
+- **R3 (was E9) — rollover publish-failure window.**
+  `upload_rollover_snapshot` folds the WAL into the local `.db`
+  (`checkpoint_wal_truncate`) *before* putting the rollover snapshot; if the
+  put fails, the folded rows sit local-only until the next successful tick or
+  restart re-detects the rollover and republishes (idempotent, full-DB
+  snapshot). Adjudicated NOT silent loss: no `Ok` ever acknowledges those
+  rows as durable (the durability cursor advances only on `frame_count > 0`),
+  and the DST oracle models the window exactly. Suggested defensive
+  narrowing: reverse the truncate/put order — critical-path work, take it
+  deliberately.
 
 ## Future Considerations (v1.0+)
 
