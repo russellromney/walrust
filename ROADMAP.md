@@ -69,11 +69,10 @@ Order of work (each lands as its own PR through the normal gate):
    and proves current code restores them row-exact (latest + PITR). Every
    future version must pass it: buckets written today restore forever. Cheap
    now, impossible to create retroactively.
-2. **Fresh-user drill.** Clean container, `cargo install walrust` from
-   crates.io, follow the README *verbatim* to a verified restore — no repo
-   checkout, no improvising. Every deviation forced by reality is a docs bug.
-   Include the "bad migration 10 minutes ago" exercise: find the right PITR
-   point using `walrust list` output alone.
+2. **Fresh-user drill.** DONE — `drills/fresh-user.sh` (nightly + dispatchable
+   via `.github/workflows/fresh-user.yml`; locally `make drill-fresh-user`);
+   five README findings fixed in the same PR, no product bugs found (see
+   CHANGELOG Unreleased).
 3. **Library dogfood app.** A small real app (axum; sessions table, job-queue
    table with DELETE churn, blob table) depending on `walrust-core` from the
    **registry**, exercising the patterns real embedders need:

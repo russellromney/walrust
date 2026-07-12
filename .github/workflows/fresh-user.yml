@@ -1,0 +1,169 @@
+name: Fresh User Drill
+
+# The fresh-user dogfooding drill (drills/fresh-user.sh): installs the
+# PUBLISHED walrust from crates.io into an isolated prefix and follows the
+# README verbatim against a local MinIO — no workspace build is involved, so
+# this workflow deliberately never compiles the repo. It runs nightly and can
+# be dispatched manually; dispatching with induce_loss=true is the standing
+# teeth proof (bucket contents deleted before restore; the run MUST go red).
+
+on:
+  schedule:
+    - cron: "41 10 * * *"
+  workflow_dispatch:
+    inputs:
+      induce_loss:
+        description: "Delete bucket contents before restore to prove the drill fails loudly (expected: red run)"
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  issues: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # sccache over the GHA cache accelerates the crates.io release build. It is
+  # content-keyed per compiler invocation, so it can never serve a stale
+  # walrust: the installed binary itself is written to a temp prefix and is
+  # NEVER cached across runs.
+  RUSTC_WRAPPER: sccache
+  SCCACHE_GHA_ENABLED: "true"
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  fresh-user:
+    name: fresh-user drill
+    runs-on: ubuntu-latest
+
+    env:
+      AWS_ACCESS_KEY_ID: minioadmin
+      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ENDPOINT_URL: http://127.0.0.1:9000
+      AWS_ENDPOINT_URL_S3: http://127.0.0.1:9000
+      AWS_REGION: us-east-1
+      TIERED_TEST_BUCKET: walrust-fresh-user
+      GH_TOKEN: ${{ github.token }}
+      WALRUST_DRILL_INDUCE_LOSS: ${{ inputs.induce_loss == true && '1' || '0' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start MinIO
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=minioadmin \
+            -e MINIO_ROOT_PASSWORD=minioadmin \
+            minio/minio:latest server /data
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:9000/minio/health/live && exit 0
+            sleep 2
+          done
+          echo "MinIO failed to become healthy" >&2
+          docker logs minio >&2
+          exit 1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      # Key the registry cache on the published version so a new release gets
+      # a fresh key. Only registry sources are cached — never the installed
+      # binary (it lives in the drill's temp prefix and is rebuilt each run,
+      # with sccache absorbing the compilation cost).
+      - name: Resolve published walrust version
+        id: crate
+        run: |
+          version=$(curl -sf -A "walrust-ci (github.com/${GITHUB_REPOSITORY})" \
+            https://crates.io/api/v1/crates/walrust \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["crate"]["newest_version"])' \
+            || echo unknown)
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "published walrust version: ${version}"
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ runner.os }}-fresh-user-cargo-${{ steps.crate.outputs.version }}
+          restore-keys: |
+            ${{ runner.os }}-fresh-user-cargo-
+
+      - name: Install system tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y sqlite3 shellcheck
+          python3 -m pip install --user minio
+
+      - name: Create MinIO bucket
+        run: |
+          python3 - <<'PY'
+          from minio import Minio
+
+          client = Minio(
+              "127.0.0.1:9000",
+              access_key="minioadmin",
+              secret_key="minioadmin",
+              secure=False,
+          )
+          bucket = "walrust-fresh-user"
+          if not client.bucket_exists(bucket):
+              client.make_bucket(bucket)
+          print(f"Bucket {bucket} ready")
+          PY
+
+      - name: Shellcheck drill
+        run: shellcheck drills/fresh-user.sh
+
+      - name: Fresh-user drill
+        id: drill
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          make drill-fresh-user USE_SOUP=0 2>&1 | tee drill.log
+
+      # Nightly failures file an issue like drill-nightly does. Manual
+      # dispatches (including deliberate induce_loss red runs) never do.
+      - name: Open or update failure issue
+        if: steps.drill.outcome == 'failure' && github.event_name == 'schedule'
+        run: |
+          title="Fresh-user drill failed"
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          body=$(mktemp)
+          {
+            printf 'Nightly fresh-user drill failure.\n\n'
+            printf 'Run: %s\n\n' "$run_url"
+            printf 'Recent log:\n\n```text\n'
+            tail -n 120 drill.log
+            printf '\n```\n'
+          } >"$body"
+
+          existing=$(
+            TITLE="$title" gh issue list \
+              --state open \
+              --search "$title in:title" \
+              --json number,title \
+              --jq '.[] | select(.title == env.TITLE) | .number' |
+            head -n 1
+          )
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body-file "$body"
+          else
+            gh issue create --title "$title" --body-file "$body"
+          fi
+
+      - name: Propagate drill result
+        if: steps.drill.outcome == 'failure'
+        run: exit 1
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats

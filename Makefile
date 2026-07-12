@@ -1,4 +1,4 @@
-.PHONY: build release test basic-e2e drill drill-version-skew clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-multidb help
+.PHONY: build release test basic-e2e drill drill-version-skew drill-fresh-user clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-multidb help
 
 SOUP_PROJECT ?= turbolite
 SOUP_ENV ?= development
@@ -51,6 +51,13 @@ drill: release
 # access (flaky in CI) and can fall back to an expensive from-source build.
 drill-version-skew: release
 	$(TEST_RUNNER) sh -c '$(TEST_ENV); WALRUST_BIN="$$(pwd)/target/release/walrust" drills/version-skew.sh'
+
+# Fresh-user drill: installs the PUBLISHED walrust from crates.io into an
+# isolated prefix and follows the README verbatim (no workspace binary — hence
+# no build dependency here). Needs crates.io network access plus AWS_* env or
+# a local MinIO; runs nightly in CI via .github/workflows/fresh-user.yml.
+drill-fresh-user:
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); drills/fresh-user.sh'
 
 # Run micro-benchmarks (cargo bench)
 bench:
@@ -135,6 +142,7 @@ help:
 	@echo "    make basic-e2e      - Run the fast basic_e2e drill tier"
 	@echo "    make drill          - Run the full drill suite"
 	@echo "    make drill-version-skew - Manual-only: old binary vs a leveled bucket"
+	@echo "    make drill-fresh-user - Fresh-user drill: crates.io install + README verbatim"
 	@echo ""
 	@echo "  Benchmark:"
 	@echo "    make bench          - Run micro-benchmarks (cargo bench)"
