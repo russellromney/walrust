@@ -10,6 +10,13 @@ name: Fresh User Drill
 on:
   schedule:
     - cron: "41 10 * * *"
+  # Path-filtered PR trigger: the drill hits crates.io, so it must not run on
+  # every PR — only on PRs that change the drill or this workflow (which also
+  # registers the workflow with GitHub so workflow_dispatch can target it).
+  pull_request:
+    paths:
+      - "drills/fresh-user.sh"
+      - ".github/workflows/fresh-user.yml"
   workflow_dispatch:
     inputs:
       induce_loss:
