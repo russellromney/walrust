@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Format-stability fixture (dogfooding item 1)**: two frozen buckets written by the PUBLISHED 0.7.0 artifacts live under `tests/fixtures/format-stability/` — `cli-v0.7.0` (crates.io `cargo install walrust --version 0.7.0 --locked` binary running `watch --independent-tasks` with leveled compaction at comedy knobs: ≥2 snapshots, live L0 tail, populated L1 AND L2, and a real `walrust prune` boundary with superseded objects actually deleted — the interleaved litestream-heritage-LTX ⟷ HADBP `levels/` seam frozen on disk) and `owned-v0.7.0` (registry `walrust-core = "=0.7.0"` via a throwaway scratch generator crate, `add_without_snapshot()` + autonomous snapshots + compaction: snapshots + levels + L0 tail). Each carries a `MANIFEST.json` (generator version, exact knobs, expected latest row-count/row-content SHA-256, one mid-history PITR TXID with its expected checksum, full object index) plus `generate.sh` (manual-only, needs crates.io network like `drills/version-skew.sh`) to mint future `vX` fixtures the same way. The S3-gated proving test `tests/format_stability.rs` uploads each fixture to a unique scratch prefix and drives the SAME restore path a real user uses (CLI binary for the CLI fixture; library `Replicator::restore()`/`sync::restore()` for the owned one), asserting restore-to-latest + PITR row-exact against the manifest and `integrity_check` clean — buckets written by 0.7.0 must restore forever. Skips ONLY on missing S3 env; a missing/corrupt fixture with S3 present FAILS loudly. Failure-proven at the call site: a one-byte tamper in a level/L0 object fails with a HADBP checksum mismatch (both fixtures), and an un-uploaded (empty) prefix fails loudly (both restore paths), never a skip or a pass.
+
 ## [0.7.0] - 2026-07-10
 
 ### Added

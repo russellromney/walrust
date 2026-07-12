@@ -70,6 +70,8 @@ Order of work (each lands as its own PR through the normal gate):
    and proves current code restores them row-exact (latest + PITR). Every
    future version must pass it: buckets written today restore forever. Cheap
    now, impossible to create retroactively.
+   **DONE** — `tests/fixtures/format-stability/` (cli-v0.7.0 + owned-v0.7.0 +
+   `generate.sh`), proven by `tests/format_stability.rs`; see CHANGELOG.
 2. **Fresh-user drill.** Clean container, `cargo install walrust` from
    crates.io, follow the README *verbatim* to a verified restore — no repo
    checkout, no improvising. Every deviation forced by reality is a docs bug.
