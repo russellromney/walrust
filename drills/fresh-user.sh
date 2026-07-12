@@ -116,12 +116,22 @@ finding() {
   log "FINDING F$id: $*"
 }
 
+# The drill later overrides HOME to simulate a fresh user, which would hide
+# pip --user site-packages (the CI runner installs the minio module there).
+# The python S3 helper is drill plumbing, not user simulation, so it runs
+# against the real HOME captured here.
+REAL_HOME=${HOME:-}
+
+drill_python_has_minio() {
+  HOME="$REAL_HOME" python3 -c 'import minio' >/dev/null 2>&1
+}
+
 # S3 prefix deletion, used by the induce-loss teeth proof and by cleanup.
 # Objects are passed via argv, never via a pipe into the heredoc (a heredoc
 # claims stdin; see the note in drills/lib.sh).
 s3_delete_prefix() {
   local prefix=$1
-  python3 - "$BUCKET_NAME" "$prefix" <<'PY'
+  HOME="$REAL_HOME" python3 - "$BUCKET_NAME" "$prefix" <<'PY'
 import os
 import sys
 from urllib.parse import urlparse
@@ -176,7 +186,7 @@ cleanup() {
     log "keeping artifacts in $WORK and $BUCKET_URI"
     return 0
   fi
-  if python3 -c 'import minio' >/dev/null 2>&1; then
+  if drill_python_has_minio; then
     s3_delete_prefix "$RUN_PREFIX" >/dev/null 2>&1
   else
     log "python3+minio unavailable; leaving S3 prefix $BUCKET_URI behind"
@@ -407,9 +417,22 @@ grep -qi "journal_mode" "$WORK/watch1-nonwal.log" \
 finding 2 "README's CLI sections never said the database must already be in WAL mode: 'walrust watch' on a stock sqlite3 database refuses with a journal_mode error (correct fail-loudly behavior, undocumented for CLI users). Fixed: Quick start now says so and points at 'walrust pragma'."
 
 # Remedy using the product's own guidance: README "Use as a library" notes
-# say `walrust pragma` prints the recommended settings; apply them.
-walrust pragma | sqlite3 app.db
-[ "$(sqlite3 app.db 'PRAGMA journal_mode;')" = "wal" ] || fail "walrust pragma did not switch app.db to WAL mode"
+# say `walrust pragma` prints the recommended settings. The natural pipe is
+# `walrust pragma | sqlite3 app.db` — but with a walrust.toml in cwd (which
+# the README told us to write), `walrust pragma` logs an ANSI-colored
+# tracing line ("INFO walrust::config Loaded config from ./walrust.toml")
+# to STDOUT ahead of the SQL, and sqlite3 dies with a parse error.
+# FINDING F6 (PRODUCT — recorded, deliberately NOT fixed in this drill PR):
+# tracing output belongs on stderr; stdout of `pragma` should be clean SQL.
+if walrust pragma 2>/dev/null | sqlite3 app.db >"$WORK/pragma-pipe.log" 2>&1; then
+  log "note: 'walrust pragma | sqlite3' pipe worked (no config-log pollution on stdout); F6 may be fixed"
+else
+  finding 6 "PRODUCT: 'walrust pragma | sqlite3 app.db' fails when a walrust.toml is in cwd — the config auto-load logs an ANSI tracing line to STDOUT ahead of the SQL (repro: write walrust.toml, run the pipe; sqlite3: Parse error near line 1: unrecognized token). Tracing should go to stderr. Workaround: walrust pragma --output pragma.sql && sqlite3 app.db < pragma.sql (the README now shows the --output form)."
+fi
+# Apply via --output, which writes clean SQL to a file regardless of F6.
+walrust pragma --output "$WORK/pragma.sql" >/dev/null
+sqlite3 app.db <"$WORK/pragma.sql"
+[ "$(sqlite3 app.db 'PRAGMA journal_mode;')" = "wal" ] || fail "walrust pragma settings did not switch app.db to WAL mode"
 
 # =============================================================================
 # Step 5 — `walrust watch`, for real this time.
@@ -479,7 +502,7 @@ log "deleted the local database (the disaster)"
 # Induced-failure teeth proof: with the bucket emptied, the README restore
 # below MUST fail loudly. If the drill still exits 0, the drill has no teeth.
 if [ "$INDUCE_LOSS" = "1" ]; then
-  python3 -c 'import minio' >/dev/null 2>&1 \
+  drill_python_has_minio \
     || fail "WALRUST_DRILL_INDUCE_LOSS=1 requires python3 with the minio module"
   log "INDUCE_LOSS: deleting every object under $BUCKET_URI before restore"
   s3_delete_prefix "$RUN_PREFIX"
@@ -519,8 +542,10 @@ endpoint = "$ENDPOINT"
 path = "$MACHINE2/app.db"
 TOML
 # `walrust pragma` says to run its settings "once when creating your database,
-# or on every connection" — apply to the restored copy before watching it.
-walrust pragma | sqlite3 app.db
+# or on every connection" — apply to the restored copy before watching it
+# (via --output; the direct pipe is broken by config-log pollution, see F6).
+walrust pragma --output "$WORK/pragma2.sql" >/dev/null
+sqlite3 app.db <"$WORK/pragma2.sql"
 
 start_watch "$MACHINE2" "$WORK/watch2.log"
 sleep 3

@@ -73,8 +73,15 @@ export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev   # your S3-compatible
 
 Your database must already be in WAL mode — `walrust watch` refuses a
 rollback-journal database rather than replicate it wrong. A stock `sqlite3`
-database is *not* in WAL mode; `walrust pragma | sqlite3 app.db` applies the
-recommended settings.
+database is *not* in WAL mode; apply the recommended settings with:
+
+```bash
+walrust pragma --output pragma.sql && sqlite3 app.db < pragma.sql
+```
+
+(Use the `--output` form: piping `walrust pragma` straight into sqlite3
+currently breaks when a `walrust.toml` is in the working directory, because a
+config log line precedes the SQL on stdout.)
 
 ```bash
 walrust watch app.db -b s3://my-bucket --endpoint https://fly.storage.tigris.dev
