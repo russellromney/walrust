@@ -136,6 +136,43 @@ pub struct ExternalBaseCursor {
     pub checksum: u64,
 }
 
+/// Opaque identity of a database restored by [`restore`].
+///
+/// Walrust keeps the checksum and namespace details private so an embedder
+/// cannot accidentally mix the external-base and walrust-owned protocols.
+/// Pass this value directly to [`resume_owned_after_restore`] when this process
+/// has exclusive ownership of the walrust-owned stream.
+#[derive(Debug)]
+pub struct RestoreResult {
+    seq: u64,
+    checksum: u64,
+    db_name: String,
+    prefix: String,
+    output: PathBuf,
+    lineage_id: Option<String>,
+    latest: bool,
+}
+
+impl RestoreResult {
+    /// Highest HADBP sequence applied by the restore.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
+/// Caller-owned exclusive lease held across walrust-owned restore adoption.
+///
+/// Walrust does not acquire, renew, or release distributed leases. The
+/// embedder supplies a guard from its own coordinator. Borrowing the guard for
+/// [`resume_owned_after_restore`] must keep exclusive writer ownership valid
+/// for the entire future, including snapshot upload and state persistence.
+/// `ensure_held` must fail once the lease is lost or too close to expiry to
+/// cover an in-flight storage operation.
+pub trait OwnedResumeLease: Send + Sync {
+    /// Fail unless this guard still owns the exclusive writer lease.
+    fn ensure_held(&self) -> Result<()>;
+}
+
 /// Follower cursor for incremental pull APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullCursor {
@@ -634,7 +671,7 @@ pub async fn ensure_no_saved_state(
     let state_key = state_key(prefix, db_name);
     if storage.exists(&state_key).await? {
         anyhow::bail!(
-            "{}: database already has replication state at {}; use add_without_snapshot after restoring/reopening instead of creating a new walrust-owned lineage",
+            "{}: database already has replication state at {}; use resume_owned_after_restore for a newly restored database, or add_without_snapshot only when reopening the same local database/WAL files",
             db_name,
             state_key
         );
@@ -2067,7 +2104,12 @@ pub async fn take_snapshot(
     let new_seq = state.current_seq + 1;
 
     let prev_checksum = state.db_checksum.unwrap_or(0);
-    let snapshot = ltx::encode_sqlite_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    // The checkpoint blocker pins the main database file while writers append
+    // only to WAL. Encode that exact page layout. VACUUM INTO is not valid here:
+    // it may reorder b-tree/overflow pages, so later WAL pages from the live
+    // database would be applied to a different physical layout on restore.
+    let snapshot =
+        ltx::encode_snapshot_with_checksum(&state.db_path, page_size, new_seq, prev_checksum)?;
     let db_checksum = snapshot.checksum;
     let changeset_bytes = snapshot.bytes;
 
@@ -2104,14 +2146,16 @@ pub async fn take_snapshot(
 /// Restore a database from storage using HADBP changesets.
 ///
 /// Discovers available changesets by listing S3 objects (no manifest needed).
-/// Returns the seq that was actually restored to.
+/// Returns an opaque restore identity. Call [`RestoreResult::seq`] to inspect
+/// the restored sequence, or pass the result to
+/// [`resume_owned_after_restore`] to resume walrust-owned replication.
 pub async fn restore(
     storage: Arc<dyn StorageBackend>,
     prefix: &str,
     db_name: &str,
     output: &Path,
     point_in_time: Option<&str>,
-) -> Result<u64> {
+) -> Result<RestoreResult> {
     let target_seq = parse_point_in_time_seq(point_in_time)?;
     let storage_ref = storage.as_ref();
 
@@ -2186,7 +2230,7 @@ pub async fn restore(
         false
     };
 
-    let restored_seq = if leveled {
+    let (restored_seq, restored_checksum) = if leveled {
         let layout = crate::compaction::SeqLayout::new(storage.clone(), prefix, db_name);
         let candidates =
             crate::compaction::gather_candidates(&layout, snapshot.seq, u64::MAX).await?;
@@ -2249,14 +2293,15 @@ pub async fn restore(
             plan.files.len(),
             target
         );
-        crate::compaction::apply_plan(
+        let applied = crate::compaction::restore::apply_plan_with_checksum(
             &layout,
             &plan,
             staged_output,
             decode_result.checksum,
             crate::compaction::DEFAULT_PREFETCH_DEPTH,
         )
-        .await?
+        .await?;
+        (applied.seq, applied.checksum)
     } else {
         // Find incrementals after the snapshot (un-leveled bucket: the original
         // linear path, unchanged).
@@ -2308,12 +2353,161 @@ pub async fn restore(
             restored_seq = inc.seq;
             current_checksum = result.checksum;
         }
-        restored_seq
+        (restored_seq, current_checksum)
     };
 
     verify_sqlite_integrity(staged_output)?;
     staged_restore.publish(output)?;
-    Ok(restored_seq)
+    Ok(RestoreResult {
+        seq: restored_seq,
+        checksum: restored_checksum,
+        db_name: db_name.to_string(),
+        prefix: prefix.to_string(),
+        output: output.to_path_buf(),
+        lineage_id,
+        latest: point_in_time.is_none(),
+    })
+}
+
+/// Resume a walrust-owned stream after [`restore`] by publishing a fresh base.
+///
+/// A restored process must not start with a fresh sequence cursor: doing so
+/// would attempt to replace sequence 1 and correctly trip the equivocation
+/// guard. This function adopts the opaque restored identity, then publishes a
+/// full walrust-owned snapshot at `restored.seq() + 1`. Future incrementals
+/// chain from that new base.
+///
+/// The restore must have targeted latest (not point-in-time), and `state` must
+/// be fresh and point at the exact restored output. `lease` is a caller-owned
+/// guard whose borrow must retain exclusive writer ownership for this entire
+/// operation. Walrust does not implement lease acquisition or renewal.
+///
+/// The restored database must run in WAL mode with `wal_autocheckpoint=0`, the
+/// standard walrust-owned contract: the published base encodes the
+/// checkpointed main file while the checkpoint blocker pins it, so an external
+/// checkpointer racing the encode could tear the image.
+///
+/// Snapshot upload and resumed-state persistence both use `retry_policy`. If
+/// snapshot upload fails, `state` is restored to its input value. If the
+/// snapshot succeeds but state persistence exhausts its retries, the function
+/// returns the error and leaves `state` at the published snapshot cursor; the
+/// caller must stop rather than start again from a fresh cursor.
+pub async fn resume_owned_after_restore(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+    restored: &RestoreResult,
+    lease: &dyn OwnedResumeLease,
+    retry_policy: &RetryPolicy,
+) -> Result<()> {
+    lease.ensure_held()?;
+    if !restored.latest {
+        anyhow::bail!(
+            "{}: cannot resume walrust-owned replication from a point-in-time restore",
+            restored.db_name
+        );
+    }
+    if restored.prefix != prefix {
+        anyhow::bail!(
+            "{}: restore prefix {:?} does not match resume prefix {:?}",
+            restored.db_name,
+            restored.prefix,
+            prefix
+        );
+    }
+    if restored.db_name != state.name {
+        anyhow::bail!(
+            "restore database {:?} does not match SyncState database {:?}",
+            restored.db_name,
+            state.name
+        );
+    }
+    if restored.output != state.db_path {
+        anyhow::bail!(
+            "{}: restored output {} does not match SyncState database path {}",
+            state.name,
+            restored.output.display(),
+            state.db_path.display()
+        );
+    }
+    if state.current_seq != 0
+        || state.current_txid != 0
+        || state.wal_offset != 0
+        || state.wal_generation != 0
+        || state.lineage_id.is_some()
+        || state.external_base.is_some()
+        || state.db_checksum.is_some()
+        || state.checkpoint_blocker.is_some()
+    {
+        anyhow::bail!(
+            "{}: resume_owned_after_restore requires a fresh SyncState",
+            state.name
+        );
+    }
+
+    let next_seq = restored.seq.checked_add(1).ok_or_else(|| {
+        anyhow!(
+            "{}: cannot resume walrust-owned replication beyond u64::MAX",
+            restored.db_name
+        )
+    })?;
+    let mut namespace = state.clone();
+    namespace.lineage_id = restored.lineage_id.clone();
+    for generation in [GENERATION_LIVE, GENERATION_SNAPSHOT] {
+        let key = build_state_changeset_key(prefix, &namespace, generation, next_seq);
+        if storage.get(&key).await?.is_some() {
+            return Err(WalrustError::equivocation(format!(
+                "{}: cannot resume at seq {} because another walrust-owned object already exists at {}",
+                restored.db_name, next_seq, key
+            ))
+            .into());
+        }
+    }
+    if restored.lineage_id.is_none() {
+        let levels_prefix = format!("{}{}/levels/", prefix, restored.db_name);
+        let covered = storage.list(&levels_prefix, None).await?.iter().any(|key| {
+            key.rsplit('/')
+                .next()
+                .and_then(|name| crate::compaction::parse_range_name(name, "hadbp"))
+                .is_some_and(|range| range.min <= next_seq && next_seq <= range.max)
+        });
+        if covered {
+            return Err(WalrustError::equivocation(format!(
+                "{}: cannot resume at seq {} because compacted history already covers that sequence",
+                restored.db_name, next_seq
+            ))
+            .into());
+        }
+    }
+    lease.ensure_held()?;
+
+    let original = state.clone();
+    state.current_seq = restored.seq;
+    state.current_txid = change_counter_from_file(&state.db_path).unwrap_or(0);
+    state.db_checksum = Some(restored.checksum);
+    state.lineage_id = restored.lineage_id.clone();
+
+    if let Err(error) =
+        take_snapshot_with_retry_guarded(storage, prefix, state, retry_policy, Some(lease)).await
+    {
+        *state = original;
+        return Err(error);
+    }
+    lease.ensure_held()?;
+
+    let state_key = state_key(prefix, &state.name);
+    let state_data = Arc::new(state_json_bytes(state)?);
+    retry_policy
+        .execute_with_context("save resumed walrust-owned state", || {
+            let key = state_key.clone();
+            let data = Arc::clone(&state_data);
+            async move {
+                lease.ensure_held()?;
+                storage.put(&key, data.as_slice()).await
+            }
+        })
+        .await?;
+    lease.ensure_held()
 }
 
 /// Restore using an external snapshot source (e.g., turbolite page groups).
@@ -2439,6 +2633,16 @@ pub async fn take_snapshot_with_retry(
     state: &mut SyncState,
     retry_policy: &RetryPolicy,
 ) -> Result<()> {
+    take_snapshot_with_retry_guarded(storage, prefix, state, retry_policy, None).await
+}
+
+async fn take_snapshot_with_retry_guarded(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+    retry_policy: &RetryPolicy,
+    lease: Option<&dyn OwnedResumeLease>,
+) -> Result<()> {
     let timestamp = Utc::now();
     release_checkpoint_blocker(state).await?;
     checkpoint_wal(&state.db_path).await?;
@@ -2455,7 +2659,8 @@ pub async fn take_snapshot_with_retry(
 
     let new_seq = state.current_seq + 1;
     let prev_checksum = state.db_checksum.unwrap_or(0);
-    let snapshot = ltx::encode_sqlite_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let snapshot =
+        ltx::encode_snapshot_with_checksum(&state.db_path, page_size, new_seq, prev_checksum)?;
     let db_checksum = snapshot.checksum;
     let changeset_bytes = snapshot.bytes;
 
@@ -2472,6 +2677,9 @@ pub async fn take_snapshot_with_retry(
             let key = upload_key.clone();
             let name = upload_name.clone();
             async move {
+                if let Some(lease) = lease {
+                    lease.ensure_held()?;
+                }
                 put_changeset_if_absent(
                     storage,
                     &key,
@@ -3170,6 +3378,14 @@ mod tests {
     use std::collections::HashMap as StdHashMap;
     use std::sync::{Arc, Mutex};
 
+    struct HeldResumeLease;
+
+    impl OwnedResumeLease for HeldResumeLease {
+        fn ensure_held(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     // ---- Mock storage for testing ----
 
     struct TestStorage {
@@ -3827,7 +4043,7 @@ mod tests {
             .await
             .expect("core restore should choose the latest snapshot <= target");
 
-        assert_eq!(restored_seq, 1);
+        assert_eq!(restored_seq.seq(), 1);
         let conn = rusqlite::Connection::open(&output).unwrap();
         let marker: String = conn
             .query_row("SELECT value FROM marker", [], |row| row.get(0))
@@ -4715,6 +4931,7 @@ mod tests {
     /// semantics, for exercising the publish CAS path. The earlier
     /// `TestStorage` no-ops those, which is fine for the chain-replay
     /// tests but useless for the equivocation guard.
+    #[derive(Clone)]
     struct MutStorage {
         objects: Arc<Mutex<StdHashMap<String, Vec<u8>>>>,
     }
@@ -4794,6 +5011,126 @@ mod tests {
             end_page_count: 100 + seq,
             ltx_payload: ltx,
         }
+    }
+
+    #[tokio::test]
+    async fn owned_restore_resume_reanchors_before_new_writes() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join("owned.db");
+        let source = rusqlite::Connection::open(&source_path).unwrap();
+        source
+            .execute_batch(
+                "
+                PRAGMA journal_mode=WAL;
+                PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO items (id, value) VALUES (1, 'base');
+                ",
+            )
+            .unwrap();
+
+        let storage = MutStorage::new();
+        let retry = RetryPolicy::default_policy();
+        let mut original = SyncState::new(source_path.clone()).unwrap();
+        original.name = "owned".to_string();
+        take_snapshot_with_retry(&storage, "p/", &mut original, &retry)
+            .await
+            .unwrap();
+        save_state(&storage, "p/", &original).await.unwrap();
+
+        source
+            .execute(
+                "INSERT INTO items (id, value) VALUES (2, 'before-restore')",
+                [],
+            )
+            .unwrap();
+        sync_wal_with_retry(&storage, "p/", &mut original, &retry)
+            .await
+            .unwrap();
+        assert_eq!(original.current_seq, 2);
+
+        let restored_dir = tempfile::tempdir().unwrap();
+        let restored_path = restored_dir.path().join("owned.db");
+        let restored = restore(
+            Arc::new(storage.clone()),
+            "p/",
+            "owned",
+            &restored_path,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.seq(), 2);
+
+        let mut resumed = SyncState::new(restored_path.clone()).unwrap();
+        resumed.name = "owned".to_string();
+        resume_owned_after_restore(
+            &storage,
+            "p/",
+            &mut resumed,
+            &restored,
+            &HeldResumeLease,
+            &retry,
+        )
+        .await
+        .expect("owned resume must publish a fresh base above the restored tip");
+        assert_eq!(resumed.current_seq, 3);
+
+        let resumed_writer = rusqlite::Connection::open(&restored_path).unwrap();
+        resumed_writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        resumed_writer
+            .execute(
+                "INSERT INTO items (id, value) VALUES (3, 'after-restore')",
+                [],
+            )
+            .unwrap();
+        sync_wal_with_retry(&storage, "p/", &mut resumed, &retry)
+            .await
+            .unwrap();
+        assert_eq!(resumed.current_seq, 4);
+
+        let verify_dir = tempfile::tempdir().unwrap();
+        let verify_path = verify_dir.path().join("owned.db");
+        let second = restore(Arc::new(storage), "p/", "owned", &verify_path, None)
+            .await
+            .unwrap();
+        assert_eq!(second.seq(), 4);
+
+        let verify = rusqlite::Connection::open(&verify_path).unwrap();
+        let rows: Vec<(i64, String)> = verify
+            .prepare("SELECT id, value FROM items ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "base".to_string()),
+                (2, "before-restore".to_string()),
+                (3, "after-restore".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_future_is_send_in_spawned_tasks() {
+        let storage: Arc<dyn StorageBackend> = Arc::new(MutStorage::new());
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("missing.db");
+
+        let result =
+            tokio::spawn(async move { restore(storage, "p/", "missing", &output, None).await })
+                .await
+                .expect("restore task must be Send");
+
+        assert!(
+            result.is_err(),
+            "empty storage should still report not found"
+        );
     }
 
     #[tokio::test]

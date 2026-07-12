@@ -132,13 +132,35 @@ pub async fn apply_plan(
     floor_checksum: u64,
     queue_depth: usize,
 ) -> Result<u64> {
+    Ok(
+        apply_plan_with_checksum(layout, plan, staged_db, floor_checksum, queue_depth)
+            .await?
+            .seq,
+    )
+}
+
+pub(crate) struct AppliedPlan {
+    pub(crate) seq: u64,
+    pub(crate) checksum: u64,
+}
+
+/// Internal restore result used by owned resume. The public executor keeps its
+/// historical `u64` return type, while core restore retains the already-known
+/// chain checksum instead of hashing the whole restored database a second time.
+pub(crate) async fn apply_plan_with_checksum(
+    layout: &dyn CompactionLayout,
+    plan: &RestorePlan,
+    staged_db: &Path,
+    floor_checksum: u64,
+    queue_depth: usize,
+) -> Result<AppliedPlan> {
     let depth = queue_depth.max(1);
     let mut running = floor_checksum;
     let mut cursor = plan.floor;
 
     // Bounded, order-preserving prefetch: at most `depth` downloads in flight;
     // objects are yielded — and therefore applied — in strict plan order.
-    let mut fetched = stream::iter(plan.files.iter().map(|cand| {
+    let mut fetched = stream::iter(plan.files.iter().cloned().map(|cand| {
         let lf = LayoutFile {
             key: cand.key.clone(),
             level: cand.level,
@@ -188,5 +210,8 @@ pub async fn apply_plan(
             plan.target
         ))));
     }
-    Ok(cursor)
+    Ok(AppliedPlan {
+        seq: cursor,
+        checksum: running,
+    })
 }
