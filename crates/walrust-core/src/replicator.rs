@@ -422,16 +422,21 @@ impl Replicator {
         Ok(())
     }
 
-    /// Register a database without taking a snapshot.
-    /// Use after `restore()` when the database already has the latest state
-    /// from S3. Avoids uploading a redundant snapshot that could race with
-    /// other nodes' changesets.
+    /// Reopen the same local database without taking a new snapshot.
+    ///
+    /// This reloads the saved WAL offset and is therefore only for a process
+    /// restart over the same database/WAL files. It is not safe for a newly
+    /// restored database. Low-level embedders must use
+    /// [`sync::resume_owned_after_restore`] after [`sync::restore`] so walrust
+    /// re-anchors above the restored sequence.
     pub async fn add_without_snapshot(&self, name: &str, db_path: &Path) -> Result<()> {
         self.add_without_snapshot_with_wal_path(name, db_path, &db_path.with_extension("db-wal"))
             .await
     }
 
-    /// Register a database without taking a snapshot, with an explicit WAL path.
+    /// Reopen the same local database without taking a snapshot, with an
+    /// explicit WAL path. See [`Self::add_without_snapshot`] for the restored
+    /// database warning.
     pub async fn add_without_snapshot_with_wal_path(
         &self,
         name: &str,

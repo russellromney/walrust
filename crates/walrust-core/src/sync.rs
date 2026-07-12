@@ -658,7 +658,7 @@ pub async fn ensure_no_saved_state(
     let state_key = state_key(prefix, db_name);
     if storage.exists(&state_key).await? {
         anyhow::bail!(
-            "{}: database already has replication state at {}; use add_without_snapshot after restoring/reopening instead of creating a new walrust-owned lineage",
+            "{}: database already has replication state at {}; use resume_owned_after_restore for a newly restored database, or add_without_snapshot only when reopening the same local database/WAL files",
             db_name,
             state_key
         );
@@ -2091,7 +2091,12 @@ pub async fn take_snapshot(
     let new_seq = state.current_seq + 1;
 
     let prev_checksum = state.db_checksum.unwrap_or(0);
-    let snapshot = ltx::encode_sqlite_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    // The checkpoint blocker pins the main database file while writers append
+    // only to WAL. Encode that exact page layout. VACUUM INTO is not valid here:
+    // it may reorder b-tree/overflow pages, so later WAL pages from the live
+    // database would be applied to a different physical layout on restore.
+    let snapshot =
+        ltx::encode_snapshot_with_checksum(&state.db_path, page_size, new_seq, prev_checksum)?;
     let db_checksum = snapshot.checksum;
     let changeset_bytes = snapshot.bytes;
 
@@ -2212,7 +2217,7 @@ pub async fn restore(
         false
     };
 
-    let restored_seq = if leveled {
+    let (restored_seq, restored_checksum) = if leveled {
         let layout = crate::compaction::SeqLayout::new(storage.clone(), prefix, db_name);
         let candidates =
             crate::compaction::gather_candidates(&layout, snapshot.seq, u64::MAX).await?;
@@ -2275,14 +2280,15 @@ pub async fn restore(
             plan.files.len(),
             target
         );
-        crate::compaction::apply_plan(
+        let applied = crate::compaction::restore::apply_plan_with_checksum(
             &layout,
             &plan,
             staged_output,
             decode_result.checksum,
             crate::compaction::DEFAULT_PREFETCH_DEPTH,
         )
-        .await?
+        .await?;
+        (applied.seq, applied.checksum)
     } else {
         // Find incrementals after the snapshot (un-leveled bucket: the original
         // linear path, unchanged).
@@ -2334,15 +2340,14 @@ pub async fn restore(
             restored_seq = inc.seq;
             current_checksum = result.checksum;
         }
-        restored_seq
+        (restored_seq, current_checksum)
     };
 
     verify_sqlite_integrity(staged_output)?;
-    let checksum = ltx::compute_checksum_from_file(staged_output)?;
     staged_restore.publish(output)?;
     Ok(RestoreResult {
         seq: restored_seq,
-        checksum,
+        checksum: restored_checksum,
         db_name: db_name.to_string(),
         prefix: prefix.to_string(),
         output: output.to_path_buf(),
@@ -2361,9 +2366,10 @@ pub async fn restore(
 ///
 /// The restore must have targeted latest (not point-in-time), and `state` must
 /// be fresh and point at the exact restored output. The caller must also have
-/// exclusive writer ownership before calling this function; walrust's object
-/// CAS rejects a concurrent writer at the next sequence but does not provide a
-/// distributed leadership lease.
+/// exclusive writer ownership before calling this function. Walrust rejects an
+/// already-published object at the next sequence, but that preflight is not a
+/// distributed leadership lease and cannot close a race with a writer that is
+/// still active.
 ///
 /// Snapshot upload and resumed-state persistence both use `retry_policy`. If
 /// snapshot upload fails, `state` is restored to its input value. If the
@@ -2419,6 +2425,41 @@ pub async fn resume_owned_after_restore(
             "{}: resume_owned_after_restore requires a fresh SyncState",
             state.name
         );
+    }
+
+    let next_seq = restored.seq.checked_add(1).ok_or_else(|| {
+        anyhow!(
+            "{}: cannot resume walrust-owned replication beyond u64::MAX",
+            restored.db_name
+        )
+    })?;
+    let mut namespace = state.clone();
+    namespace.lineage_id = restored.lineage_id.clone();
+    for generation in [GENERATION_LIVE, GENERATION_SNAPSHOT] {
+        let key = build_state_changeset_key(prefix, &namespace, generation, next_seq);
+        if storage.get(&key).await?.is_some() {
+            return Err(WalrustError::equivocation(format!(
+                "{}: cannot resume at seq {} because another walrust-owned object already exists at {}",
+                restored.db_name, next_seq, key
+            ))
+            .into());
+        }
+    }
+    if restored.lineage_id.is_none() {
+        let levels_prefix = format!("{}{}/levels/", prefix, restored.db_name);
+        let covered = storage.list(&levels_prefix, None).await?.iter().any(|key| {
+            key.rsplit('/')
+                .next()
+                .and_then(|name| crate::compaction::parse_range_name(name, "hadbp"))
+                .is_some_and(|range| range.min <= next_seq && next_seq <= range.max)
+        });
+        if covered {
+            return Err(WalrustError::equivocation(format!(
+                "{}: cannot resume at seq {} because compacted history already covers that sequence",
+                restored.db_name, next_seq
+            ))
+            .into());
+        }
     }
 
     let original = state.clone();
@@ -2582,7 +2623,8 @@ pub async fn take_snapshot_with_retry(
 
     let new_seq = state.current_seq + 1;
     let prev_checksum = state.db_checksum.unwrap_or(0);
-    let snapshot = ltx::encode_sqlite_snapshot(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let snapshot =
+        ltx::encode_snapshot_with_checksum(&state.db_path, page_size, new_seq, prev_checksum)?;
     let db_checksum = snapshot.checksum;
     let changeset_bytes = snapshot.bytes;
 

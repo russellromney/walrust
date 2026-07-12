@@ -23,6 +23,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   owns each planned candidate instead of retaining borrowed plan entries across
   the async stream, fixing the non-general `Send` future seen by embedders using
   `tokio::spawn`.
+- **Snapshot page-layout corruption:** walrust-owned snapshots no longer use
+  `VACUUM INTO`. Vacuum can renumber b-tree and overflow pages; later WAL frames
+  from the live database then target the wrong physical pages in the restored
+  vacuumed image. Snapshots now encode the exact checkpointed main file while
+  the checkpoint blocker pins it. Wide-row/blob E2E coverage caught the old
+  path producing an invalid overflow chain and dozens of orphan pages.
+- **Owned-resume conflict and retry safety:** resume now refuses an already
+  published next sequence across snapshot, incremental, and compacted storage,
+  checks sequence overflow, and completes all remote preflight before mutating
+  `SyncState`. A transient preflight failure therefore leaves the same fresh
+  state retryable. Documentation now reserves `add_without_snapshot` for
+  reopening the same local database/WAL files rather than newly restored files.
+- **Restore I/O regression:** `RestoreResult` reuses the checksum already
+  produced by linear or leveled restore instead of hashing the entire restored
+  database again. The public compaction executor keeps its existing `u64`
+  return type while the internal executor retains the final chain checksum.
+
+### Testing
+
+- Added public-API integration coverage for flat and lineaged owned histories,
+  leveled-compaction restore/resume, mixed DDL/INSERT/UPDATE/DELETE/blob loads,
+  PITR refusal with no storage writes, competing-writer refusal with byte-exact
+  preservation of the winner, transient preflight retry, and the
+  snapshot-upload/state-save crash window. Added the same mixed-workload
+  restore/resume/restore path against live S3-compatible storage.
 
 ## [0.7.0] - 2026-07-10
 

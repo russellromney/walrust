@@ -34,6 +34,7 @@ use walrust_core::compaction::{
     RangeLayout, SeqLayout,
 };
 use walrust_core::ltx;
+use walrust_core::{RetryConfig, RetryPolicy, SyncState};
 
 // ── In-memory backend (correct range_get via default slice) ─────────────────
 
@@ -347,6 +348,68 @@ async fn seq_layout_e2e_restore_through_merged_objects() {
         "decay error must name nearest restorable points on both sides: {msg}"
     );
     assert!(!out5.exists(), "no partial output on a failed PITR");
+}
+
+#[tokio::test]
+async fn owned_resume_after_leveled_restore_uses_planner_checksum() {
+    let fx = build_fixture("resume-levels/", "db", 13, false);
+    let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
+    compact_to_l1_l2(&layout).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let restored_path = dir.path().join("db.db");
+    let restored =
+        walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &restored_path, None)
+            .await
+            .unwrap();
+    assert_eq!(restored.seq(), fx.max_seq);
+
+    let retry = RetryPolicy::new(RetryConfig {
+        max_retries: 0,
+        circuit_breaker_enabled: false,
+        ..Default::default()
+    });
+    let writer = Connection::open(&restored_path).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    let mut resumed = SyncState::new(restored_path.clone()).unwrap();
+    resumed.name = fx.db.clone();
+    walrust_core::sync::resume_owned_after_restore(
+        fx.store.as_ref(),
+        &fx.prefix,
+        &mut resumed,
+        &restored,
+        &retry,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.current_seq, fx.max_seq + 1);
+
+    writer
+        .execute("INSERT INTO t(id, v) VALUES (9999, 'after-resume')", [])
+        .unwrap();
+    assert!(
+        walrust_core::sync::sync_wal_with_retry(
+            fx.store.as_ref(),
+            &fx.prefix,
+            &mut resumed,
+            &retry,
+        )
+        .await
+        .unwrap()
+            > 0
+    );
+
+    let verified_path = dir.path().join("verified.db");
+    let verified = walrust_core::sync::restore(fx.store, &fx.prefix, &fx.db, &verified_path, None)
+        .await
+        .unwrap();
+    assert_eq!(verified.seq(), fx.max_seq + 2);
+    assert!(integrity_ok(&verified_path));
+    assert!(query_rows(&verified_path)
+        .iter()
+        .any(|row| row == &(9999, "after-resume".to_string())));
 }
 
 #[tokio::test]
