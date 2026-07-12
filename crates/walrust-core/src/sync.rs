@@ -2382,6 +2382,11 @@ pub async fn restore(
 /// guard whose borrow must retain exclusive writer ownership for this entire
 /// operation. Walrust does not implement lease acquisition or renewal.
 ///
+/// The restored database must run in WAL mode with `wal_autocheckpoint=0`, the
+/// standard walrust-owned contract: the published base encodes the
+/// checkpointed main file while the checkpoint blocker pins it, so an external
+/// checkpointer racing the encode could tear the image.
+///
 /// Snapshot upload and resumed-state persistence both use `retry_policy`. If
 /// snapshot upload fails, `state` is restored to its input value. If the
 /// snapshot succeeds but state persistence exhausts its retries, the function

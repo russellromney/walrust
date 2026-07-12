@@ -53,6 +53,33 @@ impl OwnedResumeLease for ExpiringLease {
     }
 }
 
+/// A lease that stays valid for the first `valid_checks` checks and is
+/// permanently expired afterwards — models a real lease that lapses mid-way
+/// through retry backoff and never comes back.
+struct LapsedLease {
+    checks: AtomicUsize,
+    valid_checks: usize,
+}
+
+impl LapsedLease {
+    fn new(valid_checks: usize) -> Self {
+        Self {
+            checks: AtomicUsize::new(0),
+            valid_checks,
+        }
+    }
+}
+
+impl OwnedResumeLease for LapsedLease {
+    fn ensure_held(&self) -> Result<()> {
+        let check = self.checks.fetch_add(1, Ordering::SeqCst) + 1;
+        if check > self.valid_checks {
+            anyhow::bail!("owned resume lease expired at check {check}");
+        }
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 struct MemStorage {
     objects: Mutex<HashMap<String, Vec<u8>>>,
@@ -62,6 +89,7 @@ struct FailStatePut {
     inner: Arc<MemStorage>,
     fail_state_put: AtomicBool,
     fail_preflight_get: AtomicBool,
+    fail_snapshot_cas_once: AtomicBool,
 }
 
 impl FailStatePut {
@@ -70,6 +98,7 @@ impl FailStatePut {
             inner,
             fail_state_put: AtomicBool::new(true),
             fail_preflight_get: AtomicBool::new(false),
+            fail_snapshot_cas_once: AtomicBool::new(false),
         }
     }
 
@@ -78,6 +107,16 @@ impl FailStatePut {
             inner,
             fail_state_put: AtomicBool::new(false),
             fail_preflight_get: AtomicBool::new(true),
+            fail_snapshot_cas_once: AtomicBool::new(false),
+        }
+    }
+
+    fn snapshot_cas_once(inner: Arc<MemStorage>) -> Self {
+        Self {
+            inner,
+            fail_state_put: AtomicBool::new(false),
+            fail_preflight_get: AtomicBool::new(false),
+            fail_snapshot_cas_once: AtomicBool::new(true),
         }
     }
 }
@@ -193,6 +232,11 @@ impl StorageBackend for FailStatePut {
     }
 
     async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+        if key.ends_with("0000000000000003.hadbp")
+            && self.fail_snapshot_cas_once.swap(false, Ordering::SeqCst)
+        {
+            anyhow::bail!("injected transient snapshot upload failure");
+        }
         self.inner.put_if_absent(key, data).await
     }
 
@@ -538,6 +582,55 @@ async fn public_owned_resume_detects_lease_loss_during_state_persistence() {
     assert_integrity(&verify_path);
 }
 
+/// The retry loop must re-check the lease on every retried attempt, not only
+/// on the first: a lease that lapses during retry backoff must stop the
+/// retried snapshot PUT before it writes anything.
+#[tokio::test]
+async fn public_owned_resume_lease_lapse_during_retry_backoff_blocks_the_retried_put() {
+    let storage = Arc::new(MemStorage::default());
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_path = source_dir.path().join("lease-lapse.db");
+    let (_writer, _state) = seed_owned_history(&storage, &source_path, "lease-lapse", false).await;
+    let restore_dir = tempfile::tempdir().unwrap();
+    let restore_path = restore_dir.path().join("lease-lapse.db");
+    let restored = restore(storage.clone(), "wal/", "lease-lapse", &restore_path, None)
+        .await
+        .unwrap();
+
+    // Attempt 1 of the snapshot upload fails transiently at the CAS. The lease
+    // is valid through: entry (1), post-preflight (2), inside upload attempt 1
+    // (3) — and permanently expired from check 4 (inside upload attempt 2) on.
+    let failing = FailStatePut::snapshot_cas_once(storage.clone());
+    let lease = LapsedLease::new(3);
+    let retry = RetryPolicy::new(RetryConfig {
+        max_retries: 1,
+        base_delay_ms: 1,
+        max_delay_ms: 1,
+        circuit_breaker_enabled: false,
+        ..Default::default()
+    });
+    let mut resumed = SyncState::new(restore_path).unwrap();
+    resumed.name = "lease-lapse".to_string();
+
+    let err = resume_owned_after_restore(&failing, "wal/", &mut resumed, &restored, &lease, &retry)
+        .await
+        .expect_err("a lease that lapses during retry backoff must fail the resume");
+    assert!(err.to_string().contains("lease expired"), "{err}");
+    assert!(
+        !storage
+            .keys()
+            .iter()
+            .any(|key| key.ends_with("0000000000000003.hadbp")),
+        "the retried snapshot PUT ran with a lapsed lease: {:?}",
+        storage.keys()
+    );
+    assert_eq!(
+        resumed.current_seq, 0,
+        "failed adoption must restore the fresh state"
+    );
+    assert!(resumed.db_checksum.is_none());
+}
+
 #[tokio::test]
 async fn public_owned_resume_state_failure_is_loud_and_snapshot_is_recoverable() {
     let storage = Arc::new(MemStorage::default());
@@ -588,11 +681,36 @@ async fn public_owned_resume_state_failure_is_loud_and_snapshot_is_recoverable()
 
     let verify_dir = tempfile::tempdir().unwrap();
     let verify_path = verify_dir.path().join("state-fail.db");
-    let recovered = restore(storage, "wal/", "state-fail", &verify_path, None)
+    let recovered = restore(storage.clone(), "wal/", "state-fail", &verify_path, None)
         .await
         .expect("object discovery must recover the published snapshot");
     assert_eq!(recovered.seq(), 3);
     assert_integrity(&verify_path);
+
+    // The documented recovery for the snapshot-published/state-save-failed
+    // window: restore again and resume again from the recovered tip. The torn
+    // window (object at seq 3, state.json at seq 2) must not wedge the stream.
+    let mut recovered_state = SyncState::new(verify_path.clone()).unwrap();
+    recovered_state.name = "state-fail".to_string();
+    resume_owned_after_restore(
+        &*storage,
+        "wal/",
+        &mut recovered_state,
+        &recovered,
+        &HeldLease,
+        &no_retry(),
+    )
+    .await
+    .expect("a second resume above the recovered tip must succeed");
+    assert_eq!(recovered_state.current_seq, 4);
+
+    let final_dir = tempfile::tempdir().unwrap();
+    let final_path = final_dir.path().join("state-fail.db");
+    let last = restore(storage, "wal/", "state-fail", &final_path, None)
+        .await
+        .unwrap();
+    assert_eq!(last.seq(), 4);
+    assert_integrity(&final_path);
 }
 
 #[tokio::test]

@@ -54,7 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   expiry during the final state PUT is detected before the API can return
   success while leaving the published snapshot/state recoverable. Lease
   validity is also checked inside every retried snapshot and state PUT attempt,
-  so retry backoff cannot silently outlive the caller's lease.
+  so retry backoff cannot silently outlive the caller's lease — proven by a
+  retry test that fails the first snapshot CAS transiently, lapses the lease
+  during backoff, and asserts the retried attempt refuses before writing any
+  object. The snapshot-published/state-save-failed crash window's documented
+  recovery (restore again, resume again above the recovered tip) is exercised
+  end to end.
 
 ### Removed
 - Removed the adversarial-review ledgers (`ADVERSARIAL_REVIEW.md`, `ADVERSARIAL_REVIEW_2.md`) — dev artifacts, fully resolved except three residuals now tracked as R1–R3 in ROADMAP.md's "Residual risk register" (multi-writer lease out of scope by design; cross-generation cache collision backstopped by restore chain checksums; rollover truncate-before-put publish window, adjudicated not silent loss). Full ledgers remain in git history.
