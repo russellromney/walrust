@@ -193,6 +193,9 @@ drill_python_has_minio() {
 # S3 prefix deletion, used by the induce-loss teeth proof and by cleanup.
 # Objects are passed via argv, never via a pipe into the heredoc (a heredoc
 # claims stdin; see the note in drills/lib.sh).
+# Prints the number of objects deleted on stdout; exits nonzero if any
+# individual deletion errored (the induce-loss caller checks both — a teeth
+# proof whose deletion silently no-ops would let the run go vacuously green).
 s3_delete_prefix() {
   local prefix=$1
   HOME="$REAL_HOME" python3 - "$BUCKET_NAME" "$prefix" <<'PY'
@@ -213,8 +216,12 @@ client = Minio(
 )
 objects = [DeleteObject(o.object_name) for o in client.list_objects(bucket, prefix=prefix, recursive=True)]
 print(f"deleting {len(objects)} objects under {prefix}", file=sys.stderr)
+errors = 0
 for err in client.remove_objects(bucket, objects):
+    errors += 1
     print(err, file=sys.stderr)
+print(len(objects) - errors)
+sys.exit(1 if errors else 0)
 PY
 }
 
@@ -591,12 +598,13 @@ finding 2 "README's CLI sections never said the database must already be in WAL 
 # the README told us to write), `walrust pragma` logs an ANSI-colored
 # tracing line ("INFO walrust::config Loaded config from ./walrust.toml")
 # to STDOUT ahead of the SQL, and sqlite3 dies with a parse error.
-# FINDING F6 (PRODUCT — recorded, deliberately NOT fixed in this drill PR):
+# FINDING F6 (PRODUCT — recorded as ledger item DF3 under ROADMAP
+# "Dogfooding findings (open)", deliberately NOT fixed in this drill PR):
 # tracing output belongs on stderr; stdout of `pragma` should be clean SQL.
 if walrust pragma 2>/dev/null | sqlite3 app.db >"$WORK/pragma-pipe.log" 2>&1; then
   log "note: 'walrust pragma | sqlite3' pipe worked (no config-log pollution on stdout); F6 may be fixed"
 else
-  finding 6 "PRODUCT: 'walrust pragma | sqlite3 app.db' fails when a walrust.toml is in cwd — the config auto-load logs an ANSI tracing line to STDOUT ahead of the SQL (repro: write walrust.toml, run the pipe; sqlite3: Parse error near line 1: unrecognized token). Tracing should go to stderr. Workaround: walrust pragma --output pragma.sql && sqlite3 app.db < pragma.sql (the README now shows the --output form)."
+  finding 6 "PRODUCT: 'walrust pragma | sqlite3 app.db' fails when a walrust.toml is in cwd — the config auto-load logs an ANSI tracing line to STDOUT ahead of the SQL (repro: write walrust.toml, run the pipe; sqlite3: Parse error near line 1: unrecognized token). Tracing should go to stderr. Workaround: walrust pragma --output pragma.sql && sqlite3 app.db < pragma.sql (the README now shows the --output form). Tracked as ledger item DF3 (ROADMAP Dogfooding findings)."
 fi
 # Apply via --output, which writes clean SQL to a file regardless of F6.
 walrust pragma --output "$WORK/pragma.sql" >/dev/null
@@ -668,11 +676,18 @@ log "deleted the local database (the disaster)"
 
 # Induced-failure teeth proof: with the bucket emptied, the README restore
 # below MUST fail loudly. If the drill still exits 0, the drill has no teeth.
+# The deletion itself is verified (nonzero count, no delete errors): a teeth
+# proof whose deletion silently deleted nothing would let the restore succeed
+# and the "expected red" run come back green.
 if [ "$INDUCE_LOSS" = "1" ]; then
   drill_python_has_minio \
     || fail "WALRUST_DRILL_INDUCE_LOSS=1 requires python3 with the minio module"
   log "INDUCE_LOSS: deleting every object under $BUCKET_URI before restore"
-  s3_delete_prefix "$RUN_PREFIX"
+  induced_deleted=$(s3_delete_prefix "$RUN_PREFIX") \
+    || fail "INDUCE_LOSS: prefix deletion reported errors — the teeth proof did not actually destroy the backup"
+  [ -n "$induced_deleted" ] && [ "$induced_deleted" -gt 0 ] \
+    || fail "INDUCE_LOSS: deleted ${induced_deleted:-0} objects under $RUN_PREFIX — nothing was destroyed, so a red run cannot be proven"
+  log "INDUCE_LOSS: deleted $induced_deleted objects"
 fi
 
 # =============================================================================
@@ -830,9 +845,17 @@ log "bad-migration recovery: pre-migration state found at TXID $found_txid after
 #   TXID, `walrust verify` exits 0, SIGINT's "syncing remaining data" ships
 #   nothing, and a later restore silently returns only the startup snapshot.
 # Deliberately NOT fixed in this drill PR (durability-path change); tracked as
-# a ledger item (ROADMAP residual R4). If a future walrust ships the fix, this
-# probe sees the rows replicate and records no finding.
+# ledger item DF2 under ROADMAP "Dogfooding findings (open)".
+#
+# Rot-proofing: this probe must never become a permanent skip. On the
+# known-buggy published versions listed below it records finding F7 and the
+# drill still passes (the bug is leddered, not news). On ANY other version it
+# ENFORCES: rows that don't replicate are a hard drill failure. So the moment
+# a release ships — with or without the DF2 fix — this probe starts asserting.
 # =============================================================================
+# Published versions where DF2 is known present. Grows only if a release ships
+# while DF2 is still open; never remove entries.
+F7_KNOWN_BUGGY_VERSIONS=" 0.7.0 "
 PROBE_DIR="$WORK/probe7"
 PROBE_URI="$BUCKET_URI/f7probe"
 mkdir -p "$PROBE_DIR"
@@ -872,13 +895,17 @@ SQL
   sleep 1.2
 done
 probe_local=$(row_count app.db)
+probe_local_hash=$(row_hash app.db)
 
 probe_deadline=$((SECONDS + ${WALRUST_DRILL_F7_DEADLINE_SECS:-45}))
 probe_replicated=0
 while [ "$SECONDS" -lt "$probe_deadline" ]; do
   rm -f probe7-restored.db
   if walrust restore app -o probe7-restored.db -b "$PROBE_URI" >"$WORK/probe7-restore.log" 2>&1; then
-    if [ "$(row_count probe7-restored.db)" = "$probe_local" ]; then
+    # Row-exact, same as every other gate in this drill: count alone could
+    # pass on wrong rows.
+    if [ "$(row_count probe7-restored.db)" = "$probe_local" ] \
+      && [ "$(row_hash probe7-restored.db)" = "$probe_local_hash" ]; then
       probe_replicated=1
       break
     fi
@@ -887,10 +914,22 @@ while [ "$SECONDS" -lt "$probe_deadline" ]; do
 done
 stop_watch
 if [ "$probe_replicated" = "1" ]; then
-  log "note: intermittent-writer probe replicated fully ($probe_local rows) — F7 appears fixed in walrust $installed_version; no finding recorded"
+  log "note: intermittent-writer probe replicated row-exact ($probe_local rows) — DF2 fixed or not triggered in walrust $installed_version; no finding recorded"
 else
   probe_restored=$(row_count probe7-restored.db 2>/dev/null || echo "unavailable")
-  finding 7 "PRODUCT: default 'walrust watch' (shadow mode) silently stops replicating writes that arrive from short-lived sqlite3 sessions started after watch startup on a freshly WAL-converted database ($probe_local rows local, $probe_restored restorable after ${WALRUST_DRILL_F7_DEADLINE_SECS:-45}s; no error logged, list/verify look healthy, SIGINT shutdown ships nothing). Repro: convert db to WAL, walrust watch via walrust.toml, write via separate sqlite3 -cli sessions, restore. Root area: startup snapshot's PASSIVE checkpoint fully backfills the WAL; the next writer session restarts the WAL and the shadow copier never ships another frame. Tracked as ROADMAP residual R4 — deliberately not fixed in the drill PR."
+  f7_msg="PRODUCT: default 'walrust watch' (shadow mode) silently stops replicating writes that arrive from short-lived sqlite3 sessions started after watch startup on a freshly WAL-converted database ($probe_local rows local, $probe_restored restorable after ${WALRUST_DRILL_F7_DEADLINE_SECS:-45}s; no error logged, list/verify look healthy, SIGINT shutdown ships nothing). Repro: convert db to WAL, walrust watch via walrust.toml, write via separate sqlite3 -cli sessions, restore. Root area: startup snapshot's PASSIVE checkpoint fully backfills the WAL; the next writer session restarts the WAL and the shadow copier never ships another frame. Tracked as ledger item DF2 (ROADMAP Dogfooding findings) — deliberately not fixed in the drill PR."
+  case "$F7_KNOWN_BUGGY_VERSIONS" in
+    *" $installed_version "*)
+      # Known-buggy release: record the leddered finding, keep the drill green.
+      finding 7 "$f7_msg"
+      ;;
+    *)
+      # Any other published version must replicate intermittent-writer rows.
+      # A failure here is either a DF2 regression or a release that shipped
+      # with DF2 still open — both must be loud, never a skipped probe.
+      fail "intermittent-writer probe (DF2) failed on walrust $installed_version, which is not in the known-buggy list ($F7_KNOWN_BUGGY_VERSIONS). $f7_msg"
+      ;;
+  esac
 fi
 
 # =============================================================================

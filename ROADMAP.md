@@ -73,8 +73,10 @@ Order of work (each lands as its own PR through the normal gate):
    `generate.sh`), proven by `tests/format_stability.rs`; see CHANGELOG.
 2. **Fresh-user drill.** DONE — `drills/fresh-user.sh` (nightly + dispatchable
    via `.github/workflows/fresh-user.yml`; locally `make drill-fresh-user`);
-   five README findings fixed in the same PR, no product bugs found (see
-   CHANGELOG Unreleased).
+   five README findings fixed in the same PR, plus two product bugs recorded
+   under "Dogfooding findings" above: DF2 (silent replication stall for
+   intermittent writers, serious) and DF3 (`walrust pragma` logs a tracing
+   line to stdout, breaking the `| sqlite3` pipe). See CHANGELOG Unreleased.
 3. **Library dogfood app.** A small real app (axum; sessions table, job-queue
    table with DELETE churn, blob table) depending on `walrust-core` from the
    **registry**, exercising the patterns real embedders need:
@@ -120,6 +122,44 @@ Order of work (each lands as its own PR through the normal gate):
   path), never process death. Drills never caught it because every drill
   driver holds one long-lived connection. Needs: repro test with an
   ephemeral-connection writer, the re-anchor fix, and a revert-proof test.
+
+- **DF2 — shadow watch silently STOPS REPLICATING after an external WAL
+  restart (intermittent writers).** Found 2026-07-12 by `drills/fresh-user.sh`
+  (finding F7) against the published 0.7.0 binary, default shadow `walrust
+  watch` on a freshly WAL-converted database, writer = short-lived `sqlite3`
+  CLI sessions (cron/script usage). The on-startup snapshot's PASSIVE
+  checkpoint fully backfills the WAL; the next write from a short-lived
+  session (no long-lived app connection pinning the WAL) restarts the WAL, and
+  the shadow copier never ships another frame. Silent, which is the wrong
+  reaction twice over: no error is logged, `walrust list` keeps showing a
+  plausible TXID, `walrust verify` exits 0, SIGINT's "syncing remaining data"
+  ships nothing, and a later restore silently returns only the startup
+  snapshot (observed 3/3; secondary evidence: a doubled startup snapshot
+  gen1+gen2 and a duplicated initial shadow copy at offset 0). Right reaction:
+  a WAL restart after full backfill is the same event class as DF1's
+  unlink/recreate race — re-anchor loudly and keep replicating, never wedge.
+  Continuous-writer workloads (every pre-existing drill) never hit it because
+  in-flight writes keep the backfill incomplete. Repro + permanent regression
+  probe: `drills/fresh-user.sh` step 12 — on known-buggy 0.7.0 it records F7;
+  on any later published version it hard-fails the drill if the rows don't
+  replicate, so the probe starts enforcing the moment a new release ships.
+  Suspect area: `ShadowWal::copy_frames` salt-change handling vs the checked
+  WAL reader after a full-backfill restart. Fix is a durability-path change
+  (full adversarial gate), under active fix together with DF1 on
+  `fix/df1-ephemeral-writer-wal-race` — deliberately not bundled into the
+  drill PR.
+
+- **DF3 — `walrust pragma` logs to stdout, breaking the natural pipe.** Found
+  2026-07-12 by `drills/fresh-user.sh` (finding F6) on the published 0.7.0
+  binary: with a `walrust.toml` in cwd, config auto-load prints an
+  ANSI-colored tracing line ("INFO walrust::config Loaded config from
+  ./walrust.toml") on STDOUT ahead of the SQL, so
+  `walrust pragma | sqlite3 app.db` dies with a sqlite3 parse error. Wrong
+  reaction: tracing belongs on stderr; stdout of `pragma` should be clean SQL.
+  Workaround (now in README Quick start):
+  `walrust pragma --output pragma.sql && sqlite3 app.db < pragma.sql`. Fix:
+  route tracing to stderr — and audit the other commands whose stdout users
+  parse (`list`, `explain`) for the same pollution.
 
 ---
 
@@ -549,25 +589,6 @@ anything it covers.
   downstream. Trigger: two generations producing an identical `(min,max)`
   range while the local cache is warm. Suggested fix: bind the cache key to
   lineage/etag.
-- **R4 (found by `drills/fresh-user.sh`, 2026-07-12) — shadow watch silently
-  stops replicating after an external WAL restart (intermittent writers).**
-  Default `walrust watch` (shadow mode) on a freshly WAL-converted database:
-  the on-startup snapshot's PASSIVE checkpoint fully backfills the WAL; the
-  next write arriving from a *short-lived* sqlite3 session (cron job, shell
-  script — no long-lived app connection pinning the WAL) restarts the WAL, and
-  the shadow copier never ships another frame. No error is logged, `walrust
-  list` keeps showing a plausible TXID, `walrust verify` exits 0, SIGINT's
-  "syncing remaining data" ships nothing, and a later restore silently returns
-  only the startup snapshot (observed 3/3 on the published 0.7.0 binary;
-  secondary evidence: a doubled startup snapshot gen1+gen2 and a duplicated
-  initial shadow copy at offset 0). Continuous-writer workloads (every
-  existing drill) never hit it because in-flight writes keep the backfill
-  incomplete. Repro + permanent regression probe:
-  `drills/fresh-user.sh` step 12 (records finding F7 while the bug exists,
-  auto-clears when fixed). Suspect area: `ShadowWal::copy_frames` salt-change
-  handling vs the checked WAL reader after a full-backfill restart. Fix is a
-  durability-path change — needs the full adversarial gate, deliberately not
-  bundled into the drill PR.
 - **R3 (was E9) — rollover publish-failure window.**
   `upload_rollover_snapshot` folds the WAL into the local `.db`
   (`checkpoint_wal_truncate`) *before* putting the rollover snapshot; if the

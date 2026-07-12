@@ -201,13 +201,13 @@ behavior breaks:
   provably-clean restart is possible future work (see ROADMAP).
 - **Single writer, enforced.** A lock file (`.walrust-<db>.lock`) makes a
   second watcher on the same host fail fast instead of corrupting the backup.
-- **Known issue (R4): intermittent writers can silently stall replication.**
+- **Known issue (DF2): intermittent writers can silently stall replication.**
   If your writes come from short-lived sqlite3 sessions (cron jobs, scripts)
   rather than a long-lived app connection, the default watch mode can stop
   shipping writes after a WAL restart — with no error and a healthy-looking
   `list`/`verify`. Confirmed on 0.7.0 by `drills/fresh-user.sh`; tracked as
-  residual R4 in `ROADMAP.md`. Until fixed, prefer a long-running app
-  connection, and test your restore.
+  DF2 under "Dogfooding findings" in `ROADMAP.md` (fix in progress). Until
+  fixed, prefer a long-running app connection, and test your restore.
 - **Retention never orphans a restore point.** `prune` keeps every object a
   retained point-in-time restore still needs.
 
