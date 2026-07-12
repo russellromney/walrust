@@ -23,9 +23,10 @@ visible-failures and revert-proof tests).
 
 ## Correctness ledger
 
-- `ADVERSARIAL_REVIEW_2.md` is the findings ledger: every fixed finding names its
-  proving test; the DEFERRED register (D1–D7) at the bottom holds known residual risks
-  with trigger scenarios. Update it when touching anything it covers — nothing
+- Fixed-finding history (every finding named its proving test) lives in
+  CHANGELOG.md and git history — the old `ADVERSARIAL_REVIEW*.md` ledgers were
+  removed 2026-07-11. Known residual risks live in ROADMAP.md's "Residual risk
+  register" (R1–R3): update it when touching anything it covers — nothing
   vanishes silently.
 - Never weaken: the racing-checkpoint E2Es (`tests/production_e2e.rs`), the two-writer
   split-brain test, the fenced-follower rejection tests, or SIGKILL crash tests. They
