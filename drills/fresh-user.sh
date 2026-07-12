@@ -685,8 +685,9 @@ if [ "$INDUCE_LOSS" = "1" ]; then
   log "INDUCE_LOSS: deleting every object under $BUCKET_URI before restore"
   induced_deleted=$(s3_delete_prefix "$RUN_PREFIX") \
     || fail "INDUCE_LOSS: prefix deletion reported errors — the teeth proof did not actually destroy the backup"
-  [ -n "$induced_deleted" ] && [ "$induced_deleted" -gt 0 ] \
-    || fail "INDUCE_LOSS: deleted ${induced_deleted:-0} objects under $RUN_PREFIX — nothing was destroyed, so a red run cannot be proven"
+  if ! { [ -n "$induced_deleted" ] && [ "$induced_deleted" -gt 0 ]; }; then
+    fail "INDUCE_LOSS: deleted ${induced_deleted:-0} objects under $RUN_PREFIX — nothing was destroyed, so a red run cannot be proven"
+  fi
   log "INDUCE_LOSS: deleted $induced_deleted objects"
 fi
 
