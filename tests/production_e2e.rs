@@ -5,6 +5,14 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
+struct HeldResumeLease;
+
+impl walrust::walrust_core::OwnedResumeLease for HeldResumeLease {
+    fn ensure_held(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 fn test_bucket() -> String {
     std::env::var("TIERED_TEST_BUCKET").unwrap_or_else(|_| "walrust-test-rr-2026".to_string())
 }
@@ -693,6 +701,121 @@ async fn e2e_core_replicator_restore_round_trips_sqlite_rows() -> Result<()> {
 
     assert_integrity_ok(&restored_path)?;
     assert_eq!(rows(&db_path)?, rows(&restored_path)?);
+
+    Ok(())
+}
+
+/// Public embedder path against real object storage: owned snapshot + WAL,
+/// restore to a fresh directory, adopt/re-anchor, mutate the restored database,
+/// then restore again. Wide values, blobs, DELETE, UPDATE, and DDL force the
+/// test across overflow pages and page-layout changes that tiny row tests miss.
+#[tokio::test]
+async fn e2e_core_owned_restore_resume_round_trips_mixed_workload() -> Result<()> {
+    require_s3!("e2e_core_owned_restore_resume_round_trips_mixed_workload");
+    let source_dir = TempDir::new()?;
+    let restored_dir = TempDir::new()?;
+    let verify_dir = TempDir::new()?;
+    let name = unique_name("owned-resume-e2e");
+    let prefix = format!("e2e/{name}/");
+    let source_path = source_dir.path().join(format!("{name}.db"));
+    let restored_path = restored_dir.path().join(format!("{name}.db"));
+    let verify_path = verify_dir.path().join(format!("{name}.db"));
+
+    let source_writer = create_source_db(&source_path, 8)?;
+    source_writer.execute_batch(
+        "CREATE TABLE blobs (id INTEGER PRIMARY KEY, value BLOB NOT NULL);
+         INSERT INTO blobs VALUES (1, randomblob(196608));",
+    )?;
+
+    let storage = walrust::s3_backend_from_env(test_bucket(), test_endpoint().as_deref()).await?;
+    let retry = walrust::walrust_core::RetryPolicy::default_policy();
+    let mut source_state = walrust::walrust_core::SyncState::new(source_path.clone())?;
+    source_state.name = name.clone();
+    walrust::walrust_core::sync::take_snapshot_with_retry(
+        storage.as_ref(),
+        &prefix,
+        &mut source_state,
+        &retry,
+    )
+    .await?;
+    walrust::walrust_core::sync::save_state(storage.as_ref(), &prefix, &source_state).await?;
+
+    append_wide_rows(&source_writer, 9, 80, "before-restore")?;
+    source_writer.execute_batch(
+        "UPDATE items SET value = 'updated-before' WHERE id = 2;
+         DELETE FROM items WHERE id = 3;
+         UPDATE blobs SET value = randomblob(262144) WHERE id = 1;",
+    )?;
+    anyhow::ensure!(
+        walrust::walrust_core::sync::sync_wal_with_retry(
+            storage.as_ref(),
+            &prefix,
+            &mut source_state,
+            &retry,
+        )
+        .await?
+            > 0,
+        "pre-restore WAL sync must publish frames"
+    );
+
+    let restored =
+        walrust::walrust_core::sync::restore(storage.clone(), &prefix, &name, &restored_path, None)
+            .await?;
+    drop(source_writer);
+    drop(source_state);
+
+    let mut resumed = walrust::walrust_core::SyncState::new(restored_path.clone())?;
+    resumed.name = name.clone();
+    walrust::walrust_core::sync::resume_owned_after_restore(
+        storage.as_ref(),
+        &prefix,
+        &mut resumed,
+        &restored,
+        &HeldResumeLease,
+        &retry,
+    )
+    .await?;
+
+    let resumed_writer = Connection::open(&restored_path)?;
+    resumed_writer.execute_batch(
+        "PRAGMA journal_mode=WAL;
+         PRAGMA wal_autocheckpoint=0;
+         ALTER TABLE items ADD COLUMN note TEXT;
+         UPDATE items SET note = 'migrated' WHERE id <= 10;
+         INSERT INTO items (id, value, note) VALUES (1000, 'after-restore', 'new');
+         INSERT INTO blobs VALUES (2, randomblob(327680));",
+    )?;
+    anyhow::ensure!(
+        walrust::walrust_core::sync::sync_wal_with_retry(
+            storage.as_ref(),
+            &prefix,
+            &mut resumed,
+            &retry,
+        )
+        .await?
+            > 0,
+        "post-resume WAL sync must publish frames"
+    );
+
+    let final_restore =
+        walrust::walrust_core::sync::restore(storage, &prefix, &name, &verify_path, None).await?;
+    anyhow::ensure!(
+        final_restore.seq() == resumed.current_seq,
+        "second restore stopped at seq {}, expected {}",
+        final_restore.seq(),
+        resumed.current_seq
+    );
+    assert_integrity_ok(&verify_path)?;
+    assert_eq!(rows(&verify_path)?, rows(&restored_path)?);
+
+    let verified = Connection::open(&verify_path)?;
+    let blob_bytes: i64 =
+        verified.query_row("SELECT SUM(length(value)) FROM blobs", [], |row| row.get(0))?;
+    assert_eq!(blob_bytes, 262144 + 327680);
+    let note: String = verified.query_row("SELECT note FROM items WHERE id = 1000", [], |row| {
+        row.get(0)
+    })?;
+    assert_eq!(note, "new");
 
     Ok(())
 }

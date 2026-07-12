@@ -9,7 +9,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Fresh-user drill (dogfooding item 2)**: `drills/fresh-user.sh` plays a stranger who reads the README, `cargo install walrust --locked`s the **published crates.io binary** into an isolated `--root` prefix (a guard asserts the workspace binary is never involved and `walrust --version` matches what cargo installed), and follows the README verbatim — every command in the drill carries a comment naming the README section it comes from. The journey: stock `sqlite3` database → the README's `walrust.toml` → `walrust watch` (config auto-discovery) → app writes → `walrust list`/`walrust verify` → Ctrl-C → delete the database → `walrust restore` proven row-exact with sqlite3 (count + ordered content hash + `integrity_check`) → continue replicating the restored copy from a second machine dir → the "bad migration" exercise: a destructive `DELETE` + `ALTER TABLE DROP COLUMN` is synced, then the pre-migration restore point is found **using only what `walrust list` shows a user** (current TXID as ceiling, newest-snapshot TXID as floor, trial `--point-in-time` restores walking down, each inspected with sqlite3) and the PITR restore is asserted row-exact against the recorded pre-migration state. Five README findings were recorded and fixed in the same PR: **F1** Quick start never mentioned the required `AWS_*` credentials/region/endpoint env (demonstrated by a no-env probe that fails); **F2** the CLI docs never said the database must already be in WAL mode — `walrust watch` (correctly, loudly) refuses a stock rollback-journal database, and the drill remediates with the product's own `walrust pragma`; **F3** the restore/verify examples used the name `mydb` while the watch example used `app.db`, with the name rule (file stem, as `walrust list` shows) never stated; **F4** the prune example omitted the required database-name positional and could not run at all; **F5** `walrust list` gives no restore-point history and no timestamps, so "the TXID from before my migration" cannot be read off — trial restores are the only user strategy, now documented honestly in the README ("Finding a point-in-time restore target"), including the advice to note the TXID before risky migrations. No product bugs found: every product behavior the drill hit (WAL refusal, verified restore, PITR probing, restart re-anchor on the restored copy) worked as documented once the docs told the truth. CI: `.github/workflows/fresh-user.yml` runs the drill nightly against MinIO on a schedule of its own (kept out of `make drill`/`run-all.sh` like the version-skew drill, because it needs crates.io network access) and is `workflow_dispatch`-able with an `induce_loss` input — the standing teeth proof deletes every bucket object right before the restore and the run must go red (`WALRUST_DRILL_INDUCE_LOSS=1`). The cargo-registry cache is keyed on the published version and the installed binary itself is never cached. Locally: `make drill-fresh-user`.
+
+- **Safe walrust-owned resume after restore:** `sync::restore` now returns an
+  opaque `RestoreResult`, and `sync::resume_owned_after_restore` consumes that
+  identity to publish a fresh walrust-owned snapshot above the restored tip.
+  The checksum and lineage stay inside walrust; embedders cannot accidentally
+  route an owned base through the external-base protocol. The API rejects PITR,
+  prefix, database, path, and non-fresh-state mismatches, and documents that the
+  caller must hold exclusive writer ownership before re-anchoring. The API now
+  requires an `OwnedResumeLease` guard supplied and maintained by the embedder;
+  walrust does not acquire, renew, or release leases itself.
 - **Format-stability fixture (dogfooding item 1)**: two frozen buckets written by the PUBLISHED 0.7.0 artifacts live under `tests/fixtures/format-stability/` — `cli-v0.7.0` (crates.io `cargo install walrust --version 0.7.0 --locked` binary running `watch --independent-tasks` with leveled compaction at comedy knobs: ≥2 snapshots, live L0 tail, populated L1 AND L2, and a real `walrust prune` boundary with superseded objects actually deleted — the interleaved litestream-heritage-LTX ⟷ HADBP `levels/` seam frozen on disk) and `owned-v0.7.0` (registry `walrust-core = "=0.7.0"` via a throwaway scratch generator crate, `add_without_snapshot()` + autonomous snapshots + compaction: snapshots + levels + L0 tail). Each carries a `MANIFEST.json` (generator version, exact knobs, expected latest row-count/row-content SHA-256, one mid-history PITR TXID with its expected checksum, full object index) plus `generate.sh` (manual-only, needs crates.io network like `drills/version-skew.sh`) to mint future `vX` fixtures the same way. The S3-gated proving test `tests/format_stability.rs` uploads each fixture to a unique scratch prefix and drives the SAME restore path a real user uses (CLI binary for the CLI fixture; library `Replicator::restore()`/`sync::restore()` for the owned one), asserting restore-to-latest + PITR row-exact against the manifest and `integrity_check` clean — buckets written by 0.7.0 must restore forever. Skips ONLY on missing S3 env; a missing/corrupt fixture with S3 present FAILS loudly. Failure-proven at the call site: a one-byte tamper in a level/L0 object fails with a HADBP checksum mismatch (both fixtures), and an un-uploaded (empty) prefix fails loudly (both restore paths), never a skip or a pass. Review hardening (same PR): adversarial review found that restore-to-latest/PITR plan forward from the newest snapshot ≤ target, so level objects below it (cli L2; owned L1/L2 — pre-PITR history) were frozen but never decoded — a tampered byte in them passed. Closed three ways, each proven by a tamper-neuter: every HADBP payload in both fixtures (all `levels/` objects + every owned `.hadbp`) must decode with the current checksum-verifying decoder; the cli bucket must pass current `walrust verify` (downloads + checksum-verifies every real-LTX object, exercises the prune-/level-aware gap logic); and the owned fixture is PITR-restored through each 0.7.0-written L1 merged object (targets derived from the manifest: snapshot base at `min-1`, target `max`), with the restored rows required to be a strict non-empty prefix of the manifest-anchored latest rows. `load_manifest` now also fails on manifest↔disk drift (objects on disk the manifest does not list).
+
+### Fixed
+
+- **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
+  owns each planned candidate instead of retaining borrowed plan entries across
+  the async stream, fixing the non-general `Send` future seen by embedders using
+  `tokio::spawn`.
+- **Snapshot page-layout corruption:** walrust-owned snapshots no longer use
+  `VACUUM INTO`. Vacuum can renumber b-tree and overflow pages; later WAL frames
+  from the live database then target the wrong physical pages in the restored
+  vacuumed image. Snapshots now encode the exact checkpointed main file while
+  the checkpoint blocker pins it. Wide-row/blob E2E coverage caught the old
+  path producing an invalid overflow chain and dozens of orphan pages.
+- **Owned-resume conflict and retry safety:** resume now refuses an already
+  published next sequence across snapshot, incremental, and compacted storage,
+  checks sequence overflow, and completes all remote preflight before mutating
+  `SyncState`. A transient preflight failure therefore leaves the same fresh
+  state retryable. Documentation now reserves `add_without_snapshot` for
+  reopening the same local database/WAL files rather than newly restored files.
+- **Restore I/O regression:** `RestoreResult` reuses the checksum already
+  produced by linear or leveled restore instead of hashing the entire restored
+  database again. The public compaction executor keeps its existing `u64`
+  return type while the internal executor retains the final chain checksum.
+
+### Testing
+
+- Added public-API integration coverage for flat and lineaged owned histories,
+  leveled-compaction restore/resume, mixed DDL/INSERT/UPDATE/DELETE/blob loads,
+  PITR refusal with no storage writes, competing-writer refusal with byte-exact
+  preservation of the winner, transient preflight retry, and the
+  snapshot-upload/state-save crash window. Added the same mixed-workload
+  restore/resume/restore path against live S3-compatible storage. A revoked
+  lease is rejected before storage access or `SyncState` mutation, and lease
+  expiry during the final state PUT is detected before the API can return
+  success while leaving the published snapshot/state recoverable. Lease
+  validity is also checked inside every retried snapshot and state PUT attempt,
+  so retry backoff cannot silently outlive the caller's lease — proven by a
+  retry test that fails the first snapshot CAS transiently, lapses the lease
+  during backoff, and asserts the retried attempt refuses before writing any
+  object. The snapshot-published/state-save-failed crash window's documented
+  recovery (restore again, resume again above the recovered tip) is exercised
+  end to end.
 
 ### Removed
 - Removed the adversarial-review ledgers (`ADVERSARIAL_REVIEW.md`, `ADVERSARIAL_REVIEW_2.md`) — dev artifacts, fully resolved except three residuals now tracked as R1–R3 in ROADMAP.md's "Residual risk register" (multi-writer lease out of scope by design; cross-generation cache collision backstopped by restore chain checksums; rollover truncate-before-put publish window, adjudicated not silent loss). Full ledgers remain in git history.

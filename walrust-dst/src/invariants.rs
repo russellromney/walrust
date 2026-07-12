@@ -462,7 +462,7 @@ pub fn prop_production_published_delta_restore() -> Result<()> {
                 .await
                 .expect("production restore should consume published deltas");
                 prop_assert_eq!(
-                    restored_seq,
+                    restored_seq.seq(),
                     state.current_seq,
                     "restore should reach the production stream head"
                 );

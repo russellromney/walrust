@@ -422,16 +422,21 @@ impl Replicator {
         Ok(())
     }
 
-    /// Register a database without taking a snapshot.
-    /// Use after `restore()` when the database already has the latest state
-    /// from S3. Avoids uploading a redundant snapshot that could race with
-    /// other nodes' changesets.
+    /// Reopen the same local database without taking a new snapshot.
+    ///
+    /// This reloads the saved WAL offset and is therefore only for a process
+    /// restart over the same database/WAL files. It is not safe for a newly
+    /// restored database. Low-level embedders must use
+    /// [`sync::resume_owned_after_restore`] after [`sync::restore`] so walrust
+    /// re-anchors above the restored sequence.
     pub async fn add_without_snapshot(&self, name: &str, db_path: &Path) -> Result<()> {
         self.add_without_snapshot_with_wal_path(name, db_path, &db_path.with_extension("db-wal"))
             .await
     }
 
-    /// Register a database without taking a snapshot, with an explicit WAL path.
+    /// Reopen the same local database without taking a snapshot, with an
+    /// explicit WAL path. See [`Self::add_without_snapshot`] for the restored
+    /// database warning.
     pub async fn add_without_snapshot_with_wal_path(
         &self,
         name: &str,
@@ -633,27 +638,27 @@ impl Replicator {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let seq = match sync::restore(self.storage.clone(), &prefix, name, output_path, None).await
-        {
-            Ok(seq) => seq,
-            Err(e)
-                if matches!(
-                    e.downcast_ref::<WalrustError>(),
-                    Some(WalrustError::RestoreNotFound(_))
-                ) =>
-            {
-                return Ok(None);
-            }
-            Err(e) => return Err(e),
-        };
+        let restored =
+            match sync::restore(self.storage.clone(), &prefix, name, output_path, None).await {
+                Ok(restored) => restored,
+                Err(e)
+                    if matches!(
+                        e.downcast_ref::<WalrustError>(),
+                        Some(WalrustError::RestoreNotFound(_))
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
 
         tracing::info!(
             "Replicator: restored '{}' to seq {} ({})",
             name,
-            seq,
+            restored.seq(),
             output_path.display()
         );
-        Ok(Some(seq))
+        Ok(Some(restored.seq()))
     }
 
     /// Flush pending WAL frames for a specific database to S3.

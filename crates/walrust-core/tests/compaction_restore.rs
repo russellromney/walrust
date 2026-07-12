@@ -34,6 +34,15 @@ use walrust_core::compaction::{
     RangeLayout, SeqLayout,
 };
 use walrust_core::ltx;
+use walrust_core::{OwnedResumeLease, RetryConfig, RetryPolicy, SyncState};
+
+struct HeldResumeLease;
+
+impl OwnedResumeLease for HeldResumeLease {
+    fn ensure_held(&self) -> Result<()> {
+        Ok(())
+    }
+}
 
 // ── In-memory backend (correct range_get via default slice) ─────────────────
 
@@ -306,7 +315,7 @@ async fn seq_layout_e2e_restore_through_merged_objects() {
     let seq = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out, None)
         .await
         .unwrap();
-    assert_eq!(seq, fx.max_seq);
+    assert_eq!(seq.seq(), fx.max_seq);
     assert!(integrity_ok(&out));
     assert_eq!(query_rows(&out), fx.rows);
     assert_eq!(
@@ -320,7 +329,7 @@ async fn seq_layout_e2e_restore_through_merged_objects() {
     let seq9 = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out9, Some("9"))
         .await
         .unwrap();
-    assert_eq!(seq9, 9);
+    assert_eq!(seq9.seq(), 9);
     assert!(integrity_ok(&out9));
     assert_eq!(std::fs::read(&out9).unwrap(), fx.state_at[&9]);
 
@@ -347,6 +356,69 @@ async fn seq_layout_e2e_restore_through_merged_objects() {
         "decay error must name nearest restorable points on both sides: {msg}"
     );
     assert!(!out5.exists(), "no partial output on a failed PITR");
+}
+
+#[tokio::test]
+async fn owned_resume_after_leveled_restore_uses_planner_checksum() {
+    let fx = build_fixture("resume-levels/", "db", 13, false);
+    let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
+    compact_to_l1_l2(&layout).await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let restored_path = dir.path().join("db.db");
+    let restored =
+        walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &restored_path, None)
+            .await
+            .unwrap();
+    assert_eq!(restored.seq(), fx.max_seq);
+
+    let retry = RetryPolicy::new(RetryConfig {
+        max_retries: 0,
+        circuit_breaker_enabled: false,
+        ..Default::default()
+    });
+    let writer = Connection::open(&restored_path).unwrap();
+    writer
+        .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+        .unwrap();
+    let mut resumed = SyncState::new(restored_path.clone()).unwrap();
+    resumed.name = fx.db.clone();
+    walrust_core::sync::resume_owned_after_restore(
+        fx.store.as_ref(),
+        &fx.prefix,
+        &mut resumed,
+        &restored,
+        &HeldResumeLease,
+        &retry,
+    )
+    .await
+    .unwrap();
+    assert_eq!(resumed.current_seq, fx.max_seq + 1);
+
+    writer
+        .execute("INSERT INTO t(id, v) VALUES (9999, 'after-resume')", [])
+        .unwrap();
+    assert!(
+        walrust_core::sync::sync_wal_with_retry(
+            fx.store.as_ref(),
+            &fx.prefix,
+            &mut resumed,
+            &retry,
+        )
+        .await
+        .unwrap()
+            > 0
+    );
+
+    let verified_path = dir.path().join("verified.db");
+    let verified = walrust_core::sync::restore(fx.store, &fx.prefix, &fx.db, &verified_path, None)
+        .await
+        .unwrap();
+    assert_eq!(verified.seq(), fx.max_seq + 2);
+    assert!(integrity_ok(&verified_path));
+    assert!(query_rows(&verified_path)
+        .iter()
+        .any(|row| row == &(9999, "after-resume".to_string())));
 }
 
 #[tokio::test]
@@ -380,7 +452,7 @@ async fn seq_layout_crash_overlap_restores_without_double_apply() {
     let seq = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out, None)
         .await
         .unwrap();
-    assert_eq!(seq, fx.max_seq);
+    assert_eq!(seq.seq(), fx.max_seq);
     assert!(integrity_ok(&out));
     assert_eq!(query_rows(&out), fx.rows);
     assert_eq!(std::fs::read(&out).unwrap(), fx.state_at[&fx.max_seq]);
@@ -435,7 +507,7 @@ async fn restore_finds_l2_when_l1_is_fully_promoted_away() {
     let seq = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out, None)
         .await
         .expect("restore must not phantom-gap across an empty lower level");
-    assert_eq!(seq, fx.max_seq);
+    assert_eq!(seq.seq(), fx.max_seq);
     assert!(integrity_ok(&out));
     assert_eq!(query_rows(&out), fx.rows);
     assert_eq!(std::fs::read(&out).unwrap(), fx.state_at[&fx.max_seq]);
@@ -620,7 +692,7 @@ async fn owned_vacuum_shrink_merges_and_restores_row_exact() {
     let seq = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out, None)
         .await
         .unwrap();
-    assert_eq!(seq, fx.max_seq);
+    assert_eq!(seq.seq(), fx.max_seq);
     assert!(integrity_ok(&out), "restored DB passes integrity_check");
     assert_eq!(query_rows(&out), fx.rows, "restore-to-latest is row-exact");
     assert_eq!(

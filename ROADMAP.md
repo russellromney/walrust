@@ -81,7 +81,11 @@ Order of work (each lands as its own PR through the normal gate):
    restore-or-create on boot, `shutdown()` on SIGTERM mid-burst, app-owned
    connections alongside the replicator, app-issued `wal_checkpoint(TRUNCATE)`,
    `VACUUM`, an `ALTER TABLE` migration. Runs nightly against live S3; doubles
-   as the README's library example.
+   as the README's library example. Restore-or-create on boot should also
+   settle the ergonomics gap around `sync::resume_owned_after_restore`:
+   `Replicator`-level embedders currently have to drop to the sync layer and
+   hand-build a `SyncState` to resume a restored database (a
+   `Replicator`-level wrapper is candidate follow-up work).
 4. **Footgun drill.** Each plausible misuse asserts a *specific loud error*,
    never exit 0 with weirdness: two watchers on the same prefix (fencing, from
    the CLI as a user hits it), restore onto a live open database, bucket-prefix
@@ -516,6 +520,10 @@ anything it covers.
   `PublishIntent` authorship proof is a durability fence, not a distributed
   lease. A true lease/epoch token belongs in an external coordinator (the
   hadb internal-lease-store work), not in walrust.
+  `sync::resume_owned_after_restore` follows this split: its
+  `OwnedResumeLease` is a caller-supplied guard hook (re-checked at every
+  phase and inside every retried storage attempt), not a walrust-acquired
+  lease — walrust never acquires, renews, or releases it.
 - **R2 (was D6) — cross-generation same-(min,max) cache collision.**
   Theoretically possible; backstopped by restore's `pre/post_apply` checksums
   (computed from actual DB bytes), which catch a wrong-lineage substitution
@@ -532,6 +540,22 @@ anything it covers.
   and the DST oracle models the window exactly. Suggested defensive
   narrowing: reverse the truncate/put order — critical-path work, take it
   deliberately.
+- **R4 — legacy CLI snapshots still go through `VACUUM INTO`.** The owned-mode
+  snapshot paths (`sync::take_snapshot` / `take_snapshot_with_retry`) were
+  fixed to encode the checkpointed main file directly, because VACUUM can
+  renumber b-tree/overflow pages and later WAL-frame incrementals then target
+  the wrong physical pages in the restored image (proven: reverting the owned
+  fix makes `public_owned_resume_round_trips_lineaged_mixed_workload` fail
+  integrity_check with a broken overflow chain and orphan pages). The legacy
+  CLI path (`legacy_ltx.rs` `StableSqliteSnapshot::create`) still snapshots
+  via `VACUUM INTO`, and its incrementals are also physical WAL frames of the
+  live layout — the same hazard class, unproven either way for legacy.
+  Trigger: a fragmented database whose vacuumed page layout differs from the
+  live layout, plus post-snapshot incrementals, then restore. Drills have not
+  hit it (append-heavy workloads vacuum to a near-identical layout).
+  Suggested fix: check whether the legacy checkpoint story pins the main file
+  the way owned mode's blocker does, and if so make the same swap there — its
+  own careful wave with a fragmented-layout regression test, not a drive-by.
 
 ## Future Considerations (v1.0+)
 
