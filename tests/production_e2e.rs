@@ -5,6 +5,14 @@ use std::process::{Child, Command};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
 
+struct HeldResumeLease;
+
+impl walrust::walrust_core::OwnedResumeLease for HeldResumeLease {
+    fn ensure_held(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
 fn test_bucket() -> String {
     std::env::var("TIERED_TEST_BUCKET").unwrap_or_else(|_| "walrust-test-rr-2026".to_string())
 }
@@ -763,6 +771,7 @@ async fn e2e_core_owned_restore_resume_round_trips_mixed_workload() -> Result<()
         &prefix,
         &mut resumed,
         &restored,
+        &HeldResumeLease,
         &retry,
     )
     .await?;

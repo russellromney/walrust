@@ -160,6 +160,19 @@ impl RestoreResult {
     }
 }
 
+/// Caller-owned exclusive lease held across walrust-owned restore adoption.
+///
+/// Walrust does not acquire, renew, or release distributed leases. The
+/// embedder supplies a guard from its own coordinator. Borrowing the guard for
+/// [`resume_owned_after_restore`] must keep exclusive writer ownership valid
+/// for the entire future, including snapshot upload and state persistence.
+/// `ensure_held` must fail once the lease is lost or too close to expiry to
+/// cover an in-flight storage operation.
+pub trait OwnedResumeLease: Send + Sync {
+    /// Fail unless this guard still owns the exclusive writer lease.
+    fn ensure_held(&self) -> Result<()>;
+}
+
 /// Follower cursor for incremental pull APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullCursor {
@@ -2365,11 +2378,9 @@ pub async fn restore(
 /// chain from that new base.
 ///
 /// The restore must have targeted latest (not point-in-time), and `state` must
-/// be fresh and point at the exact restored output. The caller must also have
-/// exclusive writer ownership before calling this function. Walrust rejects an
-/// already-published object at the next sequence, but that preflight is not a
-/// distributed leadership lease and cannot close a race with a writer that is
-/// still active.
+/// be fresh and point at the exact restored output. `lease` is a caller-owned
+/// guard whose borrow must retain exclusive writer ownership for this entire
+/// operation. Walrust does not implement lease acquisition or renewal.
 ///
 /// Snapshot upload and resumed-state persistence both use `retry_policy`. If
 /// snapshot upload fails, `state` is restored to its input value. If the
@@ -2381,8 +2392,10 @@ pub async fn resume_owned_after_restore(
     prefix: &str,
     state: &mut SyncState,
     restored: &RestoreResult,
+    lease: &dyn OwnedResumeLease,
     retry_policy: &RetryPolicy,
 ) -> Result<()> {
+    lease.ensure_held()?;
     if !restored.latest {
         anyhow::bail!(
             "{}: cannot resume walrust-owned replication from a point-in-time restore",
@@ -2461,6 +2474,7 @@ pub async fn resume_owned_after_restore(
             .into());
         }
     }
+    lease.ensure_held()?;
 
     let original = state.clone();
     state.current_seq = restored.seq;
@@ -2472,6 +2486,7 @@ pub async fn resume_owned_after_restore(
         *state = original;
         return Err(error);
     }
+    lease.ensure_held()?;
 
     let state_key = state_key(prefix, &state.name);
     let state_data = Arc::new(state_json_bytes(state)?);
@@ -3338,6 +3353,14 @@ mod tests {
     use async_trait::async_trait;
     use std::collections::HashMap as StdHashMap;
     use std::sync::{Arc, Mutex};
+
+    struct HeldResumeLease;
+
+    impl OwnedResumeLease for HeldResumeLease {
+        fn ensure_held(&self) -> Result<()> {
+            Ok(())
+        }
+    }
 
     // ---- Mock storage for testing ----
 
@@ -5017,9 +5040,16 @@ mod tests {
 
         let mut resumed = SyncState::new(restored_path.clone()).unwrap();
         resumed.name = "owned".to_string();
-        resume_owned_after_restore(&storage, "p/", &mut resumed, &restored, &retry)
-            .await
-            .expect("owned resume must publish a fresh base above the restored tip");
+        resume_owned_after_restore(
+            &storage,
+            "p/",
+            &mut resumed,
+            &restored,
+            &HeldResumeLease,
+            &retry,
+        )
+        .await
+        .expect("owned resume must publish a fresh base above the restored tip");
         assert_eq!(resumed.current_seq, 3);
 
         let resumed_writer = rusqlite::Connection::open(&restored_path).unwrap();

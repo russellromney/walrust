@@ -34,7 +34,15 @@ use walrust_core::compaction::{
     RangeLayout, SeqLayout,
 };
 use walrust_core::ltx;
-use walrust_core::{RetryConfig, RetryPolicy, SyncState};
+use walrust_core::{OwnedResumeLease, RetryConfig, RetryPolicy, SyncState};
+
+struct HeldResumeLease;
+
+impl OwnedResumeLease for HeldResumeLease {
+    fn ensure_held(&self) -> Result<()> {
+        Ok(())
+    }
+}
 
 // ── In-memory backend (correct range_get via default slice) ─────────────────
 
@@ -380,6 +388,7 @@ async fn owned_resume_after_leveled_restore_uses_planner_checksum() {
         &fx.prefix,
         &mut resumed,
         &restored,
+        &HeldResumeLease,
         &retry,
     )
     .await

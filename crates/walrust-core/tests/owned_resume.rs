@@ -9,9 +9,25 @@ use hadb_storage::{CasResult, StorageBackend};
 use rusqlite::Connection;
 use walrust_core::sync::{
     restore, resume_owned_after_restore, save_state, sync_wal_with_retry, take_snapshot_with_retry,
-    SyncState,
+    OwnedResumeLease, SyncState,
 };
 use walrust_core::{RetryConfig, RetryPolicy};
+
+struct HeldLease;
+
+impl OwnedResumeLease for HeldLease {
+    fn ensure_held(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+struct RevokedLease;
+
+impl OwnedResumeLease for RevokedLease {
+    fn ensure_held(&self) -> Result<()> {
+        anyhow::bail!("owned resume lease is not held")
+    }
+}
 
 #[derive(Default)]
 struct MemStorage {
@@ -261,9 +277,16 @@ async fn public_owned_resume_round_trips_lineaged_mixed_workload() {
     let retry = no_retry();
     let mut resumed = SyncState::new(restore_path.clone()).unwrap();
     resumed.name = "app".to_string();
-    resume_owned_after_restore(&*storage, "wal/", &mut resumed, &restored, &retry)
-        .await
-        .unwrap();
+    resume_owned_after_restore(
+        &*storage,
+        "wal/",
+        &mut resumed,
+        &restored,
+        &HeldLease,
+        &retry,
+    )
+    .await
+    .unwrap();
     assert_eq!(resumed.current_seq, 3);
 
     let writer = Connection::open(&restore_path).unwrap();
@@ -346,9 +369,16 @@ async fn public_owned_resume_refuses_concurrent_writer_without_overwrite() {
         .unwrap();
     let mut resumed = SyncState::new(restore_path.clone()).unwrap();
     resumed.name = "split".to_string();
-    let err = resume_owned_after_restore(&*storage, "wal/", &mut resumed, &restored, &no_retry())
-        .await
-        .expect_err("a live writer at restored seq + 1 must win the CAS");
+    let err = resume_owned_after_restore(
+        &*storage,
+        "wal/",
+        &mut resumed,
+        &restored,
+        &HeldLease,
+        &no_retry(),
+    )
+    .await
+    .expect_err("a live writer at restored seq + 1 must win the CAS");
     assert!(err.to_string().contains("equivocation"), "{err}");
     assert_eq!(
         resumed.current_seq, 0,
@@ -386,12 +416,50 @@ async fn public_owned_resume_rejects_pitr_without_storage_writes() {
     let keys_before = storage.keys();
     let mut resumed = SyncState::new(restore_path).unwrap();
     resumed.name = "pitr".to_string();
-    let err = resume_owned_after_restore(&*storage, "wal/", &mut resumed, &restored, &no_retry())
-        .await
-        .expect_err("PITR history must not replace latest history");
+    let err = resume_owned_after_restore(
+        &*storage,
+        "wal/",
+        &mut resumed,
+        &restored,
+        &HeldLease,
+        &no_retry(),
+    )
+    .await
+    .expect_err("PITR history must not replace latest history");
     assert!(err.to_string().contains("point-in-time"), "{err}");
     assert_eq!(storage.keys(), keys_before);
     assert_eq!(resumed.current_seq, 0);
+}
+
+#[tokio::test]
+async fn public_owned_resume_requires_held_lease_before_storage_access() {
+    let storage = Arc::new(MemStorage::default());
+    let source_dir = tempfile::tempdir().unwrap();
+    let source_path = source_dir.path().join("lease.db");
+    let (_writer, _state) = seed_owned_history(&storage, &source_path, "lease", false).await;
+    let restore_dir = tempfile::tempdir().unwrap();
+    let restore_path = restore_dir.path().join("lease.db");
+    let restored = restore(storage.clone(), "wal/", "lease", &restore_path, None)
+        .await
+        .unwrap();
+    let keys_before = storage.keys();
+    let mut resumed = SyncState::new(restore_path).unwrap();
+    resumed.name = "lease".to_string();
+
+    let err = resume_owned_after_restore(
+        &*storage,
+        "wal/",
+        &mut resumed,
+        &restored,
+        &RevokedLease,
+        &no_retry(),
+    )
+    .await
+    .expect_err("resume without an exclusive lease must fail before storage access");
+    assert!(err.to_string().contains("lease is not held"), "{err}");
+    assert_eq!(storage.keys(), keys_before);
+    assert_eq!(resumed.current_seq, 0);
+    assert!(resumed.db_checksum.is_none());
 }
 
 #[tokio::test]
@@ -410,9 +478,16 @@ async fn public_owned_resume_state_failure_is_loud_and_snapshot_is_recoverable()
     let mut resumed = SyncState::new(restore_path).unwrap();
     resumed.name = "state-fail".to_string();
 
-    let err = resume_owned_after_restore(&failing, "wal/", &mut resumed, &restored, &no_retry())
-        .await
-        .expect_err("state persistence failure must be returned");
+    let err = resume_owned_after_restore(
+        &failing,
+        "wal/",
+        &mut resumed,
+        &restored,
+        &HeldLease,
+        &no_retry(),
+    )
+    .await
+    .expect_err("state persistence failure must be returned");
     assert!(err.to_string().contains("state.json"), "{err}");
     assert_eq!(
         resumed.current_seq, 3,
@@ -459,9 +534,16 @@ async fn public_owned_resume_preflight_failure_leaves_state_retryable() {
     let mut resumed = SyncState::new(restore_path).unwrap();
     resumed.name = "preflight".to_string();
 
-    let err = resume_owned_after_restore(&failing, "wal/", &mut resumed, &restored, &no_retry())
-        .await
-        .expect_err("preflight storage failure must propagate");
+    let err = resume_owned_after_restore(
+        &failing,
+        "wal/",
+        &mut resumed,
+        &restored,
+        &HeldLease,
+        &no_retry(),
+    )
+    .await
+    .expect_err("preflight storage failure must propagate");
     assert!(err.to_string().contains("preflight read failure"), "{err}");
     assert_eq!(resumed.current_seq, 0);
     assert_eq!(resumed.current_txid, 0);
@@ -469,8 +551,15 @@ async fn public_owned_resume_preflight_failure_leaves_state_retryable() {
     assert!(resumed.lineage_id.is_none());
     assert!(resumed.db_checksum.is_none());
 
-    resume_owned_after_restore(&*storage, "wal/", &mut resumed, &restored, &no_retry())
-        .await
-        .expect("same fresh state must be retryable after transient preflight failure");
+    resume_owned_after_restore(
+        &*storage,
+        "wal/",
+        &mut resumed,
+        &restored,
+        &HeldLease,
+        &no_retry(),
+    )
+    .await
+    .expect("same fresh state must be retryable after transient preflight failure");
     assert_eq!(resumed.current_seq, 3);
 }

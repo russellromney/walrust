@@ -15,7 +15,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   The checksum and lineage stay inside walrust; embedders cannot accidentally
   route an owned base through the external-base protocol. The API rejects PITR,
   prefix, database, path, and non-fresh-state mismatches, and documents that the
-  caller must hold exclusive writer ownership before re-anchoring.
+  caller must hold exclusive writer ownership before re-anchoring. The API now
+  requires an `OwnedResumeLease` guard supplied and maintained by the embedder;
+  walrust does not acquire, renew, or release leases itself.
 
 ### Fixed
 
@@ -47,7 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   PITR refusal with no storage writes, competing-writer refusal with byte-exact
   preservation of the winner, transient preflight retry, and the
   snapshot-upload/state-save crash window. Added the same mixed-workload
-  restore/resume/restore path against live S3-compatible storage.
+  restore/resume/restore path against live S3-compatible storage. A revoked
+  lease is rejected before storage access or `SyncState` mutation.
 
 ## [0.7.0] - 2026-07-10
 
