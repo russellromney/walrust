@@ -17,6 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   prefix, database, path, and non-fresh-state mismatches, and documents that the
   caller must hold exclusive writer ownership before re-anchoring.
 
+### Fixed
+
+- **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
+  owns each planned candidate instead of retaining borrowed plan entries across
+  the async stream, fixing the non-general `Send` future seen by embedders using
+  `tokio::spawn`.
+
 ## [0.7.0] - 2026-07-10
 
 ### Added

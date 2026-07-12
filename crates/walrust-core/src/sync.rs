@@ -5021,6 +5021,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restore_future_is_send_in_spawned_tasks() {
+        let storage: Arc<dyn StorageBackend> = Arc::new(MutStorage::new());
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("missing.db");
+
+        let result =
+            tokio::spawn(async move { restore(storage, "p/", "missing", &output, None).await })
+                .await
+                .expect("restore task must be Send");
+
+        assert!(
+            result.is_err(),
+            "empty storage should still report not found"
+        );
+    }
+
+    #[tokio::test]
     async fn publish_delta_envelope_is_idempotent_on_identical_bytes() {
         let storage = MutStorage::new();
         let payload = delta_payload(1, 5, "w", vec![1, 2, 3]);

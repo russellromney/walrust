@@ -138,7 +138,7 @@ pub async fn apply_plan(
 
     // Bounded, order-preserving prefetch: at most `depth` downloads in flight;
     // objects are yielded — and therefore applied — in strict plan order.
-    let mut fetched = stream::iter(plan.files.iter().map(|cand| {
+    let mut fetched = stream::iter(plan.files.iter().cloned().map(|cand| {
         let lf = LayoutFile {
             key: cand.key.clone(),
             level: cand.level,
