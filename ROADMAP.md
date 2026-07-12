@@ -530,6 +530,25 @@ anything it covers.
   downstream. Trigger: two generations producing an identical `(min,max)`
   range while the local cache is warm. Suggested fix: bind the cache key to
   lineage/etag.
+- **R4 (found by `drills/fresh-user.sh`, 2026-07-12) — shadow watch silently
+  stops replicating after an external WAL restart (intermittent writers).**
+  Default `walrust watch` (shadow mode) on a freshly WAL-converted database:
+  the on-startup snapshot's PASSIVE checkpoint fully backfills the WAL; the
+  next write arriving from a *short-lived* sqlite3 session (cron job, shell
+  script — no long-lived app connection pinning the WAL) restarts the WAL, and
+  the shadow copier never ships another frame. No error is logged, `walrust
+  list` keeps showing a plausible TXID, `walrust verify` exits 0, SIGINT's
+  "syncing remaining data" ships nothing, and a later restore silently returns
+  only the startup snapshot (observed 3/3 on the published 0.7.0 binary;
+  secondary evidence: a doubled startup snapshot gen1+gen2 and a duplicated
+  initial shadow copy at offset 0). Continuous-writer workloads (every
+  existing drill) never hit it because in-flight writes keep the backfill
+  incomplete. Repro + permanent regression probe:
+  `drills/fresh-user.sh` step 12 (records finding F7 while the bug exists,
+  auto-clears when fixed). Suspect area: `ShadowWal::copy_frames` salt-change
+  handling vs the checked WAL reader after a full-backfill restart. Fix is a
+  durability-path change — needs the full adversarial gate, deliberately not
+  bundled into the drill PR.
 - **R3 (was E9) — rollover publish-failure window.**
   `upload_rollover_snapshot` folds the WAL into the local `.db`
   (`checkpoint_wal_truncate`) *before* putting the rollover snapshot; if the

@@ -242,6 +242,10 @@ stop_watch() {
 
 cleanup() {
   set +e
+  if [ -n "${APP_PID:-}" ]; then
+    kill -9 "$APP_PID" >/dev/null 2>&1
+    wait "$APP_PID" >/dev/null 2>&1
+  fi
   if [ -n "${WATCH_PID:-}" ]; then
     kill -9 "$WATCH_PID" >/dev/null 2>&1
     wait "$WATCH_PID" >/dev/null 2>&1
@@ -357,6 +361,105 @@ start_watch() {
 
 watch_alive() {
   [ -n "${WATCH_PID:-}" ] && kill -0 "$WATCH_PID" >/dev/null 2>&1
+}
+
+# --- the user's application -------------------------------------------------
+# A small long-lived writer, standing in for "your app writes to app.db as
+# normal" (README "Use as a library" puts it exactly that way, and the README's
+# sidecar diagram has the app and walrust sharing the database). It holds one
+# connection open and commits a row at a time, applying the `walrust pragma`
+# per-connection settings the product recommends. NOTE deliberately long-lived:
+# finding F7 (recorded by the probe at the end of this drill) shows that
+# writes arriving from short-lived sqlite3 sessions around watch startup stop
+# replicating silently on walrust 0.7.0.
+APP_PID=
+APP_PAUSE=
+
+write_app_script() {
+  cat >"$WORK/app-writer.py" <<'PY'
+import os
+import sqlite3
+import sys
+import time
+
+db, pause_path, interval, label = sys.argv[1], sys.argv[2], float(sys.argv[3]), sys.argv[4]
+conn = sqlite3.connect(db, timeout=5.0, isolation_level=None)
+# Per-connection settings straight from `walrust pragma` guidance.
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("PRAGMA wal_autocheckpoint=0")
+conn.execute("PRAGMA synchronous=NORMAL")
+n = 0
+while True:
+    if os.path.exists(pause_path):
+        time.sleep(interval)
+        continue
+    conn.execute("BEGIN IMMEDIATE")
+    conn.execute(
+        "INSERT INTO items(value, note) VALUES(?, ?)",
+        (f"{label}-{n}", f"note-{label}-{n}"),
+    )
+    conn.execute("COMMIT")
+    n += 1
+    time.sleep(interval)
+PY
+}
+
+start_app() {
+  local db=$1
+  local label=$2
+  APP_PAUSE="$WORK/app-pause.$label"
+  rm -f "$APP_PAUSE"
+  python3 "$WORK/app-writer.py" "$db" "$APP_PAUSE" "${WALRUST_DRILL_APP_INTERVAL:-0.1}" "$label" \
+    >"$WORK/app-$label.log" 2>&1 &
+  APP_PID=$!
+  log "app writer pid=$APP_PID (label=$label)"
+}
+
+# Pause the app's writes (the process and its connection stay alive) and wait
+# for the committed row count to become stable.
+pause_app() {
+  local db=$1
+  [ -n "${APP_PID:-}" ] || fail "app writer is not running"
+  kill -0 "$APP_PID" >/dev/null 2>&1 || fail "app writer died; see its log in $WORK"
+  touch "$APP_PAUSE"
+  local before after
+  before=$(row_count "$db")
+  local deadline=$((SECONDS + 30))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    sleep 1
+    after=$(row_count "$db")
+    if [ "$after" = "$before" ]; then
+      return 0
+    fi
+    before=$after
+  done
+  fail "app writer did not quiesce within 30s"
+}
+
+# The app is stopped with SIGKILL, not a clean exit: closing the last
+# connection to a WAL database triggers SQLite's own implicit checkpoint,
+# a determinism hazard this drill suite documents (see the stop_wide_driver
+# note in drills/version-skew.sh).
+stop_app() {
+  if [ -n "${APP_PID:-}" ] && kill -0 "$APP_PID" >/dev/null 2>&1; then
+    kill -9 "$APP_PID" >/dev/null 2>&1 || true
+    wait "$APP_PID" >/dev/null 2>&1 || true
+  fi
+  APP_PID=
+}
+
+wait_local_rows() {
+  local db=$1
+  local min=$2
+  local deadline=$((SECONDS + DEADLINE))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if [ "$(row_count "$db")" -ge "$min" ]; then
+      return 0
+    fi
+    kill -0 "${APP_PID:-0}" >/dev/null 2>&1 || fail "app writer died before reaching $min rows"
+    sleep 1
+  done
+  fail "app never reached $min rows locally"
 }
 
 # =============================================================================
@@ -501,9 +604,14 @@ sqlite3 app.db <"$WORK/pragma.sql"
 [ "$(sqlite3 app.db 'PRAGMA journal_mode;')" = "wal" ] || fail "walrust pragma settings did not switch app.db to WAL mode"
 
 # =============================================================================
-# Step 5 — `walrust watch`, for real this time.
+# Step 5 — the app starts writing, then `walrust watch`, for real this time.
 # README "Configuration": `walrust watch  # auto-discovers walrust.toml`.
+# The app writer (a long-lived connection, see the helper's note) runs across
+# watch startup — the same shape as a real service that was already running
+# when the operator added replication.
 # =============================================================================
+write_app_script
+start_app "$MACHINE1/app.db" m1
 start_watch "$MACHINE1" "$WORK/watch1.log"
 
 # README "Quick start (CLI)" more-commands: `walrust list -b s3://my-bucket`.
@@ -516,23 +624,13 @@ watch_alive || fail "walrust watch exited while waiting for first sync; see $WOR
 finding 3 "README restore/verify examples used the name 'mydb' while the watch example used 'app.db', and the name rule (file stem of the watched path, as shown by 'walrust list') was never stated. Fixed: examples now agree and the rule is spelled out."
 
 # =============================================================================
-# Step 6 — the user's app writes rows while walrust watches.
-# README "How it works": walrust polls the WAL and uploads changes (~1s sync
-# interval per "Safety and design"), so pauses between batches let ticks land.
+# Step 6 — let the app accumulate rows, then quiesce and let walrust settle.
+# README "Safety and design": the recovery point is bounded by the ~1s sync
+# interval, so after the app pauses the bucket TXID settles within seconds.
 # =============================================================================
-t0=$(current_txid)
-for batch in 1 2 3; do
-  sqlite3 app.db <<SQL
-.timeout 5000
-BEGIN IMMEDIATE;
-WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12)
-INSERT INTO items(value, note)
-SELECT 'batch$batch-' || n, 'note-b$batch-' || n FROM seq;
-COMMIT;
-SQL
-  sleep 1.2
-done
-settled_txid=$(wait_txid_settled "$t0")
+wait_local_rows "$MACHINE1/app.db" 40
+pause_app "$MACHINE1/app.db"
+settled_txid=$(wait_txid_settled 0)
 log "machine1 writes settled at TXID $settled_txid ($(row_count app.db) rows)"
 
 # =============================================================================
@@ -556,9 +654,11 @@ fi
 finding 4 "README's prune example 'walrust prune -b s3://my-bucket' omitted the required database-name positional and cannot run (usage error). Fixed: the example is now 'walrust prune app -b s3://my-bucket'."
 
 # =============================================================================
-# Step 8 — stop the watcher (Ctrl-C), record ground truth, lose the database.
+# Step 8 — stop the watcher (Ctrl-C) and the app, record ground truth, lose
+# the database.
 # =============================================================================
 stop_watch
+stop_app
 expected_count=$(row_count app.db)
 expected_hash=$(row_hash app.db)
 log "ground truth before disaster: $expected_count rows, hash $expected_hash"
@@ -614,28 +714,24 @@ TOML
 walrust pragma --output "$WORK/pragma2.sql" >/dev/null
 sqlite3 app.db <"$WORK/pragma2.sql"
 
+# The app resumes on the restored copy and keeps writing across watch startup
+# (same long-lived-writer shape as machine1); post-restore rows are the state
+# the bad migration will destroy.
+start_app "$MACHINE2/app.db" m2
 start_watch "$MACHINE2" "$WORK/watch2.log"
-sleep 3
+wait_until "machine2 stream to advance past machine1's TXID $settled_txid" "$DEADLINE" txid_at_least "$settled_txid"
 watch_alive || fail "walrust watch (machine2) exited during startup; see $WORK/watch2.log"
 
-# Post-restore "good" writes: the state we will need to get back to. Written
-# immediately after startup; the settle gate below proves both that the new
-# watcher came up against the existing bucket AND that it shipped these rows.
-sqlite3 app.db <<'SQL'
-.timeout 5000
-BEGIN IMMEDIATE;
-WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 20)
-INSERT INTO items(value, note)
-SELECT 'postrestore-' || n, 'note-pr-' || n FROM seq;
-COMMIT;
-SQL
-sleep 1.2
+wait_local_rows "$MACHINE2/app.db" $((expected_count + 15))
+pause_app "$MACHINE2/app.db"
 good_txid_settled=$(wait_txid_settled "$settled_txid")
 pre_migration_count=$(row_count app.db)
 pre_migration_hash=$(row_hash app.db)
 log "pre-migration state settled (bucket TXID $good_txid_settled): $pre_migration_count rows, hash $pre_migration_hash"
 
 # The bad migration: destructive schema + data change, synced to the bucket.
+# Run from the operator's own sqlite3 session while the app is paused (its
+# connection stays open, so the WAL keeps its running chain).
 sqlite3 app.db <<'SQL'
 .timeout 5000
 BEGIN IMMEDIATE;
@@ -643,11 +739,11 @@ DELETE FROM items WHERE id % 3 = 0;
 COMMIT;
 ALTER TABLE items DROP COLUMN note;
 SQL
-sleep 1.2
 bad_txid_settled=$(wait_txid_settled "$good_txid_settled")
 log "bad migration synced (bucket TXID $bad_txid_settled)"
 
 stop_watch
+stop_app
 
 # Restore-to-latest must reflect the migration (the disaster is real and PITR
 # is genuinely needed).
@@ -722,6 +818,82 @@ probe_hash=$(row_hash probe.db)
 log "bad-migration recovery: pre-migration state found at TXID $found_txid after $probes trial restore(s), row-exact"
 
 # =============================================================================
+# Step 12 — the intermittent-writer probe (FINDING F7, PRODUCT).
+# The main journey above uses a long-lived app connection writing continuously
+# across watch startup. This probe replays the OTHER completely ordinary usage
+# — writes arriving from short-lived sqlite3 sessions (cron jobs, shell
+# scripts) with no concurrent writer at watch startup — in an isolated prefix,
+# because on walrust 0.7.0 it reproducibly wedges replication:
+#   the on_startup snapshot's PASSIVE checkpoint fully backfills the WAL; the
+#   next short-lived writer session restarts the WAL, and the shadow copier
+#   never ships another frame — no error, `walrust list` keeps a plausible
+#   TXID, `walrust verify` exits 0, SIGINT's "syncing remaining data" ships
+#   nothing, and a later restore silently returns only the startup snapshot.
+# Deliberately NOT fixed in this drill PR (durability-path change); tracked as
+# a ledger item (ROADMAP residual R4). If a future walrust ships the fix, this
+# probe sees the rows replicate and records no finding.
+# =============================================================================
+PROBE_DIR="$WORK/probe7"
+PROBE_URI="$BUCKET_URI/f7probe"
+mkdir -p "$PROBE_DIR"
+cd "$PROBE_DIR"
+sqlite3 app.db <<'SQL'
+CREATE TABLE items (
+  id INTEGER PRIMARY KEY,
+  value TEXT NOT NULL,
+  note TEXT
+);
+INSERT INTO items(value, note) VALUES ('seed-1', 'note-1'), ('seed-2', 'note-2'), ('seed-3', 'note-3');
+SQL
+sqlite3 app.db <"$WORK/pragma.sql"
+cat >walrust.toml <<TOML
+[s3]
+bucket = "$PROBE_URI"
+endpoint = "$ENDPOINT"
+
+[[databases]]
+path = "$PROBE_DIR/app.db"
+TOML
+start_watch "$PROBE_DIR" "$WORK/watch-probe7.log"
+wait_until "probe database to appear in walrust list" "$DEADLINE" \
+  sh -c "walrust list -b '$PROBE_URI' 2>/dev/null | grep -qE '^ *app \(TXID: '"
+watch_alive || fail "probe watch exited during startup; see $WORK/watch-probe7.log"
+
+# Three script-style write sessions, the way a cron job would do it.
+for batch in 1 2 3; do
+  sqlite3 app.db <<SQL
+.timeout 5000
+BEGIN IMMEDIATE;
+WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12)
+INSERT INTO items(value, note)
+SELECT 'batch$batch-' || n, 'note-b$batch-' || n FROM seq;
+COMMIT;
+SQL
+  sleep 1.2
+done
+probe_local=$(row_count app.db)
+
+probe_deadline=$((SECONDS + ${WALRUST_DRILL_F7_DEADLINE_SECS:-45}))
+probe_replicated=0
+while [ "$SECONDS" -lt "$probe_deadline" ]; do
+  rm -f probe7-restored.db
+  if walrust restore app -o probe7-restored.db -b "$PROBE_URI" >"$WORK/probe7-restore.log" 2>&1; then
+    if [ "$(row_count probe7-restored.db)" = "$probe_local" ]; then
+      probe_replicated=1
+      break
+    fi
+  fi
+  sleep 2
+done
+stop_watch
+if [ "$probe_replicated" = "1" ]; then
+  log "note: intermittent-writer probe replicated fully ($probe_local rows) — F7 appears fixed in walrust $installed_version; no finding recorded"
+else
+  probe_restored=$(row_count probe7-restored.db 2>/dev/null || echo "unavailable")
+  finding 7 "PRODUCT: default 'walrust watch' (shadow mode) silently stops replicating writes that arrive from short-lived sqlite3 sessions started after watch startup on a freshly WAL-converted database ($probe_local rows local, $probe_restored restorable after ${WALRUST_DRILL_F7_DEADLINE_SECS:-45}s; no error logged, list/verify look healthy, SIGINT shutdown ships nothing). Repro: convert db to WAL, walrust watch via walrust.toml, write via separate sqlite3 -cli sessions, restore. Root area: startup snapshot's PASSIVE checkpoint fully backfills the WAL; the next writer session restarts the WAL and the shadow copier never ships another frame. Tracked as ROADMAP residual R4 — deliberately not fixed in the drill PR."
+fi
+
+# =============================================================================
 # Verdict
 # =============================================================================
 log "=================================================================="
@@ -730,6 +902,7 @@ log "  installed from crates.io: walrust $installed_version ($resolved)"
 log "  machine1: $expected_count rows replicated, verified, restored row-exact"
 log "  machine2: restored copy re-watched, bad migration recovered via"
 log "            --point-in-time $found_txid ($probes trial restores)"
-log "FINDINGS (each fixed in the README by the PR that added this drill):"
+log "FINDINGS (docs findings fixed in the README by this drill's PR; product"
+log "findings recorded in the ledger, not fixed here):"
 sed 's/^/  /' "$FINDINGS" >&2
 log "=================================================================="
