@@ -351,8 +351,8 @@ Three instruments run continuously: the unit/integration suite and a fast
 `basic_e2e` drill tier (real binary, kill/restart, restore row-diff, prune +
 PITR) gate every PR; the full drill suite runs nightly and files an issue on
 failure. Run them locally with `make basic-e2e` and `make drill` against any S3
-endpoint via `AWS_*` env vars (or Tigris via Soup). `ADVERSARIAL_REVIEW_2.md`
-is the findings ledger.
+endpoint via `AWS_*` env vars (or Tigris via Soup). Known residual risks are
+tracked in the "Residual risk register" section of `ROADMAP.md`.
 
 ## License
 
