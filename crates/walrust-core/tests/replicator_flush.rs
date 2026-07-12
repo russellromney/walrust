@@ -1956,7 +1956,7 @@ async fn test_walrust_owned_restore_uses_active_lineage_namespace() {
     .await
     .expect("restore must discover active lineage from state.json");
     assert_eq!(
-        restored_seq,
+        restored_seq.seq(),
         replicator
             .current_seq("owned-lineage-restore")
             .await

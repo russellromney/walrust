@@ -306,7 +306,7 @@ async fn seq_layout_e2e_restore_through_merged_objects() {
     let seq = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out, None)
         .await
         .unwrap();
-    assert_eq!(seq, fx.max_seq);
+    assert_eq!(seq.seq(), fx.max_seq);
     assert!(integrity_ok(&out));
     assert_eq!(query_rows(&out), fx.rows);
     assert_eq!(
@@ -320,7 +320,7 @@ async fn seq_layout_e2e_restore_through_merged_objects() {
     let seq9 = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out9, Some("9"))
         .await
         .unwrap();
-    assert_eq!(seq9, 9);
+    assert_eq!(seq9.seq(), 9);
     assert!(integrity_ok(&out9));
     assert_eq!(std::fs::read(&out9).unwrap(), fx.state_at[&9]);
 
@@ -380,7 +380,7 @@ async fn seq_layout_crash_overlap_restores_without_double_apply() {
     let seq = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out, None)
         .await
         .unwrap();
-    assert_eq!(seq, fx.max_seq);
+    assert_eq!(seq.seq(), fx.max_seq);
     assert!(integrity_ok(&out));
     assert_eq!(query_rows(&out), fx.rows);
     assert_eq!(std::fs::read(&out).unwrap(), fx.state_at[&fx.max_seq]);
@@ -435,7 +435,7 @@ async fn restore_finds_l2_when_l1_is_fully_promoted_away() {
     let seq = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out, None)
         .await
         .expect("restore must not phantom-gap across an empty lower level");
-    assert_eq!(seq, fx.max_seq);
+    assert_eq!(seq.seq(), fx.max_seq);
     assert!(integrity_ok(&out));
     assert_eq!(query_rows(&out), fx.rows);
     assert_eq!(std::fs::read(&out).unwrap(), fx.state_at[&fx.max_seq]);
@@ -620,7 +620,7 @@ async fn owned_vacuum_shrink_merges_and_restores_row_exact() {
     let seq = walrust_core::sync::restore(fx.store.clone(), &fx.prefix, &fx.db, &out, None)
         .await
         .unwrap();
-    assert_eq!(seq, fx.max_seq);
+    assert_eq!(seq.seq(), fx.max_seq);
     assert!(integrity_ok(&out), "restored DB passes integrity_check");
     assert_eq!(query_rows(&out), fx.rows, "restore-to-latest is row-exact");
     assert_eq!(

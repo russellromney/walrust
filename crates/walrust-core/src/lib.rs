@@ -51,9 +51,10 @@ pub use snapshot_source::{SnapshotCheckpoint, SnapshotSource};
 pub use sync::{
     fetch_delta_envelope, list_delta_envelopes_after, publish_delta_envelope,
     pull_incremental_into_sink, reconstruct_fenced_follower, restore_with_snapshot_source,
-    run_wal_replication, sync_wal_fenced_delta, DeltaPublishResult, DiscoveredDelta,
-    ExternalBaseCursor, FencedDeltaSyncParams, FencedFollowerCursor, FencedFollowerResult,
-    PullCursor, ReplicationConfig, RolloverEvent, RolloverObserver, SnapshotOwnership, SyncState,
+    resume_owned_after_restore, run_wal_replication, sync_wal_fenced_delta, DeltaPublishResult,
+    DiscoveredDelta, ExternalBaseCursor, FencedDeltaSyncParams, FencedFollowerCursor,
+    FencedFollowerResult, PullCursor, ReplicationConfig, RestoreResult, RolloverEvent,
+    RolloverObserver, SnapshotOwnership, SyncState,
 };
 
 // Fenced delta envelope codec.

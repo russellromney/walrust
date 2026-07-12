@@ -136,6 +136,30 @@ pub struct ExternalBaseCursor {
     pub checksum: u64,
 }
 
+/// Opaque identity of a database restored by [`restore`].
+///
+/// Walrust keeps the checksum and namespace details private so an embedder
+/// cannot accidentally mix the external-base and walrust-owned protocols.
+/// Pass this value directly to [`resume_owned_after_restore`] when this process
+/// has exclusive ownership of the walrust-owned stream.
+#[derive(Debug)]
+pub struct RestoreResult {
+    seq: u64,
+    checksum: u64,
+    db_name: String,
+    prefix: String,
+    output: PathBuf,
+    lineage_id: Option<String>,
+    latest: bool,
+}
+
+impl RestoreResult {
+    /// Highest HADBP sequence applied by the restore.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
+}
+
 /// Follower cursor for incremental pull APIs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PullCursor {
@@ -2104,14 +2128,16 @@ pub async fn take_snapshot(
 /// Restore a database from storage using HADBP changesets.
 ///
 /// Discovers available changesets by listing S3 objects (no manifest needed).
-/// Returns the seq that was actually restored to.
+/// Returns an opaque restore identity. Call [`RestoreResult::seq`] to inspect
+/// the restored sequence, or pass the result to
+/// [`resume_owned_after_restore`] to resume walrust-owned replication.
 pub async fn restore(
     storage: Arc<dyn StorageBackend>,
     prefix: &str,
     db_name: &str,
     output: &Path,
     point_in_time: Option<&str>,
-) -> Result<u64> {
+) -> Result<RestoreResult> {
     let target_seq = parse_point_in_time_seq(point_in_time)?;
     let storage_ref = storage.as_ref();
 
@@ -2312,8 +2338,109 @@ pub async fn restore(
     };
 
     verify_sqlite_integrity(staged_output)?;
+    let checksum = ltx::compute_checksum_from_file(staged_output)?;
     staged_restore.publish(output)?;
-    Ok(restored_seq)
+    Ok(RestoreResult {
+        seq: restored_seq,
+        checksum,
+        db_name: db_name.to_string(),
+        prefix: prefix.to_string(),
+        output: output.to_path_buf(),
+        lineage_id,
+        latest: point_in_time.is_none(),
+    })
+}
+
+/// Resume a walrust-owned stream after [`restore`] by publishing a fresh base.
+///
+/// A restored process must not start with a fresh sequence cursor: doing so
+/// would attempt to replace sequence 1 and correctly trip the equivocation
+/// guard. This function adopts the opaque restored identity, then publishes a
+/// full walrust-owned snapshot at `restored.seq() + 1`. Future incrementals
+/// chain from that new base.
+///
+/// The restore must have targeted latest (not point-in-time), and `state` must
+/// be fresh and point at the exact restored output. The caller must also have
+/// exclusive writer ownership before calling this function; walrust's object
+/// CAS rejects a concurrent writer at the next sequence but does not provide a
+/// distributed leadership lease.
+///
+/// Snapshot upload and resumed-state persistence both use `retry_policy`. If
+/// snapshot upload fails, `state` is restored to its input value. If the
+/// snapshot succeeds but state persistence exhausts its retries, the function
+/// returns the error and leaves `state` at the published snapshot cursor; the
+/// caller must stop rather than start again from a fresh cursor.
+pub async fn resume_owned_after_restore(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    state: &mut SyncState,
+    restored: &RestoreResult,
+    retry_policy: &RetryPolicy,
+) -> Result<()> {
+    if !restored.latest {
+        anyhow::bail!(
+            "{}: cannot resume walrust-owned replication from a point-in-time restore",
+            restored.db_name
+        );
+    }
+    if restored.prefix != prefix {
+        anyhow::bail!(
+            "{}: restore prefix {:?} does not match resume prefix {:?}",
+            restored.db_name,
+            restored.prefix,
+            prefix
+        );
+    }
+    if restored.db_name != state.name {
+        anyhow::bail!(
+            "restore database {:?} does not match SyncState database {:?}",
+            restored.db_name,
+            state.name
+        );
+    }
+    if restored.output != state.db_path {
+        anyhow::bail!(
+            "{}: restored output {} does not match SyncState database path {}",
+            state.name,
+            restored.output.display(),
+            state.db_path.display()
+        );
+    }
+    if state.current_seq != 0
+        || state.current_txid != 0
+        || state.wal_offset != 0
+        || state.wal_generation != 0
+        || state.lineage_id.is_some()
+        || state.external_base.is_some()
+        || state.db_checksum.is_some()
+        || state.checkpoint_blocker.is_some()
+    {
+        anyhow::bail!(
+            "{}: resume_owned_after_restore requires a fresh SyncState",
+            state.name
+        );
+    }
+
+    let original = state.clone();
+    state.current_seq = restored.seq;
+    state.current_txid = change_counter_from_file(&state.db_path).unwrap_or(0);
+    state.db_checksum = Some(restored.checksum);
+    state.lineage_id = restored.lineage_id.clone();
+
+    if let Err(error) = take_snapshot_with_retry(storage, prefix, state, retry_policy).await {
+        *state = original;
+        return Err(error);
+    }
+
+    let state_key = state_key(prefix, &state.name);
+    let state_data = Arc::new(state_json_bytes(state)?);
+    retry_policy
+        .execute_with_context("save resumed walrust-owned state", || {
+            let key = state_key.clone();
+            let data = Arc::clone(&state_data);
+            async move { storage.put(&key, data.as_slice()).await }
+        })
+        .await
 }
 
 /// Restore using an external snapshot source (e.g., turbolite page groups).
@@ -3827,7 +3954,7 @@ mod tests {
             .await
             .expect("core restore should choose the latest snapshot <= target");
 
-        assert_eq!(restored_seq, 1);
+        assert_eq!(restored_seq.seq(), 1);
         let conn = rusqlite::Connection::open(&output).unwrap();
         let marker: String = conn
             .query_row("SELECT value FROM marker", [], |row| row.get(0))
@@ -4715,6 +4842,7 @@ mod tests {
     /// semantics, for exercising the publish CAS path. The earlier
     /// `TestStorage` no-ops those, which is fine for the chain-replay
     /// tests but useless for the equivocation guard.
+    #[derive(Clone)]
     struct MutStorage {
         objects: Arc<Mutex<StdHashMap<String, Vec<u8>>>>,
     }
@@ -4794,6 +4922,102 @@ mod tests {
             end_page_count: 100 + seq,
             ltx_payload: ltx,
         }
+    }
+
+    #[tokio::test]
+    async fn owned_restore_resume_reanchors_before_new_writes() {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join("owned.db");
+        let source = rusqlite::Connection::open(&source_path).unwrap();
+        source
+            .execute_batch(
+                "
+                PRAGMA journal_mode=WAL;
+                PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO items (id, value) VALUES (1, 'base');
+                ",
+            )
+            .unwrap();
+
+        let storage = MutStorage::new();
+        let retry = RetryPolicy::default_policy();
+        let mut original = SyncState::new(source_path.clone()).unwrap();
+        original.name = "owned".to_string();
+        take_snapshot_with_retry(&storage, "p/", &mut original, &retry)
+            .await
+            .unwrap();
+        save_state(&storage, "p/", &original).await.unwrap();
+
+        source
+            .execute(
+                "INSERT INTO items (id, value) VALUES (2, 'before-restore')",
+                [],
+            )
+            .unwrap();
+        sync_wal_with_retry(&storage, "p/", &mut original, &retry)
+            .await
+            .unwrap();
+        assert_eq!(original.current_seq, 2);
+
+        let restored_dir = tempfile::tempdir().unwrap();
+        let restored_path = restored_dir.path().join("owned.db");
+        let restored = restore(
+            Arc::new(storage.clone()),
+            "p/",
+            "owned",
+            &restored_path,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(restored.seq(), 2);
+
+        let mut resumed = SyncState::new(restored_path.clone()).unwrap();
+        resumed.name = "owned".to_string();
+        resume_owned_after_restore(&storage, "p/", &mut resumed, &restored, &retry)
+            .await
+            .expect("owned resume must publish a fresh base above the restored tip");
+        assert_eq!(resumed.current_seq, 3);
+
+        let resumed_writer = rusqlite::Connection::open(&restored_path).unwrap();
+        resumed_writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")
+            .unwrap();
+        resumed_writer
+            .execute(
+                "INSERT INTO items (id, value) VALUES (3, 'after-restore')",
+                [],
+            )
+            .unwrap();
+        sync_wal_with_retry(&storage, "p/", &mut resumed, &retry)
+            .await
+            .unwrap();
+        assert_eq!(resumed.current_seq, 4);
+
+        let verify_dir = tempfile::tempdir().unwrap();
+        let verify_path = verify_dir.path().join("owned.db");
+        let second = restore(Arc::new(storage), "p/", "owned", &verify_path, None)
+            .await
+            .unwrap();
+        assert_eq!(second.seq(), 4);
+
+        let verify = rusqlite::Connection::open(&verify_path).unwrap();
+        let rows: Vec<(i64, String)> = verify
+            .prepare("SELECT id, value FROM items ORDER BY id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (1, "base".to_string()),
+                (2, "before-restore".to_string()),
+                (3, "after-restore".to_string()),
+            ]
+        );
     }
 
     #[tokio::test]

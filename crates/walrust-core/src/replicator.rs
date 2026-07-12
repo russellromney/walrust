@@ -633,27 +633,27 @@ impl Replicator {
             tokio::fs::create_dir_all(parent).await?;
         }
 
-        let seq = match sync::restore(self.storage.clone(), &prefix, name, output_path, None).await
-        {
-            Ok(seq) => seq,
-            Err(e)
-                if matches!(
-                    e.downcast_ref::<WalrustError>(),
-                    Some(WalrustError::RestoreNotFound(_))
-                ) =>
-            {
-                return Ok(None);
-            }
-            Err(e) => return Err(e),
-        };
+        let restored =
+            match sync::restore(self.storage.clone(), &prefix, name, output_path, None).await {
+                Ok(restored) => restored,
+                Err(e)
+                    if matches!(
+                        e.downcast_ref::<WalrustError>(),
+                        Some(WalrustError::RestoreNotFound(_))
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(e) => return Err(e),
+            };
 
         tracing::info!(
             "Replicator: restored '{}' to seq {} ({})",
             name,
-            seq,
+            restored.seq(),
             output_path.display()
         );
-        Ok(Some(seq))
+        Ok(Some(restored.seq()))
     }
 
     /// Flush pending WAL frames for a specific database to S3.

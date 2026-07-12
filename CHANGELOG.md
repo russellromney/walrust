@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Safe walrust-owned resume after restore:** `sync::restore` now returns an
+  opaque `RestoreResult`, and `sync::resume_owned_after_restore` consumes that
+  identity to publish a fresh walrust-owned snapshot above the restored tip.
+  The checksum and lineage stay inside walrust; embedders cannot accidentally
+  route an owned base through the external-base protocol. The API rejects PITR,
+  prefix, database, path, and non-fresh-state mismatches, and documents that the
+  caller must hold exclusive writer ownership before re-anchoring.
+
 ## [0.7.0] - 2026-07-10
 
 ### Added
