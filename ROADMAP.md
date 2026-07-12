@@ -51,6 +51,55 @@ Core differentiators:
 
 ---
 
+## Dogfooding (next up)
+
+0.7.0 is on crates.io. The drills prove the mechanisms; dogfooding proves the
+product. The frame: walrust is a standalone SQLite replication tool. It must
+work in all four postures — CLI sidecar watching one database, CLI sidecar
+watching many, embedded as a library inside an app, and as a read replica.
+(turbolite is one possible consumer of the library posture, not the target.)
+Every scenario below plays a real user and every gap found gets a finding in
+the ledger, same rules as the adversarial reviews.
+
+Order of work (each lands as its own PR through the normal gate):
+
+1. **Format-stability fixture (now-or-never).** Freeze a bucket written by the
+   published 0.7.0 binary — snapshots, L0 tail, L1+L2 levels, a prune
+   boundary — into `tests/fixtures/`, with recorded expected rows and PITR
+   points. An S3-gated test uploads the fixture objects to a scratch prefix
+   and proves current code restores them row-exact (latest + PITR). Every
+   future version must pass it: buckets written today restore forever. Cheap
+   now, impossible to create retroactively.
+2. **Fresh-user drill.** Clean container, `cargo install walrust` from
+   crates.io, follow the README *verbatim* to a verified restore — no repo
+   checkout, no improvising. Every deviation forced by reality is a docs bug.
+   Include the "bad migration 10 minutes ago" exercise: find the right PITR
+   point using `walrust list` output alone.
+3. **Library dogfood app.** A small real app (axum; sessions table, job-queue
+   table with DELETE churn, blob table) depending on `walrust-core` from the
+   **registry**, exercising the patterns real embedders need:
+   restore-or-create on boot, `shutdown()` on SIGTERM mid-burst, app-owned
+   connections alongside the replicator, app-issued `wal_checkpoint(TRUNCATE)`,
+   `VACUUM`, an `ALTER TABLE` migration. Runs nightly against live S3; doubles
+   as the README's library example.
+4. **Footgun drill.** Each plausible misuse asserts a *specific loud error*,
+   never exit 0 with weirdness: two watchers on the same prefix (fencing, from
+   the CLI as a user hits it), restore onto a live open database, bucket-prefix
+   typo (must not silently start a fresh lineage over nothing), `prune`/
+   `compact` run from a second machine while the watcher runs.
+5. **Fleet posture.** Extend `bench/multidb-rss.sh` into a correctness drill:
+   100+ databases watched by one process, startup storm, per-DB failure
+   isolation (revoke one prefix mid-run; the other 99 keep replicating and the
+   failure is loud and attributable), all N restorable at the end.
+6. **Real-time soak.** Two parts: (a) the laptop test — `walrust watch` on a
+   real database on a real machine for a week (sleep/wake, wifi flaps, clock
+   jumps) against live S3; (b) a multi-day VM soak at *production* knobs
+   (30s sync, real compaction cadence — not comedy knobs) with a daily
+   RSS/lag report. Credential rotation mid-run belongs here: fail loudly,
+   recover cleanly, never wedge silently.
+
+---
+
 ## Compaction (shipped — default off)
 
 **Status: SHIPPED behind `[compaction] enabled` (default `false`).** All five
