@@ -54,11 +54,51 @@ log() {
 WATCH_LOG=
 fail() {
   printf '[%s] ERROR: %s\n' "$DRILL_NAME" "$*" >&2
-  if [ -n "$WATCH_LOG" ] && [ -f "$WATCH_LOG" ]; then
-    printf '[%s] --- last 40 lines of %s ---\n' "$DRILL_NAME" "$WATCH_LOG" >&2
-    tail -n 40 "$WATCH_LOG" >&2 || true
-  fi
+  dump_diagnostics || true
   exit 1
+}
+
+# Failure forensics only — never used to drive the user journey.
+dump_diagnostics() {
+  set +e
+  if [ -n "${WATCH_LOG:-}" ] && [ -f "${WATCH_LOG:-}" ]; then
+    printf '[%s] --- last 60 lines of %s ---\n' "$DRILL_NAME" "$WATCH_LOG" >&2
+    tail -n 60 "$WATCH_LOG" >&2
+  fi
+  for f in "${WORK:-/nonexistent}"/restore1.log "${WORK:-/nonexistent}"/restore-latest.log; do
+    if [ -f "$f" ]; then
+      printf '[%s] --- %s ---\n' "$DRILL_NAME" "$f" >&2
+      cat "$f" >&2
+    fi
+  done
+  if command -v walrust >/dev/null 2>&1 && [ -n "${BUCKET_URI:-}" ]; then
+    printf '[%s] --- walrust list ---\n' "$DRILL_NAME" >&2
+    walrust list -b "$BUCKET_URI" >&2 2>&1
+  fi
+  for d in "${MACHINE1:-}" "${MACHINE2:-}"; do
+    if [ -n "$d" ] && [ -d "$d" ]; then
+      printf '[%s] --- ls -la %s ---\n' "$DRILL_NAME" "$d" >&2
+      ls -la "$d" >&2
+    fi
+  done
+  if [ -n "${RUN_PREFIX:-}" ] && drill_python_has_minio 2>/dev/null; then
+    printf '[%s] --- S3 objects under %s ---\n' "$DRILL_NAME" "$RUN_PREFIX" >&2
+    HOME="${REAL_HOME:-${HOME:-}}" python3 - "$BUCKET_NAME" "$RUN_PREFIX" >&2 <<'PY'
+import os, sys
+from urllib.parse import urlparse
+from minio import Minio
+bucket, prefix = sys.argv[1], sys.argv[2]
+endpoint = os.environ.get("AWS_ENDPOINT_URL_S3") or os.environ.get("AWS_ENDPOINT_URL")
+parsed = urlparse(endpoint if "://" in endpoint else f"http://{endpoint}")
+client = Minio(parsed.netloc or parsed.path,
+               access_key=os.environ["AWS_ACCESS_KEY_ID"],
+               secret_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+               secure=parsed.scheme == "https")
+for o in client.list_objects(bucket, prefix=prefix, recursive=True):
+    print(f"{o.size:>10}  {o.object_name}")
+PY
+  fi
+  set -e
 }
 
 require_cmd() {
@@ -123,7 +163,7 @@ finding() {
 REAL_HOME=${HOME:-}
 
 drill_python_has_minio() {
-  HOME="$REAL_HOME" python3 -c 'import minio' >/dev/null 2>&1
+  HOME="${REAL_HOME:-${HOME:-}}" python3 -c 'import minio' >/dev/null 2>&1
 }
 
 # S3 prefix deletion, used by the induce-loss teeth proof and by cleanup.
@@ -284,7 +324,9 @@ start_watch() {
   local dir=$1
   local logfile=$2
   WATCH_LOG=$logfile
-  (cd "$dir" && exec walrust watch) >"$logfile" 2>&1 &
+  # RUST_LOG=walrust=debug is drill forensics (the log file is drill-owned,
+  # never parsed to drive the journey); a real user runs the plain command.
+  (cd "$dir" && RUST_LOG=walrust=debug exec walrust watch) >"$logfile" 2>&1 &
   WATCH_PID=$!
   log "walrust watch pid=$WATCH_PID (cwd=$dir, log=$logfile)"
 }
@@ -457,6 +499,7 @@ finding 3 "README restore/verify examples used the name 'mydb' while the watch e
 t0=$(current_txid)
 for batch in 1 2 3; do
   sqlite3 app.db <<SQL
+.timeout 5000
 BEGIN IMMEDIATE;
 WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 12)
 INSERT INTO items(value, note)
@@ -555,6 +598,7 @@ watch_alive || fail "walrust watch (machine2) exited during startup; see $WORK/w
 # immediately after startup; the settle gate below proves both that the new
 # watcher came up against the existing bucket AND that it shipped these rows.
 sqlite3 app.db <<'SQL'
+.timeout 5000
 BEGIN IMMEDIATE;
 WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM seq WHERE n < 20)
 INSERT INTO items(value, note)
@@ -569,6 +613,7 @@ log "pre-migration state settled (bucket TXID $good_txid_settled): $pre_migratio
 
 # The bad migration: destructive schema + data change, synced to the bucket.
 sqlite3 app.db <<'SQL'
+.timeout 5000
 BEGIN IMMEDIATE;
 DELETE FROM items WHERE id % 3 = 0;
 COMMIT;
