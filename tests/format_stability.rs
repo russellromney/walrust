@@ -12,6 +12,16 @@
 //! — asserting restore-to-latest and PITR are row-exact against the
 //! MANIFEST.json checksums and that `PRAGMA integrity_check` passes.
 //!
+//! Beyond the two recorded restore points, each test also proves the parts of
+//! the frozen bucket those restores never touch: every HADBP payload (merged
+//! `levels/` objects in both fixtures, every `.hadbp` object in the owned one)
+//! must decode with the current decoder (content checksums verified); the CLI
+//! fixture must pass `walrust verify` (which downloads and checksum-verifies
+//! every real-LTX object and runs the prune-/level-aware gap logic); and the
+//! owned fixture is PITR-restored through each 0.7.0-written L1 merged object
+//! (snapshot base + apply-plan chain linkage), with the result required to be
+//! a strict prefix of the manifest-anchored latest rows.
+//!
 //! Skip policy (never weaken): these tests skip ONLY when no S3
 //! endpoint/credentials are configured, exactly like every other S3-gated
 //! test in this file's siblings. When S3 IS configured, a missing or corrupt
@@ -101,8 +111,9 @@ fn fixture_dir(fixture: &str) -> PathBuf {
 }
 
 /// Load a fixture's manifest. With S3 configured, ANY problem here (missing
-/// dir, missing MANIFEST.json, unparseable JSON, empty object list) is a loud
-/// test failure — a broken fixture must never look like a pass or a skip.
+/// dir, missing MANIFEST.json, unparseable JSON, empty object list, or a
+/// manifest that drifted from the files actually on disk) is a loud test
+/// failure — a broken fixture must never look like a pass or a skip.
 fn load_manifest(fixture: &str) -> Result<Manifest> {
     let dir = fixture_dir(fixture);
     let manifest_path = dir.join("MANIFEST.json");
@@ -124,7 +135,79 @@ fn load_manifest(fixture: &str) -> Result<Manifest> {
         manifest.latest.row_count > 0 && manifest.pitr.row_count > 0,
         "fixture {fixture}: manifest row counts must be non-zero"
     );
+
+    // Manifest ↔ disk set equality. A missing file is caught at upload time;
+    // this catches the other direction — files on disk the manifest does NOT
+    // list (a silently-shrunk manifest would silently shrink the proof).
+    let objects_dir = dir.join("objects");
+    let mut on_disk = std::collections::BTreeSet::new();
+    let mut stack = vec![objects_dir.clone()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d)
+            .with_context(|| format!("fixture {fixture}: cannot list {}", d.display()))?
+        {
+            let path = entry?.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else {
+                let rel = path
+                    .strip_prefix(&objects_dir)
+                    .expect("walked path is under objects_dir")
+                    .to_string_lossy()
+                    .replace(std::path::MAIN_SEPARATOR, "/");
+                on_disk.insert(rel);
+            }
+        }
+    }
+    let in_manifest: std::collections::BTreeSet<String> =
+        manifest.objects.iter().map(|o| o.key.clone()).collect();
+    let extra: Vec<&String> = on_disk.difference(&in_manifest).collect();
+    anyhow::ensure!(
+        extra.is_empty(),
+        "fixture {fixture}: objects on disk not listed in MANIFEST.json (manifest drift): {extra:?}"
+    );
     Ok(manifest)
+}
+
+// ── HADBP decode guard (format stability of restore-unreachable objects) ───
+//
+// The end-to-end restores below only decode objects on a restore path, and a
+// pruned/compacted 0.7.0 bucket legitimately carries objects NO restore can
+// reach (e.g. the cli fixture's L2 ranges sit entirely under the newest
+// snapshot with their fine history pruned; the owned fixture's L2 predates
+// the first snapshot). Their bytes are still frozen 0.7.0 output, so decode
+// every HADBP payload — merged `levels/` objects in both fixtures, and every
+// `.hadbp` snapshot/delta in the owned fixture — with the CURRENT decoder.
+// `decode_sqlite_changeset` verifies the embedded content checksum, so a
+// format break or a single flipped byte fails loudly. (The cli fixture's
+// `0000/` + generation objects are real-LTX, not HADBP; their content is
+// covered end-to-end by the restores and by `walrust verify` below.)
+fn assert_hadbp_objects_decode(fixture: &str, manifest: &Manifest) -> Result<()> {
+    let objects_dir = fixture_dir(fixture).join("objects");
+    let mut decoded = 0usize;
+    for entry in &manifest.objects {
+        let is_merged_level = entry.key.contains("/levels/");
+        let is_owned_hadbp = entry.key.ends_with(".hadbp");
+        if !is_merged_level && !is_owned_hadbp {
+            continue;
+        }
+        let data = std::fs::read(objects_dir.join(&entry.key))
+            .with_context(|| format!("fixture {fixture}: cannot read object {}", entry.key))?;
+        walrust::walrust_core::ltx::decode_sqlite_changeset(&data).with_context(|| {
+            format!(
+                "fixture {fixture}: object {} was written by walrust 0.7.0 but no longer \
+                 decodes with the current HADBP decoder — format stability is broken",
+                entry.key
+            )
+        })?;
+        decoded += 1;
+    }
+    anyhow::ensure!(
+        decoded > 0,
+        "fixture {fixture}: no HADBP objects found to decode — the fixture shape changed \
+         and this guard went vacuous"
+    );
+    Ok(())
 }
 
 /// Upload every fixture object to `{scratch_prefix}/{key}`. A missing object
@@ -176,18 +259,20 @@ async fn delete_scratch(storage: &Arc<dyn StorageBackend>, scratch_prefix: &str)
 //
 // SHA-256 over the concatenation of "{id}|{value}\n" for
 // `SELECT id, value FROM items ORDER BY id`.
-fn rows_sha(path: &Path) -> Result<(u64, String)> {
+fn read_rows(path: &Path) -> Result<Vec<(i64, String)>> {
     let conn = Connection::open(path)?;
     let mut stmt = conn.prepare("SELECT id, value FROM items ORDER BY id")?;
-    let mut hasher = Sha256::new();
-    let mut count = 0u64;
     let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?;
-    for row in rows {
-        let (id, value) = row?;
+    Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+}
+
+fn rows_sha(path: &Path) -> Result<(u64, String)> {
+    let rows = read_rows(path)?;
+    let mut hasher = Sha256::new();
+    for (id, value) in &rows {
         hasher.update(format!("{id}|{value}\n"));
-        count += 1;
     }
-    Ok((count, format!("{:x}", hasher.finalize())))
+    Ok((rows.len() as u64, format!("{:x}", hasher.finalize())))
 }
 
 fn assert_integrity_ok(path: &Path) -> Result<()> {
@@ -249,6 +334,43 @@ fn run_cli_restore(
     Ok(())
 }
 
+// ── Mid-level PITR targets (owned fixture) ──────────────────────────────────
+//
+// Restore-to-latest plans forward from the NEWEST snapshot, so it never
+// decodes a merged `levels/` object that sits below it. To prove the leveled
+// restore planner (`gather_candidates`/`plan_restore`/`apply_plan`) decodes
+// GENUINE 0.7.0-written merged objects — snapshot base + L1 chain-checksum
+// linkage across the seam — derive PITR targets from the manifest: for every
+// L1 range `[min, max]` with a snapshot exactly at `min-1`, PITR to `max`
+// must restore through that snapshot and that L1 object.
+fn owned_snapshot_seqs(manifest: &Manifest) -> Vec<u64> {
+    let snap_dir = format!("{}/0001/", manifest.db_name);
+    manifest
+        .objects
+        .iter()
+        .filter_map(|o| {
+            let stem = o.key.strip_prefix(&snap_dir)?.strip_suffix(".hadbp")?;
+            u64::from_str_radix(stem, 16).ok()
+        })
+        .collect()
+}
+
+fn owned_l1_ranges(manifest: &Manifest) -> Vec<(u64, u64)> {
+    let l1_dir = format!("{}/levels/L1/", manifest.db_name);
+    manifest
+        .objects
+        .iter()
+        .filter_map(|o| {
+            let stem = o.key.strip_prefix(&l1_dir)?.strip_suffix(".hadbp")?;
+            let (min, max) = stem.split_once('-')?;
+            Some((
+                u64::from_str_radix(min, 16).ok()?,
+                u64::from_str_radix(max, 16).ok()?,
+            ))
+        })
+        .collect()
+}
+
 // ── The proofs ──────────────────────────────────────────────────────────────
 
 /// A bucket written by the PUBLISHED walrust 0.7.0 CLI binary (leveled
@@ -259,6 +381,7 @@ async fn format_stability_cli_v0_7_0_bucket_restores_row_exact() -> Result<()> {
     require_s3!("format_stability_cli_v0_7_0_bucket_restores_row_exact");
     let fixture = "cli-v0.7.0";
     let manifest = load_manifest(fixture)?;
+    assert_hadbp_objects_decode(fixture, &manifest)?;
     let scratch = unique_scratch_prefix("cli");
     let bucket = test_bucket();
     let endpoint = test_endpoint();
@@ -301,6 +424,28 @@ async fn format_stability_cli_v0_7_0_bucket_restores_row_exact() -> Result<()> {
             manifest.pitr.row_count,
             &manifest.pitr.rows_sha256,
         )?;
+
+        // `walrust verify` (same binary/path a real user runs) must exit 0 on
+        // the 0.7.0 bucket. This downloads and checksum-verifies EVERY real-LTX
+        // object — including L0 objects the two restores above never touch —
+        // and exercises the level-/prune-aware gap logic against a genuine
+        // pruned 0.7.0 layout.
+        let mut verify = Command::new(env!("CARGO_BIN_EXE_walrust"));
+        verify
+            .arg("verify")
+            .arg(&manifest.db_name)
+            .arg("--bucket")
+            .arg(&bucket_arg);
+        if let Some(endpoint) = endpoint.as_deref() {
+            verify.arg("--endpoint").arg(endpoint);
+        }
+        let output = verify.output().context("run walrust verify")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "walrust verify failed on the cli-v0.7.0 fixture bucket\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         Ok(())
     })();
 
@@ -317,6 +462,7 @@ async fn format_stability_owned_v0_7_0_bucket_restores_row_exact() -> Result<()>
     require_s3!("format_stability_owned_v0_7_0_bucket_restores_row_exact");
     let fixture = "owned-v0.7.0";
     let manifest = load_manifest(fixture)?;
+    assert_hadbp_objects_decode(fixture, &manifest)?;
     let scratch = unique_scratch_prefix("owned");
     let bucket = test_bucket();
     let endpoint = test_endpoint();
@@ -364,6 +510,55 @@ async fn format_stability_owned_v0_7_0_bucket_restores_row_exact() -> Result<()>
             manifest.pitr.row_count,
             &manifest.pitr.rows_sha256,
         )?;
+
+        // Mid-level PITR: force the leveled planner through each 0.7.0-written
+        // L1 merged object (snapshot base at `min-1`, target `max`). The
+        // workload that wrote this fixture is INSERT-only with monotonically
+        // increasing ids, so every mid-history state must be a strict prefix
+        // of the (manifest-anchored) latest rows — a wrong-content restore
+        // that somehow passed the chain checksums would still fail here.
+        let snapshots = owned_snapshot_seqs(&manifest);
+        let latest_rows = read_rows(&latest_out)?;
+        let mut mid_level_targets = 0usize;
+        for (min, max) in owned_l1_ranges(&manifest) {
+            if min == 0 || !snapshots.contains(&(min - 1)) {
+                continue;
+            }
+            mid_level_targets += 1;
+            let out = temp.path().join(format!("pitr-l1-{max}.db"));
+            walrust::walrust_core::sync::restore(
+                storage.clone(),
+                &prefix,
+                &manifest.db_name,
+                &out,
+                Some(&max.to_string()),
+            )
+            .await
+            .with_context(|| {
+                format!("owned-v0.7.0: mid-level PITR to seq {max} (via L1 {min}-{max})")
+            })?;
+            assert_integrity_ok(&out).with_context(|| {
+                format!("owned-v0.7.0 mid-level PITR seq {max}: integrity_check")
+            })?;
+            let rows = read_rows(&out)?;
+            anyhow::ensure!(
+                !rows.is_empty() && rows.len() < latest_rows.len(),
+                "owned-v0.7.0 mid-level PITR seq {max}: expected a non-empty strict subset of \
+                 latest ({} rows), got {} rows",
+                latest_rows.len(),
+                rows.len()
+            );
+            anyhow::ensure!(
+                rows == latest_rows[..rows.len()],
+                "owned-v0.7.0 mid-level PITR seq {max}: restored rows are not a prefix of the \
+                 manifest-anchored latest rows"
+            );
+        }
+        anyhow::ensure!(
+            mid_level_targets > 0,
+            "owned-v0.7.0: no L1 merged range had a snapshot base at min-1 — the mid-level \
+             PITR proof went vacuous; regenerate the fixture or fix the target derivation"
+        );
         Ok(())
     }
     .await;
