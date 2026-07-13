@@ -26,8 +26,9 @@ use rusqlite::Connection;
 use walrust_core::legacy_shadow_watch::{
     apply_shadow_sync_result_to_state, apply_shadow_sync_results_strict,
     checkpoint_blocker_heartbeat_is_live, checkpoint_data_version, load_shadow_progress,
-    rearm_checkpoint_blocker, save_shadow_watch_progress as save_shadow_progress,
-    shadow_sync_input, wait_for_cache_checkpoint_durability,
+    rearm_checkpoint_blocker, refresh_checkpoint_data_version_monitor,
+    save_shadow_watch_progress as save_shadow_progress, shadow_sync_input,
+    wait_for_cache_checkpoint_durability,
 };
 
 use super::shadow::{
@@ -100,6 +101,13 @@ async fn checkpoint_with_state_blocker(
     // the primitive's final heartbeat-to-BEGIN micro-window is the documented
     // residual release/reacquire boundary.
     let data_version_after = checkpoint_data_version(state);
+    let monitor_refresh_result = refresh_checkpoint_data_version_monitor(state);
+    if let Err(error) = monitor_refresh_result {
+        return Err(error.context(format!(
+            "{}: failed to refresh checkpoint data_version monitor",
+            state.name
+        )));
+    }
     let rearm_result = rearm_checkpoint_blocker(state);
     let heartbeat_live = match &rearm_result {
         Ok(()) => checkpoint_blocker_heartbeat_is_live(state),

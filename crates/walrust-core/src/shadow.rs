@@ -94,6 +94,12 @@ pub struct ShadowWal {
     /// and `wal_salt` hold defaults; the first real header seeds them without
     /// being mistaken for a checkpoint rollover (B5).
     header_seeded: bool,
+    /// Whether lifecycle states may be probed by opening a one-shot SQLite
+    /// connection. Owned/library mode permits this because `ShadowWal` also
+    /// owns and can restore its blocker. CLI file-tailer mode must remain
+    /// connection-free: closing any SQLite handle in that process can erase
+    /// the separately owned blocker's process-scoped POSIX locks.
+    probe_wal_mode_on_lifecycle_state: bool,
 }
 
 /// A segment file in the shadow WAL
@@ -175,6 +181,7 @@ impl ShadowWal {
             wal_salt: (salt1, salt2),
             wal_chain: None,
             header_seeded,
+            probe_wal_mode_on_lifecycle_state: hold_checkpoint_blocker,
         })
     }
 
@@ -303,7 +310,9 @@ impl ShadowWal {
 
         // Check if WAL exists
         if !wal_path.exists() {
-            Self::ensure_database_in_wal_mode(&self.db_path).await?;
+            if self.probe_wal_mode_on_lifecycle_state {
+                Self::ensure_database_in_wal_mode(&self.db_path).await?;
+            }
             return Ok((Vec::new(), offset));
         }
 
@@ -311,7 +320,9 @@ impl ShadowWal {
         let header = match wal::read_header(&wal_path).await? {
             Some(h) => h,
             None => {
-                Self::ensure_database_in_wal_mode(&self.db_path).await?;
+                if self.probe_wal_mode_on_lifecycle_state {
+                    Self::ensure_database_in_wal_mode(&self.db_path).await?;
+                }
                 return Ok((Vec::new(), offset));
             }
         };
@@ -940,6 +951,7 @@ mod tests {
                 wal_salt: (0, 0),
                 wal_chain: None,
                 header_seeded: false,
+                probe_wal_mode_on_lifecycle_state: false,
             };
             shadow
                 .current_segment_path()

@@ -56,9 +56,9 @@ pub struct ShadowWatchState {
     /// CLI shadow watch's explicitly owned checkpoint blocker. This connection
     /// lives with the per-database watch state rather than the file tailer.
     pub checkpoint_blocker: Option<rusqlite::Connection>,
-    /// Lifetime connection used only for `PRAGMA data_version`. Unlike the
-    /// replaceable blocker, this handle never closes during watch, so it can
-    /// detect app commits across controlled release/reacquire windows.
+    /// Long-lived connection used only for `PRAGMA data_version`. It detects
+    /// app commits across controlled release/reacquire windows and is replaced
+    /// immediately before the blocker at operation-boundary handoffs.
     pub data_version_monitor: Option<rusqlite::Connection>,
     pub shadow_sync_generation: u64,
     pub shadow_sync_offset: u64,
@@ -72,16 +72,27 @@ pub struct ShadowWatchState {
 /// before `open_checkpoint_blocker` writes and pins a fresh committed heartbeat;
 /// this proven primitive is the final source-DB handle opened in the process.
 pub fn rearm_checkpoint_blocker(state: &mut ShadowWatchState) -> Result<()> {
-    let old_blocker = state
-        .checkpoint_blocker
-        .take()
-        .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
-    if !old_blocker.is_autocommit() {
-        old_blocker.execute_batch("ROLLBACK;")?;
+    if let Some(old_blocker) = state.checkpoint_blocker.take() {
+        if !old_blocker.is_autocommit() {
+            old_blocker.execute_batch("ROLLBACK;")?;
+        }
+        drop(old_blocker);
     }
-    drop(old_blocker);
+    let mut last_open_error = None;
     for attempt in 1..=3 {
-        state.checkpoint_blocker = Some(ShadowWal::open_checkpoint_blocker(&state.db_path)?);
+        state.checkpoint_blocker = match ShadowWal::open_checkpoint_blocker(&state.db_path) {
+            Ok(blocker) => Some(blocker),
+            Err(error) => {
+                tracing::error!(
+                    "{}: checkpoint blocker open failed (attempt {}/3): {}",
+                    state.name,
+                    attempt,
+                    error
+                );
+                last_open_error = Some(error);
+                continue;
+            }
+        };
         if checkpoint_blocker_heartbeat_is_live(state)? {
             tracing::info!("{}: CLI checkpoint blocker rearmed", state.name);
             return Ok(());
@@ -101,8 +112,12 @@ pub fn rearm_checkpoint_blocker(state: &mut ShadowWatchState) -> Result<()> {
         drop(failed_blocker);
     }
     Err(anyhow!(
-        "{}: checkpoint blocker heartbeat was reset during all rearm attempts",
-        state.name
+        "{}: checkpoint blocker heartbeat was reset during all rearm attempts{}",
+        state.name,
+        last_open_error
+            .as_ref()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
     ))
 }
 
@@ -112,6 +127,16 @@ pub fn checkpoint_data_version(state: &ShadowWatchState) -> Result<i64> {
         .as_ref()
         .ok_or_else(|| anyhow!("{}: CLI data_version monitor was not held", state.name))?;
     Ok(monitor.query_row("PRAGMA data_version;", [], |row| row.get(0))?)
+}
+
+/// Replace the monitor before a final blocker handoff so the blocker is the
+/// last SQLite connection operation against the source database.
+pub fn refresh_checkpoint_data_version_monitor(state: &mut ShadowWatchState) -> Result<()> {
+    drop(state.data_version_monitor.take());
+    let monitor = rusqlite::Connection::open(&state.db_path)?;
+    monitor.busy_timeout(Duration::from_secs(5))?;
+    state.data_version_monitor = Some(monitor);
+    Ok(())
 }
 
 /// Verify that the replacement blocker's heartbeat is still a live frame in

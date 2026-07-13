@@ -92,6 +92,7 @@ fn assert_external_truncate_blocked(db_path: &std::path::Path, boundary: &str) -
         .arg("checkpoint_blocker_external_writer_helper")
         .arg("--nocapture")
         .env("WALRUST_BLOCKER_CHILD_DB", db_path)
+        .env("WALRUST_BLOCKER_CHILD_COUNT", "5")
         .output()?;
     anyhow::ensure!(
         output.status.success()
@@ -464,14 +465,20 @@ fn checkpoint_blocker_external_writer_helper() -> Result<()> {
         return Ok(());
     };
 
-    let conn = rusqlite::Connection::open(db_path)?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0;")?;
-    conn.execute(
-        "INSERT OR REPLACE INTO t (id, value) VALUES (1, 'ephemeral-1')",
-        [],
-    )?;
-    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-    println!("external checkpoint busy={busy}");
-    assert_eq!(busy, 1, "the parent process blocker must reject TRUNCATE");
+    let count = std::env::var("WALRUST_BLOCKER_CHILD_COUNT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(1);
+    for index in 0..count {
+        let conn = rusqlite::Connection::open(&db_path)?;
+        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0;")?;
+        conn.execute(
+            "INSERT OR REPLACE INTO t (id, value) VALUES (1, ?1)",
+            [format!("ephemeral-{index}")],
+        )?;
+        let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+        println!("external checkpoint busy={busy}");
+        assert_eq!(busy, 1, "the parent process blocker must reject TRUNCATE");
+    }
     Ok(())
 }

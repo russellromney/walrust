@@ -9,6 +9,7 @@ use crate::retry::{classify_error, ErrorKind, RetryPolicy};
 use crate::webhook::WebhookSender;
 use walrust_core::legacy_shadow_watch::{
     checkpoint_blocker_heartbeat_is_live, checkpoint_data_version, rearm_checkpoint_blocker,
+    refresh_checkpoint_data_version_monitor,
 };
 use walrust_core::legacy_wal_sync::{
     apply_sync_output_to_watched_state, sync_watched_db_once_to_cache, WatchedDbState,
@@ -338,7 +339,7 @@ pub(crate) async fn take_snapshot_with_retry_and_rearm(
         attempts += 1;
         let source_close_rearms = Cell::new(0u8);
         let safe_data_version = Cell::new(checkpoint_data_version(shadow_state)?);
-        let snapshot_result =
+        let mut snapshot_result =
             take_snapshot_with_source_close_hook(client, bucket, prefix, state, || {
                 let rearm_count = source_close_rearms.get() + 1;
                 source_close_rearms.set(rearm_count);
@@ -353,15 +354,40 @@ pub(crate) async fn take_snapshot_with_retry_and_rearm(
                     // The stable copy starts after this boundary, so commits
                     // already visible here will be included by VACUUM INTO.
                     safe_data_version.set(checkpoint_data_version(shadow_state)?);
-                } else if stable_copy_dirty || !heartbeat_live {
-                    anyhow::bail!(
-                        "{}: snapshot blocker window was dirty or its heartbeat frame was reset; retrying before upload",
-                        db_name
-                    );
+                } else {
+                    if stable_copy_dirty || !heartbeat_live {
+                        anyhow::bail!(
+                            "{}: snapshot blocker window was dirty or its heartbeat frame was reset; retrying before upload",
+                            db_name
+                        );
+                    }
+                    // Everything visible through the stable-copy close is now
+                    // represented by the snapshot. Establish the baseline for
+                    // the final operation-boundary handoff below.
+                    safe_data_version.set(checkpoint_data_version(shadow_state)?);
                 }
                 Ok(())
             })
             .await;
+
+        // The lower-level hooks cover the PASSIVE and stable-copy SQLite
+        // handles. Rearm once more after the entire wrapper has returned so
+        // any later source/WAL handle close cannot be the last process action
+        // against the database. A commit after the stable copy is not in the
+        // uploaded image; detect it before this handoff and retry loudly.
+        if source_close_rearms.get() == 2 {
+            let final_window_dirty =
+                checkpoint_data_version(shadow_state)? != safe_data_version.get();
+            refresh_checkpoint_data_version_monitor(shadow_state)?;
+            rearm_checkpoint_blocker(shadow_state)?;
+            let heartbeat_live = checkpoint_blocker_heartbeat_is_live(shadow_state)?;
+            if snapshot_result.is_ok() && (final_window_dirty || !heartbeat_live) {
+                snapshot_result = Err(anyhow::anyhow!(
+                    "{}: snapshot operation-boundary blocker window was dirty or its heartbeat frame was reset; retrying",
+                    db_name
+                ));
+            }
+        }
 
         // A failed checkpoint or stable copy can close a source-DB handle before
         // its matching callback runs. Restore the blocker immediately, before

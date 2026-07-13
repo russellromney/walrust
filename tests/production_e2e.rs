@@ -467,7 +467,7 @@ fn wait_for_cli_startup_rearms(log_path: &Path, child: &mut Child) -> Result<()>
         let log = watch_log(log_path);
         let rearm_count = log.matches("CLI checkpoint blocker rearmed").count();
         let snapshot_count = log.matches("LTX snapshot uploaded").count();
-        if rearm_count >= 4 && snapshot_count >= 2 {
+        if rearm_count >= 6 && snapshot_count >= 2 {
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
