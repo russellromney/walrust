@@ -180,9 +180,15 @@ pub async fn sync_wal_to_storage(
             input.name
         );
 
-        let page_size = match wal::read_header(&input.wal_path).await? {
-            Some(header) => header.page_size,
-            None => {
+        // Missing / zero-length / zeroed-header WALs are all legal lifecycle
+        // states of an ephemeral-connection writer (last-close checkpoint,
+        // DF1); the initial snapshot reads a consistent view of the database,
+        // so only a nonzero garbage magic errors here.
+        let page_size = match wal::read_header_classified(&input.wal_path).await? {
+            wal::WalHeaderRead::Valid(header) => header.page_size,
+            wal::WalHeaderRead::Missing
+            | wal::WalHeaderRead::TooShort
+            | wal::WalHeaderRead::Zeroed => {
                 ensure_database_in_wal_mode(&input.db_path, &input.name).await?;
                 4096
             }
@@ -231,9 +237,27 @@ pub async fn sync_wal_to_storage(
         });
     }
 
-    let header = match wal::read_header(&input.wal_path).await? {
-        Some(header) => header,
-        None => {
+    let header = match wal::read_header_classified(&input.wal_path).await? {
+        wal::WalHeaderRead::Valid(header) => header,
+        wal::WalHeaderRead::Zeroed => {
+            // DF1: the WAL read back with an all-zero header — the transient
+            // state of SQLite's last-close checkpoint + recreate under an
+            // ephemeral-connection writer. Everything the checkpoint folded is
+            // in the main `.db` file, so re-anchor with a rollover snapshot —
+            // the exact reaction the salt/size rollover branch below already
+            // takes — instead of erroring out of the watch loop. (Nonzero
+            // garbage magic still errors above: that is corruption, not
+            // lifecycle.)
+            tracing::warn!(
+                "{}: live WAL header read back all-zero (magic 0x0) — SQLite last-close \
+                 checkpoint (ephemeral-connection writer) is deleting/recreating the WAL; \
+                 publishing a rollover snapshot to re-anchor instead of an incremental",
+                input.name
+            );
+            let wal_generation = input.wal_generation;
+            return upload_rollover_snapshot(storage, prefix, input, wal_generation + 1).await;
+        }
+        wal::WalHeaderRead::Missing | wal::WalHeaderRead::TooShort => {
             ensure_database_in_wal_mode(&input.db_path, &input.name).await?;
             return Ok(SyncOutput {
                 db_path: input.db_path,

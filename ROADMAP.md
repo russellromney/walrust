@@ -103,24 +103,62 @@ Order of work (each lands as its own PR through the normal gate):
    RSS/lag report. Credential rotation mid-run belongs here: fail loudly,
    recover cleanly, never wedge silently.
 
-### Dogfooding findings (open)
+### Dogfooding findings (fixed)
 
-- **DF1 — shadow watch DIES on an ephemeral-connection writer (WAL
-  unlink/recreate race).** Found 2026-07-11 by a 10-minute live-Tigris
+- **DF1 — shadow watch DIED on an ephemeral-connection writer (WAL
+  unlink/recreate race). FIXED.** Found 2026-07-11 by a 10-minute live-Tigris
   laptop-test run of the published 0.7.0 binary, default shadow `walrust
   watch`, writer = `sqlite3` CLI one connection per INSERT every 2s. When the
   last connection on a WAL database closes, SQLite checkpoints and DELETES the
   WAL file; the next write recreates it. ~3 minutes in, the shadow copy read
   the WAL in its transient zeroed state and the process exited:
   `ERROR notes: Shadow copy failed: Invalid WAL magic number: 0x0` (twice,
-  then death). Loud, but wrong reaction: an ephemeral-connection writer (shell
-  scripts, cron jobs) is normal user behavior, and this is the same event
-  class as the downtime-checkpoint / rollover races walrust already survives
-  by re-anchoring. Watch should treat invalid-magic/zero-length WAL as a
-  re-anchor trigger (loud WARN + snapshot re-anchor, like the salt-mismatch
-  path), never process death. Drills never caught it because every drill
-  driver holds one long-lived connection. Needs: repro test with an
-  ephemeral-connection writer, the re-anchor fix, and a revert-proof test.
+  then death). **Fixed:** watch is now lifecycle-aware. `read_header_classified`
+  maps missing / zero-length / all-zero-header to legal last-close states and a
+  NONZERO garbage magic to a still-loud corruption error; the shadow copy
+  re-anchors (loud WARN + eager snapshot, like the D3 downtime-checkpoint path)
+  on the legal states over an established cursor, never process death. The
+  independent-tasks direct path re-anchors the same way. Watch-side only;
+  restore strictness unchanged. Proving tests:
+  `wal::tests::df1_read_header_classified_maps_lifecycle_states` +
+  `df1_read_header_classified_nonzero_garbage_magic_still_fails_loudly`,
+  `shadow::tests::df1_zeroed_wal_header_reanchors_instead_of_dying` /
+  `df1_missing_wal_after_observed_frames_reanchors` /
+  `df1_nonzero_garbage_wal_magic_still_fails_loudly` /
+  `df1_fresh_start_does_not_reanchor`,
+  `watch_shadow::tests::df1_initial_shadow_copy_zeroed_wal_reanchors_instead_of_dying`
+  / `df1_initial_shadow_copy_vanished_wal_schedules_reanchor` /
+  `df1_initial_shadow_copy_garbage_magic_still_fails_loudly`,
+  `legacy_wal_sync` `df1_independent_sync_zeroed_wal_header_reanchors_with_rollover_snapshot`
+  / `df1_independent_sync_garbage_wal_magic_still_fails_loudly` /
+  `df1_independent_sync_missing_wal_stays_noop`, and the live-S3
+  `e2e_cli_watch_survives_ephemeral_connection_writer`. Revert-proven at both
+  decision points (neuter → the exact 0.7.0 error).
+
+- **DF2 — shadow watch silently STOPPED REPLICATING an ephemeral-connection
+  writer after the startup snapshot's checkpoint (silent-wrong-data). FIXED.**
+  Found by `drills/fresh-user.sh` (finding F7) against the published 0.7.0
+  binary. After the on-startup snapshot's PASSIVE checkpoint fully backfills the
+  WAL, an ephemeral writer folds every subsequent commit into the `.db` and
+  deletes/truncates the WAL before the 1 s poll reads a frame, so the WAL-based
+  copy shipped nothing and a restore silently returned only the day-one snapshot
+  (no error, `list`/`verify` looked healthy). Same event class as DF1's
+  unlink/recreate race. **Fixed:** the shadow copy re-arms the re-anchor every
+  tick while the WAL stays absent-after-data, and the watch loop snapshots
+  whenever the `.db` content checksum advanced (an *idle* DB whose WAL merely
+  churns is skipped via the same checksum; SQLite's file change counter is
+  unreliable in WAL mode, hence a content checksum). The guard only debounces
+  *unchanged* content — a busy ephemeral writer on a large DB can snapshot once
+  per poll tick; see residual R5 for the cost bound.
+  Independent-tasks mode gets the same re-anchor
+  (`maybe_reanchor_ephemeral_writer`, cache and no-cache paths). Proving tests:
+  `shadow::tests::df1_missing_wal_after_observed_frames_reanchors` (the per-tick
+  re-arm) and the live-S3
+  `e2e_cli_watch_replicates_short_lived_writes_after_startup_checkpoint` +
+  `e2e_cli_watch_independent_replicates_ephemeral_writer` — both cross the
+  startup passive-checkpoint boundary and, with the fix neutered, restore the
+  WRONG (day-one-only) rows; with the fix, row-exact. (Supersedes the
+  ROADMAP-residual-R4 / F7 note recorded by the fresh-user drill.)
 
 ---
 
@@ -576,6 +614,31 @@ anything it covers.
   Suggested fix: check whether the legacy checkpoint story pins the main file
   the way owned mode's blocker does, and if so make the same swap there — its
   own careful wave with a fragmented-layout regression test, not a drive-by.
+- **R5 (new, DF2 re-anchor) — full-snapshot cost under a busy ephemeral-connection
+  writer.** The DF2 fix re-anchors with a full `.db` snapshot on every poll tick
+  where the live WAL is absent-after-data AND the `.db` content checksum advanced.
+  The content-checksum guard suppresses repeat snapshots only while the DB is
+  *idle* (content unchanged); it does NOT rate-limit a DB that is actively being
+  written. Worst case: a writer committing at least once per `wal_sync_interval`
+  (default **1 s**) whose last-close checkpoint keeps folding rows into the `.db`
+  with the WAL deleted every tick produces **up to ~60 full-DB snapshots per
+  minute** — one per poll tick. Bounded to one snapshot *per tick* (not several),
+  but each is a whole-`.db` upload, so the byte cost scales with DB size and is
+  unbounded in bytes (a 10 GB DB → ~600 GB/min of PUTs). Additionally,
+  `compute_checksum_from_file` reads the ENTIRE `.db` every tick the WAL is
+  absent, even when the snapshot is then skipped (idle) — a full-DB SHA per poll
+  for any absent-WAL database. The "ephemeral-writer workloads are small-DB by
+  nature" assumption is asserted in the code comments, not enforced. In default
+  shadow mode the read-transaction blocker usually keeps the WAL present, so the
+  storm is rare there; it is most reachable in `--independent-tasks --no-cache`
+  (no blocker) and in the shadow-mode startup/blocker-gap window. Trigger: a
+  large database written by one-connection-per-statement clients (cron/shell/
+  `sqlite3` CLI) at a steady sub-`wal_sync_interval` cadence. Suggested fix:
+  rate-limit the ephemeral re-anchor snapshot (a minimum interval between eager
+  snapshots, accepting bounded RPO staleness) and/or gate the per-tick full-DB
+  checksum behind the cheaper WAL-size/mtime signal first. Deferred as its own
+  change; correctness (folded rows are always eventually captured) is not
+  affected — this is a cost/DoS-surface bound, not a data-loss bound.
 
 ## Future Considerations (v1.0+)
 

@@ -22,6 +22,49 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **DF1 — `walrust watch` no longer dies on an ephemeral-connection writer
+  (WAL unlink/recreate race).** SQLite deletes the WAL when the last connection
+  on a WAL database closes and recreates it on the next write, so a writer that
+  opens one connection per statement (shell scripts, cron jobs, the `sqlite3`
+  CLI) routinely leaves the WAL missing / zero-length / zeroed-header. The
+  published 0.7.0 binary read that zeroed transient and the watch process
+  **exited**: `Shadow copy failed: Invalid WAL magic number: 0x0`. Watch is now
+  lifecycle-aware: `wal::read_header_classified` distinguishes a missing /
+  too-short / all-zero header (legal last-close states) from a NONZERO garbage
+  magic (still a loud error — corruption, kept load-bearing). The shadow copy
+  treats the legal states over an established read cursor as a **re-anchor
+  trigger** — loud WARN naming the event, then the same eager snapshot the D3
+  downtime-checkpoint path takes — never process death, never a silent skip.
+  The independent-tasks direct path (`sync_wal_to_storage`) re-anchors the same
+  way (rollover snapshot). Watch-side only; restore-path WAL-header strictness
+  is unchanged. Proven by `wal::tests::df1_read_header_classified_*`,
+  `shadow::tests::df1_*`, `watch_shadow::tests::df1_initial_shadow_copy_*`,
+  `legacy_wal_sync` `df1_independent_sync_*`, and the live-S3
+  `e2e_cli_watch_survives_ephemeral_connection_writer`; the corruption pins keep
+  a nonzero garbage magic failing loudly. Revert-proven (neutered at both
+  decision points → the exact 0.7.0 error).
+- **DF2 — `walrust watch` no longer silently stops replicating an
+  ephemeral-connection writer after the startup snapshot's checkpoint
+  (silent-wrong-data).** After the on-startup snapshot's PASSIVE checkpoint
+  fully backfills the WAL, an ephemeral writer folds every subsequent commit
+  straight into the `.db` and deletes/truncates the WAL before the 1 s poll can
+  read a single frame — so the WAL-based copy shipped **nothing** and a restore
+  silently returned only the day-one snapshot (no error, `verify` exit 0). The
+  shadow copy now **re-arms** the re-anchor on every tick while the WAL stays
+  absent-after-data, and the watch loop publishes a fresh snapshot whenever the
+  `.db` content checksum advanced (an *idle* DB whose WAL merely churns is
+  skipped via the same checksum — SQLite's file change counter is unreliable in
+  WAL mode, hence a content checksum). Note the guard only debounces *unchanged*
+  content: a large DB written by a busy ephemeral-connection writer can take up
+  to one full snapshot per poll tick — see ROADMAP residual R5 for the cost
+  bound. Independent-tasks mode gets
+  the same re-anchor (`maybe_reanchor_ephemeral_writer`, both cache and no-cache
+  paths). Proven by `shadow::tests::df1_missing_wal_after_observed_frames_reanchors`
+  (re-arm) and the live-S3 `e2e_cli_watch_replicates_short_lived_writes_after_startup_checkpoint`
+  + `e2e_cli_watch_independent_replicates_ephemeral_writer`; both e2es
+  deliberately cross the startup passive-checkpoint boundary and, with the fix
+  neutered, restore the WRONG (day-one-only) rows — the silent-stall — while the
+  fix restores row-exact.
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
   owns each planned candidate instead of retaining borrowed plan entries across
   the async stream, fixing the non-general `Send` future seen by embedders using

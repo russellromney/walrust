@@ -94,10 +94,10 @@ async fn run_shadow_syncs(
 
 async fn copy_final_shadow_frames(db_states: &mut HashMap<PathBuf, ShadowDbState>) -> Result<()> {
     for state in db_states.values_mut() {
-        if !state.wal_path.exists() {
-            continue;
-        }
-
+        // No `wal_path.exists()` gate: a missing WAL over an established read
+        // cursor is the DF1 delete/recreate lifecycle and must reach
+        // `copy_frames` so the shutdown path re-anchors instead of silently
+        // leaving checkpoint-folded rows out of the stream.
         let (frames, new_offset) = state
             .shadow
             .copy_frames(state.wal_copy_offset)
@@ -257,19 +257,19 @@ async fn shutdown_shadow_uploaders(
 }
 
 /// Perform the initial shadow copy on startup and detect databases whose live
-/// WAL salt changed while walrust was down.
+/// WAL was reset while walrust was down: a salt mismatch (D3 downtime
+/// checkpoint) or a vanished/zeroed WAL (DF1 last-close checkpoint of an
+/// ephemeral-connection writer). No `wal_path.exists()` gate here: a MISSING
+/// WAL over an established read cursor is itself the DF1 signal and must reach
+/// `copy_frames` to be classified.
 ///
-/// Returns the set of database paths that should be snapshotted eagerly (D3).
+/// Returns the set of database paths that should be snapshotted eagerly.
 async fn initial_shadow_copy(
     db_states: &mut HashMap<PathBuf, ShadowDbState>,
 ) -> Result<HashSet<PathBuf>> {
     let mut eager_snapshot: HashSet<PathBuf> = HashSet::new();
 
     for (_db_path, state) in db_states.iter_mut() {
-        if !state.wal_path.exists() {
-            continue;
-        }
-
         let generation_before = state.shadow.generation();
         match state.shadow.copy_frames(state.wal_copy_offset).await {
             Ok((frames, new_offset)) => {
@@ -282,7 +282,18 @@ async fn initial_shadow_copy(
                     state.wal_copy_offset = new_offset;
                 }
 
-                if state.shadow.generation() > generation_before {
+                // DF1: the WAL vanished/zeroed during downtime (last-close
+                // checkpoint of an ephemeral-connection writer). The generation
+                // was rolled; the copy cursor restarts at 0 for the recreated
+                // WAL, and the fold demands an eager snapshot exactly like D3.
+                if state.shadow.take_reanchor_pending() {
+                    tracing::warn!(
+                        "{}: live WAL was deleted/reset during downtime (last-close checkpoint); scheduling eager re-anchor snapshot",
+                        state.name
+                    );
+                    state.wal_copy_offset = 0;
+                    eager_snapshot.insert(state.db_path.clone());
+                } else if state.shadow.generation() > generation_before {
                     tracing::info!(
                         "{}: Downtime checkpoint detected (WAL salt mismatch); scheduling eager snapshot",
                         state.name
@@ -299,6 +310,121 @@ async fn initial_shadow_copy(
     }
 
     Ok(eager_snapshot)
+}
+
+/// DF1/DF2: publish an eager re-anchor snapshot after `copy_frames` observed the
+/// live WAL vanish / zero out (SQLite's last-close checkpoint on an
+/// ephemeral-connection writer). The checkpoint folded pages into the `.db`
+/// that the shadow may never have copied; the snapshot provably captures them.
+/// Mirrors the D3 downtime-checkpoint eager-snapshot block, including the
+/// cursor resets. Fails loudly: a re-anchor that cannot be published (after the
+/// retry policy is exhausted) propagates, because continuing to chain
+/// incrementals over an unproven base risks a silently short restore.
+///
+/// DF2 storm guard: an ephemeral-connection writer keeps the WAL absent every
+/// tick, so `copy_frames` re-arms the re-anchor continuously. `reanchor_marks`
+/// records a content checksum of the `.db` captured at the last re-anchor for
+/// this database; if the checksum is unchanged (the database is idle, only the
+/// WAL is churning) the snapshot is skipped. When it HAS changed, new rows were
+/// folded into the `.db` and must be captured — the exact rows the 0.7.0
+/// silent-stall dropped. The checksum is authoritative (SQLite's file change
+/// counter is unreliable in WAL mode); it is only ever computed while the WAL
+/// is absent, i.e. the ephemeral-writer workload, which is small-DB by nature.
+/// Returns whether a snapshot was actually published.
+#[allow(clippy::too_many_arguments)]
+async fn reanchor_snapshot_after_wal_reset(
+    client: &Arc<aws_sdk_s3::Client>,
+    bucket_name: &str,
+    prefix: &str,
+    state: &mut ShadowDbState,
+    trigger: Option<&mut TriggerState>,
+    retry_policy: &RetryPolicy,
+    webhook_sender: &Arc<WebhookSender>,
+    metrics_state: &Arc<MetricsState>,
+    reanchor_marks: &mut HashMap<PathBuf, u64>,
+) -> Result<bool> {
+    // Storm guard: skip when the database content has not advanced since the
+    // last re-anchor (idle DB, WAL just churning). An unreadable checksum never
+    // suppresses — fail toward capturing, not toward silence.
+    let current_mark = ltx::compute_checksum_from_file(&state.db_path)
+        .ok()
+        .map(|c| c.into_inner());
+    if let (Some(current), Some(prev)) = (current_mark, reanchor_marks.get(&state.db_path).copied())
+    {
+        if current == prev {
+            tracing::debug!(
+                "{}: WAL absent but .db content unchanged ({:#x}); skipping re-anchor snapshot",
+                state.name,
+                current
+            );
+            return Ok(false);
+        }
+    }
+
+    tracing::warn!(
+        "{}: re-anchoring after live WAL delete/recreate (ephemeral-connection writer lifecycle): publishing eager snapshot",
+        state.name
+    );
+
+    let mut db_state = DbState {
+        name: state.name.clone(),
+        db_path: state.db_path.clone(),
+        wal_path: state.wal_path.clone(),
+        wal_offset: 0,
+        wal_generation: state.shadow.generation(),
+        current_txid: state.current_txid,
+        last_snapshot: state.last_snapshot,
+        db_checksum: state.db_checksum,
+        wal_salt: None,
+        wal_checksum_chain: None,
+    };
+    if let Err(e) = take_snapshot_with_retry(
+        client,
+        bucket_name,
+        prefix,
+        &mut db_state,
+        retry_policy,
+        webhook_sender,
+    )
+    .await
+    {
+        tracing::error!(
+            "{}: Eager re-anchor snapshot after WAL delete/recreate failed: {}",
+            state.name,
+            e
+        );
+        metrics_state.record_error(&state.name);
+        return Err(e).with_context(|| {
+            format!(
+                "{}: eager re-anchor snapshot after WAL delete/recreate failed",
+                state.name
+            )
+        });
+    }
+
+    state.current_txid = db_state.current_txid;
+    state.last_snapshot = db_state.last_snapshot;
+    state.db_checksum = db_state.db_checksum;
+    state.shadow_sync_generation = state.shadow.generation();
+    state.shadow_sync_offset = state.shadow.segment_offset();
+    state.wal_copy_offset = 0;
+    save_shadow_progress(state)?;
+    metrics_state.record_snapshot(&state.name);
+
+    // Record the content checksum this snapshot captured, so a later re-arm with
+    // the same content is recognized as idle churn and skipped. Re-read AFTER
+    // the snapshot: its own PASSIVE checkpoint folds the WAL into the .db, so
+    // this is the value a genuinely-idle next tick will match.
+    if let Ok(cs) = ltx::compute_checksum_from_file(&state.db_path) {
+        reanchor_marks.insert(state.db_path.clone(), cs.into_inner());
+    }
+
+    if let Some(trigger) = trigger {
+        trigger.frames_since_snapshot = 0;
+        trigger.first_change_time = None;
+    }
+
+    Ok(true)
 }
 
 /// Shadow WAL mode decouples S3 uploads from SQLite's active WAL file:
@@ -367,6 +493,8 @@ pub async fn watch_with_shadow(
     // Initialize shadow state for each database
     let mut db_states: HashMap<PathBuf, ShadowDbState> = HashMap::new();
     let mut trigger_states: HashMap<PathBuf, TriggerState> = HashMap::new();
+    // DF2 storm guard: last `.db` content checksum captured by a re-anchor per db.
+    let mut reanchor_marks: HashMap<PathBuf, u64> = HashMap::new();
     let mut sync_configs: HashMap<PathBuf, SyncConfig> = HashMap::new();
     // Single-writer guards, held for the lifetime of this watch (E5).
     let mut db_locks: Vec<crate::lock::DbLock> = Vec::new();
@@ -747,8 +875,34 @@ pub async fn watch_with_shadow(
                                 );
                                 state.wal_copy_offset = new_offset;
                             }
+
+                            // DF1/DF2: the live WAL vanished/zeroed mid-stream
+                            // (last-close checkpoint of an ephemeral-connection
+                            // writer), or is still absent while writes keep
+                            // folding into the .db. Re-anchor with an eager
+                            // snapshot (guarded by the .db change counter so an
+                            // idle DB does not storm) instead of dying or
+                            // silently stalling.
+                            if state.shadow.take_reanchor_pending() {
+                                let db_path = state.db_path.clone();
+                                let trigger = trigger_states.get_mut(&db_path);
+                                reanchor_snapshot_after_wal_reset(
+                                    &client,
+                                    &bucket_name,
+                                    &prefix,
+                                    state,
+                                    trigger,
+                                    &retry_policy,
+                                    &webhook_sender,
+                                    &metrics_state,
+                                    &mut reanchor_marks,
+                                ).await?;
+                            }
                         }
                         Err(e) => {
+                            // Nonzero garbage WAL magic (corruption) and real
+                            // I/O failures still exit loudly; the legal WAL
+                            // delete/recreate lifecycle never reaches here.
                             tracing::error!("{}: Shadow copy failed: {}", state.name, e);
                             webhook_sender
                                 .notify_upload_failed(&state.name, &e.to_string(), 1)
@@ -1036,6 +1190,24 @@ pub async fn watch_with_shadow(
                             )));
                         }
 
+                        // DF1/DF2: the pre-checkpoint copy may have observed the
+                        // WAL vanish/zero out; consume the re-anchor here too
+                        // so no flag is left to rot until the next sync tick.
+                        if state.shadow.take_reanchor_pending() {
+                            let trigger = trigger_states.get_mut(db_path);
+                            reanchor_snapshot_after_wal_reset(
+                                &client,
+                                &bucket_name,
+                                &prefix,
+                                state,
+                                trigger,
+                                &retry_policy,
+                                &webhook_sender,
+                                &metrics_state,
+                                &mut reanchor_marks,
+                            ).await?;
+                        }
+
                         tracing::debug!("{}: Shadow checkpoint completed", state.name);
                     } else {
                         tracing::debug!(
@@ -1129,6 +1301,31 @@ pub async fn watch_with_shadow(
     )
     .await;
     apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
+
+    // DF1/DF2: the final copy may have observed the WAL vanish/zero out (or
+    // still-absent with folded writes). Publish the re-anchor snapshot before
+    // exiting — otherwise the checkpoint-folded rows would sit local-only with
+    // no flag surviving the restart. The change-counter guard is bypassed here
+    // by forcing a fresh check: on shutdown we always want the latest .db.
+    for state in db_states.values_mut() {
+        if state.shadow.take_reanchor_pending() {
+            let db_path = state.db_path.clone();
+            reanchor_marks.remove(&db_path);
+            let trigger = trigger_states.get_mut(&db_path);
+            reanchor_snapshot_after_wal_reset(
+                &client,
+                &bucket_name,
+                &prefix,
+                state,
+                trigger,
+                &retry_policy,
+                &webhook_sender,
+                &metrics_state,
+                &mut reanchor_marks,
+            )
+            .await?;
+        }
+    }
 
     shutdown_shadow_uploaders(&cache_states, &db_states, uploader_handles).await?;
 
@@ -1758,6 +1955,164 @@ mod tests {
             db_states[&db_path].shadow.generation(),
             generation_before,
             "shadow generation must not advance without a downtime checkpoint"
+        );
+    }
+
+    // ── DF1: ephemeral-connection writer (WAL delete/recreate) at the watch
+    //    call sites. The 2026-07-11 dogfooding run died here: the shadow copy
+    //    read the live WAL in its zeroed transient and the error propagated
+    //    out of the watch loop ("Shadow copy failed: Invalid WAL magic number:
+    //    0x0" → process exit).
+
+    /// THE DF1 repro at the production call site. Zero the live WAL header
+    /// (the exact transient of SQLite's last-close checkpoint + recreate) and
+    /// run the same `initial_shadow_copy` the watch loop runs. With the fix
+    /// disabled this returns the exact observed error — "Invalid WAL magic
+    /// number: 0x0" — the failure that killed the watch process; with the fix
+    /// it schedules an eager re-anchor snapshot and continues.
+    #[tokio::test]
+    async fn df1_initial_shadow_copy_zeroed_wal_reanchors_instead_of_dying() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+
+        // Live process: the shadow has observed the WAL (seeded cursor).
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
+        assert!(!frames.is_empty(), "setup copy must read frames");
+
+        // Between ticks, the WAL header region reads back all-zero — the
+        // last-close checkpoint + recreate transient the dogfooding run hit.
+        // (Driven directly: with the shadow's blocker alive, a real last-close
+        // cannot fire, and any SQLite write would immediately rewrite the
+        // header — the transient is only observable in this window.)
+        let wal_path = db_path.with_extension("db-wal");
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&[0u8; 32]).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let mut db_states = HashMap::new();
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name: "df1-zeroed".to_string(),
+                db_path: db_path.clone(),
+                wal_path: db_path.with_extension("db-wal"),
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                shadow,
+                shadow_sync_generation: 0,
+                shadow_sync_offset: 0,
+                wal_copy_offset: offset,
+            },
+        );
+
+        let eager = initial_shadow_copy(&mut db_states)
+            .await
+            .expect("a zeroed WAL header is a legal lifecycle state, not process death");
+        assert!(
+            eager.contains(&db_path),
+            "a zeroed WAL over an established cursor must schedule an eager re-anchor snapshot"
+        );
+        assert_eq!(
+            db_states[&db_path].wal_copy_offset, 0,
+            "the copy cursor must restart at 0 for the recreated WAL"
+        );
+    }
+
+    /// The unlinked variant: the WAL is gone entirely (SQLite's last-close
+    /// checkpoint deletes it; driven directly because the shadow's own blocker
+    /// keeps the database open in-process). Before the fix this was a silent
+    /// skip (no error, no eager snapshot) — the checkpoint-folded rows stayed
+    /// out of the stream until the periodic snapshot timer. Now it must
+    /// schedule the eager re-anchor.
+    #[tokio::test]
+    async fn df1_initial_shadow_copy_vanished_wal_schedules_reanchor() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
+        assert!(!frames.is_empty(), "setup copy must read frames");
+
+        std::fs::remove_file(db_path.with_extension("db-wal")).unwrap();
+
+        let mut db_states = HashMap::new();
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name: "df1-vanished".to_string(),
+                db_path: db_path.clone(),
+                wal_path: db_path.with_extension("db-wal"),
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                shadow,
+                shadow_sync_generation: 0,
+                shadow_sync_offset: 0,
+                wal_copy_offset: offset,
+            },
+        );
+
+        let eager = initial_shadow_copy(&mut db_states).await.unwrap();
+        assert!(
+            eager.contains(&db_path),
+            "a WAL deleted by SQLite's last-close checkpoint must schedule an eager \
+             re-anchor snapshot, never a silent skip"
+        );
+        assert_eq!(db_states[&db_path].wal_copy_offset, 0);
+    }
+
+    /// Corruption pin at the call site: NONZERO garbage magic must still fail
+    /// the initial copy loudly — the DF1 fix must not have widened into
+    /// swallowing corruption.
+    #[tokio::test]
+    async fn df1_initial_shadow_copy_garbage_magic_still_fails_loudly() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let (_frames, offset) = shadow.copy_frames(0).await.unwrap();
+
+        let wal_path = db_path.with_extension("db-wal");
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&wal_path)
+                .unwrap();
+            f.seek(SeekFrom::Start(0)).unwrap();
+            f.write_all(&0xDEAD_BEEFu32.to_be_bytes()).unwrap();
+            f.sync_all().unwrap();
+        }
+
+        let mut db_states = HashMap::new();
+        db_states.insert(
+            db_path.clone(),
+            ShadowDbState {
+                name: "df1-garbage".to_string(),
+                db_path: db_path.clone(),
+                wal_path: db_path.with_extension("db-wal"),
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                shadow,
+                shadow_sync_generation: 0,
+                shadow_sync_offset: 0,
+                wal_copy_offset: offset,
+            },
+        );
+
+        let err = initial_shadow_copy(&mut db_states)
+            .await
+            .expect_err("nonzero garbage WAL magic must stay a loud failure");
+        assert!(
+            format!("{err:#}").contains("Invalid WAL magic"),
+            "got: {err:#}"
         );
     }
 }
