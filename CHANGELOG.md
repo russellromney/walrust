@@ -22,6 +22,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Lossless default CLI watch:** shadow watch retains the same pinned-frame
+  `_walrust_seq` checkpoint blocker used by owned/library replication for each
+  database, so application autocheckpoints, explicit TRUNCATE checkpoints, and
+  short-lived writer sessions cannot erase unread WAL frames. Walrust's own
+  checkpoint path durably drains shadow data before the blocker is released and
+  reacquires it immediately afterward. The blocker makes walrust responsible
+  for WAL growth: crossing `wal_truncate_threshold_pages` now emits an ERROR and
+  a `wal_size_exceeded` webhook, durably drains, then runs a controlled TRUNCATE
+  instead of letting the WAL bloat silently.
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
   owns each planned candidate instead of retaining borrowed plan entries across
   the async stream, fixing the non-general `Send` future seen by embedders using
@@ -49,6 +58,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every supported page size and synchronous level: a concurrent
   `wal_checkpoint(TRUNCATE)` reports busy and preserves the WAL until walrust
   releases its pinned read transaction.
+- Added live-S3 CLI proofs for DF1/DF2 short-lived writers with zero safety
+  re-anchors and no snapshot storm, application TRUNCATE checkpoints underneath
+  a running watcher, and the WAL-growth ERROR + webhook + durable-drain path.
 - Added public-API integration coverage for flat and lineaged owned histories,
   leveled-compaction restore/resume, mixed DDL/INSERT/UPDATE/DELETE/blob loads,
   PITR refusal with no storage writes, competing-writer refusal with byte-exact

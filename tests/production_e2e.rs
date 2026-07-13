@@ -2,8 +2,35 @@ use anyhow::{Context, Result};
 use rusqlite::Connection;
 use std::path::Path;
 use std::process::{Child, Command};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tempfile::TempDir;
+
+#[derive(Clone, Default)]
+struct WebhookCapture {
+    bodies: Arc<Mutex<Vec<String>>>,
+}
+
+async fn capture_webhook(
+    axum::extract::State(capture): axum::extract::State<WebhookCapture>,
+    body: String,
+) -> axum::http::StatusCode {
+    capture.bodies.lock().unwrap().push(body);
+    axum::http::StatusCode::OK
+}
+
+async fn start_webhook_capture() -> Result<(String, WebhookCapture, tokio::task::JoinHandle<()>)> {
+    let capture = WebhookCapture::default();
+    let app = axum::Router::new()
+        .route("/webhook", axum::routing::post(capture_webhook))
+        .with_state(capture.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}/webhook", listener.local_addr()?);
+    let handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    Ok((url, capture, handle))
+}
 
 struct HeldResumeLease;
 
@@ -378,6 +405,135 @@ fn spawn_cli_watch(
     watch.spawn().context("spawn walrust watch")
 }
 
+struct LoggedWatchArgs<'a> {
+    db_path: &'a Path,
+    bucket_arg: &'a str,
+    endpoint: Option<&'a str>,
+    log_path: &'a Path,
+    config_path: Option<&'a Path>,
+    checkpoint_interval: u64,
+    min_checkpoint_pages: u64,
+    wal_truncate_threshold: u64,
+}
+
+fn spawn_cli_watch_logged(args: LoggedWatchArgs<'_>) -> Result<Child> {
+    let log = std::fs::File::create(args.log_path)?;
+    let log_err = log.try_clone()?;
+    let mut watch = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    if let Some(config_path) = args.config_path {
+        watch.arg("--config").arg(config_path);
+    }
+    watch
+        .arg("watch")
+        .arg(args.db_path)
+        .arg("--bucket")
+        .arg(args.bucket_arg)
+        .arg("--snapshot-interval")
+        .arg("999999")
+        .arg("--wal-sync-interval")
+        .arg("1")
+        .arg("--checkpoint-interval")
+        .arg(args.checkpoint_interval.to_string())
+        .arg("--min-checkpoint-pages")
+        .arg(args.min_checkpoint_pages.to_string())
+        .arg("--wal-truncate-threshold")
+        .arg(args.wal_truncate_threshold.to_string())
+        .arg("--on-startup")
+        .arg("true")
+        .arg("--no-metrics")
+        .arg("--no-cache")
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+    if let Some(endpoint) = args.endpoint {
+        watch.arg("--endpoint").arg(endpoint);
+    }
+    watch.spawn().context("spawn logged walrust watch")
+}
+
+fn ephemeral_exec(db_path: &Path, sql: &str) -> Result<()> {
+    let conn = Connection::open(db_path)?;
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    conn.execute_batch(sql)?;
+    Ok(())
+}
+
+fn watch_log(log_path: &Path) -> String {
+    std::fs::read_to_string(log_path).unwrap_or_default()
+}
+
+fn wait_for_cli_startup_rearms(log_path: &Path, child: &mut Child) -> Result<()> {
+    let deadline = Instant::now() + e2e_poll_deadline(30);
+    while watch_log(log_path)
+        .matches("CLI checkpoint blocker rearmed")
+        .count()
+        < 2
+    {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watch exited before both startup blocker rearms ({status}):\n{}",
+                watch_log(log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for both startup blocker rearms:\n{}",
+            watch_log(log_path)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    Ok(())
+}
+
+fn assert_no_shadow_reanchors_or_snapshot_storm(log_path: &Path) -> Result<()> {
+    let log = watch_log(log_path);
+    for forbidden in [
+        "Downtime checkpoint detected",
+        "Rollover snapshot uploaded",
+        "re-anchored before continuing",
+        "re-anchoring with a fresh snapshot",
+    ] {
+        anyhow::ensure!(
+            !log.contains(forbidden),
+            "lossless shadow watch must not need safety re-anchors ({forbidden:?} found):\n{log}"
+        );
+    }
+    let snapshot_count = log.matches("LTX snapshot uploaded").count();
+    // Shadow watch currently takes the explicit on-startup snapshot and the
+    // snapshot timer's immediate first tick. That two-snapshot startup baseline
+    // predates this test; a third snapshot means the writer triggered a storm.
+    anyhow::ensure!(
+        snapshot_count <= 2,
+        "ephemeral writers caused a snapshot storm beyond the two-snapshot startup baseline \
+         ({snapshot_count} snapshots):\n{log}"
+    );
+    Ok(())
+}
+
+fn wait_for_restore_exact(
+    name: &str,
+    bucket_arg: &str,
+    endpoint: Option<&str>,
+    restored_path: &Path,
+    expected_rows: &[(i64, String)],
+) -> Result<()> {
+    let deadline = Instant::now() + e2e_poll_deadline(30);
+    loop {
+        let _ = std::fs::remove_file(restored_path);
+        if run_cli_restore(name, bucket_arg, endpoint, restored_path)
+            .and_then(|_| rows(restored_path))
+            .map(|actual| actual == expected_rows)
+            .unwrap_or(false)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for exact restore"
+        );
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
 /// Spawn `walrust watch --independent-tasks` with a short snapshot interval, for
 /// exercising the independent (poll) mode's periodic-snapshot re-anchor (B6).
 fn spawn_cli_watch_independent(
@@ -597,6 +753,202 @@ fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     drop(second_read_pin);
     stop_child(&mut second);
 
+    Ok(())
+}
+
+/// DF1: short-lived application sessions must never become SQLite's last
+/// connection while shadow watch is running. The pinned `_walrust_seq` frame
+/// keeps the WAL alive, so the watcher neither dies on WAL lifecycle states nor
+/// falls back to a snapshot re-anchor.
+#[test]
+fn e2e_cli_watch_survives_ephemeral_writer_without_reanchor() -> Result<()> {
+    require_s3!("e2e_cli_watch_survives_ephemeral_writer_without_reanchor");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-df1-lossless");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+
+    ephemeral_exec(
+        &db_path,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+    )?;
+    ephemeral_exec(
+        &db_path,
+        "INSERT INTO items (id, value) VALUES (1, 'base-1');",
+    )?;
+
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: None,
+        checkpoint_interval: 2,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+    })?;
+    wait_for_shadow_blocker(&db_path, &mut child)?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+
+    for id in 2..=18i64 {
+        ephemeral_exec(
+            &db_path,
+            &format!("INSERT INTO items (id, value) VALUES ({id}, 'ephemeral-{id}');"),
+        )?;
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "DF1: watch exited at row {id} with {status}:\n{}",
+                watch_log(&log_path)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let expected = rows(&db_path)?;
+    let restore = wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    );
+    stop_child(&mut child);
+    restore.with_context(|| format!("DF1 restore failed:\n{}", watch_log(&log_path)))?;
+    assert_integrity_ok(&restored_path)?;
+    assert_no_shadow_reanchors_or_snapshot_storm(&log_path)?;
+    Ok(())
+}
+
+/// DF2: wait until the startup snapshot is remotely restorable, then write
+/// only through short-lived sessions. The blocker must keep every post-boundary
+/// frame in the WAL until shadow watch reads it; recovery by re-snapshot is not
+/// accepted.
+#[test]
+fn e2e_cli_watch_replicates_ephemeral_writes_after_startup_without_reanchor() -> Result<()> {
+    require_s3!("e2e_cli_watch_replicates_ephemeral_writes_after_startup_without_reanchor");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-df2-lossless");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+
+    ephemeral_exec(
+        &db_path,
+        "CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+    )?;
+    for id in 1..=3i64 {
+        ephemeral_exec(
+            &db_path,
+            &format!("INSERT INTO items (id, value) VALUES ({id}, 'day-one-{id}');"),
+        )?;
+    }
+    let day_one = rows(&db_path)?;
+
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+    })?;
+    wait_for_shadow_blocker(&db_path, &mut child)?;
+    wait_for_restore_exact(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &day_one,
+    )
+    .with_context(|| format!("startup snapshot did not settle:\n{}", watch_log(&log_path)))?;
+    let startup_deadline = Instant::now() + e2e_poll_deadline(30);
+    while watch_log(&log_path)
+        .matches("LTX snapshot uploaded")
+        .count()
+        < 2
+    {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "DF2: watch exited before both startup snapshots completed ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < startup_deadline,
+            "timed out waiting for the two-snapshot startup baseline:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+    let first_writer = Connection::open(&db_path)?;
+    first_writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0;")?;
+    first_writer.execute(
+        "INSERT INTO items (id, value) VALUES (4, 'post-startup-4')",
+        [],
+    )?;
+    let first_busy = force_truncate_checkpoint(&first_writer)?.0;
+    anyhow::ensure!(
+        first_busy != 0,
+        "DF2: blocker did not stop TRUNCATE after the first post-startup commit:\n{}",
+        watch_log(&log_path)
+    );
+    drop(first_writer);
+
+    for id in 5..=15i64 {
+        ephemeral_exec(
+            &db_path,
+            &format!("INSERT INTO items (id, value) VALUES ({id}, 'post-startup-{id}');"),
+        )?;
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "DF2: watch exited at row {id} with {status}:\n{}",
+                watch_log(&log_path)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+
+    let wal_path = db_path.with_extension("db-wal");
+    let wal_size = std::fs::metadata(&wal_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    anyhow::ensure!(
+        wal_size > 32,
+        "DF2: post-boundary short-lived writes did not remain in the WAL (size={wal_size}):\n{}",
+        watch_log(&log_path)
+    );
+    let checkpoint_probe = Connection::open(&db_path)?;
+    checkpoint_probe.execute_batch("PRAGMA busy_timeout=0;")?;
+    let busy = force_truncate_checkpoint(&checkpoint_probe)?.0;
+    anyhow::ensure!(
+        busy != 0,
+        "DF2: watcher no longer held its checkpoint blocker after startup snapshots:\n{}",
+        watch_log(&log_path)
+    );
+
+    let expected = rows(&db_path)?;
+    let restore = wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    );
+    stop_child(&mut child);
+    restore.with_context(|| format!("DF2 restore failed:\n{}", watch_log(&log_path)))?;
+    assert_eq!(expected.len(), 15);
+    assert_integrity_ok(&restored_path)?;
+    assert_no_shadow_reanchors_or_snapshot_storm(&log_path)?;
     Ok(())
 }
 
@@ -915,15 +1267,12 @@ async fn e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss() -> 
     Ok(())
 }
 
-/// RACING variant for the CLI shadow watch stack (closes the A3/A4 Phase-2A scope
-/// note): NO pinned reader; an external autocheckpoint connection issues explicit
-/// TRUNCATE checkpoints racing the live watch sync. The shadow blocker pins a live
-/// WAL frame, so the external checkpoints must be blocked (or captured) and restore
-/// must round-trip every committed row. If the watcher instead dies, that is a loud
-/// failure we surface — never silent loss.
+/// An application connection issues explicit TRUNCATE checkpoints underneath a
+/// live CLI shadow watch. Every attempt must be blocked by walrust's pinned real
+/// WAL frame, and restore must contain every committed row without a re-anchor.
 #[test]
-fn e2e_cli_watch_racing_checkpoint_no_data_loss() -> Result<()> {
-    require_s3!("e2e_cli_watch_racing_checkpoint_no_data_loss");
+fn e2e_cli_watch_blocks_app_checkpoint_underneath_without_data_loss() -> Result<()> {
+    require_s3!("e2e_cli_watch_blocks_app_checkpoint_underneath_without_data_loss");
     let temp = TempDir::new()?;
     let name = unique_name("cli-race");
     let prefix = format!("e2e/{name}");
@@ -931,18 +1280,29 @@ fn e2e_cli_watch_racing_checkpoint_no_data_loss() -> Result<()> {
     let endpoint = test_endpoint();
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
 
     let setup = create_source_db(&db_path, 5)?;
     let writer = open_external_autocheckpoint_connection(&db_path)?;
     write_pin_frame(&setup, "cli-race")?;
 
-    // Deliberately NO pin_read_transaction — this is the racing variant.
-    let mut child = spawn_cli_watch(&db_path, &bucket_arg, endpoint.as_deref(), true)?;
+    // Deliberately no test-owned read pin: only walrust may block the app.
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+    })?;
     // Wait for the blocker to actually attach. A fixed sleep races the watcher's
     // startup (S3 discovery + initial snapshot); if the blocker is not yet up, the
     // "race" races nothing and the test proves nothing (this is exactly why the
     // original fixed-2s version passed vacuously — the pin was not up).
     wait_for_shadow_blocker(&db_path, &mut child)?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
 
     // The watcher runs with a huge checkpoint-interval, so once up its shadow
     // blocker holds a pinned live WAL frame for the whole test. Every external
@@ -966,10 +1326,9 @@ fn e2e_cli_watch_racing_checkpoint_no_data_loss() -> Result<()> {
         std::thread::sleep(Duration::from_millis(400));
     }
     anyhow::ensure!(
-        busy_results.iter().any(|&b| b != 0),
-        "shadow blocker never pinned the WAL: every racing TRUNCATE succeeded \
-         (busy results = {busy_results:?}); the checkpoint race was not actually \
-         defended, so this test would prove nothing about racing"
+        busy_results.iter().all(|&b| b != 0),
+        "every app TRUNCATE must be blocked for the watch lifetime \
+         (busy results = {busy_results:?})"
     );
 
     let expected_rows = rows(&db_path)?;
@@ -987,6 +1346,107 @@ fn e2e_cli_watch_racing_checkpoint_no_data_loss() -> Result<()> {
     )?;
 
     stop_child(&mut child);
+    assert_no_shadow_reanchors_or_snapshot_storm(&log_path)?;
+    Ok(())
+}
+
+/// Crossing the configured WAL ceiling is never silent: the real CLI watch
+/// loop must emit both an ERROR log and a `wal_size_exceeded` webhook, durably
+/// ship the shadow tail, run a controlled TRUNCATE, reacquire the blocker, and
+/// remain fully restorable.
+#[test]
+fn e2e_cli_watch_wal_backpressure_alarms_and_preserves_data() -> Result<()> {
+    require_s3!("e2e_cli_watch_wal_backpressure_alarms_and_preserves_data");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-wal-backpressure");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+    let config_path = temp.path().join("walrust.toml");
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let (webhook_url, capture, webhook_handle) = runtime.block_on(start_webhook_capture())?;
+    std::fs::write(
+        &config_path,
+        format!("[[webhooks]]\nurl = {webhook_url:?}\nevents = [\"wal_size_exceeded\"]\n"),
+    )?;
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "wal-backpressure")?;
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: Some(&config_path),
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 20,
+    })?;
+    wait_for_shadow_blocker(&db_path, &mut child)?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+
+    // At ~400 bytes per row this reliably crosses the 20-page ceiling even
+    // with the schema/index pages compacted efficiently by SQLite.
+    append_wide_rows(&writer, 6, 190, "backpressure")?;
+    let expected = rows(&db_path)?;
+    let deadline = Instant::now() + e2e_poll_deadline(30);
+    loop {
+        if !capture.bodies.lock().unwrap().is_empty() {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watch exited before WAL backpressure alarm with {status}:\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for wal_size_exceeded webhook:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let body = capture.bodies.lock().unwrap()[0].clone();
+    let payload: serde_json::Value = serde_json::from_str(&body)?;
+    anyhow::ensure!(payload["event"] == "wal_size_exceeded", "{payload:?}");
+    anyhow::ensure!(payload["database"] == name, "{payload:?}");
+    anyhow::ensure!(payload["context"]["wal_pages"].as_u64().unwrap_or(0) >= 20);
+    anyhow::ensure!(
+        watch_log(&log_path).contains("WAL backpressure alarm"),
+        "threshold must also produce an ERROR log:\n{}",
+        watch_log(&log_path)
+    );
+
+    writer.execute_batch("PRAGMA busy_timeout=0;")?;
+    let busy = force_truncate_checkpoint(&writer)?.0;
+    anyhow::ensure!(
+        busy != 0,
+        "controlled backpressure checkpoint must reacquire the blocker"
+    );
+
+    let restore = wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    );
+    stop_child(&mut child);
+    webhook_handle.abort();
+    restore.with_context(|| {
+        format!(
+            "restore after WAL backpressure checkpoint failed:\n{}",
+            watch_log(&log_path)
+        )
+    })?;
+    assert_integrity_ok(&restored_path)?;
     Ok(())
 }
 

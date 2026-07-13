@@ -5,7 +5,7 @@ use crate::legacy_cache::LocalCache;
 use crate::legacy_shadow::{ShadowSyncInput, ShadowSyncOutput};
 use crate::shadow::ShadowWal;
 use crate::wal::FRAME_HEADER_SIZE;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -51,9 +51,34 @@ pub struct ShadowWatchState {
     pub last_snapshot: Option<chrono::DateTime<Utc>>,
     pub db_checksum: Option<u64>,
     pub shadow: ShadowWal,
+    /// CLI shadow watch's explicitly owned checkpoint blocker. This connection
+    /// lives with the per-database watch state rather than the file tailer.
+    pub checkpoint_blocker: Option<rusqlite::Connection>,
     pub shadow_sync_generation: u64,
     pub shadow_sync_offset: u64,
     pub wal_copy_offset: u64,
+}
+
+/// Replace CLI shadow watch's checkpoint blocker after all one-shot SQLite
+/// connections for a controlled operation have closed.
+///
+/// POSIX advisory locks are process-scoped. The old connection must be rolled
+/// back and dropped before the replacement opens; otherwise closing the old
+/// handle can erase the replacement's kernel lock as observed by external app
+/// processes.
+pub fn rearm_checkpoint_blocker(state: &mut ShadowWatchState) -> Result<()> {
+    let old_blocker = state
+        .checkpoint_blocker
+        .take()
+        .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
+    if !old_blocker.is_autocommit() {
+        old_blocker.execute_batch("ROLLBACK;")?;
+    }
+    drop(old_blocker);
+
+    state.checkpoint_blocker = Some(ShadowWal::open_checkpoint_blocker(&state.db_path)?);
+    tracing::info!("{}: CLI checkpoint blocker rearmed", state.name);
+    Ok(())
 }
 
 pub fn shadow_progress_path(shadow_dir: &Path) -> PathBuf {
@@ -455,6 +480,7 @@ mod tests {
             last_snapshot: None,
             db_checksum: None,
             shadow,
+            checkpoint_blocker: None,
             shadow_sync_generation: 0,
             shadow_sync_offset: gen0_segment.len() as u64,
             wal_copy_offset: 0,

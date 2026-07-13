@@ -145,6 +145,14 @@ behavior breaks:
   `wal_checkpoint` cannot reset the WAL mid-backup. If the database *was*
   checkpointed while walrust was stopped, those pages live only in the `.db`
   file (not the WAL), so restart re-anchors from the current `.db` — see below.
+  This means CLI `watch` is not zero-touch: it opens the database read-write,
+  creates `_walrust_seq`, increments its one heartbeat row, and retains a read
+  transaction for the watch lifetime. While that transaction is held, walrust
+  is responsible for checkpointing. A stuck or undersized watcher can let the
+  WAL grow and eventually slow application writes; `wal_truncate_threshold_pages`
+  is the safety ceiling. Crossing it emits an ERROR plus the optional
+  `wal_size_exceeded` webhook, drains the shadow tail durably, then opens a
+  controlled TRUNCATE window and immediately reacquires the blocker.
 - **Restart re-anchors with a full snapshot (`--independent-tasks`).** On every
   restart against an existing stream, walrust re-anchors by uploading a fresh
   full snapshot of the current `.db`, not by resuming an incremental. This is a

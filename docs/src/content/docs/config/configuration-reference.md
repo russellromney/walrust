@@ -88,7 +88,7 @@ circuit_breaker_cooldown_ms = 60000
 # Webhook notifications
 [[webhooks]]
 url = "https://example.com/webhook"
-events = ["sync_failed", "auth_failure", "corruption_detected", "circuit_breaker_open"]
+events = ["sync_failed", "auth_failure", "corruption_detected", "circuit_breaker_open", "wal_size_exceeded"]
 secret = "your-hmac-secret"
 
 # Database configurations
@@ -147,7 +147,7 @@ Global sync and snapshot triggers.
 | `compact_interval` | integer | 0 | Compaction interval in seconds (0 = disabled) |
 | `checkpoint_interval` | integer | 60 | Run PRAGMA wal_checkpoint(PASSIVE) every N seconds |
 | `min_checkpoint_page_count` | integer | 1000 | Min WAL pages before checkpoint (1000 pages ≈ 4 MB) |
-| `wal_truncate_threshold_pages` | integer | 121359 | Emergency truncate at N WAL pages (121359 ≈ 500 MB) |
+| `wal_truncate_threshold_pages` | integer | 121359 | ERROR + `wal_size_exceeded` webhook, durable drain, and controlled TRUNCATE at N WAL pages (121359 ≈ 500 MB; 0 disables) |
 | `validation_interval` | integer | 0 | Automated backup verification interval in seconds (0 = disabled) |
 
 **Snapshot Triggers:**
@@ -355,6 +355,8 @@ Webhook notifications for failure events (array of webhooks).
 - `"auth_failure"` - S3 authentication failed
 - `"corruption_detected"` - Checksum mismatch or integrity error
 - `"circuit_breaker_open"` - Circuit breaker opened (too many failures)
+- `"wal_size_exceeded"` - A pinned WAL crossed its configured safety ceiling;
+  walrust alarms, drains, and checkpoints before application writes stall
 
 **Webhook payload:**
 
@@ -399,7 +401,7 @@ def verify_signature(payload, signature, secret):
 ```toml
 [[webhooks]]
 url = "https://example.com/walrust-webhook"
-events = ["sync_failed", "corruption_detected"]
+events = ["sync_failed", "corruption_detected", "wal_size_exceeded"]
 secret = "your-hmac-secret"
 
 [[webhooks]]

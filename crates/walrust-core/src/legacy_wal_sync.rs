@@ -584,8 +584,33 @@ pub async fn take_snapshot_to_storage(
     prefix: &str,
     input: SyncInput,
 ) -> Result<SyncOutput> {
-    let snapshot =
-        snapshot_database_to_storage(storage, prefix, &input.name, &input.db_path).await?;
+    take_snapshot_to_storage_with_post_encode(storage, prefix, input, || Ok(())).await
+}
+
+/// Take a snapshot and run `post_encode` after every SQLite connection used by
+/// the snapshot has closed, but before the encoded bytes are uploaded.
+///
+/// CLI shadow watch uses this boundary to re-establish its process-visible
+/// checkpoint blocker. On POSIX, closing any SQLite connection in the process
+/// can release that process's database locks, so waiting until after the upload
+/// would leave an unprotected network-sized window.
+pub async fn take_snapshot_to_storage_with_post_encode<F>(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    input: SyncInput,
+    post_encode: F,
+) -> Result<SyncOutput>
+where
+    F: FnOnce() -> Result<()>,
+{
+    let snapshot = snapshot_database_to_storage_with_post_encode(
+        storage,
+        prefix,
+        &input.name,
+        &input.db_path,
+        post_encode,
+    )
+    .await?;
 
     let wal_salt = wal::read_header(&input.wal_path)
         .await
@@ -612,6 +637,27 @@ pub async fn snapshot_database_to_storage(
     name: &str,
     database: &Path,
 ) -> Result<SnapshotUploadOutput> {
+    snapshot_database_to_storage_with_post_encode(storage, prefix, name, database, || Ok(())).await
+}
+
+pub async fn snapshot_database_to_storage_with_post_encode<F>(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    name: &str,
+    database: &Path,
+    post_encode: F,
+) -> Result<SnapshotUploadOutput>
+where
+    F: FnOnce() -> Result<()>,
+{
+    // Discover remote state before opening the one-shot SQLite checkpoint
+    // connection. If discovery is slow, the currently held blocker remains
+    // process-visible throughout the network wait.
+    let (current_txid, current_gen) = discover_legacy_state(storage, prefix, name).await?;
+    let new_txid = current_txid + 1;
+    let snapshot_gen = current_gen + 1;
+    let ltx_key = build_ltx_key(prefix, name, snapshot_gen, 1, new_txid);
+
     // Best-effort PASSIVE checkpoint before encoding. This path is shared by the
     // shadow watch loop, whose checkpoint blocker deliberately pins a live WAL
     // frame — a TRUNCATE here would hard-fail with busy!=0 on every tick, and the
@@ -623,10 +669,6 @@ pub async fn snapshot_database_to_storage(
     checkpoint_wal_passive(database).await?;
 
     let page_size = get_page_size(database).await?;
-    let (current_txid, current_gen) = discover_legacy_state(storage, prefix, name).await?;
-    let new_txid = current_txid + 1;
-    let snapshot_gen = current_gen + 1;
-    let ltx_key = build_ltx_key(prefix, name, snapshot_gen, 1, new_txid);
 
     let db_path_for_encode = database.to_path_buf();
     let db_name_for_error = name.to_string();
@@ -641,6 +683,10 @@ pub async fn snapshot_database_to_storage(
         })
     })
     .await??;
+
+    // The encoder and checkpoint helper have both dropped their SQLite handles.
+    // Rearm process-scoped locks before the potentially slow storage upload.
+    post_encode()?;
 
     let ltx_size = ltx_buffer.len() as u64;
     storage.put(&ltx_key, &ltx_buffer).await?;

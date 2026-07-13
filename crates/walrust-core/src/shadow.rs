@@ -112,6 +112,17 @@ pub struct ShadowSegment {
 impl ShadowWal {
     /// Create a new shadow WAL for a database
     pub async fn new(db_path: &Path) -> Result<Self> {
+        Self::new_inner(db_path, true).await
+    }
+
+    /// Create a shadow WAL file tailer without owning a checkpoint blocker.
+    /// CLI shadow watch uses this constructor because its per-database state
+    /// owns the blocker connection explicitly.
+    pub async fn new_without_checkpoint_blocker(db_path: &Path) -> Result<Self> {
+        Self::new_inner(db_path, false).await
+    }
+
+    async fn new_inner(db_path: &Path, hold_checkpoint_blocker: bool) -> Result<Self> {
         let shadow_dir = Self::shadow_dir_for(db_path);
 
         // Create shadow directory if it doesn't exist
@@ -145,8 +156,13 @@ impl ShadowWal {
         let frame_page_size = db_header_page_size(db_path).unwrap_or(page_size);
         Self::align_truncate_segments(&shadow_dir, frame_page_size).await?;
 
-        // Open read connection to prevent auto-checkpoint
-        let checkpoint_blocker = Self::open_checkpoint_blocker(db_path)?;
+        let checkpoint_blocker = if hold_checkpoint_blocker {
+            Some(Arc::new(Mutex::new(Self::open_checkpoint_blocker(
+                db_path,
+            )?)))
+        } else {
+            None
+        };
 
         Ok(Self {
             db_path: db_path.to_path_buf(),
@@ -155,7 +171,7 @@ impl ShadowWal {
             segment_index: 0,
             segment_offset: 0,
             page_size,
-            checkpoint_blocker: Some(Arc::new(Mutex::new(checkpoint_blocker))),
+            checkpoint_blocker,
             wal_salt: (salt1, salt2),
             wal_chain: None,
             header_seeded,
@@ -171,7 +187,7 @@ impl ShadowWal {
 
     /// Open a read connection that prevents SQLite from auto-checkpointing.
     /// Also used by walrust-owned replication to pin the live WAL (D2).
-    pub(crate) fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
+    pub fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
         let conn = Connection::open(db_path)?;
 
         ensure_connection_in_wal_mode(&conn, db_path)?;
@@ -508,10 +524,33 @@ impl ShadowWal {
         Ok((frames, new_offset))
     }
 
-    /// Trigger a manual checkpoint and rotate shadow WAL
+    /// Trigger a manual PASSIVE checkpoint and rotate shadow WAL.
     ///
-    /// This releases the read transaction, runs checkpoint, then re-establishes the blocker
+    /// This releases the read transaction, runs checkpoint, then re-establishes the blocker.
     pub async fn checkpoint(&mut self) -> Result<()> {
+        self.checkpoint_with_mode("PASSIVE").await
+    }
+
+    /// Trigger a manual TRUNCATE checkpoint and rotate shadow WAL.
+    ///
+    /// Used as the emergency WAL-growth safety brake after every shadow frame
+    /// has been durably synced. The blocker is released only for the controlled
+    /// checkpoint and is re-established before this returns.
+    pub async fn checkpoint_truncate(&mut self) -> Result<()> {
+        self.checkpoint_with_mode("TRUNCATE").await
+    }
+
+    /// Run a PASSIVE checkpoint when the caller owns the blocker lifecycle.
+    pub async fn checkpoint_unblocked(&mut self) -> Result<()> {
+        self.execute_checkpoint("PASSIVE")
+    }
+
+    /// Run a TRUNCATE checkpoint when the caller owns the blocker lifecycle.
+    pub async fn checkpoint_truncate_unblocked(&mut self) -> Result<()> {
+        self.execute_checkpoint("TRUNCATE")
+    }
+
+    async fn checkpoint_with_mode(&mut self, mode: &'static str) -> Result<()> {
         // Release checkpoint blocker
         if let Some(blocker) = self.checkpoint_blocker.take() {
             let conn = blocker.lock().await;
@@ -519,25 +558,7 @@ impl ShadowWal {
             drop(conn);
         }
 
-        let checkpoint_result = {
-            let conn = Connection::open(&self.db_path)?;
-            conn.busy_timeout(Duration::from_secs(5))?;
-            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
-                conn.query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?;
-            if busy != 0 || checkpointed_frames < log_frames {
-                Err(anyhow!(
-                    "{}: shadow checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
-                    self.db_path.display(),
-                    busy,
-                    log_frames,
-                    checkpointed_frames
-                ))
-            } else {
-                Ok(())
-            }
-        };
+        let checkpoint_result = self.execute_checkpoint(mode);
 
         // Re-establish checkpoint blocker
         let reopen_result = Self::open_checkpoint_blocker(&self.db_path);
@@ -560,11 +581,33 @@ impl ShadowWal {
         }
 
         tracing::debug!(
-            "Shadow WAL: checkpoint complete for {}",
+            "Shadow WAL: {} checkpoint complete for {}",
+            mode,
             self.db_path.display()
         );
 
         Ok(())
+    }
+
+    fn execute_checkpoint(&self, mode: &'static str) -> Result<()> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            conn.query_row(&format!("PRAGMA wal_checkpoint({mode});"), [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 || checkpointed_frames < log_frames {
+            Err(anyhow!(
+                "{}: shadow {} checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
+                self.db_path.display(),
+                mode,
+                busy,
+                log_frames,
+                checkpointed_frames
+            ))
+        } else {
+            Ok(())
+        }
     }
 
     /// Clean up old shadow segments after successful upload
@@ -768,6 +811,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_checkpoint_blocker_preserves_wal_across_short_lived_writer_sessions() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ephemeral-writers.db");
+        let setup = Connection::open(&db_path).unwrap();
+        setup
+            .execute_batch(
+                "
+                PRAGMA journal_mode=WAL;
+                PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE app_data (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                ",
+            )
+            .unwrap();
+        drop(setup);
+
+        let blocker = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+        for snapshot_index in 0..2 {
+            {
+                let snapshot_checkpoint = Connection::open(&db_path).unwrap();
+                let _: (i64, i64, i64) = snapshot_checkpoint
+                    .query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+            }
+            let snapshot_path = dir.path().join(format!("snapshot-{snapshot_index}.db"));
+            let snapshot_reader = Connection::open(&db_path).unwrap();
+            snapshot_reader
+                .execute("VACUUM INTO ?1", [snapshot_path.to_str().unwrap()])
+                .unwrap();
+        }
+        for id in 1..=10i64 {
+            let writer = Connection::open(&db_path).unwrap();
+            writer.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            writer
+                .execute(
+                    "INSERT INTO app_data (id, value) VALUES (?1, ?2)",
+                    rusqlite::params![id, format!("ephemeral-{id}")],
+                )
+                .unwrap();
+        }
+
+        let wal_path = db_path.with_extension("db-wal");
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > 32,
+            "short-lived writer closes must leave their frames in the pinned WAL"
+        );
+        let checkpoint = Connection::open(&db_path).unwrap();
+        checkpoint.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        let busy: i64 = checkpoint
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            busy, 1,
+            "the blocker must remain pinned across writer closes"
+        );
+
+        blocker.execute_batch("ROLLBACK;").unwrap();
     }
 
     #[tokio::test]

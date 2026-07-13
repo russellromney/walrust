@@ -19,13 +19,13 @@ use crate::retry::{RetryConfig, RetryPolicy};
 use crate::s3::{self, create_client, parse_bucket};
 use crate::shadow::ShadowWal;
 use crate::uploader::{spawn_uploader, UploadMessage, Uploader, UploaderStats};
-use crate::webhook::WebhookSender;
+use crate::webhook::{WebhookPayload, WebhookSender};
 use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
 use walrust_core::legacy_shadow_watch::{
     apply_shadow_sync_result_to_state, apply_shadow_sync_results_strict, load_shadow_progress,
-    save_shadow_watch_progress as save_shadow_progress, shadow_sync_input,
-    wait_for_cache_checkpoint_durability,
+    rearm_checkpoint_blocker, save_shadow_watch_progress as save_shadow_progress,
+    shadow_sync_input, wait_for_cache_checkpoint_durability,
 };
 
 use super::shadow::{
@@ -33,12 +33,56 @@ use super::shadow::{
 };
 use super::types::{DbState, Manifest, ShadowDbState, ShadowSyncInput, TriggerState};
 use super::verify::validate_backup_integrity;
-use super::wal_sync::take_snapshot_with_retry;
+use super::wal_sync::take_snapshot_with_retry_and_rearm;
 
 type ShadowSyncFuture =
     Pin<Box<dyn Future<Output = Result<super::types::ShadowSyncOutput>> + Send>>;
 
 const CHECKPOINT_UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+const WAL_SIZE_EXCEEDED_EVENT: &str = "wal_size_exceeded";
+
+#[derive(Clone, Copy)]
+enum ShadowCheckpointMode {
+    Passive,
+    Truncate,
+}
+
+async fn checkpoint_with_state_blocker(
+    state: &mut ShadowDbState,
+    mode: ShadowCheckpointMode,
+) -> Result<()> {
+    let release_result = state
+        .checkpoint_blocker
+        .as_ref()
+        .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))
+        .and_then(|blocker| {
+            blocker
+                .execute_batch("ROLLBACK;")
+                .map_err(anyhow::Error::from)
+        });
+
+    let checkpoint_result = match release_result {
+        Ok(()) => match mode {
+            ShadowCheckpointMode::Passive => state.shadow.checkpoint_unblocked().await,
+            ShadowCheckpointMode::Truncate => state.shadow.checkpoint_truncate_unblocked().await,
+        },
+        Err(error) => Err(error),
+    };
+
+    let rearm_result = rearm_checkpoint_blocker(state);
+    match (checkpoint_result, rearm_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(checkpoint_error), Ok(())) => Err(checkpoint_error),
+        (Ok(()), Err(rearm_error)) => Err(rearm_error),
+        (Err(checkpoint_error), Err(rearm_error)) => {
+            return Err(anyhow!(
+                "{}; additionally failed to rearm CLI checkpoint blocker: {}",
+                checkpoint_error,
+                rearm_error
+            ));
+        }
+    }
+}
 
 #[derive(Clone)]
 struct DirectShadowSyncTarget {
@@ -120,6 +164,7 @@ async fn checkpoint_shadow_after_durable_sync(
     retry_policy: &RetryPolicy,
     webhook_sender: Arc<WebhookSender>,
     drain_timeout: Duration,
+    checkpoint_mode: ShadowCheckpointMode,
 ) -> Result<()> {
     let (frames, new_offset) = state
         .shadow
@@ -175,9 +220,7 @@ async fn checkpoint_shadow_after_durable_sync(
 
     apply_shadow_sync_result_to_state(state, &output).await?;
 
-    state
-        .shadow
-        .checkpoint()
+    checkpoint_with_state_blocker(state, checkpoint_mode)
         .await
         .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
 
@@ -191,6 +234,89 @@ async fn checkpoint_shadow_after_durable_sync(
     }
 
     Ok(())
+}
+
+async fn live_wal_page_count(wal_path: &std::path::Path) -> Result<u64> {
+    use tokio::io::AsyncReadExt;
+
+    let metadata = match tokio::fs::metadata(wal_path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.len() < 32 {
+        return Ok(0);
+    }
+
+    let mut file = tokio::fs::File::open(wal_path).await?;
+    let mut header = [0u8; 32];
+    file.read_exact(&mut header).await?;
+    let page_size = u32::from_be_bytes([header[8], header[9], header[10], header[11]]) as u64;
+    if page_size == 0 {
+        return Ok(0);
+    }
+
+    Ok(metadata.len().saturating_sub(32) / (page_size + 24))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enforce_wal_backpressure(
+    state: &mut ShadowDbState,
+    threshold_pages: u64,
+    cache_state: Option<&(Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
+    direct_target: Option<DirectShadowSyncTarget>,
+    retry_policy: &RetryPolicy,
+    webhook_sender: Arc<WebhookSender>,
+    drain_timeout: Duration,
+) -> Result<bool> {
+    if threshold_pages == 0 {
+        return Ok(false);
+    }
+
+    let wal_pages = live_wal_page_count(&state.wal_path)
+        .await
+        .with_context(|| format!("{}: cannot measure live WAL size", state.name))?;
+    if wal_pages < threshold_pages {
+        return Ok(false);
+    }
+
+    let alarm = format!(
+        "{}: WAL backpressure alarm: live WAL reached {} pages (configured threshold: {}); \
+         walrust may be falling behind and application writes can stall. Draining shadow data \
+         durably before a controlled TRUNCATE checkpoint",
+        state.name, wal_pages, threshold_pages
+    );
+    tracing::error!("{}", alarm);
+    webhook_sender
+        .send(
+            WebhookPayload::custom(WAL_SIZE_EXCEEDED_EVENT, &state.name, &alarm, 1).with_context(
+                serde_json::json!({
+                    "wal_pages": wal_pages,
+                    "threshold_pages": threshold_pages,
+                    "wal_path": state.wal_path.display().to_string(),
+                }),
+            ),
+        )
+        .await;
+
+    checkpoint_shadow_after_durable_sync(
+        state,
+        cache_state,
+        direct_target,
+        retry_policy,
+        webhook_sender,
+        drain_timeout,
+        ShadowCheckpointMode::Truncate,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "{}: WAL backpressure checkpoint failed after threshold alarm",
+            state.name
+        )
+    })?;
+
+    Ok(true)
 }
 
 async fn shutdown_shadow_uploaders(
@@ -440,13 +566,15 @@ pub async fn watch_with_shadow(
         let mut shadow_sync_offset = 0;
 
         // Create shadow WAL manager (this holds the checkpoint blocker)
-        let mut shadow = match ShadowWal::new(db_path).await {
+        let mut shadow = match ShadowWal::new_without_checkpoint_blocker(db_path).await {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!("{}: Failed to create shadow WAL: {}", name, e);
                 return Err(e);
             }
         };
+        let checkpoint_blocker = ShadowWal::open_checkpoint_blocker(db_path)
+            .with_context(|| format!("{}: failed to open CLI checkpoint blocker", name))?;
 
         let mut restored_wal_copy_offset = 0u64;
         if let Some(progress) = load_shadow_progress(&shadow, &name)? {
@@ -509,6 +637,7 @@ pub async fn watch_with_shadow(
                 last_snapshot,
                 db_checksum,
                 shadow,
+                checkpoint_blocker: Some(checkpoint_blocker),
                 shadow_sync_generation,
                 shadow_sync_offset,
                 wal_copy_offset: restored_wal_copy_offset,
@@ -563,16 +692,23 @@ pub async fn watch_with_shadow(
                 wal_salt: None,
                 wal_checksum_chain: None,
             };
-            if let Err(e) = take_snapshot_with_retry(
+            let snapshot_result = take_snapshot_with_retry_and_rearm(
                 &client,
                 &bucket_name,
                 &prefix,
                 &mut db_state,
+                state,
                 &retry_policy,
                 &webhook_sender,
             )
             .await
-            {
+            .with_context(|| {
+                format!(
+                    "{}: failed to rearm blocker after initial snapshot attempt",
+                    state.name
+                )
+            })?;
+            if let Err(e) = snapshot_result {
                 tracing::error!("{}: Initial snapshot failed: {}", state.name, e);
             } else {
                 state.current_txid = db_state.current_txid;
@@ -610,16 +746,23 @@ pub async fn watch_with_shadow(
             wal_salt: None,
             wal_checksum_chain: None,
         };
-        if let Err(e) = take_snapshot_with_retry(
+        let snapshot_result = take_snapshot_with_retry_and_rearm(
             &client,
             &bucket_name,
             &prefix,
             &mut db_state,
+            state,
             &retry_policy,
             &webhook_sender,
         )
         .await
-        {
+        .with_context(|| {
+            format!(
+                "{}: failed to rearm blocker after eager snapshot attempt",
+                state.name
+            )
+        })?;
+        if let Err(e) = snapshot_result {
             tracing::error!(
                 "{}: Eager snapshot after downtime checkpoint failed: {}",
                 state.name,
@@ -835,7 +978,8 @@ pub async fn watch_with_shadow(
                                             wal_salt: None,
                                             wal_checksum_chain: None,
                                         };
-                                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                                        let snapshot_result = take_snapshot_with_retry_and_rearm(&client, &bucket_name, &prefix, &mut db_state, state, &retry_policy, &webhook_sender).await.with_context(|| format!("{}: failed to rearm blocker after max_changes snapshot attempt", state.name))?;
+                                        if let Err(e) = snapshot_result {
                                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
                                             metrics_state.record_error(&state.name);
                                         } else {
@@ -855,6 +999,35 @@ pub async fn watch_with_shadow(
                             tracing::error!("Shadow sync failed: {}", e);
                             return Err(e).context("shadow sync failed");
                         }
+                    }
+                }
+
+                // Holding the checkpoint blocker makes walrust responsible for
+                // bounding the live WAL. Alarm before the configured ceiling turns
+                // into application write stalls, then drain every copied frame to
+                // durable storage before opening the controlled TRUNCATE window.
+                for (db_path, state) in db_states.iter_mut() {
+                    let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
+                    if let Err(error) = enforce_wal_backpressure(
+                        state,
+                        sync_config.wal_truncate_threshold_pages,
+                        cache_states.get(db_path),
+                        Some(DirectShadowSyncTarget {
+                            client: Arc::clone(&client),
+                            bucket_name: bucket_name.clone(),
+                            prefix: prefix.clone(),
+                        }),
+                        &retry_policy,
+                        Arc::clone(&webhook_sender),
+                        CHECKPOINT_UPLOAD_DRAIN_TIMEOUT,
+                    )
+                    .await
+                    {
+                        tracing::error!("{}: {}", state.name, error);
+                        webhook_sender
+                            .notify_upload_failed(&state.name, &error.to_string(), 1)
+                            .await;
+                        return Err(error);
                     }
                 }
             }
@@ -919,7 +1092,8 @@ pub async fn watch_with_shadow(
                             wal_checksum_chain: None,
                         };
 
-                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                        let snapshot_result = take_snapshot_with_retry_and_rearm(&client, &bucket_name, &prefix, &mut db_state, state, &retry_policy, &webhook_sender).await.with_context(|| format!("{}: failed to rearm blocker after trigger snapshot attempt", state.name))?;
+                        if let Err(e) = snapshot_result {
                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
                             metrics_state.record_error(&state.name);
                         } else {
@@ -933,6 +1107,7 @@ pub async fn watch_with_shadow(
                         }
                     }
                 }
+
             }
 
             // Periodic snapshot timer
@@ -951,7 +1126,16 @@ pub async fn watch_with_shadow(
                         wal_checksum_chain: None,
                     };
 
-                    if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                    let snapshot_result = take_snapshot_with_retry_and_rearm(&client, &bucket_name, &prefix, &mut db_state, state, &retry_policy, &webhook_sender).await.with_context(|| format!("{}: failed to rearm blocker after periodic snapshot attempt", state.name))?;
+                    anyhow::ensure!(
+                        state
+                            .checkpoint_blocker
+                            .as_ref()
+                            .is_some_and(|blocker| !blocker.is_autocommit()),
+                        "{}: CLI checkpoint blocker transaction ended during periodic snapshot",
+                        state.name
+                    );
+                    if let Err(e) = snapshot_result {
                         tracing::error!("Failed to snapshot {}: {}", state.name, e);
                         metrics_state.record_error(&state.name);
                     } else {
@@ -978,6 +1162,7 @@ pub async fn watch_with_shadow(
                         }
                     }
                 }
+
             }
 
             // Pruning timer
@@ -1025,6 +1210,7 @@ pub async fn watch_with_shadow(
                             &retry_policy,
                             Arc::clone(&webhook_sender),
                             CHECKPOINT_UPLOAD_DRAIN_TIMEOUT,
+                            ShadowCheckpointMode::Passive,
                         ).await {
                             tracing::error!("{}: Shadow checkpoint failed: {}", state.name, e);
                             webhook_sender
@@ -1183,10 +1369,12 @@ fn seed_state_from_manifest_fetch(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::WebhookConfig;
     use crate::shadow::format_segment_name;
     use rusqlite::Connection;
     use std::io::{Read, Write};
     use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // ── H8 cousin: manifest-fetch seeding never silently starts fresh ────────
 
@@ -1326,6 +1514,50 @@ mod tests {
         (temp, db_path, conn)
     }
 
+    async fn capture_one_webhook() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 1024];
+
+            loop {
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert!(count > 0, "webhook closed before sending its body");
+                buffer.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.strip_prefix("Content-Length:")
+                            .or_else(|| line.strip_prefix("content-length:"))
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap_or(0);
+                let body_start = header_end + 4;
+                if buffer.len() < body_start + content_length {
+                    continue;
+                }
+
+                let body =
+                    String::from_utf8(buffer[body_start..body_start + content_length].to_vec())
+                        .unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .await
+                    .unwrap();
+                return body;
+            }
+        });
+
+        (url, handle)
+    }
+
     fn write_shadow_segment(
         shadow_dir: &std::path::Path,
         generation: u64,
@@ -1345,7 +1577,9 @@ mod tests {
     #[tokio::test]
     async fn test_shadow_shutdown_syncs_final_real_wal_frames_to_cache() {
         let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
         let wal_path = db_path.with_extension("db-wal");
 
         let mut db_states = HashMap::new();
@@ -1359,6 +1593,7 @@ mod tests {
                 last_snapshot: None,
                 db_checksum: None,
                 shadow,
+                checkpoint_blocker: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: 0,
@@ -1408,7 +1643,9 @@ mod tests {
     #[tokio::test]
     async fn test_shadow_sync_persists_restart_progress_after_durable_cache_write() {
         let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
         let progress_path = shadow.shadow_dir().join("progress.json");
         let wal_path = db_path.with_extension("db-wal");
 
@@ -1423,6 +1660,7 @@ mod tests {
                 last_snapshot: None,
                 db_checksum: None,
                 shadow,
+                checkpoint_blocker: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: 0,
@@ -1478,7 +1716,9 @@ mod tests {
         write_shadow_segment(&shadow_dir, 0, page_size, &page);
         write_shadow_segment(&shadow_dir, 1, page_size, &page);
 
-        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
         assert_eq!(
             shadow.generation(),
             1,
@@ -1497,6 +1737,7 @@ mod tests {
                 last_snapshot: None,
                 db_checksum: None,
                 shadow,
+                checkpoint_blocker: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: frame_size,
                 wal_copy_offset: 0,
@@ -1551,7 +1792,9 @@ mod tests {
     #[tokio::test]
     async fn test_shadow_checkpoint_copies_syncs_and_waits_for_cache_upload() {
         let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
         let wal_path = db_path.with_extension("db-wal");
         let mut state = ShadowDbState {
             name: "checkpoint_shadow".to_string(),
@@ -1561,6 +1804,7 @@ mod tests {
             last_snapshot: None,
             db_checksum: None,
             shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -1584,6 +1828,7 @@ mod tests {
             &RetryPolicy::new(RetryConfig::default()),
             Arc::new(WebhookSender::new(vec![])),
             Duration::from_secs(2),
+            ShadowCheckpointMode::Passive,
         )
         .await
         .unwrap();
@@ -1608,9 +1853,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_wal_backpressure_alarms_drains_truncates_and_reacquires_blocker() {
+        let (_temp, db_path, conn) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        for id in 0..40i64 {
+            conn.execute(
+                "INSERT INTO items (value) VALUES (?1)",
+                [format!("backpressure-{id}-{}", "x".repeat(500))],
+            )
+            .unwrap();
+        }
+
+        let wal_path = db_path.with_extension("db-wal");
+        let mut state = ShadowDbState {
+            name: "backpressure-shadow".to_string(),
+            db_path: db_path.clone(),
+            wal_path: wal_path.clone(),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let before_pages = live_wal_page_count(&wal_path).await.unwrap();
+        assert!(
+            before_pages > 2,
+            "test must create a meaningfully large WAL"
+        );
+
+        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
+        let (upload_tx, mut upload_rx) = mpsc::channel(10);
+        let ack_cache = Arc::clone(&cache);
+        let ack_handle = tokio::spawn(async move {
+            match upload_rx.recv().await {
+                Some(UploadMessage::Upload(txid)) => ack_cache.mark_uploaded(txid).unwrap(),
+                other => panic!("expected upload notification, got {other:?}"),
+            }
+        });
+        let cache_state = (Arc::clone(&cache), upload_tx);
+        let (webhook_url, webhook_body) = capture_one_webhook().await;
+        let webhook_sender = Arc::new(WebhookSender::new(vec![WebhookConfig {
+            url: webhook_url,
+            events: vec![WAL_SIZE_EXCEEDED_EVENT.to_string()],
+            secret: None,
+        }]));
+
+        assert!(
+            enforce_wal_backpressure(
+                &mut state,
+                before_pages,
+                Some(&cache_state),
+                None,
+                &RetryPolicy::new(RetryConfig::default()),
+                Arc::clone(&webhook_sender),
+                Duration::from_secs(2),
+            )
+            .await
+            .unwrap(),
+            "crossing the threshold must run the backpressure path"
+        );
+        ack_handle.await.unwrap();
+
+        let payload: serde_json::Value = serde_json::from_str(
+            &tokio::time::timeout(Duration::from_secs(2), webhook_body)
+                .await
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(payload["event"], WAL_SIZE_EXCEEDED_EVENT);
+        assert_eq!(payload["database"], state.name);
+        assert_eq!(payload["context"]["wal_pages"], before_pages);
+        assert_eq!(payload["context"]["threshold_pages"], before_pages);
+
+        let after_pages = live_wal_page_count(&wal_path).await.unwrap();
+        assert!(
+            after_pages < before_pages,
+            "controlled TRUNCATE must shrink the WAL (before={before_pages}, after={after_pages})"
+        );
+        conn.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        let busy: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            busy, 1,
+            "backpressure checkpoint must reacquire the blocker before returning"
+        );
+    }
+
+    #[tokio::test]
     async fn test_shadow_checkpoint_refuses_pending_cache_upload() {
         let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
         let wal_path = db_path.with_extension("db-wal");
         let mut state = ShadowDbState {
             name: "checkpoint_shadow_pending".to_string(),
@@ -1620,6 +1961,7 @@ mod tests {
             last_snapshot: None,
             db_checksum: None,
             shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -1636,6 +1978,7 @@ mod tests {
             &RetryPolicy::new(RetryConfig::default()),
             Arc::new(WebhookSender::new(vec![])),
             Duration::from_millis(100),
+            ShadowCheckpointMode::Passive,
         )
         .await
         .expect_err("checkpoint must fail closed while cache uploads are pending")
@@ -1690,6 +2033,7 @@ mod tests {
                 last_snapshot: None,
                 db_checksum: None,
                 shadow,
+                checkpoint_blocker: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: offset,
@@ -1743,6 +2087,7 @@ mod tests {
                 last_snapshot: None,
                 db_checksum: None,
                 shadow,
+                checkpoint_blocker: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: offset,

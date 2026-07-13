@@ -1,16 +1,18 @@
 use anyhow::Result;
 use chrono::Utc;
 use hadb_storage_s3::S3Storage;
+use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::dashboard::{DbStatus, MetricsState};
 use crate::retry::{classify_error, ErrorKind, RetryPolicy};
 use crate::webhook::WebhookSender;
+use walrust_core::legacy_shadow_watch::rearm_checkpoint_blocker;
 use walrust_core::legacy_wal_sync::{
     apply_sync_output_to_watched_state, sync_watched_db_once_to_cache, WatchedDbState,
 };
 
-use super::types::{DbState, DbTaskState, SyncInput, SyncOutput};
+use super::types::{DbState, DbTaskState, ShadowDbState, SyncInput, SyncOutput};
 
 // ============================================================================
 // Concurrent WAL sync operations (immutable, for parallel execution)
@@ -315,6 +317,84 @@ pub(crate) async fn take_snapshot_with_retry(
     }
 }
 
+/// Shadow-watch snapshot retry. Rearms the state-owned blocker after every
+/// attempt, before any retry backoff, so a failed upload cannot leave external
+/// writers exposed to a last-close checkpoint.
+pub(crate) async fn take_snapshot_with_retry_and_rearm(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    state: &mut DbState,
+    shadow_state: &mut ShadowDbState,
+    retry_policy: &RetryPolicy,
+    webhook_sender: &Arc<WebhookSender>,
+) -> Result<Result<()>> {
+    let db_name = state.name.clone();
+    let mut attempts = 0u32;
+
+    loop {
+        attempts += 1;
+        let post_encode_rearmed = Cell::new(false);
+        let snapshot_result = take_snapshot_with_post_encode(client, bucket, prefix, state, || {
+            rearm_checkpoint_blocker(shadow_state)?;
+            post_encode_rearmed.set(true);
+            Ok(())
+        })
+        .await;
+
+        // Failures before the post-encode boundary (including encode failures)
+        // still close one-shot SQLite handles. Restore the blocker immediately,
+        // before classifying the error or sleeping for a retry.
+        if !post_encode_rearmed.get() {
+            rearm_checkpoint_blocker(shadow_state)?;
+        }
+
+        match snapshot_result {
+            Ok(()) => return Ok(Ok(())),
+            Err(error) => {
+                let error_kind = classify_error(&error);
+                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
+
+                if error_kind == ErrorKind::AuthError {
+                    tracing::error!(
+                        "{}: Authentication error during snapshot: {}",
+                        db_name,
+                        error
+                    );
+                    webhook_sender
+                        .notify_auth_failure(&db_name, &error.to_string())
+                        .await;
+                    return Ok(Err(error));
+                }
+
+                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
+                    tracing::error!(
+                        "{}: Snapshot failed after {} attempts: {}",
+                        db_name,
+                        attempts,
+                        error
+                    );
+                    webhook_sender
+                        .notify_upload_failed(&db_name, &error.to_string(), attempts)
+                        .await;
+                    return Ok(Err(error));
+                }
+
+                let delay = retry_policy.calculate_delay(attempts - 1);
+                tracing::warn!(
+                    "{}: Snapshot attempt {}/{} failed, retrying in {:?}: {}",
+                    db_name,
+                    attempts,
+                    retry_policy.config().max_retries + 1,
+                    delay,
+                    error
+                );
+                tokio::time::sleep(delay).await;
+            }
+        }
+    }
+}
+
 /// Take a full database snapshot as LTX
 pub(crate) async fn take_snapshot(
     client: &aws_sdk_s3::Client,
@@ -322,12 +402,26 @@ pub(crate) async fn take_snapshot(
     prefix: &str,
     state: &mut DbState,
 ) -> Result<()> {
+    take_snapshot_with_post_encode(client, bucket, prefix, state, || Ok(())).await
+}
+
+async fn take_snapshot_with_post_encode<F>(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    state: &mut DbState,
+    post_encode: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
     let timestamp = Utc::now();
     let storage = S3Storage::new(client.clone(), bucket.to_string());
-    let output = walrust_core::legacy_wal_sync::take_snapshot_to_storage(
+    let output = walrust_core::legacy_wal_sync::take_snapshot_to_storage_with_post_encode(
         &storage,
         prefix,
         SyncInput::from(&*state),
+        post_encode,
     )
     .await?;
 
