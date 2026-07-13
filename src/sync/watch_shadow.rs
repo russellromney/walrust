@@ -312,14 +312,25 @@ async fn initial_shadow_copy(
     Ok(eager_snapshot)
 }
 
-/// DF1: publish an eager re-anchor snapshot after `copy_frames` observed the
-/// live WAL vanish / zero out mid-stream (SQLite's last-close checkpoint on an
+/// DF1/DF2: publish an eager re-anchor snapshot after `copy_frames` observed the
+/// live WAL vanish / zero out (SQLite's last-close checkpoint on an
 /// ephemeral-connection writer). The checkpoint folded pages into the `.db`
 /// that the shadow may never have copied; the snapshot provably captures them.
 /// Mirrors the D3 downtime-checkpoint eager-snapshot block, including the
 /// cursor resets. Fails loudly: a re-anchor that cannot be published (after the
 /// retry policy is exhausted) propagates, because continuing to chain
 /// incrementals over an unproven base risks a silently short restore.
+///
+/// DF2 storm guard: an ephemeral-connection writer keeps the WAL absent every
+/// tick, so `copy_frames` re-arms the re-anchor continuously. `reanchor_marks`
+/// records a content checksum of the `.db` captured at the last re-anchor for
+/// this database; if the checksum is unchanged (the database is idle, only the
+/// WAL is churning) the snapshot is skipped. When it HAS changed, new rows were
+/// folded into the `.db` and must be captured — the exact rows the 0.7.0
+/// silent-stall dropped. The checksum is authoritative (SQLite's file change
+/// counter is unreliable in WAL mode); it is only ever computed while the WAL
+/// is absent, i.e. the ephemeral-writer workload, which is small-DB by nature.
+/// Returns whether a snapshot was actually published.
 #[allow(clippy::too_many_arguments)]
 async fn reanchor_snapshot_after_wal_reset(
     client: &Arc<aws_sdk_s3::Client>,
@@ -330,7 +341,26 @@ async fn reanchor_snapshot_after_wal_reset(
     retry_policy: &RetryPolicy,
     webhook_sender: &Arc<WebhookSender>,
     metrics_state: &Arc<MetricsState>,
-) -> Result<()> {
+    reanchor_marks: &mut HashMap<PathBuf, u64>,
+) -> Result<bool> {
+    // Storm guard: skip when the database content has not advanced since the
+    // last re-anchor (idle DB, WAL just churning). An unreadable checksum never
+    // suppresses — fail toward capturing, not toward silence.
+    let current_mark = ltx::compute_checksum_from_file(&state.db_path)
+        .ok()
+        .map(|c| c.into_inner());
+    if let (Some(current), Some(prev)) = (current_mark, reanchor_marks.get(&state.db_path).copied())
+    {
+        if current == prev {
+            tracing::debug!(
+                "{}: WAL absent but .db content unchanged ({:#x}); skipping re-anchor snapshot",
+                state.name,
+                current
+            );
+            return Ok(false);
+        }
+    }
+
     tracing::warn!(
         "{}: re-anchoring after live WAL delete/recreate (ephemeral-connection writer lifecycle): publishing eager snapshot",
         state.name
@@ -381,12 +411,20 @@ async fn reanchor_snapshot_after_wal_reset(
     save_shadow_progress(state)?;
     metrics_state.record_snapshot(&state.name);
 
+    // Record the content checksum this snapshot captured, so a later re-arm with
+    // the same content is recognized as idle churn and skipped. Re-read AFTER
+    // the snapshot: its own PASSIVE checkpoint folds the WAL into the .db, so
+    // this is the value a genuinely-idle next tick will match.
+    if let Ok(cs) = ltx::compute_checksum_from_file(&state.db_path) {
+        reanchor_marks.insert(state.db_path.clone(), cs.into_inner());
+    }
+
     if let Some(trigger) = trigger {
         trigger.frames_since_snapshot = 0;
         trigger.first_change_time = None;
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// Shadow WAL mode decouples S3 uploads from SQLite's active WAL file:
@@ -455,6 +493,8 @@ pub async fn watch_with_shadow(
     // Initialize shadow state for each database
     let mut db_states: HashMap<PathBuf, ShadowDbState> = HashMap::new();
     let mut trigger_states: HashMap<PathBuf, TriggerState> = HashMap::new();
+    // DF2 storm guard: last `.db` content checksum captured by a re-anchor per db.
+    let mut reanchor_marks: HashMap<PathBuf, u64> = HashMap::new();
     let mut sync_configs: HashMap<PathBuf, SyncConfig> = HashMap::new();
     // Single-writer guards, held for the lifetime of this watch (E5).
     let mut db_locks: Vec<crate::lock::DbLock> = Vec::new();
@@ -836,10 +876,13 @@ pub async fn watch_with_shadow(
                                 state.wal_copy_offset = new_offset;
                             }
 
-                            // DF1: the live WAL vanished/zeroed mid-stream
+                            // DF1/DF2: the live WAL vanished/zeroed mid-stream
                             // (last-close checkpoint of an ephemeral-connection
-                            // writer). Re-anchor with an eager snapshot instead
-                            // of dying — and never skip it silently.
+                            // writer), or is still absent while writes keep
+                            // folding into the .db. Re-anchor with an eager
+                            // snapshot (guarded by the .db change counter so an
+                            // idle DB does not storm) instead of dying or
+                            // silently stalling.
                             if state.shadow.take_reanchor_pending() {
                                 let db_path = state.db_path.clone();
                                 let trigger = trigger_states.get_mut(&db_path);
@@ -852,6 +895,7 @@ pub async fn watch_with_shadow(
                                     &retry_policy,
                                     &webhook_sender,
                                     &metrics_state,
+                                    &mut reanchor_marks,
                                 ).await?;
                             }
                         }
@@ -1146,7 +1190,7 @@ pub async fn watch_with_shadow(
                             )));
                         }
 
-                        // DF1: the pre-checkpoint copy may have observed the
+                        // DF1/DF2: the pre-checkpoint copy may have observed the
                         // WAL vanish/zero out; consume the re-anchor here too
                         // so no flag is left to rot until the next sync tick.
                         if state.shadow.take_reanchor_pending() {
@@ -1160,6 +1204,7 @@ pub async fn watch_with_shadow(
                                 &retry_policy,
                                 &webhook_sender,
                                 &metrics_state,
+                                &mut reanchor_marks,
                             ).await?;
                         }
 
@@ -1257,12 +1302,15 @@ pub async fn watch_with_shadow(
     .await;
     apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
 
-    // DF1: the final copy may have observed the WAL vanish/zero out. Publish
-    // the re-anchor snapshot before exiting — otherwise the checkpoint-folded
-    // rows would sit local-only with no flag surviving the restart.
+    // DF1/DF2: the final copy may have observed the WAL vanish/zero out (or
+    // still-absent with folded writes). Publish the re-anchor snapshot before
+    // exiting — otherwise the checkpoint-folded rows would sit local-only with
+    // no flag surviving the restart. The change-counter guard is bypassed here
+    // by forcing a fresh check: on shutdown we always want the latest .db.
     for state in db_states.values_mut() {
         if state.shadow.take_reanchor_pending() {
             let db_path = state.db_path.clone();
+            reanchor_marks.remove(&db_path);
             let trigger = trigger_states.get_mut(&db_path);
             reanchor_snapshot_after_wal_reset(
                 &client,
@@ -1273,6 +1321,7 @@ pub async fn watch_with_shadow(
                 &retry_policy,
                 &webhook_sender,
                 &metrics_state,
+                &mut reanchor_marks,
             )
             .await?;
         }

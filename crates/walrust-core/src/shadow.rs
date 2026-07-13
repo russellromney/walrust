@@ -105,6 +105,13 @@ pub struct ShadowWal {
     /// downtime-checkpoint path. (A plain mid-run salt roll does NOT set this:
     /// that is the routine own-checkpoint shape, already copied + synced.)
     reanchor_pending: bool,
+    /// True while the live WAL has vanished after frames were observed and has
+    /// not yet reappeared with a real header (DF2). An ephemeral-connection
+    /// writer folds each commit straight into the `.db` and deletes/truncates
+    /// the WAL before the next tick, so the WAL is empty every tick and the
+    /// per-tick re-arm (guarded by the `.db` change counter in the watch loop)
+    /// is the only way those folded writes get captured.
+    wal_absent: bool,
 }
 
 /// A segment file in the shadow WAL
@@ -180,6 +187,7 @@ impl ShadowWal {
             wal_chain: None,
             header_seeded,
             reanchor_pending: false,
+            wal_absent: false,
         })
     }
 
@@ -324,6 +332,11 @@ impl ShadowWal {
         // The next real header is a fresh initialization (B5 seeding), not a
         // second rollover.
         self.header_seeded = false;
+        // Stay in the "absent" state until a real WAL header reappears, so that
+        // while an ephemeral-connection writer keeps folding rows into the .db
+        // (WAL deleted before every tick), each tick re-arms the re-anchor
+        // (DF2) instead of falling into the quiet never-seeded idle branch.
+        self.wal_absent = true;
         self.reanchor_pending = true;
     }
 
@@ -347,8 +360,24 @@ impl ShadowWal {
                     _ => "zeroed (header read back all-zero, magic 0x0)",
                 };
                 if self.header_seeded {
+                    // First detection of this vanish: roll the generation and
+                    // flag the eager re-anchor (DF1).
                     self.begin_vanished_wal_reanchor(observed);
                     return Ok((Vec::new(), 0));
+                }
+                if self.wal_absent {
+                    // DF2: the WAL is STILL gone from an earlier vanish and has
+                    // not reappeared with frames. An ephemeral-connection
+                    // writer (last-close checkpoint every commit) keeps folding
+                    // rows straight into the `.db` and deleting/truncating the
+                    // WAL before the next tick can read a single frame — the
+                    // silent-stall the 0.7.0 fresh-user drill hit. Re-arm the
+                    // re-anchor every tick so the watch loop re-checks the
+                    // `.db` content checksum and snapshots when it actually
+                    // advanced (the checksum guard stops an idle DB from
+                    // snapshot-storming). Do NOT re-roll the generation here.
+                    self.reanchor_pending = true;
+                    return Ok((Vec::new(), offset));
                 }
                 // No WAL ever observed: the normal idle state of a database
                 // with nothing to replicate yet.
@@ -356,6 +385,9 @@ impl ShadowWal {
                 return Ok((Vec::new(), offset));
             }
         };
+        // A real WAL header is back: clear the absent state so a later vanish is
+        // detected fresh (rolls a new generation) rather than only re-armed.
+        self.wal_absent = false;
 
         // Detect checkpoint by salt change
         let current_salt = (header.salt1, header.salt2);
@@ -792,6 +824,7 @@ mod tests {
                 wal_chain: None,
                 header_seeded: false,
                 reanchor_pending: false,
+                wal_absent: false,
             };
             shadow
                 .current_segment_path()
@@ -1159,17 +1192,28 @@ mod tests {
             shadow.take_reanchor_pending(),
             "a WAL that vanished mid-stream must flag an eager snapshot re-anchor"
         );
-
-        // Self-quiescing: the read cursor is unseeded again, so while the WAL
-        // stays missing further ticks take the quiet idle branch — one
-        // lifecycle event, one re-anchor, no storm. (The recreate-and-continue
-        // leg runs cross-process in the DF1 e2e,
-        // e2e_cli_watch_survives_ephemeral_connection_writer; an in-process
-        // unlink leaves SQLite's cached shm pointing at the dead WAL, so no
-        // further SQLite I/O is possible here.)
         assert!(
             shadow.wal_read_salt().is_none(),
-            "the re-anchor must clear the seeded header so no second re-anchor can fire"
+            "the vanish must clear the seeded header (fresh init on WAL return)"
+        );
+
+        // DF2: while the WAL stays absent, every subsequent tick must RE-ARM the
+        // re-anchor (an ephemeral-connection writer keeps folding rows into the
+        // .db with the WAL deleted before each tick — the silent-stall shape).
+        // The generation is NOT re-rolled; the watch loop's .db-change-counter
+        // guard, not a quiet idle branch, is what prevents a snapshot storm.
+        let gen_after_first = shadow.generation();
+        let (frames, _off) = shadow.copy_frames(0).await.unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(
+            shadow.generation(),
+            gen_after_first,
+            "a still-absent WAL must not re-roll the generation each tick"
+        );
+        assert!(
+            shadow.take_reanchor_pending(),
+            "DF2: a still-absent WAL must re-arm the re-anchor every tick so folded \
+             writes get captured (pre-DF2-fix this fell into the quiet idle branch)"
         );
     }
 
@@ -1222,10 +1266,7 @@ mod tests {
             .copy_frames(offset)
             .await
             .expect_err("garbage WAL magic must stay a loud error");
-        assert!(
-            err.to_string().contains("Invalid WAL magic"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("Invalid WAL magic"), "got: {err}");
         assert!(
             !shadow.take_reanchor_pending(),
             "corruption must not be blurred into the re-anchor lifecycle path"

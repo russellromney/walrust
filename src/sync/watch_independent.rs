@@ -502,6 +502,96 @@ async fn maybe_compact_legacy(
     Ok(())
 }
 
+/// DF1/DF2 for independent-tasks mode. An ephemeral-connection writer (shell
+/// scripts, cron jobs, `sqlite3` CLI) folds each commit straight into the `.db`
+/// and deletes/zeroes the WAL before the poll tick can read a frame, so the
+/// WAL-based sync ships nothing — the same silent stall (and, on the zeroed
+/// transient, the same would-be crash) that DF1/DF2 fixed in default shadow
+/// mode. This re-anchors with a fresh snapshot whenever the live WAL is in the
+/// ephemeral reset state AND the `.db` content advanced since the last
+/// re-anchor.
+///
+/// Covers both sub-modes:
+/// - cache path: `ShadowWal::copy_frames` (inside `do_sync`) already flags the
+///   vanish via `take_reanchor_pending`; we consume it here.
+/// - no-cache direct path: classify the live WAL header here (there is no
+///   `ShadowWal`), treating missing/zeroed/too-short over an established stream
+///   as the reset state. A NONZERO garbage magic is deliberately NOT treated as
+///   a reset — it is left for the sync path to surface loudly (corruption).
+///
+/// The `.db` content-checksum guard stops an idle database (WAL merely churning,
+/// nothing written) from snapshot-storming; for a normal long-lived-writer DB
+/// the WAL is always present so this is a no-op with zero extra I/O.
+#[allow(clippy::too_many_arguments)]
+async fn maybe_reanchor_ephemeral_writer(
+    state: &mut DbTaskState,
+    cache_state: Option<&CacheState>,
+    reanchor_mark: &mut Option<u64>,
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    retry_policy: &RetryPolicy,
+    webhook_sender: &Arc<WebhookSender>,
+) -> Result<()> {
+    // Is the live WAL in the ephemeral-writer reset state?
+    let pending = if let Some(cache) = cache_state {
+        let mut shadow = cache.shadow.lock().await;
+        shadow.take_reanchor_pending()
+    } else {
+        // No-cache direct path: no ShadowWal, so classify the header ourselves.
+        // Only over an ALREADY-ESTABLISHED stream (current_txid > 0): a fresh
+        // stream with no WAL yet is the initial-sync path, not a reset.
+        match walrust_core::wal::read_header_classified(&state.db_state.wal_path).await {
+            Ok(walrust_core::wal::WalHeaderRead::Valid(_)) => false,
+            Ok(_) => state.db_state.current_txid > 0,
+            // Nonzero garbage magic / IO error: leave it for the sync path to
+            // surface loudly; never silently re-anchor over corruption.
+            Err(_) => false,
+        }
+    };
+    if !pending {
+        return Ok(());
+    }
+
+    // Storm guard: only snapshot when the .db content advanced since the last
+    // re-anchor. An unreadable checksum never suppresses (fail toward capture).
+    let current = ltx::compute_checksum_from_file(&state.db_state.db_path)
+        .ok()
+        .map(|c| c.into_inner());
+    if let (Some(cur), Some(prev)) = (current, *reanchor_mark) {
+        if cur == prev {
+            tracing::debug!(
+                "{}: WAL in ephemeral reset state but .db content unchanged ({:#x}); skipping re-anchor",
+                state.db_state.name,
+                cur
+            );
+            return Ok(());
+        }
+    }
+
+    tracing::warn!(
+        "{}: re-anchoring after ephemeral-connection writer WAL reset (independent mode): publishing snapshot",
+        state.db_state.name
+    );
+    take_snapshot_with_retry(
+        client,
+        bucket,
+        prefix,
+        &mut state.db_state,
+        retry_policy,
+        webhook_sender,
+    )
+    .await?;
+
+    // Record the content captured, so a later reset with the same content is
+    // recognized as idle churn and skipped. Re-read AFTER the snapshot (its
+    // PASSIVE checkpoint folds the WAL into the .db).
+    if let Ok(cs) = ltx::compute_checksum_from_file(&state.db_state.db_path) {
+        *reanchor_mark = Some(cs.into_inner());
+    }
+    Ok(())
+}
+
 async fn run_db_task(
     mut state: DbTaskState,
     client: Arc<aws_sdk_s3::Client>,
@@ -562,6 +652,11 @@ async fn run_db_task(
         wal_path.display()
     );
 
+    // DF1/DF2 (independent mode): last `.db` content checksum captured by an
+    // ephemeral-writer re-anchor, so an idle DB whose WAL merely churns does not
+    // snapshot-storm. `None` until the first re-anchor.
+    let mut reanchor_mark: Option<u64> = None;
+
     loop {
         tokio::select! {
             // Shutdown signal
@@ -570,6 +665,15 @@ async fn run_db_task(
                 do_sync(&mut state, &client, &bucket, &prefix, &retry_policy, &webhook_sender, &metrics_state, cache_state.as_ref())
                     .await
                     .with_context(|| format!("{}: final sync before shutdown failed", db_name))?;
+                // DF1/DF2: capture any ephemeral-writer .db advance the WAL
+                // could not carry, before we exit (force a fresh check).
+                reanchor_mark = None;
+                maybe_reanchor_ephemeral_writer(
+                    &mut state, cache_state.as_ref(), &mut reanchor_mark,
+                    &client, &bucket, &prefix, &retry_policy, &webhook_sender,
+                )
+                .await
+                .with_context(|| format!("{}: final ephemeral-writer re-anchor failed", db_name))?;
                 // Signal uploader to shutdown if cache is enabled
                 if let Some(mut cache) = cache_state.take() {
                     cache.upload_tx
@@ -596,6 +700,18 @@ async fn run_db_task(
                         if frame_count > 0 {
                             tracing::debug!("{}: Synced {} frames", db_name, frame_count);
                         }
+                        // DF1/DF2: an ephemeral-connection writer folds each
+                        // commit into the .db and deletes/zeroes the WAL before
+                        // this tick can read a frame, so the WAL-based sync
+                        // above ships nothing. Re-anchor with a snapshot when
+                        // the .db content advanced (guarded so an idle DB does
+                        // not storm) — never a silent stall.
+                        maybe_reanchor_ephemeral_writer(
+                            &mut state, cache_state.as_ref(), &mut reanchor_mark,
+                            &client, &bucket, &prefix, &retry_policy, &webhook_sender,
+                        )
+                        .await
+                        .with_context(|| format!("{}: ephemeral-writer re-anchor failed", db_name))?;
                         // Compaction tick — piggybacks on sync activity.
                         // Controlled by the single `[compaction] enabled` config
                         // knob; a failure here never disturbs the sync path.

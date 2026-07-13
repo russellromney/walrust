@@ -1811,10 +1811,7 @@ mod tests {
             "nonzero garbage magic must stay a loud error in the classified reader"
         );
         let plain = read_header(&path).await;
-        assert!(plain
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid WAL magic"));
+        assert!(plain.unwrap_err().to_string().contains("Invalid WAL magic"));
 
         tokio::fs::remove_file(&path).await.ok();
     }

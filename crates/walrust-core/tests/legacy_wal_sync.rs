@@ -350,7 +350,10 @@ async fn df1_independent_sync_zeroed_wal_header_reanchors_with_rollover_snapshot
         "the re-anchor must be reported as a checkpoint/rollover event"
     );
     assert_eq!(output.new_wal_offset, 0, "the WAL cursor must reset");
-    assert_eq!(output.new_current_txid, 4, "the snapshot consumes its own txid");
+    assert_eq!(
+        output.new_current_txid, 4,
+        "the snapshot consumes its own txid"
+    );
 
     // The re-anchor snapshot must exist and contain the folded rows.
     let key = build_ltx_key("backups", "app", 1, 1, 4);
@@ -384,10 +387,7 @@ async fn df1_independent_sync_garbage_wal_magic_still_fails_loudly() -> Result<(
         Ok(_) => panic!("garbage WAL magic must stay a loud error"),
         Err(e) => e,
     };
-    assert!(
-        err.to_string().contains("Invalid WAL magic"),
-        "got: {err}"
-    );
+    assert!(err.to_string().contains("Invalid WAL magic"), "got: {err}");
     let keys = storage.list("backups", None).await?;
     assert!(
         keys.is_empty(),
