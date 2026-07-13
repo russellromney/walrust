@@ -679,6 +679,13 @@ mod tests {
 
         for page_size in [512u32, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
             for synchronous in ["OFF", "NORMAL", "FULL", "EXTRA"] {
+                let expected_synchronous = match synchronous {
+                    "OFF" => 0,
+                    "NORMAL" => 1,
+                    "FULL" => 2,
+                    "EXTRA" => 3,
+                    _ => unreachable!("test matrix only contains supported synchronous levels"),
+                };
                 let db_path = dir
                     .path()
                     .join(format!("blocker-{page_size}-{synchronous}.db"));
@@ -696,6 +703,24 @@ mod tests {
                     "
                 ))
                 .unwrap();
+                assert_eq!(
+                    app.query_row("PRAGMA page_size;", [], |row| row.get::<_, u32>(0))
+                        .unwrap(),
+                    page_size,
+                    "test setup must apply page_size={page_size}"
+                );
+                assert_eq!(
+                    app.query_row("PRAGMA journal_mode;", [], |row| row.get::<_, String>(0))
+                        .unwrap(),
+                    "wal",
+                    "test setup must enter WAL mode for page_size={page_size}, synchronous={synchronous}"
+                );
+                assert_eq!(
+                    app.query_row("PRAGMA synchronous;", [], |row| row.get::<_, i64>(0))
+                        .unwrap(),
+                    expected_synchronous,
+                    "test setup must apply synchronous={synchronous} for page_size={page_size}"
+                );
 
                 let blocker = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
 
@@ -703,9 +728,9 @@ mod tests {
                 // unread work a concurrent application checkpoint must not erase.
                 app.execute("INSERT INTO app_data (value) VALUES ('after-blocker')", [])
                     .unwrap();
-                let wal_size_before = std::fs::metadata(&wal_path).unwrap().len();
+                let wal_before = std::fs::read(&wal_path).unwrap();
                 assert!(
-                    wal_size_before > 0,
+                    !wal_before.is_empty(),
                     "test setup must create a WAL for page_size={page_size}, synchronous={synchronous}"
                 );
 
@@ -719,9 +744,9 @@ mod tests {
                     "checkpoint blocker must make concurrent TRUNCATE report busy for page_size={page_size}, synchronous={synchronous}"
                 );
                 assert_eq!(
-                    std::fs::metadata(&wal_path).unwrap().len(),
-                    wal_size_before,
-                    "blocked TRUNCATE must preserve the WAL for page_size={page_size}, synchronous={synchronous}"
+                    std::fs::read(&wal_path).unwrap(),
+                    wal_before,
+                    "blocked TRUNCATE must preserve the WAL bytes for page_size={page_size}, synchronous={synchronous}"
                 );
 
                 blocker.execute_batch("ROLLBACK;").unwrap();
