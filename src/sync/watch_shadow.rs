@@ -22,8 +22,10 @@ use crate::uploader::{spawn_uploader, UploadMessage, Uploader, UploaderStats};
 use crate::webhook::{WebhookPayload, WebhookSender};
 use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
+use rusqlite::Connection;
 use walrust_core::legacy_shadow_watch::{
-    apply_shadow_sync_result_to_state, apply_shadow_sync_results_strict, load_shadow_progress,
+    apply_shadow_sync_result_to_state, apply_shadow_sync_results_strict,
+    checkpoint_blocker_heartbeat_is_live, checkpoint_data_version, load_shadow_progress,
     rearm_checkpoint_blocker, save_shadow_watch_progress as save_shadow_progress,
     shadow_sync_input, wait_for_cache_checkpoint_durability,
 };
@@ -50,28 +52,61 @@ enum ShadowCheckpointMode {
 async fn checkpoint_with_state_blocker(
     state: &mut ShadowDbState,
     mode: ShadowCheckpointMode,
-) -> Result<()> {
-    let release_result = state
+    data_version_before: i64,
+) -> Result<bool> {
+    // End the blocker read transaction, then run the checkpoint on the
+    // lifetime monitor. Its own checkpoint does not change its connection-local
+    // data_version; any app commit since the caller's final copy baseline does,
+    // including one in the unblocked window.
+    let blocker = state
         .checkpoint_blocker
         .as_ref()
-        .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))
-        .and_then(|blocker| {
-            blocker
-                .execute_batch("ROLLBACK;")
-                .map_err(anyhow::Error::from)
+        .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
+    blocker.execute_batch("ROLLBACK;")?;
+
+    let monitor = state
+        .data_version_monitor
+        .as_ref()
+        .ok_or_else(|| anyhow!("{}: CLI data_version monitor was not held", state.name))?;
+
+    let mode_name = match mode {
+        ShadowCheckpointMode::Passive => "PASSIVE",
+        ShadowCheckpointMode::Truncate => "TRUNCATE",
+    };
+    let checkpoint_result = monitor
+        .query_row(
+            &format!("PRAGMA wal_checkpoint({mode_name});"),
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(anyhow::Error::from)
+        .and_then(|(busy, log_frames, checkpointed_frames): (i64, i64, i64)| {
+            if busy != 0 || checkpointed_frames < log_frames {
+                Err(anyhow!(
+                    "{}: shadow {} checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
+                    state.db_path.display(),
+                    mode_name,
+                    busy,
+                    log_frames,
+                    checkpointed_frames
+                ))
+            } else {
+                Ok(())
+            }
         });
 
-    let checkpoint_result = match release_result {
-        Ok(()) => match mode {
-            ShadowCheckpointMode::Passive => state.shadow.checkpoint_unblocked().await,
-            ShadowCheckpointMode::Truncate => state.shadow.checkpoint_truncate_unblocked().await,
-        },
-        Err(error) => Err(error),
-    };
-
+    // Sample before opening the replacement blocker because its heartbeat is
+    // itself an other-connection commit. Commits through this point are dirty;
+    // the primitive's final heartbeat-to-BEGIN micro-window is the documented
+    // residual release/reacquire boundary.
+    let data_version_after = checkpoint_data_version(state);
     let rearm_result = rearm_checkpoint_blocker(state);
+    let heartbeat_live = match &rearm_result {
+        Ok(()) => checkpoint_blocker_heartbeat_is_live(state),
+        Err(_) => Ok(false),
+    };
     match (checkpoint_result, rearm_result) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(()), Ok(())) => Ok(data_version_after? != data_version_before || !heartbeat_live?),
         (Err(checkpoint_error), Ok(())) => Err(checkpoint_error),
         (Ok(()), Err(rearm_error)) => Err(rearm_error),
         (Err(checkpoint_error), Err(rearm_error)) => {
@@ -165,7 +200,11 @@ async fn checkpoint_shadow_after_durable_sync(
     webhook_sender: Arc<WebhookSender>,
     drain_timeout: Duration,
     checkpoint_mode: ShadowCheckpointMode,
-) -> Result<()> {
+) -> Result<bool> {
+    // `data_version` is connection-local and changes only when another
+    // connection commits. Read it before the final copy so any app commit that
+    // can race the drain/checkpoint boundary is detected after reactivation.
+    let data_version_before = checkpoint_data_version(state)?;
     let (frames, new_offset) = state
         .shadow
         .copy_frames(state.wal_copy_offset)
@@ -220,9 +259,10 @@ async fn checkpoint_shadow_after_durable_sync(
 
     apply_shadow_sync_result_to_state(state, &output).await?;
 
-    checkpoint_with_state_blocker(state, checkpoint_mode)
-        .await
-        .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
+    let checkpoint_window_dirty =
+        checkpoint_with_state_blocker(state, checkpoint_mode, data_version_before)
+            .await
+            .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
 
     let cleanup_before_gen = state.shadow_sync_generation;
     if cleanup_before_gen > 0 {
@@ -233,7 +273,7 @@ async fn checkpoint_shadow_after_durable_sync(
             .with_context(|| format!("{}: shadow cleanup failed", state.name))?;
     }
 
-    Ok(())
+    Ok(checkpoint_window_dirty)
 }
 
 async fn live_wal_page_count(wal_path: &std::path::Path) -> Result<u64> {
@@ -257,6 +297,52 @@ async fn live_wal_page_count(wal_path: &std::path::Path) -> Result<u64> {
     }
 
     Ok(metadata.len().saturating_sub(32) / (page_size + 24))
+}
+
+async fn reanchor_after_dirty_checkpoint(
+    state: &mut ShadowDbState,
+    target: DirectShadowSyncTarget,
+    retry_policy: &RetryPolicy,
+    webhook_sender: &Arc<WebhookSender>,
+) -> Result<()> {
+    tracing::error!(
+        "{}: application commit crossed walrust's controlled checkpoint window; re-anchoring with a fresh snapshot",
+        state.name
+    );
+    let mut db_state = DbState {
+        name: state.name.clone(),
+        db_path: state.db_path.clone(),
+        wal_path: state.wal_path.clone(),
+        wal_offset: 0,
+        wal_generation: state.shadow.generation(),
+        current_txid: state.current_txid,
+        last_snapshot: state.last_snapshot,
+        db_checksum: state.db_checksum,
+        wal_salt: None,
+        wal_checksum_chain: None,
+    };
+    take_snapshot_with_retry_and_rearm(
+        &target.client,
+        &target.bucket_name,
+        &target.prefix,
+        &mut db_state,
+        state,
+        retry_policy,
+        webhook_sender,
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "{}: failed to protect dirty controlled-checkpoint window",
+            state.name
+        )
+    })??;
+
+    state.current_txid = db_state.current_txid;
+    state.last_snapshot = db_state.last_snapshot;
+    state.db_checksum = db_state.db_checksum;
+    save_shadow_progress(state)?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -299,12 +385,12 @@ async fn enforce_wal_backpressure(
         )
         .await;
 
-    checkpoint_shadow_after_durable_sync(
+    let checkpoint_window_dirty = checkpoint_shadow_after_durable_sync(
         state,
         cache_state,
-        direct_target,
+        direct_target.clone(),
         retry_policy,
-        webhook_sender,
+        Arc::clone(&webhook_sender),
         drain_timeout,
         ShadowCheckpointMode::Truncate,
     )
@@ -315,6 +401,16 @@ async fn enforce_wal_backpressure(
             state.name
         )
     })?;
+
+    if checkpoint_window_dirty {
+        let target = direct_target.ok_or_else(|| {
+            anyhow!(
+                "{}: controlled checkpoint raced an app commit but no direct snapshot target is available",
+                state.name
+            )
+        })?;
+        reanchor_after_dirty_checkpoint(state, target, retry_policy, &webhook_sender).await?;
+    }
 
     Ok(true)
 }
@@ -573,6 +669,9 @@ pub async fn watch_with_shadow(
                 return Err(e);
             }
         };
+        let data_version_monitor = Connection::open(db_path)
+            .with_context(|| format!("{}: failed to open CLI data_version monitor", name))?;
+        data_version_monitor.busy_timeout(Duration::from_secs(5))?;
         let checkpoint_blocker = ShadowWal::open_checkpoint_blocker(db_path)
             .with_context(|| format!("{}: failed to open CLI checkpoint blocker", name))?;
 
@@ -638,11 +737,23 @@ pub async fn watch_with_shadow(
                 db_checksum,
                 shadow,
                 checkpoint_blocker: Some(checkpoint_blocker),
+                data_version_monitor: Some(data_version_monitor),
                 shadow_sync_generation,
                 shadow_sync_offset,
                 wal_copy_offset: restored_wal_copy_offset,
             },
         );
+        let state = db_states
+            .get_mut(db_path)
+            .expect("shadow state inserted above");
+        if !checkpoint_blocker_heartbeat_is_live(state)? {
+            rearm_checkpoint_blocker(state).with_context(|| {
+                format!(
+                    "{}: failed to verify initial CLI checkpoint blocker",
+                    state.name
+                )
+            })?;
+        }
 
         trigger_states.insert(db_path.clone(), TriggerState::default());
         sync_configs.insert(db_path.clone(), db_config.sync.clone());
@@ -1199,19 +1310,23 @@ pub async fn watch_with_shadow(
                             estimated_frames
                         );
 
-                        if let Err(e) = checkpoint_shadow_after_durable_sync(
+                        let direct_target = DirectShadowSyncTarget {
+                            client: Arc::clone(&client),
+                            bucket_name: bucket_name.clone(),
+                            prefix: prefix.clone(),
+                        };
+                        let checkpoint_result = checkpoint_shadow_after_durable_sync(
                             state,
                             cache_states.get(db_path),
-                            Some(DirectShadowSyncTarget {
-                                client: Arc::clone(&client),
-                                bucket_name: bucket_name.clone(),
-                                prefix: prefix.clone(),
-                            }),
+                            Some(direct_target.clone()),
                             &retry_policy,
                             Arc::clone(&webhook_sender),
                             CHECKPOINT_UPLOAD_DRAIN_TIMEOUT,
                             ShadowCheckpointMode::Passive,
-                        ).await {
+                        ).await;
+                        let checkpoint_window_dirty = match checkpoint_result {
+                            Ok(dirty) => dirty,
+                            Err(e) => {
                             tracing::error!("{}: Shadow checkpoint failed: {}", state.name, e);
                             webhook_sender
                                 .notify_upload_failed(&state.name, &e.to_string(), 1)
@@ -1220,6 +1335,15 @@ pub async fn watch_with_shadow(
                                 "{}: shadow checkpoint failed",
                                 state.name
                             )));
+                            }
+                        };
+                        if checkpoint_window_dirty {
+                            reanchor_after_dirty_checkpoint(
+                                state,
+                                direct_target,
+                                &retry_policy,
+                                &webhook_sender,
+                            ).await?;
                         }
 
                         tracing::debug!("{}: Shadow checkpoint completed", state.name);
@@ -1594,6 +1718,7 @@ mod tests {
                 db_checksum: None,
                 shadow,
                 checkpoint_blocker: None,
+                data_version_monitor: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: 0,
@@ -1661,6 +1786,7 @@ mod tests {
                 db_checksum: None,
                 shadow,
                 checkpoint_blocker: None,
+                data_version_monitor: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: 0,
@@ -1738,6 +1864,7 @@ mod tests {
                 db_checksum: None,
                 shadow,
                 checkpoint_blocker: None,
+                data_version_monitor: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: frame_size,
                 wal_copy_offset: 0,
@@ -1790,7 +1917,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_shadow_checkpoint_copies_syncs_and_waits_for_cache_upload() {
+    async fn test_shadow_checkpoint_detects_app_commit_after_durable_copy() {
         let (_temp, db_path, _conn) = create_real_wal_db();
         let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
             .await
@@ -1805,6 +1932,7 @@ mod tests {
             db_checksum: None,
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -1813,15 +1941,25 @@ mod tests {
         let cache = Arc::new(LocalCache::new(&db_path).unwrap());
         let (upload_tx, mut upload_rx) = mpsc::channel(10);
         let ack_cache = Arc::clone(&cache);
+        let late_write_db = db_path.clone();
         let ack_handle = tokio::spawn(async move {
             match upload_rx.recv().await {
-                Some(UploadMessage::Upload(txid)) => ack_cache.mark_uploaded(txid).unwrap(),
+                Some(UploadMessage::Upload(txid)) => {
+                    let app = Connection::open(late_write_db).unwrap();
+                    app.execute(
+                        "INSERT INTO items (value) VALUES ('commit-after-durable-copy')",
+                        [],
+                    )
+                    .unwrap();
+                    drop(app);
+                    ack_cache.mark_uploaded(txid).unwrap();
+                }
                 other => panic!("expected upload notification, got {other:?}"),
             }
         });
         let cache_state = (Arc::clone(&cache), upload_tx);
 
-        checkpoint_shadow_after_durable_sync(
+        let checkpoint_window_dirty = checkpoint_shadow_after_durable_sync(
             &mut state,
             Some(&cache_state),
             None,
@@ -1833,6 +1971,10 @@ mod tests {
         .await
         .unwrap();
         ack_handle.await.unwrap();
+        assert!(
+            checkpoint_window_dirty,
+            "an app commit after the durable shadow copy must force a snapshot re-anchor"
+        );
 
         assert!(
             state.wal_copy_offset > 0,
@@ -1876,6 +2018,7 @@ mod tests {
             db_checksum: None,
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -1962,6 +2105,7 @@ mod tests {
             db_checksum: None,
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -2034,6 +2178,7 @@ mod tests {
                 db_checksum: None,
                 shadow,
                 checkpoint_blocker: None,
+                data_version_monitor: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: offset,
@@ -2088,6 +2233,7 @@ mod tests {
                 db_checksum: None,
                 shadow,
                 checkpoint_blocker: None,
+                data_version_monitor: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: offset,

@@ -27,8 +27,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   database, so application autocheckpoints, explicit TRUNCATE checkpoints, and
   short-lived writer sessions cannot erase unread WAL frames. Walrust's own
   checkpoint path durably drains shadow data before the blocker is released and
-  reacquires it immediately afterward. The blocker makes walrust responsible
-  for WAL growth: crossing `wal_truncate_threshold_pages` now emits an ERROR and
+  reacquires it immediately afterward. A lifetime `PRAGMA data_version` monitor
+  plus live-heartbeat-frame verification detects an app commit/reset in the
+  controlled release window and conditionally re-anchors instead of losing it.
+  The blocker makes walrust responsible for WAL growth: crossing
+  `wal_truncate_threshold_pages` now emits an ERROR and
   a `wal_size_exceeded` webhook, durably drains, then runs a controlled TRUNCATE
   instead of letting the WAL bloat silently.
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now

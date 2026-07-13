@@ -4,7 +4,9 @@ use crate::errors::WalrustError;
 use crate::legacy_cache::LocalCache;
 use crate::legacy_shadow::{ShadowSyncInput, ShadowSyncOutput};
 use crate::shadow::ShadowWal;
-use crate::wal::FRAME_HEADER_SIZE;
+use crate::wal::{
+    validate_header_checksum, verify_frame_checksum, FRAME_HEADER_SIZE, WAL_MAGIC_BE, WAL_MAGIC_LE,
+};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -54,6 +56,10 @@ pub struct ShadowWatchState {
     /// CLI shadow watch's explicitly owned checkpoint blocker. This connection
     /// lives with the per-database watch state rather than the file tailer.
     pub checkpoint_blocker: Option<rusqlite::Connection>,
+    /// Lifetime connection used only for `PRAGMA data_version`. Unlike the
+    /// replaceable blocker, this handle never closes during watch, so it can
+    /// detect app commits across controlled release/reacquire windows.
+    pub data_version_monitor: Option<rusqlite::Connection>,
     pub shadow_sync_generation: u64,
     pub shadow_sync_offset: u64,
     pub wal_copy_offset: u64,
@@ -62,10 +68,9 @@ pub struct ShadowWatchState {
 /// Replace CLI shadow watch's checkpoint blocker after all one-shot SQLite
 /// connections for a controlled operation have closed.
 ///
-/// POSIX advisory locks are process-scoped. The old connection must be rolled
-/// back and dropped before the replacement opens; otherwise closing the old
-/// handle can erase the replacement's kernel lock as observed by external app
-/// processes.
+/// POSIX advisory locks are process-scoped. The old connection must close
+/// before `open_checkpoint_blocker` writes and pins a fresh committed heartbeat;
+/// this proven primitive is the final source-DB handle opened in the process.
 pub fn rearm_checkpoint_blocker(state: &mut ShadowWatchState) -> Result<()> {
     let old_blocker = state
         .checkpoint_blocker
@@ -75,10 +80,127 @@ pub fn rearm_checkpoint_blocker(state: &mut ShadowWatchState) -> Result<()> {
         old_blocker.execute_batch("ROLLBACK;")?;
     }
     drop(old_blocker);
+    for attempt in 1..=3 {
+        state.checkpoint_blocker = Some(ShadowWal::open_checkpoint_blocker(&state.db_path)?);
+        if checkpoint_blocker_heartbeat_is_live(state)? {
+            tracing::info!("{}: CLI checkpoint blocker rearmed", state.name);
+            return Ok(());
+        }
+        tracing::error!(
+            "{}: checkpoint blocker heartbeat was reset in the release/reacquire window (attempt {}/3)",
+            state.name,
+            attempt
+        );
+        let failed_blocker = state
+            .checkpoint_blocker
+            .take()
+            .expect("blocker was assigned above");
+        if !failed_blocker.is_autocommit() {
+            failed_blocker.execute_batch("ROLLBACK;")?;
+        }
+        drop(failed_blocker);
+    }
+    Err(anyhow!(
+        "{}: checkpoint blocker heartbeat was reset during all rearm attempts",
+        state.name
+    ))
+}
 
-    state.checkpoint_blocker = Some(ShadowWal::open_checkpoint_blocker(&state.db_path)?);
-    tracing::info!("{}: CLI checkpoint blocker rearmed", state.name);
-    Ok(())
+pub fn checkpoint_data_version(state: &ShadowWatchState) -> Result<i64> {
+    let monitor = state
+        .data_version_monitor
+        .as_ref()
+        .ok_or_else(|| anyhow!("{}: CLI data_version monitor was not held", state.name))?;
+    Ok(monitor.query_row("PRAGMA data_version;", [], |row| row.get(0))?)
+}
+
+/// Verify that the replacement blocker's heartbeat is still a live frame in
+/// the current WAL generation. Once this returns true, the active read mark
+/// prevents a later reset. A checkpoint that slipped between heartbeat COMMIT
+/// and BEGIN removes that frame (or changes the WAL salt), so callers must
+/// retry/re-anchor rather than trust the gap.
+pub fn checkpoint_blocker_heartbeat_is_live(state: &ShadowWatchState) -> Result<bool> {
+    let blocker = state
+        .checkpoint_blocker
+        .as_ref()
+        .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
+    let root_page: u32 = blocker.query_row(
+        "SELECT rootpage FROM sqlite_schema WHERE name = '_walrust_seq' AND type = 'table'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let wal = match std::fs::read(&state.wal_path) {
+        Ok(wal) => wal,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if wal.len() < 32 {
+        return Ok(false);
+    }
+    let header: [u8; 32] = wal[0..32].try_into().expect("32-byte WAL header");
+    let magic = u32::from_be_bytes(header[0..4].try_into().expect("four-byte WAL magic"));
+    if magic != WAL_MAGIC_LE && magic != WAL_MAGIC_BE {
+        return Err(anyhow!(
+            "{}: invalid WAL magic while verifying checkpoint blocker: {magic:#x}",
+            state.name
+        ));
+    }
+    let page_size = u32::from_be_bytes(header[8..12].try_into().expect("four-byte page size"));
+    if page_size < 512 || page_size > 65_536 || !page_size.is_power_of_two() {
+        return Err(anyhow!(
+            "{}: invalid WAL page size while verifying checkpoint blocker: {}",
+            state.name,
+            page_size
+        ));
+    }
+    let big_endian = magic == WAL_MAGIC_BE;
+    let mut checksum = validate_header_checksum(&header, big_endian)?;
+    let salt1 = &header[16..20];
+    let salt2 = &header[20..24];
+    let frame_size = 24usize + page_size as usize;
+    let mut root_frame_pending_commit = false;
+    for frame in wal[32..].chunks_exact(frame_size) {
+        let frame_header: [u8; 24] = frame[0..24].try_into().expect("24-byte frame header");
+        if &frame_header[8..12] != salt1 || &frame_header[12..16] != salt2 {
+            return Err(anyhow!(
+                "{}: WAL frame salt changed while verifying checkpoint blocker",
+                state.name
+            ));
+        }
+        checksum = verify_frame_checksum(
+            checksum,
+            &frame_header,
+            &frame[24..24 + page_size as usize],
+            big_endian,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "{}: WAL frame checksum failed while verifying checkpoint blocker",
+                state.name
+            )
+        })?;
+        if u32::from_be_bytes(
+            frame_header[0..4]
+                .try_into()
+                .expect("four-byte page number"),
+        ) == root_page
+        {
+            root_frame_pending_commit = true;
+        }
+        let db_size = u32::from_be_bytes(
+            frame_header[4..8]
+                .try_into()
+                .expect("four-byte commit size"),
+        );
+        if db_size != 0 {
+            if root_frame_pending_commit {
+                return Ok(true);
+            }
+            root_frame_pending_commit = false;
+        }
+    }
+    Ok(false)
 }
 
 pub fn shadow_progress_path(shadow_dir: &Path) -> PathBuf {
@@ -481,6 +603,7 @@ mod tests {
             db_checksum: None,
             shadow,
             checkpoint_blocker: None,
+            data_version_monitor: None,
             shadow_sync_generation: 0,
             shadow_sync_offset: gen0_segment.len() as u64,
             wal_copy_offset: 0,

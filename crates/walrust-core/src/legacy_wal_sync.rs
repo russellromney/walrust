@@ -584,31 +584,32 @@ pub async fn take_snapshot_to_storage(
     prefix: &str,
     input: SyncInput,
 ) -> Result<SyncOutput> {
-    take_snapshot_to_storage_with_post_encode(storage, prefix, input, || Ok(())).await
+    take_snapshot_to_storage_with_source_close_hook(storage, prefix, input, || Ok(())).await
 }
 
-/// Take a snapshot and run `post_encode` after every SQLite connection used by
-/// the snapshot has closed, but before the encoded bytes are uploaded.
+/// Take a snapshot and run `post_source_close` after each SQLite connection
+/// used against the source database has closed.
 ///
-/// CLI shadow watch uses this boundary to re-establish its process-visible
+/// CLI shadow watch uses these boundaries to re-establish its process-visible
 /// checkpoint blocker. On POSIX, closing any SQLite connection in the process
-/// can release that process's database locks, so waiting until after the upload
-/// would leave an unprotected network-sized window.
-pub async fn take_snapshot_to_storage_with_post_encode<F>(
+/// can release that process's database locks, so waiting until after snapshot
+/// encoding or upload would leave an unprotected database/CPU/network-sized
+/// window.
+pub async fn take_snapshot_to_storage_with_source_close_hook<F>(
     storage: &dyn StorageBackend,
     prefix: &str,
     input: SyncInput,
-    post_encode: F,
+    post_source_close: F,
 ) -> Result<SyncOutput>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnMut() -> Result<()>,
 {
-    let snapshot = snapshot_database_to_storage_with_post_encode(
+    let snapshot = snapshot_database_to_storage_with_source_close_hook(
         storage,
         prefix,
         &input.name,
         &input.db_path,
-        post_encode,
+        post_source_close,
     )
     .await?;
 
@@ -637,18 +638,19 @@ pub async fn snapshot_database_to_storage(
     name: &str,
     database: &Path,
 ) -> Result<SnapshotUploadOutput> {
-    snapshot_database_to_storage_with_post_encode(storage, prefix, name, database, || Ok(())).await
+    snapshot_database_to_storage_with_source_close_hook(storage, prefix, name, database, || Ok(()))
+        .await
 }
 
-pub async fn snapshot_database_to_storage_with_post_encode<F>(
+pub async fn snapshot_database_to_storage_with_source_close_hook<F>(
     storage: &dyn StorageBackend,
     prefix: &str,
     name: &str,
     database: &Path,
-    post_encode: F,
+    mut post_source_close: F,
 ) -> Result<SnapshotUploadOutput>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnMut() -> Result<()>,
 {
     // Discover remote state before opening the one-shot SQLite checkpoint
     // connection. If discovery is slow, the currently held blocker remains
@@ -667,15 +669,18 @@ where
     // completeness-checked TRUNCATE fold before calling this (see
     // `sync::prune::snapshot`).
     checkpoint_wal_passive(database).await?;
+    // The PASSIVE helper opened and closed the source DB. Restore any
+    // process-scoped locks before the stable-copy connection opens.
+    post_source_close()?;
 
     let page_size = get_page_size(database).await?;
 
     let db_path_for_encode = database.to_path_buf();
     let db_name_for_error = name.to_string();
-    let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
-        ltx::encode_sqlite_snapshot_to_vec(&db_path_for_encode, page_size, new_txid).map_err(|e| {
+    let stable_snapshot = tokio::task::spawn_blocking(move || {
+        ltx::StableSqliteSnapshot::create(&db_path_for_encode).map_err(|e| {
             anyhow::anyhow!(
-                "{}: Snapshot encode failed for {}: {}",
+                "{}: Stable SQLite copy failed for {}: {}",
                 db_name_for_error,
                 db_path_for_encode.display(),
                 e
@@ -684,9 +689,16 @@ where
     })
     .await??;
 
-    // The encoder and checkpoint helper have both dropped their SQLite handles.
-    // Rearm process-scoped locks before the potentially slow storage upload.
-    post_encode()?;
+    // VACUUM INTO has now closed its source-DB connection. Rearm before the
+    // potentially long stable-image encode and storage upload.
+    post_source_close()?;
+
+    let db_name_for_error = name.to_string();
+    let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
+        ltx::encode_stable_sqlite_snapshot_to_vec(stable_snapshot, page_size, new_txid)
+            .map_err(|e| anyhow::anyhow!("{}: Snapshot encode failed: {}", db_name_for_error, e))
+    })
+    .await??;
 
     let ltx_size = ltx_buffer.len() as u64;
     storage.put(&ltx_key, &ltx_buffer).await?;

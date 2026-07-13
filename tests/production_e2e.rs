@@ -463,25 +463,26 @@ fn watch_log(log_path: &Path) -> String {
 
 fn wait_for_cli_startup_rearms(log_path: &Path, child: &mut Child) -> Result<()> {
     let deadline = Instant::now() + e2e_poll_deadline(30);
-    while watch_log(log_path)
-        .matches("CLI checkpoint blocker rearmed")
-        .count()
-        < 2
-    {
+    loop {
+        let log = watch_log(log_path);
+        let rearm_count = log.matches("CLI checkpoint blocker rearmed").count();
+        let snapshot_count = log.matches("LTX snapshot uploaded").count();
+        if rearm_count >= 4 && snapshot_count >= 2 {
+            return Ok(());
+        }
         if let Some(status) = child.try_wait()? {
             anyhow::bail!(
-                "watch exited before both startup blocker rearms ({status}):\n{}",
-                watch_log(log_path)
+                "watch exited before both startup snapshots and their blocker rearms \
+                 ({status}, snapshots={snapshot_count}, rearms={rearm_count}):\n{log}"
             );
         }
         anyhow::ensure!(
             Instant::now() < deadline,
-            "timed out waiting for both startup blocker rearms:\n{}",
-            watch_log(log_path)
+            "timed out waiting for both startup snapshots and their blocker rearms \
+             (snapshots={snapshot_count}, rearms={rearm_count}):\n{log}"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
-    Ok(())
 }
 
 fn assert_no_shadow_reanchors_or_snapshot_storm(log_path: &Path) -> Result<()> {

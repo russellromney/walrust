@@ -154,6 +154,7 @@ async fn legacy_shadow_multi_db_sync_apply_is_owned_by_core() -> Result<()> {
             db_checksum: None,
             shadow,
             checkpoint_blocker: None,
+            data_version_monitor: None,
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,

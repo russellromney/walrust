@@ -540,16 +540,6 @@ impl ShadowWal {
         self.checkpoint_with_mode("TRUNCATE").await
     }
 
-    /// Run a PASSIVE checkpoint when the caller owns the blocker lifecycle.
-    pub async fn checkpoint_unblocked(&mut self) -> Result<()> {
-        self.execute_checkpoint("PASSIVE")
-    }
-
-    /// Run a TRUNCATE checkpoint when the caller owns the blocker lifecycle.
-    pub async fn checkpoint_truncate_unblocked(&mut self) -> Result<()> {
-        self.execute_checkpoint("TRUNCATE")
-    }
-
     async fn checkpoint_with_mode(&mut self, mode: &'static str) -> Result<()> {
         // Release checkpoint blocker
         if let Some(blocker) = self.checkpoint_blocker.take() {
@@ -872,6 +862,61 @@ mod tests {
         );
 
         blocker.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_blocker_data_version_detects_only_other_connection_commits() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("data-version.db");
+        let setup = Connection::open(&db_path).unwrap();
+        setup
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE app_data (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+        drop(setup);
+
+        let monitor = Connection::open(&db_path).unwrap();
+        let before: i64 = monitor
+            .query_row("PRAGMA data_version;", [], |row| row.get(0))
+            .unwrap();
+        monitor
+            .execute("INSERT INTO app_data (id, value) VALUES (1, 'monitor')", [])
+            .unwrap();
+        let after_own_commit: i64 = monitor
+            .query_row("PRAGMA data_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after_own_commit, before,
+            "a connection's own commit must not dirty its connection-local data_version"
+        );
+
+        let app = Connection::open(&db_path).unwrap();
+        app.execute(
+            "INSERT INTO app_data (id, value) VALUES (2, 'external')",
+            [],
+        )
+        .unwrap();
+        drop(app);
+        let after_app_commit: i64 = monitor
+            .query_row("PRAGMA data_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(
+            after_app_commit, after_own_commit,
+            "another connection's commit must dirty the checkpoint-window detector"
+        );
+
+        monitor
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |_| Ok(()))
+            .unwrap();
+        let after_own_checkpoint: i64 = monitor
+            .query_row("PRAGMA data_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after_own_checkpoint, after_app_commit,
+            "a checkpoint on the monitored connection must not dirty its own data_version"
+        );
     }
 
     #[tokio::test]

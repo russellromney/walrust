@@ -7,7 +7,9 @@ use std::sync::Arc;
 use crate::dashboard::{DbStatus, MetricsState};
 use crate::retry::{classify_error, ErrorKind, RetryPolicy};
 use crate::webhook::WebhookSender;
-use walrust_core::legacy_shadow_watch::rearm_checkpoint_blocker;
+use walrust_core::legacy_shadow_watch::{
+    checkpoint_blocker_heartbeat_is_live, checkpoint_data_version, rearm_checkpoint_blocker,
+};
 use walrust_core::legacy_wal_sync::{
     apply_sync_output_to_watched_state, sync_watched_db_once_to_cache, WatchedDbState,
 };
@@ -334,18 +336,38 @@ pub(crate) async fn take_snapshot_with_retry_and_rearm(
 
     loop {
         attempts += 1;
-        let post_encode_rearmed = Cell::new(false);
-        let snapshot_result = take_snapshot_with_post_encode(client, bucket, prefix, state, || {
-            rearm_checkpoint_blocker(shadow_state)?;
-            post_encode_rearmed.set(true);
-            Ok(())
-        })
-        .await;
+        let source_close_rearms = Cell::new(0u8);
+        let safe_data_version = Cell::new(checkpoint_data_version(shadow_state)?);
+        let snapshot_result =
+            take_snapshot_with_source_close_hook(client, bucket, prefix, state, || {
+                let rearm_count = source_close_rearms.get() + 1;
+                source_close_rearms.set(rearm_count);
+                let current_data_version = checkpoint_data_version(shadow_state)?;
+                let stable_copy_dirty =
+                    rearm_count == 2 && current_data_version != safe_data_version.get();
+                // Rearm even when the stable-copy window was dirty; retry
+                // classification/backoff must always run with a live blocker.
+                rearm_checkpoint_blocker(shadow_state)?;
+                let heartbeat_live = checkpoint_blocker_heartbeat_is_live(shadow_state)?;
+                if rearm_count == 1 {
+                    // The stable copy starts after this boundary, so commits
+                    // already visible here will be included by VACUUM INTO.
+                    safe_data_version.set(checkpoint_data_version(shadow_state)?);
+                } else if stable_copy_dirty || !heartbeat_live {
+                    anyhow::bail!(
+                        "{}: snapshot blocker window was dirty or its heartbeat frame was reset; retrying before upload",
+                        db_name
+                    );
+                }
+                Ok(())
+            })
+            .await;
 
-        // Failures before the post-encode boundary (including encode failures)
-        // still close one-shot SQLite handles. Restore the blocker immediately,
-        // before classifying the error or sleeping for a retry.
-        if !post_encode_rearmed.get() {
+        // A failed checkpoint or stable copy can close a source-DB handle before
+        // its matching callback runs. Restore the blocker immediately, before
+        // classifying the error or sleeping for a retry. Once both callbacks
+        // ran, later encode/upload failures cannot erase the source DB lock.
+        if source_close_rearms.get() < 2 {
             rearm_checkpoint_blocker(shadow_state)?;
         }
 
@@ -402,26 +424,26 @@ pub(crate) async fn take_snapshot(
     prefix: &str,
     state: &mut DbState,
 ) -> Result<()> {
-    take_snapshot_with_post_encode(client, bucket, prefix, state, || Ok(())).await
+    take_snapshot_with_source_close_hook(client, bucket, prefix, state, || Ok(())).await
 }
 
-async fn take_snapshot_with_post_encode<F>(
+async fn take_snapshot_with_source_close_hook<F>(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
     state: &mut DbState,
-    post_encode: F,
+    source_close_hook: F,
 ) -> Result<()>
 where
-    F: FnOnce() -> Result<()>,
+    F: FnMut() -> Result<()>,
 {
     let timestamp = Utc::now();
     let storage = S3Storage::new(client.clone(), bucket.to_string());
-    let output = walrust_core::legacy_wal_sync::take_snapshot_to_storage_with_post_encode(
+    let output = walrust_core::legacy_wal_sync::take_snapshot_to_storage_with_source_close_hook(
         &storage,
         prefix,
         SyncInput::from(&*state),
-        post_encode,
+        source_close_hook,
     )
     .await?;
 

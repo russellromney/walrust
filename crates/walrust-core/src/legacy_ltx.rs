@@ -30,9 +30,21 @@ pub fn encode_sqlite_snapshot_to_vec(
     page_size: u32,
     txid: u64,
 ) -> Result<(Vec<u8>, Checksum)> {
-    let db_size = std::fs::metadata(db_path)?.len() as usize;
+    let snapshot = StableSqliteSnapshot::create(db_path)?;
+    encode_stable_sqlite_snapshot_to_vec(snapshot, page_size, txid)
+}
+
+/// Encode an already-created stable SQLite copy. Keeping stable-copy creation
+/// separate lets callers re-establish process-scoped locks as soon as the
+/// source database connection closes, before this potentially long CPU pass.
+pub(crate) fn encode_stable_sqlite_snapshot_to_vec(
+    snapshot: StableSqliteSnapshot,
+    page_size: u32,
+    txid: u64,
+) -> Result<(Vec<u8>, Checksum)> {
+    let db_size = std::fs::metadata(snapshot.path())?.len() as usize;
     let mut buffer = Vec::with_capacity(db_size.saturating_mul(2));
-    let checksum = encode_sqlite_snapshot(&mut buffer, db_path, page_size, txid)?;
+    let checksum = encode_snapshot_with_checksum(&mut buffer, snapshot.path(), page_size, txid)?;
     Ok((buffer, checksum))
 }
 
@@ -98,12 +110,12 @@ pub fn encode_snapshot_with_checksum<W: Write>(
     Ok(checksum)
 }
 
-struct StableSqliteSnapshot {
+pub(crate) struct StableSqliteSnapshot {
     path: PathBuf,
 }
 
 impl StableSqliteSnapshot {
-    fn create(source: &Path) -> Result<Self> {
+    pub(crate) fn create(source: &Path) -> Result<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
         let parent = source.parent().unwrap_or_else(|| Path::new("."));
@@ -133,7 +145,7 @@ impl StableSqliteSnapshot {
         Ok(Self { path })
     }
 
-    fn path(&self) -> &Path {
+    pub(crate) fn path(&self) -> &Path {
         &self.path
     }
 }
