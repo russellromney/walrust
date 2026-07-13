@@ -673,6 +673,78 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    #[test]
+    fn test_checkpoint_blocker_prevents_concurrent_truncate_across_supported_wal_configs() {
+        let dir = tempdir().unwrap();
+
+        for page_size in [512u32, 1024, 2048, 4096, 8192, 16384, 32768, 65536] {
+            for synchronous in ["OFF", "NORMAL", "FULL", "EXTRA"] {
+                let db_path = dir
+                    .path()
+                    .join(format!("blocker-{page_size}-{synchronous}.db"));
+                let wal_path = db_path.with_extension("db-wal");
+                let app = Connection::open(&db_path).unwrap();
+                app.execute_batch(&format!(
+                    "
+                    PRAGMA page_size={page_size};
+                    PRAGMA journal_mode=WAL;
+                    PRAGMA synchronous={synchronous};
+                    PRAGMA wal_autocheckpoint=0;
+                    PRAGMA busy_timeout=0;
+                    CREATE TABLE app_data (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                    INSERT INTO app_data (value) VALUES ('before-blocker');
+                    "
+                ))
+                .unwrap();
+
+                let blocker = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+
+                // This commit lands after the blocker's pinned read-mark. It is the
+                // unread work a concurrent application checkpoint must not erase.
+                app.execute("INSERT INTO app_data (value) VALUES ('after-blocker')", [])
+                    .unwrap();
+                let wal_size_before = std::fs::metadata(&wal_path).unwrap().len();
+                assert!(
+                    wal_size_before > 0,
+                    "test setup must create a WAL for page_size={page_size}, synchronous={synchronous}"
+                );
+
+                let (busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = app
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    busy, 1,
+                    "checkpoint blocker must make concurrent TRUNCATE report busy for page_size={page_size}, synchronous={synchronous}"
+                );
+                assert_eq!(
+                    std::fs::metadata(&wal_path).unwrap().len(),
+                    wal_size_before,
+                    "blocked TRUNCATE must preserve the WAL for page_size={page_size}, synchronous={synchronous}"
+                );
+
+                blocker.execute_batch("ROLLBACK;").unwrap();
+                drop(blocker);
+
+                let (busy, _log_frames, _checkpointed_frames): (i64, i64, i64) = app
+                    .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                assert_eq!(
+                    busy, 0,
+                    "TRUNCATE must succeed after releasing the blocker for page_size={page_size}, synchronous={synchronous}"
+                );
+                assert_eq!(
+                    std::fs::metadata(&wal_path).unwrap().len(),
+                    0,
+                    "successful TRUNCATE must empty the WAL for page_size={page_size}, synchronous={synchronous}"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn test_shadow_dir_path() {
         let db_path = PathBuf::from("/data/myapp.db");
