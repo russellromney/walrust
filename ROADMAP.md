@@ -116,11 +116,168 @@ Order of work (each lands as its own PR through the normal gate):
   then death). Loud, but wrong reaction: an ephemeral-connection writer (shell
   scripts, cron jobs) is normal user behavior, and this is the same event
   class as the downtime-checkpoint / rollover races walrust already survives
-  by re-anchoring. Watch should treat invalid-magic/zero-length WAL as a
-  re-anchor trigger (loud WARN + snapshot re-anchor, like the salt-mismatch
-  path), never process death. Drills never caught it because every drill
-  driver holds one long-lived connection. Needs: repro test with an
-  ephemeral-connection writer, the re-anchor fix, and a revert-proof test.
+  by re-anchoring. Drills never caught it because every drill driver holds one
+  long-lived connection.
+  **DF1 and DF2 are now understood as symptoms of the architectural gap in the
+  "Lossless watch" section below — do not fix them in isolation.** PR #41
+  (re-anchor-after-the-fact) is held unmerged: it makes data safe but treats
+  the symptom and pays a full snapshot per event (the R5 storm). The root fix
+  is holding the checkpoint blocker so the WAL is never lost in the first
+  place.
+
+- **DF2 — shadow watch SILENTLY stops replicating short-lived-session writes
+  after the startup passive checkpoint.** Found 2026-07-11 by the fresh-user
+  drill (PR #40), reproduced 4/4 on 0.7.0. Same ephemeral-writer WAL lifecycle
+  as DF1, worse symptom: `list`/`verify` look healthy, restore silently
+  returns the day-one snapshot (silent wrong data — the worst failure class).
+  Also a symptom of the gap below.
+
+---
+
+## Lossless watch: adopt the checkpoint-blocker model (the litestream contract)
+
+**This is the key correctness issue for walrust as a litestream replacement.**
+Surfaced by dogfooding (DF1/DF2) and confirmed at the primitive level with a
+direct SQLite probe.
+
+### Current state (the problem, with evidence)
+
+walrust's CLI `watch` is built on a checkpoint race it can lose. A SQLite
+checkpoint folds WAL frames into the main `.db` and can reset/truncate the
+`-wal` file. If that happens **before** walrust has read those frames, they are
+gone from the sync stream. Measured directly:
+
+```
+[file-tailer, no held reader]  WAL 12392B -> 0B after an app wal_checkpoint(TRUNCATE)  => unread frames GONE
+[held read-mark]               WAL 12392B -> 12392B, checkpoint returns busy=1        => BLOCKED, frames preserved
+```
+
+Three ways the race bites, all the same root: an app autocheckpoint burst
+(default 1000 pages) between walrust polls; an explicit app
+`wal_checkpoint(TRUNCATE)`; an ephemeral-connection writer whose last-close
+checkpoint deletes the WAL (DF1 = crash on the zeroed WAL, DF2 = silent loss
+when the reset isn't detected). Today walrust survives *most* of these by
+detecting a WAL reset (salt mismatch) and re-anchoring with a full snapshot —
+**lossy-but-recovered**. DF2 is the case the recovery missed.
+
+Per-mode reality (verified in code):
+- **Owned / library mode (`Replicator`) already does it right.** It holds
+  `crate::shadow::ShadowWal::open_checkpoint_blocker` for the DB's lifetime:
+  `wal_autocheckpoint=0`, a `_walrust_seq` heartbeat row, and a `BEGIN DEFERRED`
+  read transaction pinning a real WAL frame — exactly litestream's
+  `_litestream_seq`. The held read-mark is what makes it lossless: another
+  connection's checkpoint cannot truncate past walrust's mark. `sync.rs` already
+  has the controlled `release_checkpoint_blocker` / `reacquire_checkpoint_blocker`
+  dance around walrust's own checkpoints (D2).
+- **CLI shadow mode (`src/sync/watch_shadow.rs`) holds no connection at all.**
+  `ShadowWal::new()` opens no SQLite connection; it tails the `-wal` file on
+  disk. Its "checkpoint" (`checkpoint_shadow_after_durable_sync`) only flushes
+  the shadow segment to S3 — it never checkpoints the real DB. So WAL truncation
+  is entirely at the app's mercy. `git log -S open_checkpoint_blocker` confirms
+  this path has **never** held the blocker (despite an old ledger note claiming
+  "shadow mode uses" it — the note was aspirational).
+- **CLI independent mode (`crates/walrust-core/src/legacy_wal_sync.rs`)** runs
+  `wal_checkpoint(PASSIVE/TRUNCATE)` through **one-shot** `Connection::open`s, so
+  it holds no persistent read-mark either, and by opening/closing may itself
+  trigger last-close checkpoints.
+
+### What must not change
+
+- **Data correctness and every never-weaken test.** This is a durability path.
+- **Restore-side WAL-header strictness** (`wal::read_header`) — watch-side only.
+- **Owned/library mode's existing blocker semantics** (D2) — we are extending
+  the *same* proven mechanism to the CLI, not inventing a second one.
+- **The single-writer / fencing / split-brain guarantees.**
+
+### The fix, phased (each phase its own PR through the full adversarial gate)
+
+- **Phase 0 — prove the primitive on a real DB.** Formalize the probe above as a
+  test: a held `open_checkpoint_blocker` on a real SQLite DB makes a concurrent
+  app `wal_checkpoint(TRUNCATE)` return `busy=1` and preserves the WAL, across
+  every WAL config walrust supports (page sizes, `synchronous` levels). This is
+  the load-bearing assumption; pin it before building on it.
+- **Phase 1 — CLI shadow watch holds the blocker.** Give `ShadowDbState` a
+  persistent `open_checkpoint_blocker` connection per DB, reuse the
+  release/reacquire dance for walrust's own controlled checkpoints, and add
+  **WAL-size backpressure** (see new failure mode below). With the blocker held,
+  the DF1/DF2 e2es must pass with **zero re-anchors and zero storm** — a strictly
+  stronger result than PR #41's. Add an "app-checkpoints-underneath" e2e: an app
+  connection issues `wal_checkpoint(TRUNCATE)` mid-stream and **nothing is lost**.
+- **Phase 2 — CLI independent mode holds the blocker.** Replace its one-shot
+  checkpoint connections with the held blocker + controlled dance; same proofs.
+- **Phase 3 — demote the file-tailer to an explicit, labeled degraded mode.**
+  For the genuine "can't open the DB" case (read-only mount, no write access,
+  strict no-touch policy), keep the connection-free tailer behind an explicit
+  opt-in (e.g. `--file-tailer` / `watch_mode = "file-tailer"`), documented as
+  **best-effort, lossy under checkpoint races, mitigated by resnapshot**. This is
+  where PR #41's surviving machinery lives: `read_header_classified`
+  (missing/zero-length vs nonzero-garbage magic) and the re-anchor-on-reset path
+  become the degraded mode's hardening — not the default's front line. Decide
+  during this phase whether the degraded mode earns its keep at all.
+- **Phase 4 — docs & positioning.** The "lossless like litestream" claim becomes
+  true *and provable*; update README (the ephemeral-writer known-issue note flips
+  once a release ships the fix — until then a crates.io 0.7.0 user is still
+  exposed, so no false safety claim), and the fresh-user drill's DF2 probe flips
+  from "record known-buggy" to "enforce replication."
+
+### The new failure mode this introduces (must be handled, not just accepted)
+
+Once walrust holds the read-mark, **walrust becomes the only thing that can let
+the WAL truncate.** If walrust falls behind or wedges, no one can checkpoint, the
+WAL grows unbounded, and the app's writes eventually slow or stall. This is the
+litestream tradeoff — a strictly *better* failure mode than silent data loss
+("backup is behind, WAL is growing" is loud and observable) but it is a real new
+responsibility. Phase 1 must: bound WAL growth via walrust's own checkpoint
+cadence, and **alarm loudly (webhook + error log) when the WAL exceeds a
+threshold** rather than let it bloat silently. Register this as the explicit cost
+of the model in the docs, next to the `_walrust_seq` write (shadow mode stops
+being "zero-touch": it opens the DB and writes one heartbeat row, exactly as
+litestream does — call it out plainly for operators).
+
+### Known traps (greppable)
+
+- **Wrong:** disabling the app's autocheckpoint to stop truncation. You can't —
+  `wal_autocheckpoint` is per-connection and you don't own the app's connection.
+  **Right:** the held read-mark blocks truncation *past your mark* regardless of
+  the app's autocheckpoint; the WAL grows, you read it, then you checkpoint.
+- **Wrong:** using SQLite's file change counter (header offset 24) as a
+  dirty-check — it does **not** advance per-commit in WAL mode (verified). **Use
+  `PRAGMA data_version`** (verified: bumps on another connection's commit,
+  pre-checkpoint) for any residual dirty-check, not a whole-file hash.
+- **Wrong:** treating the blocker as free. It creates `_walrust_seq` and holds a
+  read txn — a real, litestream-precedented change to shadow mode's contract.
+- **Wrong:** letting the WAL grow without a loud alarm. Silent bloat that stalls
+  the app's writes is a fail-loudly violation.
+- The release/reacquire window around walrust's own checkpoint is the one place a
+  reset can still slip in — that boundary keeps the re-anchor handling (this is
+  what survives from PR #41).
+
+### How we prove it's done
+
+- Phase 0 primitive test green.
+- DF1/DF2 e2es pass with **zero re-anchors, zero storm** (grep the logs), both
+  modes.
+- New app-checkpoint-underneath e2e: nothing lost, live S3.
+- WAL-bloat alarm fires (revert-proof: neuter the alarm, watch the test catch a
+  silent bloat).
+- The "lossless like litestream" claim ships as a passing drill, not prose.
+
+### Disposition of the open PRs
+
+- **PR #41 stays open, unmerged**, until Phase 1/3 land and cherry-pick the parts
+  that survive (`read_header_classified`, degraded-mode re-anchor). Do not merge
+  it as the primary fix; do not close it and lose the machinery.
+- **PR #40 (fresh-user drill)** can merge independently — its DF2 known-issue note
+  and version-gated probe are accurate while 0.7.0 is the shipped (lossy) binary.
+
+### Exact commands (for the executor)
+
+- Worktree: `git -C /Users/russellromney/Documents/Github/walrust worktree add
+  ../walrust-lossless -b feat/lossless-watch-blocker origin/main`
+- Wrapper-only `.cargo/config.toml`; `CARGO_TARGET_DIR=/Users/russellromney/Documents/Github/walrust/target`,
+  `RUSTC_WRAPPER=sccache`, `--offline`; narrowest targets
+  (`cargo test -p walrust --lib watch_shadow`, `-p walrust-core --lib`).
+- Live S3: `~/.soup/bin/soup run -p turbolite -e development -- <cmd>`.
 
 ---
 
