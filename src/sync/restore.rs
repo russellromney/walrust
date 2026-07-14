@@ -1,11 +1,11 @@
 use crate::cache::LocalCache;
 use crate::errors::{classify_or_else, WalrustError};
 use crate::s3::{self, create_client, parse_bucket};
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use hadb_storage::{CasResult, StorageBackend};
 use hadb_storage_s3::S3Storage;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walrust_core::legacy_restore;
 
 use super::manifest::{
@@ -16,6 +16,48 @@ use walrust_core::legacy_manifest::{parse_legacy_flat_ltx_filename, parse_ltx_fi
 struct CachedLegacyStorage {
     s3: S3Storage,
     cache: Option<LocalCache>,
+}
+
+fn unique_local_native_spool(
+    dir: &Path,
+    bucket: &str,
+    prefix: &str,
+    database: &str,
+) -> Result<Option<(PathBuf, walrust_core::native_spool::SpoolIdentity)>> {
+    let mut roots = Vec::new();
+    if dir.join("journal.json").exists() {
+        roots.push(dir.to_path_buf());
+    }
+    let native_root = dir.join("native-v1");
+    if let Ok(entries) = std::fs::read_dir(&native_root) {
+        roots.extend(entries.filter_map(|entry| entry.ok().map(|entry| entry.path())));
+    }
+    roots.sort();
+    roots.dedup();
+    let mut matches = Vec::new();
+    for root in roots {
+        let Some(identity) = walrust_core::native_spool::NativeSpool::read_identity(&root)? else {
+            continue;
+        };
+        if identity.bucket == bucket && identity.prefix == prefix && identity.database == database {
+            matches.push((root, identity));
+        }
+    }
+    if matches.len() > 1 {
+        let candidates = matches
+            .iter()
+            .map(|(root, identity)| format!("{} (lineage {})", root.display(), identity.lineage_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "multiple local native spools match s3://{}/{}{}; refusing ambiguous restore: {}",
+            bucket,
+            prefix,
+            database,
+            candidates
+        );
+    }
+    Ok(matches.pop())
 }
 
 /// True if `key` addresses a compaction **level** object (`.../levels/L{n}/…`).
@@ -215,25 +257,8 @@ pub async fn restore(
     };
 
     if let Some(dir) = cache_dir {
-        let mut roots = Vec::new();
-        if dir.join("journal.json").exists() {
-            roots.push(dir.to_path_buf());
-        }
-        let native_root = dir.join("native-v1");
-        if let Ok(entries) = std::fs::read_dir(&native_root) {
-            roots.extend(entries.filter_map(|entry| entry.ok().map(|entry| entry.path())));
-        }
-        for root in roots {
-            let Some(identity) = walrust_core::native_spool::NativeSpool::read_identity(&root)?
-            else {
-                continue;
-            };
-            if identity.bucket != bucket_name
-                || identity.prefix != prefix
-                || identity.database != name
-            {
-                continue;
-            }
+        if let Some((root, identity)) = unique_local_native_spool(dir, &bucket_name, &prefix, name)?
+        {
             let spool = walrust_core::native_spool::NativeSpool::create_or_open(
                 &root,
                 identity,
@@ -537,6 +562,34 @@ mod tests {
             cache_substitute_for_key(&cache, "").is_none(),
             "empty key must fall back to S3"
         );
+    }
+
+    #[test]
+    fn local_native_restore_rejects_multiple_matching_lineages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_a = dir.path().join("a.sqlite");
+        let db_b = dir.path().join("b.sqlite");
+        std::fs::File::create(&db_a).unwrap();
+        std::fs::File::create(&db_b).unwrap();
+        let capacity = walrust_core::native_spool::CapacityPolicy {
+            warning_bytes: u64::MAX - 1,
+            hard_bytes: u64::MAX,
+            minimum_free_bytes: 0,
+        };
+        for (db, lineage) in [(&db_a, "lineage-a"), (&db_b, "lineage-b")] {
+            let identity = walrust_core::native_spool::SpoolIdentity::new(
+                db, "bucket", "p/", "db", lineage, 1, None, true,
+            )
+            .unwrap();
+            let root = walrust_core::native_spool::NativeSpool::path_for(dir.path(), &identity);
+            walrust_core::native_spool::NativeSpool::create_or_open(&root, identity, capacity)
+                .unwrap();
+        }
+
+        let error = unique_local_native_spool(dir.path(), "bucket", "p/", "db").unwrap_err();
+        assert!(error.to_string().contains("refusing ambiguous restore"));
+        assert!(error.to_string().contains("lineage-a"));
+        assert!(error.to_string().contains("lineage-b"));
     }
 
     #[test]

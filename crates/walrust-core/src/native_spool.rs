@@ -332,6 +332,34 @@ impl NativeSpool {
         Ok(Some(journal.identity))
     }
 
+    pub fn validate_existing_complete_base(
+        root: &Path,
+        expected_identity: &SpoolIdentity,
+    ) -> Result<bool> {
+        let path = root.join("journal.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let (journal, _) = load_journal(&bytes, &path)?;
+        if &journal.identity != expected_identity {
+            bail!("native spool identity mismatch while validating local base");
+        }
+        let Some(base) = journal.objects.get(&journal.local_base_seq) else {
+            return Ok(false);
+        };
+        if base.kind != ObjectKind::Snapshot
+            || base.local_creation_state != LocalCreationState::Installed
+        {
+            return Ok(false);
+        }
+        let payload = fs::read(root.join("objects").join(base.payload_file_name()))
+            .with_context(|| format!("read local native snapshot base seq {}", base.seq))?;
+        validate_payload(base, &payload, &std::env::temp_dir())?;
+        Ok(true)
+    }
+
     pub fn create_or_open(
         root: &Path,
         identity: SpoolIdentity,
@@ -1487,7 +1515,12 @@ fn validate_payload(object: &SpoolObject, bytes: &[u8], scratch_root: &Path) -> 
             // physical changeset checksum. Reconstruct to a private temporary
             // file so orphan adoption recomputes that value rather than trusting
             // journal metadata.
-            let tmp = scratch_root.join(format!(".verify-{:016x}.db", object.seq));
+            let tmp = scratch_root.join(format!(
+                ".verify-{:016x}-{}-{}.db",
+                object.seq,
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
             let _ = fs::remove_file(&tmp);
             let decoded_result = ltx::decode_to_db(bytes, &tmp);
             let decoded_page_count = decoded_result.as_ref().ok().and_then(|result| {
@@ -1700,6 +1733,18 @@ mod tests {
         drop(spool);
         let reopened = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
         assert_eq!(reopened.read_payload(1).unwrap(), bytes);
+        assert!(NativeSpool::validate_existing_complete_base(&root, &identity(&db)).unwrap());
+    }
+
+    #[test]
+    fn identity_only_journal_is_not_an_offline_restart_base() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        File::create(&db).unwrap();
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        assert!(!NativeSpool::validate_existing_complete_base(&root, &id).unwrap());
     }
 
     #[test]

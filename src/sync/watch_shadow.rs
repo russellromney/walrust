@@ -1260,6 +1260,44 @@ pub async fn watch_with_shadow(
             {
                 bail!("{}: local native spool identity/base mismatch", name);
             }
+            if !NativeSpool::validate_existing_complete_base(&spool_root, &identity)? {
+                let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
+                match s3::download_bytes(&client, &bucket_name, &descriptor_key).await {
+                    Ok(_) => bail!(
+                        "{}: local native spool has no complete snapshot base but the remote native stream already exists",
+                        name
+                    ),
+                    Err(error) if s3::download_error_is_not_found(&error) => {
+                        let (legacy_txid, _, _) = discover_state_from_s3(
+                            &client,
+                            &bucket_name,
+                            &prefix,
+                            &name,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "{}: verify remote predecessor for incomplete local spool",
+                                name
+                            )
+                        })?;
+                        if identity.legacy_boundary_txid.unwrap_or(0) != legacy_txid {
+                            bail!(
+                                "{}: incomplete local spool predecessor differs from remote legacy head",
+                                name
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "{}: remote unavailable and local native spool has no complete snapshot base",
+                                name
+                            )
+                        })
+                    }
+                }
+            }
             (0, None, identity)
         } else {
             // One-time compatibility migration: drain any durable legacy
