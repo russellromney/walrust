@@ -1281,6 +1281,286 @@ fn e2e_cli_sigkill_restarts_every_native_cleanup_boundary() -> Result<()> {
 }
 
 #[test]
+fn e2e_cli_custom_spool_isolates_multiple_databases_collision_safely() -> Result<()> {
+    require_s3!("e2e_cli_custom_spool_isolates_multiple_databases_collision_safely");
+    let temp = TempDir::new()?;
+    let run_name = unique_name("cli-native-custom-spool");
+    let first_name = format!("{run_name}-a");
+    let second_name = format!("{run_name}-b");
+    let prefix = format!("e2e/{run_name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let first_db = temp.path().join(format!("{first_name}.db"));
+    let second_db = temp.path().join(format!("{second_name}.db"));
+    let first_restore = temp.path().join("first-restored.db");
+    let second_restore = temp.path().join("second-restored.db");
+    let custom_spool = temp.path().join("spool-on-custom-filesystem");
+    let log_path = temp.path().join("watch.log");
+    let first = create_source_db(&first_db, 5)?;
+    let second = create_source_db(&second_db, 8)?;
+    write_pin_frame(&first, "custom-spool-a")?;
+    write_pin_frame(&second, "custom-spool-b")?;
+    let first_rows = rows(&first_db)?;
+    let second_rows = rows(&second_db)?;
+
+    let log = std::fs::File::create(&log_path)?;
+    let log_err = log.try_clone()?;
+    let mut command = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    command
+        .arg("watch")
+        .arg(&first_db)
+        .arg(&second_db)
+        .arg("--bucket")
+        .arg(&bucket_arg)
+        .arg("--snapshot-interval")
+        .arg("999999")
+        .arg("--wal-sync-interval")
+        .arg("1")
+        .arg("--checkpoint-interval")
+        .arg("999999")
+        .arg("--on-startup")
+        .arg("true")
+        .arg("--cache-dir")
+        .arg(&custom_spool)
+        .arg("--no-metrics")
+        .arg("--no-cache")
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err));
+    if let Some(endpoint) = endpoint.as_deref() {
+        command.arg("--endpoint").arg(endpoint);
+    }
+    let mut child = command.spawn()?;
+    let startup_deadline = Instant::now() + e2e_poll_deadline(30);
+    loop {
+        let log = watch_log(&log_path);
+        if log
+            .matches("native HADBP snapshot admitted to durable local spool")
+            .count()
+            >= 4
+        {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!("multi-database watch exited ({status}):\n{log}");
+        }
+        anyhow::ensure!(
+            Instant::now() < startup_deadline,
+            "multi-database watch did not stage both streams:\n{log}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let native_root = custom_spool.join("native-v1");
+    let mut identities = std::fs::read_dir(&native_root)?
+        .map(|entry| {
+            let root = entry?.path();
+            walrust::walrust_core::native_spool::NativeSpool::read_identity(&root)?
+                .context("custom spool stream missing identity")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    identities.sort_by(|a, b| a.database.cmp(&b.database));
+    anyhow::ensure!(identities.len() == 2, "expected two isolated spool roots");
+    anyhow::ensure!(
+        identities[0].database != identities[1].database
+            && identities[0].canonical_db_path != identities[1].canonical_db_path
+            && identities[0].stream_digest() != identities[1].stream_digest(),
+        "custom spool identities collided: {identities:?}"
+    );
+    anyhow::ensure!(
+        !temp.path().join(".walrust-spool").exists(),
+        "custom spool configuration leaked into the database-adjacent default"
+    );
+
+    wait_for_cli_restore_rows(
+        &first_name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &first_restore,
+        &first_rows,
+    )?;
+    wait_for_cli_restore_rows(
+        &second_name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &second_restore,
+        &second_rows,
+    )?;
+    assert_integrity_ok(&first_restore)?;
+    assert_integrity_ok(&second_restore)?;
+    stop_child(&mut child);
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_spool_high_full_retains_blocker_and_recovers_after_restart() -> Result<()> {
+    require_s3!("e2e_cli_spool_high_full_retains_blocker_and_recovers_after_restart");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-capacity-restart");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let spool_path = temp.path().join("capacity-spool");
+    let config_path = temp.path().join("walrust.toml");
+    let pause_file = temp.path().join("pause-uploader");
+    let log_path = temp.path().join("capacity.log");
+    std::fs::write(&pause_file, b"paused")?;
+    std::fs::write(
+        &config_path,
+        format!(
+            "[spool]\npath = {:?}\nwarning_size = 100000\nmax_size = 300000\nmin_free_space = 0\nshutdown_drain_seconds = 0\n",
+            spool_path.to_string_lossy()
+        ),
+    )?;
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "capacity-restart")?;
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: Some(&config_path),
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: Some(&pause_file),
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+    append_wide_rows(&writer, 6, 25, "capacity-high")?;
+    let high_deadline = Instant::now() + e2e_poll_deadline(30);
+    while {
+        let log = watch_log(&log_path);
+        !(log.contains("local_spool_high")
+            && log.contains("native HADBP delta admitted to durable local spool"))
+    } {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watcher exited before high watermark ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < high_deadline,
+            "warning watermark did not fire:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    append_wide_rows(&writer, 26, 150, "capacity-full")?;
+    let full_deadline = Instant::now() + e2e_poll_deadline(30);
+    while !watch_log(&log_path).contains("local_spool_full") {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watcher exited at hard spool capacity ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < full_deadline,
+            "hard spool capacity did not fire:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(
+        child.try_wait()?.is_none(),
+        "spool-full watcher must stay alive"
+    );
+    let probe = Connection::open(&db_path)?;
+    probe.execute_batch("PRAGMA busy_timeout=0;")?;
+    anyhow::ensure!(
+        force_truncate_checkpoint(&probe)?.0 != 0,
+        "spool-full state must retain the checkpoint blocker"
+    );
+    let native_root = spool_path.join("native-v1");
+    let stream_root = std::fs::read_dir(&native_root)?
+        .next()
+        .context("capacity spool stream missing")??
+        .path();
+    let identity = walrust::walrust_core::native_spool::NativeSpool::read_identity(&stream_root)?
+        .context("capacity spool identity missing")?;
+    let before_restart = walrust::walrust_core::native_spool::NativeSpool::create_or_open(
+        &stream_root,
+        identity,
+        walrust::walrust_core::native_spool::CapacityPolicy {
+            warning_bytes: u64::MAX - 1,
+            hard_bytes: u64::MAX,
+            minimum_free_bytes: 0,
+        },
+    )?
+    .objects()
+    .map(|object| object.seq)
+    .collect::<Vec<_>>();
+    anyhow::ensure!(
+        !before_restart.is_empty(),
+        "capacity state lost pending objects"
+    );
+    stop_child(&mut child);
+
+    std::fs::write(
+        &config_path,
+        format!(
+            "[spool]\npath = {:?}\nwarning_size = 800000000\nmax_size = 1000000000\nmin_free_space = 0\nshutdown_drain_seconds = 0\n",
+            spool_path.to_string_lossy()
+        ),
+    )?;
+    let restart_log = temp.path().join("restart.log");
+    let mut restarted = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &restart_log,
+        config_path: Some(&config_path),
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: Some(&pause_file),
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_startup_rearms(&restart_log, &mut restarted)?;
+    let reopened_identity =
+        walrust::walrust_core::native_spool::NativeSpool::read_identity(&stream_root)?
+            .context("capacity spool identity vanished on restart")?;
+    let reopened = walrust::walrust_core::native_spool::NativeSpool::create_or_open(
+        &stream_root,
+        reopened_identity,
+        walrust::walrust_core::native_spool::CapacityPolicy {
+            warning_bytes: u64::MAX - 1,
+            hard_bytes: u64::MAX,
+            minimum_free_bytes: 0,
+        },
+    )?;
+    for seq in before_restart {
+        anyhow::ensure!(
+            reopened.get(seq).is_some() && reopened.read_payload(seq).is_ok(),
+            "pending native object {seq} did not survive capacity restart"
+        );
+    }
+    drop(reopened);
+    let expected = rows(&db_path)?;
+    std::fs::remove_file(&pause_file)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    stop_child(&mut restarted);
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
 fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     require_s3!("e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows");
     let temp = TempDir::new()?;
