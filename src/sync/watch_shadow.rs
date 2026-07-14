@@ -821,6 +821,19 @@ async fn checkpoint_shadow_after_native_admission(
     }
     spool_lock(&spool_state.0)?.begin_checkpoint_window(admitted_seq)?;
 
+    // Give production E2Es a deterministic way to place an actual application
+    // commit inside the release/reacquire window. This hook is compiled into
+    // debug builds only; release binaries never inspect the test environment.
+    if cfg!(debug_assertions) {
+        if let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE") {
+            let path = std::path::PathBuf::from(path);
+            std::fs::write(&path, b"entered")?;
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
+
     let checkpoint_started = std::time::Instant::now();
     let attempt =
         checkpoint_with_state_blocker_attempt(state, checkpoint_mode, data_version_before)

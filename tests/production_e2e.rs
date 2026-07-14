@@ -428,35 +428,42 @@ struct TriggerOptions {
 }
 
 fn spawn_cli_watch_logged(args: LoggedWatchArgs<'_>) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, None, None, None)
+    spawn_cli_watch_logged_with_checkpoint_pause(args, None)
+}
+
+fn spawn_cli_watch_logged_with_checkpoint_pause(
+    args: LoggedWatchArgs<'_>,
+    checkpoint_pause_file: Option<&Path>,
+) -> Result<Child> {
+    spawn_cli_watch_logged_with_options(args, None, None, None, None, checkpoint_pause_file)
 }
 
 fn spawn_cli_watch_logged_with_checkpoint_release(
     args: LoggedWatchArgs<'_>,
     checkpoint_release: Option<&str>,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, checkpoint_release, None, None, None)
+    spawn_cli_watch_logged_with_options(args, checkpoint_release, None, None, None, None)
 }
 
 fn spawn_cli_watch_logged_with_upload_crash_once(
     args: LoggedWatchArgs<'_>,
     crash_once_file: &Path,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, Some(crash_once_file), None, None)
+    spawn_cli_watch_logged_with_options(args, None, Some(crash_once_file), None, None, None)
 }
 
 fn spawn_cli_watch_logged_with_cleanup_interval(
     args: LoggedWatchArgs<'_>,
     cleanup_interval_ms: u64,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, None, Some(cleanup_interval_ms), None)
+    spawn_cli_watch_logged_with_options(args, None, None, Some(cleanup_interval_ms), None, None)
 }
 
 fn spawn_cli_watch_logged_with_triggers(
     args: LoggedWatchArgs<'_>,
     triggers: TriggerOptions,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, None, None, Some(triggers))
+    spawn_cli_watch_logged_with_options(args, None, None, None, Some(triggers), None)
 }
 
 fn spawn_cli_watch_logged_with_options(
@@ -465,6 +472,7 @@ fn spawn_cli_watch_logged_with_options(
     crash_once_file: Option<&Path>,
     cleanup_interval_ms: Option<u64>,
     triggers: Option<TriggerOptions>,
+    checkpoint_pause_file: Option<&Path>,
 ) -> Result<Child> {
     let log = std::fs::File::create(args.log_path)?;
     let log_err = log.try_clone()?;
@@ -514,6 +522,9 @@ fn spawn_cli_watch_logged_with_options(
     if let Some(path) = args.native_upload_pause_file {
         watch.env("WALRUST_TEST_NATIVE_UPLOAD_PAUSE_FILE", path);
     }
+    if let Some(path) = checkpoint_pause_file {
+        watch.env("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE", path);
+    }
     if let Some(path) = crash_once_file {
         watch.env("WALRUST_TEST_NATIVE_UPLOAD_CRASH_ONCE_FILE", path);
     }
@@ -562,6 +573,29 @@ fn wait_for_durability_failpoint(marker: &Path, log_path: &Path, child: &mut Chi
             "timed out waiting for durability failpoint:\n{}",
             watch_log(log_path)
         );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_checkpoint_pause(path: &Path, log_path: &Path, child: &mut Child) -> Result<()> {
+    let deadline = Instant::now() + e2e_poll_deadline(30);
+    loop {
+        if matches!(std::fs::read(path), Ok(bytes) if bytes == b"entered") {
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watch exited before entering the controlled-checkpoint pause ({status}):\n{}",
+                watch_log(log_path)
+            );
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "timed out waiting for controlled-checkpoint pause at {}:\n{}",
+                path.display(),
+                watch_log(log_path)
+            );
+        }
         std::thread::sleep(Duration::from_millis(25));
     }
 }
@@ -2356,6 +2390,7 @@ fn e2e_cli_sigkill_restarts_every_local_snapshot_admission_boundary() -> Result<
         );
         stop_child(&mut restarted);
     }
+
     cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())
 }
@@ -2447,6 +2482,82 @@ fn e2e_cli_sigkill_restarts_every_controlled_checkpoint_boundary() -> Result<()>
             &expected,
         )?;
         assert_integrity_ok(&restored_path)?;
+        stop_child(&mut restarted);
+    }
+
+    for (index, boundary) in [
+        "checkpoint_window_rearmed_dirty",
+        "checkpoint_reanchor_closed",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        append_wide_rows(
+            &writer,
+            3000 + index as i64 * 20,
+            3019 + index as i64 * 20,
+            boundary,
+        )?;
+        let pause = temp.path().join(format!("{boundary}.pause"));
+        std::fs::write(&pause, b"waiting")?;
+        let marker = temp.path().join(format!("{boundary}.marker"));
+        let log = temp.path().join(format!("{boundary}.log"));
+        let mut crashed = spawn_cli_watch_logged_with_checkpoint_pause(
+            LoggedWatchArgs {
+                db_path: &db_path,
+                bucket_arg: &bucket_arg,
+                endpoint: endpoint.as_deref(),
+                log_path: &log,
+                config_path: None,
+                checkpoint_interval: 1,
+                min_checkpoint_pages: 1,
+                wal_truncate_threshold: 100_000,
+                native_upload_pause_file: None,
+                durability_failpoint: Some(boundary),
+                durability_failpoint_marker: Some(&marker),
+            },
+            Some(&pause),
+        )?;
+        wait_for_checkpoint_pause(&pause, &log, &mut crashed)?;
+        ephemeral_exec(
+            &db_path,
+            &format!(
+                "INSERT INTO items(id, value) VALUES ({}, 'inside-{boundary}');",
+                4000 + index
+            ),
+        )?;
+        std::fs::remove_file(&pause)?;
+        wait_for_durability_failpoint(&marker, &log, &mut crashed)?;
+        stop_child(&mut crashed);
+
+        let restart_log = temp.path().join(format!("{boundary}-restart.log"));
+        let mut restarted = spawn_cli_watch_logged(LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &restart_log,
+            config_path: None,
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        })?;
+        let expected = rows(&db_path)?;
+        wait_for_cli_restore_rows(
+            &name,
+            &bucket_arg,
+            endpoint.as_deref(),
+            &restored_path,
+            &expected,
+        )?;
+        assert_integrity_ok(&restored_path)?;
+        anyhow::ensure!(
+            restarted.try_wait()?.is_none(),
+            "watcher died after recovering dirty boundary {boundary}:\n{}",
+            watch_log(&restart_log)
+        );
         stop_child(&mut restarted);
     }
     cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
