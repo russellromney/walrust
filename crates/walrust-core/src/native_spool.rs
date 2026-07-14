@@ -13,6 +13,8 @@ use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -133,13 +135,28 @@ impl SpoolIdentity {
         hex_digest(h.finalize().as_slice())
     }
 
-    fn local_path_digest(&self) -> String {
+    fn legacy_local_path_digest(&self) -> String {
         let mut h = Sha256::new();
         h.update(b"walrust-native-spool-path-v1");
         h.update(self.canonical_db_path.as_bytes());
         h.update(self.bucket.as_bytes());
         h.update(self.prefix.as_bytes());
         h.update(self.database.as_bytes());
+        hex_digest(h.finalize().as_slice())
+    }
+
+    fn local_path_digest(&self) -> String {
+        let mut h = Sha256::new();
+        h.update(b"walrust-native-spool-path-v2");
+        for value in [
+            self.canonical_db_path.as_str(),
+            self.bucket.as_str(),
+            self.prefix.as_str(),
+            self.database.as_str(),
+        ] {
+            h.update((value.len() as u64).to_be_bytes());
+            h.update(value.as_bytes());
+        }
         hex_digest(h.finalize().as_slice())
     }
 }
@@ -322,6 +339,10 @@ pub struct NativeSpool {
     capacity: CapacityPolicy,
     last_stage_duration_ms: u64,
     last_capacity_state: Cell<CapacityState>,
+    // The advisory lock is held for this instance's lifetime. It prevents a
+    // restore or diagnostic opener from running create_or_open's mutating
+    // recovery while the watcher/uploader owns the spool.
+    _owner_lock: File,
 }
 
 impl NativeSpool {
@@ -330,6 +351,38 @@ impl NativeSpool {
     /// the digest is namespace isolation, not the identity proof by itself.
     pub fn path_for(base: &Path, identity: &SpoolIdentity) -> PathBuf {
         base.join("native-v1").join(identity.local_path_digest())
+    }
+
+    /// Resolve the collision-safe v2 path, falling back to the original v1
+    /// path only when it already exists. This keeps PR-created local spools
+    /// restartable while all new streams use the unambiguous encoding.
+    pub fn resolve_path_for(base: &Path, identity: &SpoolIdentity) -> Result<PathBuf> {
+        let current = Self::path_for(base, identity);
+        let legacy = base
+            .join("native-v1")
+            .join(identity.legacy_local_path_digest());
+        let legacy_matches = if legacy.exists() {
+            Self::read_identity(&legacy)?.is_some_and(|stored| {
+                stored.canonical_db_path == identity.canonical_db_path
+                    && stored.bucket == identity.bucket
+                    && stored.prefix == identity.prefix
+                    && stored.database == identity.database
+            })
+        } else {
+            false
+        };
+        if current.exists() && legacy_matches {
+            bail!(
+                "both v1 and v2 native spool paths exist for the same stream: {} and {}",
+                legacy.display(),
+                current.display()
+            );
+        }
+        Ok(if current.exists() || !legacy_matches {
+            current
+        } else {
+            legacy
+        })
     }
 
     pub fn read_identity(root: &Path) -> Result<Option<SpoolIdentity>> {
@@ -431,6 +484,7 @@ impl NativeSpool {
         fs::create_dir_all(root)
             .with_context(|| format!("create native spool root {}", root.display()))?;
         sync_dir(root.parent().unwrap_or_else(|| Path::new(".")))?;
+        let owner_lock = acquire_owner_lock(root)?;
         let objects_dir = root.join("objects");
         let intents_dir = root.join("intents");
         let snapshots_dir = root.join("snapshots");
@@ -481,6 +535,7 @@ impl NativeSpool {
             capacity,
             last_stage_duration_ms: 0,
             last_capacity_state: Cell::new(CapacityState::Healthy),
+            _owner_lock: owner_lock,
         };
         if migrated {
             spool.persist_journal()?;
@@ -619,6 +674,7 @@ impl NativeSpool {
                 if seq != expected {
                     bail!("native snapshot intent expected seq {expected}, got {seq}");
                 }
+                self.ensure_capacity(serialized_json_len(&proposed)?.saturating_mul(2))?;
                 persist_json(&self.root, &self.snapshot_intent_path, &proposed)?;
                 durability_failpoint("snapshot_intent_committed");
                 proposed
@@ -837,9 +893,22 @@ impl NativeSpool {
         }
         self.validate_next_object(&object)?;
 
-        // Peak accounting includes both the caller's eventual installed object
-        // and the same-directory temporary payload.
-        self.ensure_capacity(stage.payload.len() as u64 * 2)?;
+        // Reserve the complete write-order peak before creating the intent:
+        // intent JSON, payload temporary/installed bytes, and the full new
+        // journal temporary while the old journal remains installed.
+        let mut projected_journal = self.journal.clone();
+        projected_journal.objects.insert(stage.seq, object.clone());
+        projected_journal.admitted_seq = Some(stage.seq);
+        let intent_bytes = serialized_json_len(&InstallIntent {
+            version: SPOOL_VERSION,
+            object: object.clone(),
+        })?;
+        let journal_bytes = serialized_json_len(&projected_journal)?;
+        let additional_peak = (stage.payload.len() as u64)
+            .saturating_mul(2)
+            .saturating_add(intent_bytes)
+            .saturating_add(journal_bytes);
+        self.ensure_capacity(additional_peak)?;
 
         let intent_path = self.intent_path(stage.seq);
         persist_json(
@@ -1123,6 +1192,12 @@ impl NativeSpool {
 
     pub fn last_capacity_state(&self) -> CapacityState {
         self.last_capacity_state.get()
+    }
+
+    /// Bytes needed for an atomic rewrite of the current journal plus a
+    /// conservative allowance for one newly admitted object record.
+    pub fn next_journal_rewrite_peak_bytes(&self) -> Result<u64> {
+        Ok(serialized_json_len(&self.journal)?.saturating_add(64 * 1024))
     }
 
     /// Reclaim only remotely published history older than the newest published
@@ -1886,6 +1961,44 @@ fn payload_temp_path(final_path: &Path) -> PathBuf {
     final_path.with_extension("hadbp.tmp")
 }
 
+fn serialized_json_len<T: Serialize>(value: &T) -> Result<u64> {
+    Ok(serde_json::to_vec_pretty(value)?.len() as u64)
+}
+
+fn acquire_owner_lock(root: &Path) -> Result<File> {
+    let path = root.join("owner.lock");
+    let file = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open native spool ownership lock {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            if matches!(
+                error.raw_os_error(),
+                Some(code) if code == libc::EWOULDBLOCK || code == libc::EAGAIN
+            ) {
+                bail!(
+                    "native spool {} is owned by an active watcher; stop watch before local restore or recovery",
+                    root.display()
+                );
+            }
+            return Err(error).with_context(|| {
+                format!("acquire native spool ownership lock {}", path.display())
+            });
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        bail!("native spool ownership locking is unsupported on this platform");
+    }
+    Ok(file)
+}
+
 fn persist_json<T: Serialize>(dir: &Path, path: &Path, value: &T) -> Result<()> {
     let bytes = serde_json::to_vec_pretty(value)?;
     let tmp = path.with_extension("json.tmp");
@@ -2289,6 +2402,63 @@ mod tests {
     }
 
     #[test]
+    fn local_path_digest_length_prefixes_identity_components_and_finds_v1() {
+        let dir = tempdir().unwrap();
+        let db_a = dir.path().join("a");
+        let db_ab = dir.path().join("ab");
+        File::create(&db_a).unwrap();
+        File::create(&db_ab).unwrap();
+        let first =
+            SpoolIdentity::new(&db_a, "b", "prefix/", "db", "lineage-a", 1, None, true).unwrap();
+        let second =
+            SpoolIdentity::new(&db_ab, "", "prefix/", "db", "lineage-b", 1, None, true).unwrap();
+        assert_eq!(
+            first.legacy_local_path_digest(),
+            second.legacy_local_path_digest(),
+            "the old concatenation must reproduce the adversarial tuple collision"
+        );
+        assert_ne!(
+            NativeSpool::path_for(dir.path(), &first),
+            NativeSpool::path_for(dir.path(), &second),
+            "v2 length-prefixing must separate the tuples"
+        );
+
+        let legacy = dir
+            .path()
+            .join("native-v1")
+            .join(first.legacy_local_path_digest());
+        let spool = NativeSpool::create_or_open(&legacy, first.clone(), generous()).unwrap();
+        drop(spool);
+        assert_eq!(
+            NativeSpool::resolve_path_for(dir.path(), &first).unwrap(),
+            legacy,
+            "existing v1 spools must remain discoverable"
+        );
+        assert_eq!(
+            NativeSpool::resolve_path_for(dir.path(), &second).unwrap(),
+            NativeSpool::path_for(dir.path(), &second),
+            "a colliding v1 tuple owned by another identity must not strand a new v2 stream"
+        );
+    }
+
+    #[test]
+    fn active_spool_owner_blocks_mutating_second_open() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        File::create(&db).unwrap();
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let owner = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        let error = NativeSpool::create_or_open(&root, id.clone(), generous())
+            .err()
+            .expect("a second mutating opener must not race the active owner");
+        assert!(format!("{error:#}").contains("active watcher"));
+        drop(owner);
+        NativeSpool::create_or_open(&root, id, generous())
+            .expect("the OS lock must release when the owner closes");
+    }
+
+    #[test]
     fn hard_capacity_fails_before_installing_payload() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
@@ -2319,6 +2489,142 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("local_spool_full"));
         assert_eq!(spool.admitted_seq(), None);
+    }
+
+    #[test]
+    fn admission_reserves_intent_and_full_journal_rewrite_peak() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let initial = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        let used = initial.used_bytes().unwrap();
+        drop(initial);
+        let old_payload_only_peak = (bytes.len() as u64).saturating_mul(2);
+        let hard = used.saturating_add(old_payload_only_peak).saturating_add(1);
+        let mut spool = NativeSpool::create_or_open(
+            &root,
+            id,
+            CapacityPolicy {
+                warning_bytes: hard,
+                hard_bytes: hard,
+                minimum_free_bytes: 0,
+            },
+        )
+        .unwrap();
+        let error = spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: checksum,
+                end_page_count: pages,
+                intended_remote_key: "key.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &bytes,
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("local_spool_full"));
+        assert_eq!(spool.admitted_seq(), None);
+        assert!(
+            !spool.intent_path(1).exists(),
+            "capacity refusal must happen before intent creation"
+        );
+    }
+
+    #[test]
+    fn journal_peak_dominates_after_thousand_tiny_objects() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (snapshot_bytes, mut checksum, pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: checksum,
+                end_page_count: pages,
+                intended_remote_key: "snapshot.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &snapshot_bytes,
+            })
+            .unwrap();
+        let page_size = 4096u32;
+        for seq in 2..=1001u64 {
+            let page = vec![(seq & 0xff) as u8; page_size as usize];
+            let (payload, ending) = ltx::encode_wal_changes_with_end_page_count(
+                &[(1, page)],
+                page_size,
+                seq,
+                checksum,
+                pages,
+            )
+            .unwrap();
+            let mut cursor = SourceCursor::snapshot();
+            cursor.shadow_frame_index = seq;
+            spool
+                .stage(StageObject {
+                    seq,
+                    kind: ObjectKind::Delta,
+                    previous_chain_checksum: checksum,
+                    ending_chain_checksum: ending,
+                    end_page_count: pages,
+                    intended_remote_key: format!("{seq:016x}.hadbp"),
+                    source_cursor: cursor,
+                    payload: &payload,
+                })
+                .unwrap();
+            checksum = ending;
+        }
+        let journal_len = std::fs::metadata(root.join("journal.json")).unwrap().len();
+        let page = vec![0xA5; page_size as usize];
+        let (payload, ending) = ltx::encode_wal_changes_with_end_page_count(
+            &[(1, page)],
+            page_size,
+            1002,
+            checksum,
+            pages,
+        )
+        .unwrap();
+        assert!(
+            journal_len > payload.len() as u64 * 10,
+            "test setup must make journal rewrite, not payload, the dominant peak"
+        );
+        let used = spool.used_bytes().unwrap();
+        drop(spool);
+        let old_payload_only_hard = used
+            .saturating_add(payload.len() as u64 * 2)
+            .saturating_add(1);
+        let mut tight = NativeSpool::create_or_open(
+            &root,
+            id,
+            CapacityPolicy {
+                warning_bytes: old_payload_only_hard,
+                hard_bytes: old_payload_only_hard,
+                minimum_free_bytes: 0,
+            },
+        )
+        .unwrap();
+        let mut cursor = SourceCursor::snapshot();
+        cursor.shadow_frame_index = 1002;
+        let error = tight
+            .stage(StageObject {
+                seq: 1002,
+                kind: ObjectKind::Delta,
+                previous_chain_checksum: checksum,
+                ending_chain_checksum: ending,
+                end_page_count: pages,
+                intended_remote_key: "0000000000001002.hadbp".into(),
+                source_cursor: cursor,
+                payload: &payload,
+            })
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("local_spool_full"));
+        assert_eq!(tight.admitted_seq(), Some(1001));
     }
 
     #[test]

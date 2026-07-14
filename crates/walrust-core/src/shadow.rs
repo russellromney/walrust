@@ -11,6 +11,8 @@
 
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +26,14 @@ use crate::wal::{self, ParsedFrame, FRAME_HEADER_SIZE};
 /// filename. Both are `u64`, so 16 hex digits keeps lexical order == numeric
 /// order across the full range.
 pub(crate) const SEGMENT_HEX_WIDTH: usize = 16;
+const DURABLE_TAIL_VERSION: u32 = 1;
+const DURABLE_TAIL_FILE: &str = "durable-tail-v1.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableShadowTail {
+    version: u32,
+    segments: BTreeMap<String, u64>,
+}
 
 /// Format a shadow segment filename: `{generation:016x}-{index:016x}.wal`.
 fn format_segment_name(generation: u64, index: u64) -> String {
@@ -100,6 +110,9 @@ pub struct ShadowWal {
     /// connection-free: closing any SQLite handle in that process can erase
     /// the separately owned blocker's process-scoped POSIX locks.
     probe_wal_mode_on_lifecycle_state: bool,
+    /// Startup removed bytes beyond the last fsynced durable-tail marker.
+    /// The caller must either recopy them from the pinned WAL or re-anchor.
+    discarded_unproven_tail: bool,
 }
 
 /// A segment file in the shadow WAL
@@ -160,7 +173,8 @@ impl ShadowWal {
         // a whole-frame boundary before the first append removes the torn tail;
         // the durable `wal_copy_offset` re-copies any dropped frames cleanly.
         let frame_page_size = db_header_page_size(db_path).unwrap_or(page_size);
-        Self::align_truncate_segments(&shadow_dir, frame_page_size).await?;
+        let discarded_unproven_tail =
+            Self::recover_to_durable_tail(&shadow_dir, frame_page_size).await?;
 
         let checkpoint_blocker = if hold_checkpoint_blocker {
             Some(Arc::new(Mutex::new(Self::open_checkpoint_blocker(
@@ -182,6 +196,7 @@ impl ShadowWal {
             wal_chain: None,
             header_seeded,
             probe_wal_mode_on_lifecycle_state: hold_checkpoint_blocker,
+            discarded_unproven_tail,
         })
     }
 
@@ -300,6 +315,121 @@ impl ShadowWal {
         }
         Self::fsync_dir(shadow_dir).await?;
         Ok(())
+    }
+
+    /// Recover only the prefix whose marker was atomically persisted after the
+    /// segment and directory fsync. A frame-aligned tail is not evidence of
+    /// durability: it may have been fully buffered but never reached storage.
+    async fn recover_to_durable_tail(shadow_dir: &Path, page_size: u32) -> Result<bool> {
+        let marker_path = shadow_dir.join(DURABLE_TAIL_FILE);
+        let marker = match fs::read(&marker_path).await {
+            Ok(bytes) => {
+                let marker: DurableShadowTail = serde_json::from_slice(&bytes)?;
+                if marker.version != DURABLE_TAIL_VERSION {
+                    return Err(anyhow!(
+                        "unsupported shadow durable-tail version {}",
+                        marker.version
+                    ));
+                }
+                marker
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // Compatibility migration for shadow directories created
+                // before the marker protocol: heal partial frames, fsync every
+                // surviving segment, then establish a durable baseline.
+                Self::align_truncate_segments(shadow_dir, page_size).await?;
+                let mut segments = BTreeMap::new();
+                let mut entries = fs::read_dir(shadow_dir).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if !name.ends_with(".wal") {
+                        continue;
+                    }
+                    let file = File::open(entry.path()).await?;
+                    file.sync_all().await?;
+                    segments.insert(name, file.metadata().await?.len());
+                }
+                Self::fsync_dir(shadow_dir).await?;
+                let marker = DurableShadowTail {
+                    version: DURABLE_TAIL_VERSION,
+                    segments,
+                };
+                Self::persist_durable_tail(shadow_dir, &marker).await?;
+                return Ok(false);
+            }
+            Err(error) => return Err(error.into()),
+        };
+
+        let mut discarded = false;
+        let mut entries = fs::read_dir(shadow_dir).await?;
+        let mut seen = BTreeMap::new();
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".wal") {
+                continue;
+            }
+            let Some(durable) = marker.segments.get(&name).copied() else {
+                // Either append crashed before publishing the durable marker,
+                // or cleanup committed its marker before unlinking the old
+                // segment. In both cases the marker is authoritative.
+                fs::remove_file(entry.path()).await?;
+                discarded = true;
+                continue;
+            };
+            let actual = entry.metadata().await?.len();
+            if actual < durable {
+                return Err(anyhow!(
+                    "shadow segment {} is shorter than durable marker ({} < {})",
+                    entry.path().display(),
+                    actual,
+                    durable
+                ));
+            }
+            if actual > durable {
+                let file = OpenOptions::new().write(true).open(entry.path()).await?;
+                file.set_len(durable).await?;
+                file.sync_all().await?;
+                discarded = true;
+            }
+            seen.insert(name, durable);
+        }
+        for (name, durable) in &marker.segments {
+            if *durable > 0 && !seen.contains_key(name) {
+                return Err(anyhow!(
+                    "shadow durable marker references missing segment {}",
+                    shadow_dir.join(name).display()
+                ));
+            }
+        }
+        Self::fsync_dir(shadow_dir).await?;
+        Ok(discarded)
+    }
+
+    async fn read_durable_tail(shadow_dir: &Path) -> Result<DurableShadowTail> {
+        let bytes = fs::read(shadow_dir.join(DURABLE_TAIL_FILE)).await?;
+        let marker: DurableShadowTail = serde_json::from_slice(&bytes)?;
+        if marker.version != DURABLE_TAIL_VERSION {
+            return Err(anyhow!("unsupported shadow durable-tail version"));
+        }
+        Ok(marker)
+    }
+
+    async fn persist_durable_tail(shadow_dir: &Path, marker: &DurableShadowTail) -> Result<()> {
+        let path = shadow_dir.join(DURABLE_TAIL_FILE);
+        let tmp = shadow_dir.join(format!(".durable-tail-v1-{}.tmp", std::process::id()));
+        let bytes = serde_json::to_vec_pretty(marker)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&tmp, &path).await?;
+        Self::fsync_dir(shadow_dir).await
     }
 
     /// Copy new WAL frames to the shadow WAL
@@ -425,6 +555,16 @@ impl ShadowWal {
         crate::native_spool::durability_failpoint("shadow_before_fsync");
         file.sync_all().await?;
         Self::fsync_dir(&self.shadow_dir).await?;
+        let mut marker = Self::read_durable_tail(&self.shadow_dir).await?;
+        marker.segments.insert(
+            segment_path
+                .file_name()
+                .expect("shadow segment has a filename")
+                .to_string_lossy()
+                .into_owned(),
+            file.metadata().await?.len(),
+        );
+        Self::persist_durable_tail(&self.shadow_dir, &marker).await?;
         crate::native_spool::durability_failpoint("shadow_fsync_complete");
         Ok(())
     }
@@ -615,7 +755,7 @@ impl ShadowWal {
 
     /// Clean up old shadow segments after successful upload
     pub async fn cleanup_segments(&self, up_to_generation: u64) -> Result<usize> {
-        let mut deleted = 0;
+        let mut victims = Vec::new();
 
         let mut entries = fs::read_dir(&self.shadow_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -626,23 +766,36 @@ impl ShadowWal {
                 if let Some(gen_str) = name_str.split('-').next() {
                     if let Ok(gen) = u64::from_str_radix(gen_str, 16) {
                         if gen < up_to_generation {
-                            fs::remove_file(entry.path()).await?;
-                            deleted += 1;
+                            victims.push((name_str.into_owned(), entry.path()));
                         }
                     }
                 }
             }
         }
 
-        if deleted > 0 {
+        if !victims.is_empty() {
+            // Commit the ownership change before unlinking. A crash before
+            // unlink leaves harmless unmarked files that startup removes; a
+            // crash after unlink can never leave the marker naming a missing
+            // segment.
+            let mut marker = Self::read_durable_tail(&self.shadow_dir).await?;
+            for (name, _) in &victims {
+                marker.segments.remove(name.as_str());
+            }
+            Self::persist_durable_tail(&self.shadow_dir, &marker).await?;
+            crate::native_spool::durability_failpoint("shadow_cleanup_marker_committed");
+            for (_, path) in &victims {
+                fs::remove_file(path).await?;
+            }
+            Self::fsync_dir(&self.shadow_dir).await?;
             tracing::debug!(
                 "Shadow WAL: cleaned up {} old segments (generations < {})",
-                deleted,
+                victims.len(),
                 up_to_generation
             );
         }
 
-        Ok(deleted)
+        Ok(victims.len())
     }
 
     /// Get current generation
@@ -663,6 +816,10 @@ impl ShadowWal {
     /// Get shadow directory path
     pub fn shadow_dir(&self) -> &Path {
         &self.shadow_dir
+    }
+
+    pub fn discarded_unproven_tail(&self) -> bool {
+        self.discarded_unproven_tail
     }
 
     /// The WAL header salt of the generation the live-WAL read cursor indexes
@@ -954,6 +1111,7 @@ mod tests {
                 wal_chain: None,
                 header_seeded: false,
                 probe_wal_mode_on_lifecycle_state: false,
+                discarded_unproven_tail: false,
             };
             shadow
                 .current_segment_path()
@@ -1107,6 +1265,81 @@ mod tests {
         assert_eq!(
             result.unique_pages, 2,
             "both real pages (1 and 2) must decode, with no bogus page 0"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_tail_discards_aligned_prefsync_crash_image() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("durable-tail.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t(v) VALUES ('durable');",
+        )
+        .unwrap();
+
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        shadow.copy_frames(0).await.unwrap();
+        let segment = shadow.current_segment_path();
+        let durable_len = std::fs::metadata(&segment).unwrap().len();
+        let marker_before = ShadowWal::read_durable_tail(shadow.shadow_dir())
+            .await
+            .unwrap();
+        assert_eq!(
+            marker_before.segments[segment.file_name().unwrap().to_str().unwrap()],
+            durable_len
+        );
+        drop(shadow);
+
+        // Construct the power-loss image SIGKILL cannot model: a complete,
+        // frame-aligned tail reached the file length but not the durable marker.
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap();
+        file.write_all(&e1_frame(999, 999, 0xDE)).unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(&segment).unwrap().len(),
+            durable_len + FRAME_HEADER_SIZE + E1_PAGE_SIZE as u64
+        );
+
+        let restarted = ShadowWal::new(&db_path).await.unwrap();
+        assert!(restarted.discarded_unproven_tail());
+        assert_eq!(
+            std::fs::metadata(&segment).unwrap().len(),
+            durable_len,
+            "startup must trust the fsynced marker, not aligned file length"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_tail_finishes_marker_first_cleanup_after_crash() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("cleanup-tail.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t(v) VALUES ('durable');",
+        )
+        .unwrap();
+
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let orphan = shadow.shadow_dir().join(format_segment_name(7, 0));
+        std::fs::write(&orphan, e1_frame(1, 1, 0xAA)).unwrap();
+        drop(shadow);
+
+        let restarted = ShadowWal::new(&db_path).await.unwrap();
+        assert!(restarted.discarded_unproven_tail());
+        assert!(
+            !orphan.exists(),
+            "startup must finish a marker-first cleanup instead of adopting or retaining its orphan"
         );
     }
 

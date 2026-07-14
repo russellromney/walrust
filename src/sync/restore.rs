@@ -592,6 +592,54 @@ mod tests {
         assert!(error.to_string().contains("lineage-b"));
     }
 
+    #[tokio::test]
+    async fn local_native_restore_refuses_active_spool_owner_without_cloud_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("active.sqlite");
+        std::fs::File::create(&db).unwrap();
+        let identity = walrust_core::native_spool::SpoolIdentity::new(
+            &db,
+            "bucket",
+            "p/",
+            "db",
+            "lineage-active",
+            1,
+            None,
+            true,
+        )
+        .unwrap();
+        let root = walrust_core::native_spool::NativeSpool::path_for(dir.path(), &identity);
+        let _owner = walrust_core::native_spool::NativeSpool::create_or_open(
+            &root,
+            identity,
+            walrust_core::native_spool::CapacityPolicy {
+                warning_bytes: u64::MAX - 1,
+                hard_bytes: u64::MAX,
+                minimum_free_bytes: 0,
+            },
+        )
+        .unwrap();
+        let output = dir.path().join("restore.sqlite");
+        let error = restore(
+            "db",
+            &output,
+            "bucket/p/",
+            None,
+            None,
+            Some(dir.path()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("active watcher"), "{message}");
+        assert!(
+            message.contains("stop watch before local restore"),
+            "{message}"
+        );
+        assert!(!output.exists());
+    }
+
     #[test]
     fn level_key_detection_is_structural() {
         // Real merged level objects (built as `{db}/levels/L{n}/{file}`) are always

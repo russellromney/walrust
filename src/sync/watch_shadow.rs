@@ -344,16 +344,6 @@ async fn stage_native_snapshot(
     };
     let preparation = {
         let mut spool = spool_lock(&spool_state.0)?;
-        let estimated_db_bytes = std::fs::metadata(&state.db_path)?.len();
-        let estimated_peak = estimated_db_bytes
-            .saturating_mul(3)
-            .saturating_add(source_footprint_on_spool_filesystem(state, &spool)?);
-        if spool.capacity_state(estimated_peak)? == CapacityState::Full {
-            bail!(
-                "local_spool_full: {} lacks peak capacity/reserve for native snapshot stable copy + temp + payload",
-                state.name
-            );
-        }
         let seq = spool
             .admitted_seq()
             .map(|seq| seq + 1)
@@ -386,7 +376,13 @@ async fn stage_native_snapshot(
         preparation
     } else {
         let stable_for_create = stable_path.clone();
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        let spool_for_capacity = Arc::clone(&spool_state.0);
+        let source_footprint = {
+            let spool = spool_lock(&spool_state.0)?;
+            source_footprint_on_spool_filesystem(state, &spool)?
+        };
+        let database_name = state.name.clone();
+        let copy_result = tokio::task::spawn_blocking(move || -> Result<()> {
             match std::fs::remove_file(&stable_for_create) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -394,6 +390,29 @@ async fn stage_native_snapshot(
             }
             let source = Connection::open(&db_path)?;
             source.busy_timeout(Duration::from_secs(30))?;
+            source.execute_batch("BEGIN DEFERRED;")?;
+            // Establish and hold the exact SQLite snapshot before capacity
+            // admission. page_count includes WAL-visible logical growth, unlike
+            // main-file metadata.
+            let logical_pages: u64 = source.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+            let _: i64 = source.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+            let logical_bytes = logical_pages.saturating_mul(page_size as u64);
+            let payload_upper = logical_bytes
+                .saturating_add(logical_pages.saturating_mul(64))
+                .saturating_add(4096);
+            let peak = {
+                let spool = spool_lock(&spool_for_capacity)?;
+                logical_bytes
+                    .saturating_add(payload_upper.saturating_mul(2))
+                    .saturating_add(spool.next_journal_rewrite_peak_bytes()?)
+                    .saturating_add(source_footprint)
+            };
+            if spool_lock(&spool_for_capacity)?.capacity_state(peak)? == CapacityState::Full {
+                bail!(
+                    "local_spool_full: {} lacks peak capacity/reserve for WAL-visible native snapshot stable copy + temp + payload + journal",
+                    database_name
+                );
+            }
             let mut destination = Connection::open(&stable_for_create)?;
             destination.busy_timeout(Duration::from_secs(30))?;
             {
@@ -401,13 +420,22 @@ async fn stage_native_snapshot(
                 backup.run_to_completion(256, Duration::from_millis(10), None)?;
             }
             drop(destination);
+            source.execute_batch("ROLLBACK;")?;
             drop(source);
             let stable = std::fs::File::open(&stable_for_create)?;
             stable.sync_all()?;
             std::fs::File::open(&stable_parent)?.sync_all()?;
             Ok(())
         })
-        .await??;
+        .await;
+        // The backup source close can release process-scoped POSIX locks even
+        // though the long-lived blocker transaction remains open. Always rearm
+        // before propagating success or failure; this is the final SQLite
+        // operation in the snapshot path.
+        let rearm_result = rearm_checkpoint_blocker(state)
+            .with_context(|| format!("{}: rearm blocker after snapshot copy", state.name));
+        copy_result??;
+        rearm_result?;
         spool_lock(&spool_state.0)?.mark_snapshot_stable(seq)?
     };
     let stable_for_encode = stable_path.clone();
@@ -720,6 +748,60 @@ async fn copy_final_shadow_frames(db_states: &mut HashMap<PathBuf, ShadowDbState
     }
 
     Ok(())
+}
+
+async fn finish_shutdown_local_admission(
+    db_states: &mut HashMap<PathBuf, ShadowDbState>,
+    native_spools: &HashMap<PathBuf, NativeSpoolState>,
+) {
+    loop {
+        let attempt = async {
+            copy_final_shadow_frames(db_states).await?;
+            let mut final_results = Vec::with_capacity(db_states.len());
+            for (db_path, state) in db_states.iter() {
+                final_results.push(match native_spools.get(db_path) {
+                    Some(spool) => stage_native_shadow(state, spool).await,
+                    None => Err(anyhow!("{}: native spool missing", state.name)),
+                });
+            }
+            apply_shadow_sync_results_strict(db_states, final_results).await
+        }
+        .await;
+        match attempt {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::error!(
+                    event = "local_spool_full",
+                    error = %error,
+                    "shutdown local admission is not durable; retaining checkpoint blockers and retrying (SIGKILL is the explicit forced stop)"
+                );
+                // A stage can commit its journal before progress persistence
+                // fails. Reconcile from that durable head before retrying so
+                // the same shadow suffix is never admitted under a new seq.
+                for (db_path, state) in db_states.iter_mut() {
+                    let head = match native_spools.get(db_path) {
+                        Some((spool, _)) => match spool_lock(spool) {
+                            Ok(guard) => Ok(guard.recovery_head()),
+                            Err(error) => Err(error),
+                        },
+                        None => Err(anyhow!("{}: native spool missing", state.name)),
+                    };
+                    let reconcile_result = match head {
+                        Ok(head) => reconcile_shadow_progress_from_spool(state, head).await,
+                        Err(error) => Err(error),
+                    };
+                    if let Err(reconcile_error) = reconcile_result {
+                        tracing::error!(
+                            database = %state.name,
+                            error = %reconcile_error,
+                            "shutdown could not reconcile durable spool head; retaining blocker and retrying"
+                        );
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
 }
 
 async fn checkpoint_shadow_after_durable_sync(
@@ -1179,6 +1261,13 @@ async fn initial_shadow_copy(
     let mut eager_snapshot: HashSet<PathBuf> = HashSet::new();
 
     for (_db_path, state) in db_states.iter_mut() {
+        if state.shadow.discarded_unproven_tail() {
+            tracing::error!(
+                database = %state.name,
+                "shadow startup discarded bytes beyond the durable fsync marker; scheduling conservative snapshot re-anchor"
+            );
+            eager_snapshot.insert(state.db_path.clone());
+        }
         if !state.wal_path.exists() {
             continue;
         }
@@ -1233,6 +1322,61 @@ pub async fn watch_with_shadow(
     spool_config: SpoolConfig,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
+
+    // Pin every source database before client construction or remote
+    // discovery. Credential resolution and S3 can stall indefinitely; no app
+    // checkpoint may erase unread WAL during that startup window.
+    let mut db_locks: Vec<crate::lock::DbLock> = Vec::new();
+    let mut startup_blockers: HashMap<PathBuf, Connection> = HashMap::new();
+    let mut startup_shadows: HashMap<PathBuf, ShadowWal> = HashMap::new();
+    let mut startup_data_version_monitors: HashMap<PathBuf, Connection> = HashMap::new();
+    for db_config in &databases {
+        if !db_config.path.exists() {
+            return Err(WalrustError::database(format!(
+                "Database not found: {}",
+                db_config.path.display()
+            ))
+            .into());
+        }
+        db_locks.push(crate::lock::DbLock::acquire(&db_config.path)?);
+        // Build every other same-database SQLite handle before the blocker.
+        // Closing any handle after taking a POSIX blocker can drop the
+        // process-wide inode locks, so blocker acquisition must be the final
+        // SQLite operation for this database before remote startup.
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_config.path)
+            .await
+            .with_context(|| {
+                format!(
+                    "{}: failed to initialize shadow before remote startup",
+                    db_config.prefix
+                )
+            })?;
+        let data_version_monitor = Connection::open(&db_config.path).with_context(|| {
+            format!(
+                "{}: failed to open CLI data_version monitor",
+                db_config.prefix
+            )
+        })?;
+        data_version_monitor.busy_timeout(Duration::from_secs(5))?;
+        let blocker = ShadowWal::open_checkpoint_blocker(&db_config.path).with_context(|| {
+            format!(
+                "{}: failed to pin CLI checkpoint blocker before remote startup",
+                db_config.prefix
+            )
+        })?;
+        startup_shadows.insert(db_config.path.clone(), shadow);
+        startup_data_version_monitors.insert(db_config.path.clone(), data_version_monitor);
+        startup_blockers.insert(db_config.path.clone(), blocker);
+    }
+    if cfg!(debug_assertions) {
+        if let Some(path) = std::env::var_os("WALRUST_TEST_STARTUP_DISCOVERY_PAUSE_FILE") {
+            let path = PathBuf::from(path);
+            std::fs::write(&path, b"blockers-attached")?;
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
     let client = Arc::new(
         create_client(endpoint)
             .await
@@ -1290,21 +1434,8 @@ pub async fn watch_with_shadow(
     let mut trigger_states: HashMap<PathBuf, TriggerState> = HashMap::new();
     let mut sync_configs: HashMap<PathBuf, SyncConfig> = HashMap::new();
     let mut required_native_reanchors: HashSet<PathBuf> = HashSet::new();
-    // Single-writer guards, held for the lifetime of this watch (E5).
-    let mut db_locks: Vec<crate::lock::DbLock> = Vec::new();
-
     for db_config in &databases {
         let db_path = &db_config.path;
-        if !db_path.exists() {
-            return Err(WalrustError::database(format!(
-                "Database not found: {}",
-                db_path.display()
-            ))
-            .into());
-        }
-
-        // Fail fast if another walrust instance already owns this database (E5).
-        db_locks.push(crate::lock::DbLock::acquire(db_path)?);
 
         let name = db_config.prefix.clone();
         let wal_path = db_path.with_extension("db-wal");
@@ -1325,7 +1456,7 @@ pub async fn watch_with_shadow(
             None,
             false,
         )?;
-        let spool_root = NativeSpool::path_for(&spool_base, &binding_identity);
+        let spool_root = NativeSpool::resolve_path_for(&spool_base, &binding_identity)?;
         let existing_spool_identity = NativeSpool::read_identity(&spool_root)?;
 
         // A complete matching local spool is sufficient for offline restart.
@@ -1540,18 +1671,15 @@ pub async fn watch_with_shadow(
         let mut shadow_sync_offset = 0;
 
         // Create shadow WAL manager (this holds the checkpoint blocker)
-        let mut shadow = match ShadowWal::new_without_checkpoint_blocker(db_path).await {
-            Ok(s) => s,
-            Err(e) => {
-                tracing::error!("{}: Failed to create shadow WAL: {}", name, e);
-                return Err(e);
-            }
-        };
-        let data_version_monitor = Connection::open(db_path)
-            .with_context(|| format!("{}: failed to open CLI data_version monitor", name))?;
-        data_version_monitor.busy_timeout(Duration::from_secs(5))?;
-        let checkpoint_blocker = ShadowWal::open_checkpoint_blocker(db_path)
-            .with_context(|| format!("{}: failed to open CLI checkpoint blocker", name))?;
+        let mut shadow = startup_shadows
+            .remove(db_path)
+            .ok_or_else(|| anyhow!("{}: startup shadow state missing", name))?;
+        let data_version_monitor = startup_data_version_monitors
+            .remove(db_path)
+            .ok_or_else(|| anyhow!("{}: startup data_version monitor missing", name))?;
+        let checkpoint_blocker = startup_blockers
+            .remove(db_path)
+            .ok_or_else(|| anyhow!("{}: startup checkpoint blocker missing", name))?;
 
         let mut restored_wal_copy_offset = 0u64;
         if let Some(progress) = load_shadow_progress(&shadow, &name)? {
@@ -1645,14 +1773,21 @@ pub async fn watch_with_shadow(
         let state = db_states
             .get_mut(db_path)
             .expect("shadow state inserted above");
-        if !checkpoint_blocker_heartbeat_is_live(state)? {
-            rearm_checkpoint_blocker(state).with_context(|| {
-                format!(
-                    "{}: failed to verify initial CLI checkpoint blocker",
-                    state.name
-                )
-            })?;
-        }
+        // Several startup operations open and close SQLite handles. On POSIX a
+        // close can release process-scoped fcntl locks, so rearm unconditionally
+        // after the final such operation. This is the final SQLite operation in
+        // successful startup.
+        rearm_checkpoint_blocker(state).with_context(|| {
+            format!(
+                "{}: failed to finalize initial CLI checkpoint blocker",
+                state.name
+            )
+        })?;
+        anyhow::ensure!(
+            checkpoint_blocker_heartbeat_is_live(state)?,
+            "{}: initial CLI checkpoint blocker is not live",
+            state.name
+        );
         let recovery_head = {
             let spool_state = native_spools
                 .get(db_path)
@@ -2397,15 +2532,7 @@ pub async fn watch_with_shadow(
     // Graceful shutdown - sync remaining shadow data
     tracing::info!("Shadow mode shutdown: syncing remaining data...");
 
-    copy_final_shadow_frames(&mut db_states).await?;
-    let mut final_results = Vec::with_capacity(db_states.len());
-    for (db_path, state) in &db_states {
-        final_results.push(match native_spools.get(db_path) {
-            Some(spool) => stage_native_shadow(state, spool).await,
-            None => Err(anyhow!("{}: native spool missing", state.name)),
-        });
-    }
-    apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
+    finish_shutdown_local_admission(&mut db_states, &native_spools).await;
     durability_failpoint("shutdown_local_admission_complete");
 
     shutdown_shadow_uploaders(&cache_states, &db_states, uploader_handles).await?;
@@ -3125,6 +3252,7 @@ mod tests {
         let durable_root = spool.root().to_path_buf();
         let durable_identity = spool.identity().clone();
         drop(spool);
+        drop(spool_state);
         let reopened = NativeSpool::create_or_open(
             &durable_root,
             durable_identity,
