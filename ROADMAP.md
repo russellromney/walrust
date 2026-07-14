@@ -505,15 +505,32 @@ to merge.
 
 ### PR #43 adversarial remediation gate — complete 2026-07-14
 
-The authoritative journal/cursor, snapshot intent, exact remote visibility,
-offline ownership, local restore ambiguity, native retention, uploader
-supervision/metrics, crash failpoint, capacity, migration, and user-path gaps
-from the 2026-07-14 review are closed. Each load-bearing production gate was
-neutered and observed failing before its restored green run. A genuinely fresh
-reviewer then found and fixed additional blocker-rearm, journal validation,
-cleanup pre-validation, predecessor/base publication, and retained-floor base
-selection gaps. See `CHANGELOG.md` and PR #43's atomic commit history for the
-completed proof ledger. The user retains merge authority.
+Two independent adversarial passes are closed. The second pass specifically
+proved and fixed seven gaps left by the first completion claim:
+
+- every configured database is checkpoint-pinned before S3 client creation or
+  discovery, then unconditionally rearmed as the final startup SQLite action;
+- SIGTERM at local admission failure retries with the blocker held, and only a
+  deliberate SIGKILL forces an incomplete local shutdown;
+- an atomic fsynced shadow durable-tail marker, not frame alignment, defines the
+  restart-safe prefix;
+- snapshot preflight uses a pinned WAL-visible SQLite page count and reserves
+  stable-copy, HADBP, journal, intent, source, and filesystem peaks before copy;
+- ordinary object admission reserves install-intent and complete journal
+  rewrite peaks as well as payload bytes;
+- an advisory spool owner lock makes active local restore fail loudly and keeps
+  mutating recovery out of watcher write windows; offline restore remains exact;
+- v2 local paths length-prefix every identity component, discover matching v1
+  spools, reject duplicate v1/v2 ownership, and route a colliding foreign v1
+  tuple to its distinct v2 path.
+
+The live user-path gates cover startup discovery delay plus app TRUNCATE,
+shutdown at hard capacity and restart, WAL-grown snapshots on a custom spool,
+and active-refusal/offline local restore. The shadow SIGKILL matrix covers both
+sides of its fsync marker. Narrow tests construct an aligned pre-fsync crash
+image and adversarial identity segmentation collision. Each new call site was
+neutered and failed before restoration. See `CHANGELOG.md` and the atomic PR
+history for the proof ledger. The user retains merge authority.
 
 ---
 

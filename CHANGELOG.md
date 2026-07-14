@@ -40,6 +40,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closed fail-open monitor-refresh rearm, corrupt remote cursor, pre-validation
   cleanup unlink, missing predecessor/base publication, and retained-floor base
   selection gaps.
+- **Adversarial local-first startup and filesystem hardening:** CLI watch now
+  pins every SQLite WAL before S3 client construction or remote discovery, so
+  application TRUNCATE cannot erase startup-window frames. Shadow segments use
+  an atomic, fsynced durable-tail marker and discard even frame-aligned bytes
+  beyond that proof after a crash. Snapshot capacity is computed from a pinned
+  SQLite `page_count` that includes WAL-visible growth and reserves the stable
+  copy, HADBP payloads, full journal rewrite, intents, source footprint, and
+  filesystem reserve before creating the copy. Object admission likewise
+  reserves install-intent and journal rewrite peaks. SIGTERM retries local
+  admission indefinitely with the blocker held when capacity or local I/O is
+  unhealthy; SIGKILL remains the explicit forced-stop route.
+- **Native spool ownership and collision safety:** an advisory ownership lock
+  prevents local restore or a second mutating recovery opener from racing the
+  watcher's payload-before-journal and cleanup windows. Active local restore
+  fails with an actionable message; after watch stops, the same spool restores
+  without S3. New spool paths length-prefix and domain-separate all identity
+  components. Existing v1 paths remain discoverable, while an adversarial v1
+  tuple collision belonging to another identity routes safely to v2.
 - **Native migration prune gate:** legacy pruning now requires the same
   descriptor-selected contiguous native snapshot base used by restore. A stray
   publish record beyond a gap cannot unlock deletion of the legacy recovery
@@ -92,6 +110,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   DF1/DF2, application checkpoint, WAL backpressure, racing checkpoint,
   two-writer, fenced follower, core SIGKILL, and frozen 0.7 format-stability
   gates remain green.
+- Added live-S3 user-path proofs for blocker attachment before delayed startup
+  discovery, SIGTERM at hard spool capacity, WAL-visible snapshot growth under
+  a tight custom spool limit, and active-owner local restore refusal followed
+  by exact offline restore. Added unit crash images for aligned but unproven
+  shadow tails, journal/intent rewrite peaks, ownership contention, and
+  adversarial path-component collisions. Each new production gate was disabled
+  at its call site and observed failing before its restored green run.
 - Pinned the checkpoint-blocker contract against real SQLite databases across
   every supported page size and synchronous level: a concurrent
   `wal_checkpoint(TRUNCATE)` reports busy and preserves the WAL until walrust
