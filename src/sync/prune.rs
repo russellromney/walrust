@@ -31,32 +31,96 @@ pub async fn prune(
     // that record exists, the legacy base/history is the only remote recovery
     // point and pruning it could strand unpublished local descendants.
     let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
-    match s3::download_bytes(&client, &bucket_name, &descriptor_key).await {
-        Ok(_) => {
+    let (native_state, native_descriptor) = match s3::download_bytes(
+        &client,
+        &bucket_name,
+        &descriptor_key,
+    )
+    .await
+    {
+        Ok(descriptor_bytes) => {
+            let descriptor = serde_json::from_slice::<
+                walrust_core::native_publish::StreamDescriptor,
+            >(&descriptor_bytes)?;
             let storage = S3Storage::new(client.clone(), bucket_name.clone());
             // A non-empty `published/` listing is not a visibility proof: the
             // only record may be beyond a gap, malformed, or belong to an
             // incompatible chain. Use the same contiguous descriptor-selected
             // head calculation as restore/list before allowing destructive
             // legacy retention.
-            if walrust_core::native_restore::inspect_native_v1(
+            let visible = walrust_core::native_restore::inspect_native_v1(
                 &storage,
                 &bucket_name,
                 &prefix,
                 name,
             )
-            .await?
-            .is_none()
-            {
+            .await?;
+            if visible.is_none() {
                 println!(
                     "Native migration for '{}' has no contiguous published snapshot base; refusing legacy prune",
                     name
                 );
                 return Ok(());
             }
+            (visible, Some(descriptor))
         }
-        Err(error) if s3::download_error_is_not_found(&error) => {}
+        Err(error) if s3::download_error_is_not_found(&error) => (None, None),
         Err(error) => return Err(classify_or_else(error, WalrustError::s3)),
+    };
+
+    if let Some(native) = &native_state {
+        let descriptor = native_descriptor
+            .as_ref()
+            .expect("native state and descriptor are created together");
+        let mut native_snapshots = Vec::with_capacity(native.snapshot_seqs.len());
+        for seq in &native.snapshot_seqs {
+            let key = format!(
+                "{}{}/native/v1/lineages/{}/published/{seq:016x}.json",
+                prefix, name, descriptor.lineage_id
+            );
+            let meta = s3::head_object_meta(&client, &bucket_name, &key)
+                .await
+                .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+            native_snapshots.push(SnapshotEntry {
+                key,
+                created_at: meta.last_modified,
+                sequence: *seq,
+                size: meta.size,
+            });
+        }
+        let native_plan =
+            crate::retention::analyze_retention(&native_snapshots, policy, Utc::now());
+        let floor = native_plan
+            .keep
+            .iter()
+            .map(|entry| entry.sequence)
+            .min()
+            .unwrap_or(native.retention_floor_seq);
+        let delete_count = floor.saturating_sub(native.retention_floor_seq) as usize;
+        println!(
+            "Native HADBP retention: keep floor sequence {} through visible head {} ({} older object(s) eligible)",
+            floor,
+            native.head_seq,
+            delete_count
+        );
+        if force && floor > native.retention_floor_seq {
+            let storage = S3Storage::new(client.clone(), bucket_name.clone());
+            let outcome = walrust_core::native_restore::prune_native_before_snapshot(
+                &storage,
+                &bucket_name,
+                &prefix,
+                name,
+                floor,
+            )
+            .await?;
+            println!(
+                "Native HADBP prune complete: deleted {} object/record pair(s); earliest native PIT is {}",
+                outcome.deleted_objects,
+                outcome.floor_seq
+            );
+        } else if !force && floor > native.retention_floor_seq {
+            println!("Native HADBP prune is a dry run; use --force to advance the floor.");
+        }
     }
 
     // Discover snapshots from the S3 listing — the production watch path never
@@ -66,8 +130,11 @@ pub async fn prune(
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
-    if discovered.is_empty() {
+    if discovered.is_empty() && native_state.is_none() {
         println!("No snapshots found for database '{}'", name);
+        return Ok(());
+    }
+    if discovered.is_empty() {
         return Ok(());
     }
 

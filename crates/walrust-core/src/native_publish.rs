@@ -806,6 +806,106 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_retention_floor_prunes_only_below_verified_snapshot() {
+        let dir = tempdir().unwrap();
+        let spool = staged_spool(dir.path());
+        let db = dir.path().join("db.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("INSERT INTO t DEFAULT VALUES", []).unwrap();
+        let page_size = conn
+            .query_row("PRAGMA page_size", [], |row| row.get::<_, u32>(0))
+            .unwrap();
+        drop(conn);
+        let (identity, previous) = {
+            let guard = spool.lock().unwrap();
+            (
+                guard.identity().clone(),
+                guard.get(1).unwrap().ending_chain_checksum,
+            )
+        };
+        let delta_pages = std::fs::read(&db)
+            .unwrap()
+            .chunks_exact(page_size as usize)
+            .enumerate()
+            .map(|(index, page)| ((index + 1) as u32, page.to_vec()))
+            .collect::<Vec<_>>();
+        let (delta, delta_end) = ltx::encode_wal_changes_with_end_page_count(
+            &delta_pages,
+            page_size,
+            2,
+            previous,
+            delta_pages.len() as u64,
+        )
+        .unwrap();
+        spool
+            .lock()
+            .unwrap()
+            .stage(StageObject {
+                seq: 2,
+                kind: ObjectKind::Delta,
+                previous_chain_checksum: previous,
+                ending_chain_checksum: delta_end,
+                end_page_count: delta_pages.len() as u64,
+                intended_remote_key: object_key(&identity, ObjectKind::Delta, 2),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &delta,
+            })
+            .unwrap();
+        let snapshot = ltx::encode_snapshot_with_checksum(&db, page_size, 3, delta_end).unwrap();
+        let snapshot_pages = std::fs::metadata(&db).unwrap().len() / page_size as u64;
+        spool
+            .lock()
+            .unwrap()
+            .stage(StageObject {
+                seq: 3,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: delta_end,
+                ending_chain_checksum: snapshot.checksum,
+                end_page_count: snapshot_pages,
+                intended_remote_key: object_key(&identity, ObjectKind::Snapshot, 3),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &snapshot.bytes,
+            })
+            .unwrap();
+        let storage = Arc::new(MemoryStorage::default());
+        let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool).unwrap();
+        assert!(uploader.publish_pending_once().await.unwrap());
+        assert!(uploader.publish_pending_once().await.unwrap());
+        assert!(uploader.publish_pending_once().await.unwrap());
+
+        let outcome = crate::native_restore::prune_native_before_snapshot(
+            storage.as_ref(),
+            "bucket",
+            "p/",
+            "db",
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome.deleted_objects, 2);
+        let visible =
+            crate::native_restore::inspect_native_v1(storage.as_ref(), "bucket", "p/", "db")
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(visible.head_seq, 3);
+        assert_eq!(visible.retention_floor_seq, 3);
+        assert_eq!(visible.snapshot_seqs, vec![3]);
+
+        let expired = crate::native_restore::restore_native_v1(
+            storage.as_ref(),
+            "bucket",
+            "p/",
+            "db",
+            &dir.path().join("expired.sqlite"),
+            Some(2),
+        )
+        .await
+        .unwrap_err();
+        assert!(expired.to_string().contains("intentionally expired"));
+    }
+
+    #[tokio::test]
     async fn offline_reconnect_divergent_remote_head_is_rejected_and_retained() {
         let dir = tempdir().unwrap();
         let spool = staged_spool(dir.path());

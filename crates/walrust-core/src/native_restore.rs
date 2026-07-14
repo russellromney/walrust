@@ -6,6 +6,7 @@ use crate::native_spool::NativeSpool;
 use crate::native_spool::ObjectKind;
 use anyhow::{anyhow, bail, Context, Result};
 use hadb_storage::StorageBackend;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
@@ -25,7 +26,28 @@ pub struct NativeVisibleState {
     pub head_seq: u64,
     pub object_count: usize,
     pub latest_snapshot_seq: u64,
+    pub retention_floor_seq: u64,
+    pub snapshot_seqs: Vec<u64>,
     pub legacy_boundary_txid: Option<u64>,
+}
+
+pub const RETENTION_FLOOR_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetentionFloor {
+    pub version: u32,
+    pub stream_digest: String,
+    pub lineage_id: String,
+    pub floor_seq: u64,
+    pub snapshot_publish_sha256: String,
+    pub previous_publish_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativePruneOutcome {
+    pub floor_seq: u64,
+    pub deleted_objects: usize,
+    pub visible_head_seq: u64,
 }
 
 /// Discover only the contiguous, chain-verified published native recovery
@@ -52,10 +74,17 @@ pub async fn inspect_native_v1(
         .find(|(record, _)| record.kind == ObjectKind::Snapshot)
         .map(|(record, _)| record.seq)
         .ok_or_else(|| anyhow!("visible native chain has no snapshot base"))?;
+    let snapshot_seqs = records
+        .iter()
+        .filter(|(record, _)| record.kind == ObjectKind::Snapshot)
+        .map(|(record, _)| record.seq)
+        .collect::<Vec<_>>();
     Ok(Some(NativeVisibleState {
         head_seq: head.seq,
         object_count: records.len(),
         latest_snapshot_seq,
+        retention_floor_seq: records.first().unwrap().0.seq,
+        snapshot_seqs,
         legacy_boundary_txid: descriptor.legacy_boundary_txid,
     }))
 }
@@ -233,6 +262,14 @@ pub async fn restore_native_v1(
             visible_head
         );
     }
+    let retention_floor = records.first().unwrap().0.seq;
+    if target < retention_floor {
+        bail!(
+            "native PIT {} intentionally expired below retention floor {}",
+            target,
+            retention_floor
+        );
+    }
 
     let target_records = records
         .iter()
@@ -301,8 +338,14 @@ async fn load_visible_records(
     );
     let mut keys = storage.list(&publish_prefix, None).await?;
     keys.sort();
-    let mut expected_seq = descriptor.first_native_seq;
-    let mut previous_publish_digest: Option<String> = None;
+    let floor = load_retention_floor(storage, descriptor).await?;
+    let mut expected_seq = floor
+        .as_ref()
+        .map(|floor| floor.floor_seq)
+        .unwrap_or(descriptor.first_native_seq);
+    let mut previous_publish_digest = floor
+        .as_ref()
+        .and_then(|floor| floor.previous_publish_sha256.clone());
     let mut previous_chain_checksum: Option<u64> = None;
     let mut records = Vec::<(PublishRecord, Vec<u8>)>::new();
     for key in keys {
@@ -341,6 +384,145 @@ async fn load_visible_records(
     }
 
     Ok(records)
+}
+
+async fn load_retention_floor(
+    storage: &dyn StorageBackend,
+    descriptor: &StreamDescriptor,
+) -> Result<Option<RetentionFloor>> {
+    let floor_prefix = format!(
+        "{}{}/native/v1/retention/v1/",
+        descriptor.prefix, descriptor.database
+    );
+    let mut candidates = storage
+        .list(&floor_prefix, None)
+        .await?
+        .into_iter()
+        .filter_map(|key| parse_record_seq(&key, &floor_prefix).map(|seq| (seq, key)))
+        .collect::<Vec<_>>();
+    candidates.sort_by_key(|(seq, _)| *seq);
+    let Some((key_seq, key)) = candidates.pop() else {
+        return Ok(None);
+    };
+    let bytes = storage
+        .get(&key)
+        .await?
+        .ok_or_else(|| anyhow!("native retention floor vanished during discovery: {key}"))?;
+    let floor: RetentionFloor = serde_json::from_slice(&bytes)
+        .with_context(|| format!("decode native retention floor {key}"))?;
+    if floor.version != RETENTION_FLOOR_VERSION
+        || floor.stream_digest != descriptor.stream_digest
+        || floor.lineage_id != descriptor.lineage_id
+        || floor.floor_seq != key_seq
+        || floor.floor_seq < descriptor.first_native_seq
+    {
+        bail!("native retention floor identity/sequence mismatch at {key}");
+    }
+    let publish_key = format!(
+        "{}{}/native/v1/lineages/{}/published/{:016x}.json",
+        descriptor.prefix, descriptor.database, descriptor.lineage_id, floor.floor_seq
+    );
+    let publish_bytes = storage.get(&publish_key).await?.ok_or_else(|| {
+        anyhow!("native retention floor snapshot record is missing: {publish_key}")
+    })?;
+    if sha256_hex(&publish_bytes) != floor.snapshot_publish_sha256 {
+        bail!("native retention floor snapshot publish digest mismatch");
+    }
+    let record: PublishRecord = serde_json::from_slice(&publish_bytes)?;
+    validate_record(
+        descriptor,
+        &record,
+        floor.floor_seq,
+        floor.previous_publish_sha256.as_deref(),
+        None,
+    )?;
+    if record.kind != ObjectKind::Snapshot {
+        bail!("native retention floor does not name a snapshot");
+    }
+    get_verified_object(storage, descriptor, &record).await?;
+    Ok(Some(floor))
+}
+
+pub async fn prune_native_before_snapshot(
+    storage: &dyn StorageBackend,
+    bucket: &str,
+    prefix: &str,
+    database: &str,
+    floor_seq: u64,
+) -> Result<NativePruneOutcome> {
+    let descriptor_key = format!("{}{database}/native/v1/stream.json", prefix);
+    let descriptor_bytes = storage
+        .get(&descriptor_key)
+        .await?
+        .ok_or_else(|| anyhow!("native stream descriptor is missing"))?;
+    let descriptor: StreamDescriptor = serde_json::from_slice(&descriptor_bytes)?;
+    validate_descriptor(&descriptor, bucket, prefix, database)?;
+    let records = load_visible_records(storage, &descriptor).await?;
+    let head_seq = records
+        .last()
+        .map(|(record, _)| record.seq)
+        .ok_or_else(|| anyhow!("native stream has no visible snapshot base"))?;
+    let (snapshot, snapshot_bytes) = records
+        .iter()
+        .find(|(record, _)| record.seq == floor_seq)
+        .ok_or_else(|| anyhow!("native retention floor seq {floor_seq} is not visible"))?;
+    if snapshot.kind != ObjectKind::Snapshot {
+        bail!("native retention floor seq {floor_seq} is not a snapshot");
+    }
+    let floor = RetentionFloor {
+        version: RETENTION_FLOOR_VERSION,
+        stream_digest: descriptor.stream_digest.clone(),
+        lineage_id: descriptor.lineage_id.clone(),
+        floor_seq,
+        snapshot_publish_sha256: sha256_hex(snapshot_bytes),
+        previous_publish_sha256: snapshot.previous_publish_sha256.clone(),
+    };
+    let floor_key = format!(
+        "{}{}/native/v1/retention/v1/{floor_seq:016x}.json",
+        descriptor.prefix, descriptor.database
+    );
+    put_immutable_exact(storage, &floor_key, &serde_json::to_vec_pretty(&floor)?).await?;
+
+    let verified = load_visible_records(storage, &descriptor).await?;
+    if verified.last().map(|(record, _)| record.seq) != Some(head_seq)
+        || verified.first().map(|(record, _)| record.seq) != Some(floor_seq)
+    {
+        bail!("native retention floor did not preserve the prior visible head");
+    }
+
+    let victims = records
+        .iter()
+        .filter(|(record, _)| record.seq < floor_seq)
+        .map(|(record, _)| record.clone())
+        .collect::<Vec<_>>();
+    for record in &victims {
+        let publish_key = format!(
+            "{}{}/native/v1/lineages/{}/published/{:016x}.json",
+            descriptor.prefix, descriptor.database, descriptor.lineage_id, record.seq
+        );
+        storage.delete(&publish_key).await?;
+        storage.delete(&record.object_key).await?;
+    }
+    Ok(NativePruneOutcome {
+        floor_seq,
+        deleted_objects: victims.len(),
+        visible_head_seq: head_seq,
+    })
+}
+
+async fn put_immutable_exact(storage: &dyn StorageBackend, key: &str, bytes: &[u8]) -> Result<()> {
+    let result = storage.put_if_absent(key, bytes).await?;
+    if result.success {
+        return Ok(());
+    }
+    let existing = storage
+        .get(key)
+        .await?
+        .ok_or_else(|| anyhow!("native retention floor vanished after CAS conflict"))?;
+    if existing != bytes {
+        bail!("split brain/equivocation: divergent native retention floor at {key}");
+    }
+    Ok(())
 }
 
 fn validate_descriptor(
