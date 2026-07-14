@@ -319,10 +319,16 @@ impl NativeUploader {
                 Some(
                     guard
                         .objects()
-                        .next()
-                        .filter(|object| object.kind == ObjectKind::Snapshot)
+                        .filter(|object| {
+                            object.kind == ObjectKind::Snapshot
+                                && object.seq < next
+                                && object.remote_upload_state == RemoteUploadState::Published
+                        })
+                        .last()
                         .cloned()
-                        .ok_or_else(|| anyhow!("local native retained snapshot base is missing"))?,
+                        .ok_or_else(|| {
+                            anyhow!("local native published snapshot base is missing")
+                        })?,
                 )
             } else {
                 None
