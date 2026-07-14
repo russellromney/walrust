@@ -3684,6 +3684,7 @@ dependencies = [
  "hadb-io",
  "hadb-storage",
  "hadb-storage-s3",
+ "libc",
  "litepages",
  "rusqlite",
  "serde",
