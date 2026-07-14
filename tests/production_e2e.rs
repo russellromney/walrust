@@ -1318,6 +1318,122 @@ fn e2e_cli_sigkill_during_graceful_shutdown_recovers_pending_native_work() -> Re
 }
 
 #[test]
+fn e2e_cli_graceful_shutdown_bounds_cloud_drain_and_preserves_pending_spool() -> Result<()> {
+    require_s3!("e2e_cli_graceful_shutdown_bounds_cloud_drain_and_preserves_pending_spool");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-bounded-shutdown");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let spool_path = temp.path().join("spool");
+    let config_path = temp.path().join("walrust.toml");
+    let pause_file = temp.path().join("pause-uploader");
+    let log_path = temp.path().join("shutdown.log");
+    std::fs::write(&pause_file, b"paused")?;
+    std::fs::write(
+        &config_path,
+        format!(
+            "[spool]\npath = {:?}\nwarning_size = 800000000\nmax_size = 1000000000\nmin_free_space = 0\nshutdown_drain_seconds = 1\n",
+            spool_path.to_string_lossy()
+        ),
+    )?;
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "bounded-shutdown")?;
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: Some(&config_path),
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: Some(&pause_file),
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+    append_wide_rows(&writer, 6, 80, "bounded-shutdown")?;
+    let expected = rows(&db_path)?;
+
+    let signal = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()?;
+    anyhow::ensure!(signal.success(), "failed to send SIGTERM to watch child");
+    let shutdown_started = Instant::now();
+    let deadline = shutdown_started + e2e_poll_deadline(10);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "graceful shutdown exceeded its bounded drain:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    anyhow::ensure!(status.success(), "graceful shutdown failed: {status}");
+    anyhow::ensure!(
+        shutdown_started.elapsed() < Duration::from_secs(6),
+        "one-second cloud drain did not remain bounded"
+    );
+    anyhow::ensure!(
+        watch_log(&log_path)
+            .contains("bounded shutdown cloud drain expired; native spool remains durable"),
+        "shutdown did not report retained remote lag:\n{}",
+        watch_log(&log_path)
+    );
+    let pending_payloads = std::fs::read_dir(spool_path.join("native-v1"))?
+        .filter_map(|entry| entry.ok())
+        .flat_map(|entry| {
+            std::fs::read_dir(entry.path().join("objects"))
+                .into_iter()
+                .flatten()
+        })
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().and_then(|ext| ext.to_str()) == Some("hadbp"))
+        .count();
+    anyhow::ensure!(
+        pending_payloads > 0,
+        "shutdown deleted pending HADBP payloads"
+    );
+
+    std::fs::remove_file(&pause_file)?;
+    let restart_log = temp.path().join("restart.log");
+    let mut restarted = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &restart_log,
+        config_path: Some(&config_path),
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    anyhow::ensure!(restarted.try_wait()?.is_none(), "restart watcher exited");
+    stop_child(&mut restarted);
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
 fn e2e_cli_sigkill_restarts_every_native_cleanup_boundary() -> Result<()> {
     require_s3!("e2e_cli_sigkill_restarts_every_native_cleanup_boundary");
     let endpoint = test_endpoint();
