@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const SPOOL_VERSION: u32 = 1;
+const JOURNAL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -213,6 +214,40 @@ struct Journal {
     admitted_seq: Option<u64>,
     checkpointed_seq: Option<u64>,
     remote_published_seq: Option<u64>,
+    checkpoint_window: CheckpointWindow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum CheckpointWindow {
+    Closed,
+    Opening {
+        seq: u64,
+        source_cursor: SourceCursor,
+    },
+    RearmedDirty {
+        seq: u64,
+        source_cursor: SourceCursor,
+        checkpoint_completed: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JournalV1 {
+    version: u32,
+    identity: SpoolIdentity,
+    objects: BTreeMap<u64, SpoolObject>,
+    local_base_seq: u64,
+    admitted_seq: Option<u64>,
+    checkpointed_seq: Option<u64>,
+    remote_published_seq: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryHead {
+    pub seq: u64,
+    pub ending_chain_checksum: u64,
+    pub source_cursor: SourceCursor,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -245,9 +280,16 @@ impl NativeSpool {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         };
-        let journal: Journal =
+        #[derive(Deserialize)]
+        struct IdentityEnvelope {
+            version: u32,
+            identity: SpoolIdentity,
+        }
+        let journal: IdentityEnvelope =
             serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
-        if journal.version != SPOOL_VERSION || journal.identity.version != SPOOL_VERSION {
+        if !matches!(journal.version, SPOOL_VERSION | JOURNAL_VERSION)
+            || journal.identity.version != SPOOL_VERSION
+        {
             bail!(
                 "unsupported native spool journal/identity version at {}",
                 path.display()
@@ -280,37 +322,31 @@ impl NativeSpool {
         sync_dir(root)?;
 
         let journal_path = root.join("journal.json");
-        let journal = match fs::read(&journal_path) {
+        let (journal, migrated) = match fs::read(&journal_path) {
             Ok(bytes) => {
-                let journal: Journal = serde_json::from_slice(&bytes)
-                    .with_context(|| format!("parse {}", journal_path.display()))?;
-                if journal.version != SPOOL_VERSION {
-                    bail!(
-                        "unsupported native spool journal version {}",
-                        journal.version
-                    );
-                }
+                let (journal, migrated) = load_journal(&bytes, &journal_path)?;
                 if journal.identity != identity {
                     bail!(
                         "native spool identity mismatch at {}; refusing cross-stream reuse",
                         root.display()
                     );
                 }
-                journal
+                (journal, migrated)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let local_base_seq = identity.first_native_seq;
                 let journal = Journal {
-                    version: SPOOL_VERSION,
+                    version: JOURNAL_VERSION,
                     identity,
                     objects: BTreeMap::new(),
                     local_base_seq,
                     admitted_seq: None,
                     checkpointed_seq: None,
                     remote_published_seq: None,
+                    checkpoint_window: CheckpointWindow::Closed,
                 };
                 persist_json(root, &journal_path, &journal)?;
-                journal
+                (journal, false)
             }
             Err(e) => return Err(e).context("read native spool journal"),
         };
@@ -323,6 +359,9 @@ impl NativeSpool {
             journal,
             capacity,
         };
+        if migrated {
+            spool.persist_journal()?;
+        }
         spool.complete_interrupted_cleanup()?;
         spool.verify_journal_payloads()?;
         spool.reconcile_orphans()?;
@@ -339,6 +378,39 @@ impl NativeSpool {
 
     pub fn objects(&self) -> impl Iterator<Item = &SpoolObject> {
         self.journal.objects.values()
+    }
+
+    pub fn recovery_head(&self) -> Option<RecoveryHead> {
+        self.journal
+            .objects
+            .last_key_value()
+            .map(|(seq, object)| RecoveryHead {
+                seq: *seq,
+                ending_chain_checksum: object.ending_chain_checksum,
+                source_cursor: object.source_cursor.clone(),
+            })
+    }
+
+    pub fn has_complete_local_base(&self) -> bool {
+        self.journal
+            .objects
+            .get(&self.journal.local_base_seq)
+            .is_some_and(|object| {
+                object.kind == ObjectKind::Snapshot
+                    && object.local_creation_state == LocalCreationState::Installed
+            })
+    }
+
+    pub fn checkpoint_window(&self) -> &CheckpointWindow {
+        &self.journal.checkpoint_window
+    }
+
+    pub fn requires_checkpoint_reanchor(&self) -> bool {
+        self.journal.checkpoint_window != CheckpointWindow::Closed
+    }
+
+    pub fn checkpointed_seq(&self) -> Option<u64> {
+        self.journal.checkpointed_seq
     }
 
     pub fn pending_objects(&self) -> impl Iterator<Item = &SpoolObject> {
@@ -373,7 +445,7 @@ impl NativeSpool {
             .with_context(|| format!("re-read durable journal for native seq {seq}"))?;
         let durable: Journal = serde_json::from_slice(&bytes)
             .with_context(|| format!("parse durable journal for native seq {seq}"))?;
-        if durable.version != SPOOL_VERSION || durable.identity != self.journal.identity {
+        if durable.version != JOURNAL_VERSION || durable.identity != self.journal.identity {
             bail!("durable native spool journal identity/version mismatch");
         }
         if durable.admitted_seq.map_or(true, |admitted| admitted < seq) {
@@ -402,6 +474,9 @@ impl NativeSpool {
     pub fn stage(&mut self, stage: StageObject<'_>) -> Result<SpoolObject> {
         if stage.seq == 0 {
             bail!("native spool sequence 0 is invalid");
+        }
+        if stage.kind == ObjectKind::Delta && self.requires_checkpoint_reanchor() {
+            bail!("native checkpoint window is not closed; a snapshot re-anchor is required before another delta");
         }
         let decoded = ltx::decode_sqlite_changeset(stage.payload)
             .context("native spool payload is not valid HADBP")?;
@@ -510,12 +585,129 @@ impl NativeSpool {
         Ok(object)
     }
 
-    pub fn mark_checkpointed(&mut self, seq: u64) -> Result<()> {
-        if !self.journal.objects.contains_key(&seq) {
-            bail!("cannot checkpoint unadmitted native spool sequence {seq}");
+    /// Persist the release boundary before ending the SQLite blocker read
+    /// transaction. A crash with any non-closed window requires a conservative
+    /// full native snapshot before another delta can be admitted.
+    pub fn begin_checkpoint_window(&mut self, seq: u64) -> Result<()> {
+        if self.journal.checkpoint_window != CheckpointWindow::Closed {
+            bail!("cannot open a nested native checkpoint window");
+        }
+        let object = self
+            .journal
+            .objects
+            .get(&seq)
+            .ok_or_else(|| anyhow!("cannot open checkpoint window for unadmitted seq {seq}"))?;
+        if self.journal.admitted_seq != Some(seq) {
+            bail!("cannot checkpoint native seq {seq}; it is not the admitted head");
         }
         let old = self.journal.clone();
-        self.journal.checkpointed_seq = Some(seq);
+        self.journal.checkpoint_window = CheckpointWindow::Opening {
+            seq,
+            source_cursor: object.source_cursor.clone(),
+        };
+        if let Err(error) = self.persist_journal() {
+            self.journal = old;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Record that the blocker was reacquired but an application commit crossed
+    /// the controlled window. The marker remains non-closed until a native
+    /// snapshot re-anchor has been admitted.
+    pub fn mark_checkpoint_window_rearmed_dirty(
+        &mut self,
+        seq: u64,
+        checkpoint_completed: bool,
+    ) -> Result<()> {
+        let source_cursor = match &self.journal.checkpoint_window {
+            CheckpointWindow::Opening {
+                seq: open_seq,
+                source_cursor,
+            } if *open_seq == seq => source_cursor.clone(),
+            other => {
+                bail!("cannot mark native checkpoint seq {seq} dirty from window state {other:?}")
+            }
+        };
+        let old = self.journal.clone();
+        self.journal.checkpoint_window = CheckpointWindow::RearmedDirty {
+            seq,
+            source_cursor,
+            checkpoint_completed,
+        };
+        if let Err(error) = self.persist_journal() {
+            self.journal = old;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Close a controlled checkpoint window only after the blocker is known to
+    /// be rearmed. Dirty windows additionally require a later admitted snapshot.
+    pub fn close_checkpoint_window(
+        &mut self,
+        seq: u64,
+        checkpoint_completed: bool,
+        reanchor_seq: Option<u64>,
+    ) -> Result<()> {
+        match &self.journal.checkpoint_window {
+            CheckpointWindow::Opening { seq: open_seq, .. } if *open_seq == seq => {
+                if reanchor_seq.is_some() {
+                    bail!("clean checkpoint window cannot claim a re-anchor");
+                }
+            }
+            CheckpointWindow::RearmedDirty { seq: open_seq, .. } if *open_seq == seq => {
+                let reanchor_seq = reanchor_seq.ok_or_else(|| {
+                    anyhow!(
+                        "dirty checkpoint window seq {seq} requires a native snapshot re-anchor"
+                    )
+                })?;
+                let reanchor = self.journal.objects.get(&reanchor_seq).ok_or_else(|| {
+                    anyhow!("checkpoint re-anchor seq {reanchor_seq} is not admitted")
+                })?;
+                if reanchor_seq <= seq || reanchor.kind != ObjectKind::Snapshot {
+                    bail!(
+                        "checkpoint re-anchor must be a later native snapshot (window {seq}, got {reanchor_seq})"
+                    );
+                }
+            }
+            other => bail!("cannot close native checkpoint seq {seq} from window state {other:?}"),
+        }
+        let old = self.journal.clone();
+        if checkpoint_completed {
+            self.journal.checkpointed_seq = Some(seq);
+        }
+        self.journal.checkpoint_window = CheckpointWindow::Closed;
+        if let Err(error) = self.persist_journal() {
+            self.journal = old;
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    pub fn complete_checkpoint_reanchor(&mut self, reanchor_seq: u64) -> Result<()> {
+        let (seq, checkpoint_completed) = match self.journal.checkpoint_window {
+            CheckpointWindow::Opening { seq, .. } => (seq, false),
+            CheckpointWindow::RearmedDirty {
+                seq,
+                checkpoint_completed,
+                ..
+            } => (seq, checkpoint_completed),
+            CheckpointWindow::Closed => return Ok(()),
+        };
+        let reanchor = self.journal.objects.get(&reanchor_seq).ok_or_else(|| {
+            anyhow!("checkpoint recovery re-anchor seq {reanchor_seq} is not admitted")
+        })?;
+        if reanchor_seq <= seq || reanchor.kind != ObjectKind::Snapshot {
+            bail!(
+                "checkpoint recovery requires a later native snapshot (window {seq}, got {reanchor_seq})"
+            );
+        }
+        let old = self.journal.clone();
+        if checkpoint_completed {
+            self.journal.checkpointed_seq = Some(seq);
+        }
+        self.journal.checkpoint_window = CheckpointWindow::Closed;
         if let Err(error) = self.persist_journal() {
             self.journal = old;
             return Err(error);
@@ -684,6 +876,7 @@ impl NativeSpool {
                         object.previous_chain_checksum
                     );
                 }
+                validate_source_cursor_successor(&previous.source_cursor, &object.source_cursor)?;
                 seq.checked_add(1)
                     .ok_or_else(|| anyhow!("native spool sequence overflow"))?
             }
@@ -718,6 +911,10 @@ impl NativeSpool {
                 {
                     bail!("native spool journal contains a sequence/checksum gap at {seq}");
                 }
+                validate_source_cursor_successor(&previous.source_cursor, &object.source_cursor)
+                    .with_context(|| {
+                        format!("native spool source cursor regressed at seq {seq}")
+                    })?;
             } else if object.seq != self.journal.local_base_seq
                 || object.kind != ObjectKind::Snapshot
             {
@@ -727,6 +924,31 @@ impl NativeSpool {
                 .with_context(|| format!("read admitted native payload for sequence {seq}"))?;
             validate_payload(object, &bytes, &self.root)?;
             prior = Some(object);
+        }
+        if self.journal.admitted_seq != self.journal.objects.last_key_value().map(|(seq, _)| *seq) {
+            bail!("native spool admitted cursor does not equal the journal object head");
+        }
+        if self
+            .journal
+            .checkpointed_seq
+            .is_some_and(|seq| !self.journal.objects.contains_key(&seq))
+        {
+            bail!("native spool checkpoint cursor names a missing local object");
+        }
+        match &self.journal.checkpoint_window {
+            CheckpointWindow::Closed => {}
+            CheckpointWindow::Opening { seq, source_cursor }
+            | CheckpointWindow::RearmedDirty {
+                seq, source_cursor, ..
+            } => {
+                let object =
+                    self.journal.objects.get(seq).ok_or_else(|| {
+                        anyhow!("native checkpoint window names missing seq {seq}")
+                    })?;
+                if &object.source_cursor != source_cursor {
+                    bail!("native checkpoint window source cursor differs from seq {seq}");
+                }
+            }
         }
         Ok(())
     }
@@ -855,6 +1077,68 @@ impl NativeSpool {
 
     fn persist_journal(&self) -> Result<()> {
         persist_json(&self.root, &self.journal_path, &self.journal)
+    }
+}
+
+fn validate_source_cursor_successor(previous: &SourceCursor, next: &SourceCursor) -> Result<()> {
+    if next.shadow_generation < previous.shadow_generation
+        || (next.shadow_generation == previous.shadow_generation
+            && next.shadow_frame_index < previous.shadow_frame_index)
+    {
+        bail!(
+            "shadow cursor moved backward from generation/frame {}/{} to {}/{}",
+            previous.shadow_generation,
+            previous.shadow_frame_index,
+            next.shadow_generation,
+            next.shadow_frame_index
+        );
+    }
+    Ok(())
+}
+
+fn load_journal(bytes: &[u8], path: &Path) -> Result<(Journal, bool)> {
+    #[derive(Deserialize)]
+    struct VersionEnvelope {
+        version: u32,
+    }
+    let version = serde_json::from_slice::<VersionEnvelope>(bytes)
+        .with_context(|| format!("parse native spool journal version at {}", path.display()))?
+        .version;
+    match version {
+        JOURNAL_VERSION => {
+            let journal: Journal = serde_json::from_slice(bytes)
+                .with_context(|| format!("parse {}", path.display()))?;
+            Ok((journal, false))
+        }
+        SPOOL_VERSION => {
+            let old: JournalV1 = serde_json::from_slice(bytes)
+                .with_context(|| format!("parse legacy local journal {}", path.display()))?;
+            let checkpoint_window = match old.objects.last_key_value() {
+                Some((seq, object)) => CheckpointWindow::Opening {
+                    seq: *seq,
+                    source_cursor: object.source_cursor.clone(),
+                },
+                None => CheckpointWindow::Closed,
+            };
+            tracing::error!(
+                path = %path.display(),
+                "migrating v1 native spool journal conservatively; a non-empty spool requires a snapshot re-anchor"
+            );
+            Ok((
+                Journal {
+                    version: JOURNAL_VERSION,
+                    identity: old.identity,
+                    objects: old.objects,
+                    local_base_seq: old.local_base_seq,
+                    admitted_seq: old.admitted_seq,
+                    checkpointed_seq: old.checkpointed_seq,
+                    remote_published_seq: old.remote_published_seq,
+                    checkpoint_window,
+                },
+                true,
+            ))
+        }
+        other => bail!("unsupported native spool journal version {other}"),
     }
 }
 
@@ -1108,6 +1392,88 @@ mod tests {
         drop(spool);
         let reopened = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
         assert_eq!(reopened.read_payload(1).unwrap(), bytes);
+    }
+
+    #[test]
+    fn open_checkpoint_window_survives_restart_until_later_snapshot_reanchor() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: checksum,
+                end_page_count: pages,
+                intended_remote_key: "snapshot-1.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &bytes,
+            })
+            .unwrap();
+        spool.begin_checkpoint_window(1).unwrap();
+        drop(spool);
+
+        let mut reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        assert!(reopened.requires_checkpoint_reanchor());
+        assert_eq!(reopened.checkpointed_seq(), None);
+        let (next, next_checksum, next_pages) = snapshot(&db, 2, checksum);
+        reopened
+            .stage(StageObject {
+                seq: 2,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: checksum,
+                ending_chain_checksum: next_checksum,
+                end_page_count: next_pages,
+                intended_remote_key: "snapshot-2.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &next,
+            })
+            .unwrap();
+        reopened.complete_checkpoint_reanchor(2).unwrap();
+        assert!(!reopened.requires_checkpoint_reanchor());
+    }
+
+    #[test]
+    fn v1_nonempty_journal_migration_fails_closed_to_reanchor() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: checksum,
+                end_page_count: pages,
+                intended_remote_key: "snapshot-1.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &bytes,
+            })
+            .unwrap();
+        let legacy = JournalV1 {
+            version: SPOOL_VERSION,
+            identity: spool.journal.identity.clone(),
+            objects: spool.journal.objects.clone(),
+            local_base_seq: spool.journal.local_base_seq,
+            admitted_seq: spool.journal.admitted_seq,
+            checkpointed_seq: spool.journal.checkpointed_seq,
+            remote_published_seq: spool.journal.remote_published_seq,
+        };
+        persist_json(&root, &spool.journal_path, &legacy).unwrap();
+        drop(spool);
+
+        let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        assert!(reopened.requires_checkpoint_reanchor());
+        let durable: Journal =
+            serde_json::from_slice(&fs::read(root.join("journal.json")).unwrap()).unwrap();
+        assert_eq!(durable.version, JOURNAL_VERSION);
     }
 
     #[test]

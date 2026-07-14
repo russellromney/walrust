@@ -34,7 +34,7 @@ use walrust_core::native_publish::{object_key as native_object_key, NativeUpload
 use walrust_core::native_shadow::{encode_shadow_to_hadbp, NativeShadowInput};
 use walrust_core::native_spool::{
     filesystem_available_bytes, CapacityPolicy, CapacityState, NativeSpool, ObjectKind,
-    SourceCursor, SpoolIdentity, StageObject,
+    RecoveryHead, SourceCursor, SpoolIdentity, StageObject,
 };
 
 use super::manifest::discover_state_from_s3;
@@ -86,6 +86,75 @@ fn source_footprint_on_spool_filesystem(state: &ShadowDbState, spool: &NativeSpo
         .map(|metadata| metadata.len())
         .unwrap_or(0)
         .saturating_add(shadow_storage_bytes(state)))
+}
+
+async fn reconcile_shadow_progress_from_spool(
+    state: &mut ShadowDbState,
+    head: Option<RecoveryHead>,
+) -> Result<()> {
+    let Some(head) = head else {
+        return Ok(());
+    };
+    if state.current_txid > head.seq {
+        bail!(
+            "{}: durable shadow progress seq {} is ahead of native spool head {}; refusing ambiguous restart",
+            state.name,
+            state.current_txid,
+            head.seq
+        );
+    }
+    let frame_size = 24u64 + state.shadow.page_size() as u64;
+    let head_offset = head
+        .source_cursor
+        .shadow_frame_index
+        .checked_mul(frame_size)
+        .ok_or_else(|| anyhow!("{}: native spool source cursor overflows", state.name))?;
+    let local_cursor = (state.shadow_sync_generation, state.shadow_sync_offset);
+    let spool_cursor = (head.source_cursor.shadow_generation, head_offset);
+    if head.seq > state.current_txid && spool_cursor < local_cursor {
+        bail!(
+            "{}: native spool head seq {} has a source cursor behind durable shadow progress",
+            state.name,
+            head.seq
+        );
+    }
+    if head.seq > state.current_txid || spool_cursor > local_cursor {
+        if head.source_cursor.shadow_generation > state.shadow.generation() {
+            bail!(
+                "{}: native spool source generation {} is ahead of durable shadow generation {}",
+                state.name,
+                head.source_cursor.shadow_generation,
+                state.shadow.generation()
+            );
+        }
+        let available = state
+            .shadow
+            .list_segments(head.source_cursor.shadow_generation)
+            .await?
+            .iter()
+            .map(|segment| segment.size)
+            .sum::<u64>();
+        if head_offset > available {
+            bail!(
+                "{}: native spool source cursor {} exceeds durable shadow bytes {} in generation {}",
+                state.name,
+                head_offset,
+                available,
+                head.source_cursor.shadow_generation
+            );
+        }
+        state.shadow_sync_generation = head.source_cursor.shadow_generation;
+        state.shadow_sync_offset = head_offset;
+        state.wal_copy_offset = head.source_cursor.wal_offset;
+        state.shadow.restore_read_cursor(
+            head.source_cursor.wal_salt,
+            head.source_cursor.wal_checksum_chain,
+        );
+    }
+    state.current_txid = head.seq;
+    state.db_checksum = Some(head.ending_chain_checksum);
+    save_shadow_progress(state)?;
+    Ok(())
 }
 
 async fn stage_native_shadow(
@@ -661,6 +730,7 @@ async fn checkpoint_shadow_after_native_admission(
     if checkpoint_release == crate::config::CheckpointRelease::Remote {
         wait_for_remote_publish(&spool_state.0, &state.name, admitted_seq, drain_timeout).await?;
     }
+    spool_lock(&spool_state.0)?.begin_checkpoint_window(admitted_seq)?;
 
     let checkpoint_started = std::time::Instant::now();
     let attempt =
@@ -668,10 +738,16 @@ async fn checkpoint_shadow_after_native_admission(
             .await
             .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
     skip_rearm_heartbeat_transaction(state).await?;
-    if !attempt.completed {
-        return Ok(attempt);
+    if attempt.dirty {
+        spool_lock(&spool_state.0)?
+            .mark_checkpoint_window_rearmed_dirty(admitted_seq, attempt.completed)?;
+    } else {
+        spool_lock(&spool_state.0)?.close_checkpoint_window(
+            admitted_seq,
+            attempt.completed,
+            None,
+        )?;
     }
-    spool_lock(&spool_state.0)?.mark_checkpointed(admitted_seq)?;
     tracing::info!(
         database = %state.name,
         seq = admitted_seq,
@@ -680,9 +756,11 @@ async fn checkpoint_shadow_after_native_admission(
         "controlled SQLite checkpoint completed after native spool admission"
     );
 
-    let cleanup_before_gen = state.shadow_sync_generation;
-    if cleanup_before_gen > 0 {
-        state.shadow.cleanup_segments(cleanup_before_gen).await?;
+    if attempt.completed {
+        let cleanup_before_gen = state.shadow_sync_generation;
+        if cleanup_before_gen > 0 {
+            state.shadow.cleanup_segments(cleanup_before_gen).await?;
+        }
     }
     Ok(attempt)
 }
@@ -907,7 +985,8 @@ async fn enforce_native_wal_backpressure(
         );
     }
     if attempt.dirty {
-        stage_native_snapshot(state, spool_state).await?;
+        let reanchor_seq = stage_native_snapshot(state, spool_state).await?;
+        spool_lock(&spool_state.0)?.complete_checkpoint_reanchor(reanchor_seq)?;
     }
     Ok(true)
 }
@@ -1413,6 +1492,17 @@ pub async fn watch_with_shadow(
                 )
             })?;
         }
+        let recovery_head = {
+            let spool_state = native_spools
+                .get(db_path)
+                .ok_or_else(|| anyhow!("{}: native spool missing after startup", state.name))?;
+            let guard = spool_lock(&spool_state.0)?;
+            if guard.requires_checkpoint_reanchor() {
+                required_native_reanchors.insert(db_path.clone());
+            }
+            guard.recovery_head()
+        };
+        reconcile_shadow_progress_from_spool(state, recovery_head).await?;
 
         trigger_states.insert(db_path.clone(), TriggerState::default());
         sync_configs.insert(db_path.clone(), db_config.sync.clone());
@@ -1444,6 +1534,24 @@ pub async fn watch_with_shadow(
     // timer (D3).
     let eager_snapshot_paths = initial_shadow_copy(&mut db_states).await?;
 
+    let mut startup_reanchored = HashSet::new();
+    for db_path in required_native_reanchors.clone() {
+        let state = db_states
+            .get_mut(&db_path)
+            .ok_or_else(|| anyhow!("checkpoint recovery database disappeared"))?;
+        let spool_state = native_spools
+            .get(&db_path)
+            .ok_or_else(|| anyhow!("{}: native spool was not initialized", state.name))?;
+        let seq = require_native_snapshot(state, spool_state, "open_checkpoint_window_restart")
+            .await
+            .with_context(|| {
+                format!("{}: checkpoint-window recovery snapshot failed", state.name)
+            })?;
+        spool_lock(&spool_state.0)?.complete_checkpoint_reanchor(seq)?;
+        required_native_reanchors.remove(&db_path);
+        startup_reanchored.insert(db_path);
+    }
+
     // Take initial snapshots if on_startup is enabled, skipping any DB that is
     // already scheduled for an eager snapshot below.
     for (db_path, state) in db_states.iter_mut() {
@@ -1452,7 +1560,10 @@ pub async fn watch_with_shadow(
             .get(db_path)
             .ok_or_else(|| anyhow!("{}: native spool was not initialized", state.name))?;
         let needs_base = spool_lock(&spool_state.0)?.admitted_seq().is_none();
-        if (needs_base || sync_config.on_startup) && !eager_snapshot_paths.contains(db_path) {
+        if (needs_base || sync_config.on_startup)
+            && !eager_snapshot_paths.contains(db_path)
+            && !startup_reanchored.contains(db_path)
+        {
             require_native_snapshot(state, spool_state, "initial_base")
                 .await
                 .with_context(|| {
@@ -1469,6 +1580,9 @@ pub async fn watch_with_shadow(
     // were down. This runs even when on_startup is disabled, so we do not wait
     // for the periodic snapshot timer after a downtime checkpoint.
     for db_path in &eager_snapshot_paths {
+        if startup_reanchored.contains(db_path) {
+            continue;
+        }
         let state = db_states
             .get_mut(db_path)
             .expect("eager snapshot path must exist in db_states");
@@ -1619,11 +1733,17 @@ pub async fn watch_with_shadow(
                     }
                 }
 
+                for (db_path, (spool, _)) in &native_spools {
+                    if spool_lock(spool)?.requires_checkpoint_reanchor() {
+                        required_native_reanchors.insert(db_path.clone());
+                    }
+                }
                 for db_path in required_native_reanchors.clone() {
                     let Some(state) = db_states.get_mut(&db_path) else { continue };
                     let Some(spool) = native_spools.get(&db_path) else { continue };
                     match stage_native_snapshot(state, spool).await {
-                        Ok(_) => {
+                        Ok(seq) => {
+                            spool_lock(&spool.0)?.complete_checkpoint_reanchor(seq)?;
                             required_native_reanchors.remove(&db_path);
                         }
                         Err(error) => {
@@ -1965,13 +2085,17 @@ pub async fn watch_with_shadow(
                             }
                         };
                         if checkpoint_window_dirty {
-                            if let Err(error) = stage_native_snapshot(state, spool_state).await {
+                            let reanchor = stage_native_snapshot(state, spool_state).await;
+                            if let Err(error) = reanchor.as_ref() {
                                 tracing::error!(
                                     database = %state.name,
                                     error = %error,
                                     "dirty checkpoint window re-anchor is pending; pausing deltas"
                                 );
                                 required_native_reanchors.insert(db_path.clone());
+                            } else if let Some(seq) = reanchor.ok() {
+                                spool_lock(&spool_state.0)?
+                                    .complete_checkpoint_reanchor(seq)?;
                             }
                         }
 
