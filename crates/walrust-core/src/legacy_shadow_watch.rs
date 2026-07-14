@@ -612,11 +612,49 @@ mod tests {
 
         // Generation 0 ends with the requested tail frame.
         let gen0_segment = write_shadow_frame(1, tail_db_size, page_size);
-        tokio::fs::write(&gen0_path, &gen0_segment).await.unwrap();
+        let mut gen0 = std::fs::File::create(&gen0_path).unwrap();
+        gen0.write_all(&gen0_segment).unwrap();
+        gen0.sync_all().unwrap();
 
         // A later generation exists so the drain cursor tries to advance past gen 0.
         let gen1_segment = write_shadow_frame(1, 1, page_size);
-        tokio::fs::write(&gen1_path, &gen1_segment).await.unwrap();
+        let mut gen1 = std::fs::File::create(&gen1_path).unwrap();
+        gen1.write_all(&gen1_segment).unwrap();
+        gen1.sync_all().unwrap();
+        std::fs::File::open(&shadow_dir)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        // These tests exercise cursor semantics, not crash recovery. Bind both
+        // hand-built segments to the same fsynced durable-tail protocol the
+        // production writer uses so reopen must retain (and validate) them.
+        let segments = std::collections::BTreeMap::from([
+            (
+                gen0_path.file_name().unwrap().to_str().unwrap(),
+                gen0_segment.len(),
+            ),
+            (
+                gen1_path.file_name().unwrap().to_str().unwrap(),
+                gen1_segment.len(),
+            ),
+        ]);
+        let marker = serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "segments": segments,
+        }))
+        .unwrap();
+        let marker_tmp = shadow_dir.join("durable-tail-v1.json.tmp");
+        let marker_path = shadow_dir.join("durable-tail-v1.json");
+        let mut marker_file = std::fs::File::create(&marker_tmp).unwrap();
+        marker_file.write_all(&marker).unwrap();
+        marker_file.sync_all().unwrap();
+        drop(marker_file);
+        std::fs::rename(marker_tmp, marker_path).unwrap();
+        std::fs::File::open(&shadow_dir)
+            .unwrap()
+            .sync_all()
+            .unwrap();
 
         let shadow = ShadowWal::new(&db_path).await.unwrap();
         ShadowWatchState {
