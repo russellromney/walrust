@@ -247,6 +247,31 @@ fn stop_child(child: &mut Child) {
     let _ = child.wait();
 }
 
+fn stop_child_gracefully(child: &mut Child, log_path: &Path) -> Result<()> {
+    let signal = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()?;
+    anyhow::ensure!(signal.success(), "failed to send SIGTERM to watch child");
+    let deadline = Instant::now() + e2e_poll_deadline(20);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::ensure!(
+                status.success(),
+                "graceful watch shutdown failed ({status}):\n{}",
+                watch_log(log_path)
+            );
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for graceful watch shutdown:\n{}",
+            watch_log(log_path)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
 /// Env override name for E2E poll deadlines.
 const E2E_DEADLINE_ENV: &str = "WALRUST_E2E_DEADLINE_SECS";
 
@@ -2198,6 +2223,8 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
     let db_path = temp.path().join(format!("{name}.db"));
     let initial_restore = temp.path().join("initial.db");
     let local_restore = temp.path().join("local.db");
+    let config_path = temp.path().join("walrust.toml");
+    std::fs::write(&config_path, "[spool]\nshutdown_drain_seconds = 0\n")?;
     let setup = create_source_db(&db_path, 5)?;
     let writer = open_external_no_autocheckpoint_connection(&db_path)?;
     write_pin_frame(&setup, "offline-split-brain")?;
@@ -2208,7 +2235,7 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
         bucket_arg: &bucket_arg,
         endpoint: endpoint.as_deref(),
         log_path: &initial_log,
-        config_path: None,
+        config_path: Some(&config_path),
         checkpoint_interval: 999_999,
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
@@ -2225,7 +2252,7 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
         &initial_restore,
         &initial_rows,
     )?;
-    stop_child(&mut initial);
+    stop_child_gracefully(&mut initial, &initial_log)?;
 
     let offline_log = temp.path().join("offline.log");
     let mut offline = spawn_cli_watch_logged(LoggedWatchArgs {
@@ -2233,7 +2260,7 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
         bucket_arg: &bucket_arg,
         endpoint: Some("http://127.0.0.1:9"),
         log_path: &offline_log,
-        config_path: None,
+        config_path: Some(&config_path),
         checkpoint_interval: 999_999,
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
@@ -2259,7 +2286,7 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
         );
         std::thread::sleep(Duration::from_millis(100));
     }
-    stop_child(&mut offline);
+    stop_child_gracefully(&mut offline, &offline_log)?;
 
     let spool_base = temp.path().join(".walrust-spool");
     let stream_root = std::fs::read_dir(spool_base.join("native-v1"))?
@@ -2306,7 +2333,7 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
         bucket_arg: &bucket_arg,
         endpoint: endpoint.as_deref(),
         log_path: &reconnect_log,
-        config_path: None,
+        config_path: Some(&config_path),
         checkpoint_interval: 999_999,
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
