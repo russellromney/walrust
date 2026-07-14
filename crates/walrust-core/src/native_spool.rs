@@ -777,9 +777,38 @@ impl NativeSpool {
             let payload = match fs::read(&payload_path) {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                    // Intent was durable but payload rename never happened.
-                    remove_and_sync(&path, &self.intents_dir)?;
-                    continue;
+                    // A crash can land after the payload temporary was fsynced
+                    // but before its rename. The durable intent proves the
+                    // temporary's identity. Finish an exact temporary; discard
+                    // a partial one and retry encoding later.
+                    let tmp = payload_temp_path(&payload_path);
+                    match fs::read(&tmp) {
+                        Ok(bytes) => match validate_payload(&object, &bytes, &self.root) {
+                            Ok(()) => {
+                                File::open(&tmp)?.sync_all()?;
+                                fs::rename(&tmp, &payload_path)?;
+                                sync_dir(&self.objects_dir)?;
+                                bytes
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    path = %tmp.display(),
+                                    error = %error,
+                                    "removing partial native HADBP payload temporary after interrupted install"
+                                );
+                                remove_and_sync(&tmp, &self.objects_dir)?;
+                                remove_and_sync(&path, &self.intents_dir)?;
+                                continue;
+                            }
+                        },
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                            // Intent was durable but payload creation never
+                            // reached either a temporary or final file.
+                            remove_and_sync(&path, &self.intents_dir)?;
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
                 }
                 Err(e) => return Err(e.into()),
             };
@@ -922,7 +951,7 @@ fn same_immutable_object(a: &SpoolObject, b: &SpoolObject) -> bool {
 }
 
 fn install_payload(dir: &Path, final_path: &Path, bytes: &[u8]) -> Result<()> {
-    let tmp = final_path.with_extension("hadbp.tmp");
+    let tmp = payload_temp_path(final_path);
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -933,6 +962,10 @@ fn install_payload(dir: &Path, final_path: &Path, bytes: &[u8]) -> Result<()> {
     drop(file);
     fs::rename(&tmp, final_path)?;
     sync_dir(dir)
+}
+
+fn payload_temp_path(final_path: &Path) -> PathBuf {
+    final_path.with_extension("hadbp.tmp")
 }
 
 fn persist_json<T: Serialize>(dir: &Path, path: &Path, value: &T) -> Result<()> {
@@ -1223,6 +1256,66 @@ mod tests {
         let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
         assert_eq!(reopened.admitted_seq(), Some(1));
         assert_eq!(reopened.read_payload(1).unwrap(), bytes);
+        assert!(!reopened.intent_path(1).exists());
+    }
+
+    #[test]
+    fn fsynced_payload_temp_with_durable_intent_is_finished_and_adopted() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        let object = SpoolObject {
+            version: SPOOL_VERSION,
+            stream_digest: id.stream_digest(),
+            lineage_id: id.lineage_id.clone(),
+            bucket: id.bucket.clone(),
+            prefix: id.prefix.clone(),
+            database: id.database.clone(),
+            seq: 1,
+            kind: ObjectKind::Snapshot,
+            previous_chain_checksum: 0,
+            ending_chain_checksum: checksum,
+            end_page_count: pages,
+            intended_remote_key: "key.hadbp".into(),
+            payload_length: bytes.len() as u64,
+            payload_sha256: sha256_hex(&bytes),
+            source_cursor: SourceCursor::snapshot(),
+            local_creation_state: LocalCreationState::Installed,
+            remote_upload_state: RemoteUploadState::Pending,
+            created_unix_ms: unix_ms(),
+            uploaded_unix_ms: None,
+            published_unix_ms: None,
+            publish_record_sha256: None,
+        };
+        persist_json(
+            &spool.intents_dir,
+            &spool.intent_path(1),
+            &InstallIntent {
+                version: SPOOL_VERSION,
+                object: object.clone(),
+            },
+        )
+        .unwrap();
+        let final_path = spool.payload_path(&object);
+        let tmp = payload_temp_path(&final_path);
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        drop(spool); // crash before payload rename and journal commit
+
+        let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        assert_eq!(reopened.admitted_seq(), Some(1));
+        assert_eq!(reopened.read_payload(1).unwrap(), bytes);
+        assert!(final_path.exists());
+        assert!(!tmp.exists());
         assert!(!reopened.intent_path(1).exists());
     }
 

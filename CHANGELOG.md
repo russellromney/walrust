@@ -22,6 +22,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Native spool crash recovery:** restart now validates and completes a
+  fsynced HADBP payload temporary when its durable install intent exists,
+  instead of deleting the intent and leaving a temp that blocks every retry.
 - **Lossless default CLI watch:** shadow watch retains the same pinned-frame
   `_walrust_seq` checkpoint blocker used by owned/library replication for each
   database, so application autocheckpoints, explicit TRUNCATE checkpoints, and
