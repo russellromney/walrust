@@ -414,6 +414,7 @@ struct LoggedWatchArgs<'a> {
     checkpoint_interval: u64,
     min_checkpoint_pages: u64,
     wal_truncate_threshold: u64,
+    native_upload_pause_file: Option<&'a Path>,
 }
 
 fn spawn_cli_watch_logged(args: LoggedWatchArgs<'_>) -> Result<Child> {
@@ -447,6 +448,9 @@ fn spawn_cli_watch_logged(args: LoggedWatchArgs<'_>) -> Result<Child> {
     if let Some(endpoint) = args.endpoint {
         watch.arg("--endpoint").arg(endpoint);
     }
+    if let Some(path) = args.native_upload_pause_file {
+        watch.env("WALRUST_TEST_NATIVE_UPLOAD_PAUSE_FILE", path);
+    }
     watch.spawn().context("spawn logged walrust watch")
 }
 
@@ -465,21 +469,22 @@ fn wait_for_cli_startup_rearms(log_path: &Path, child: &mut Child) -> Result<()>
     let deadline = Instant::now() + e2e_poll_deadline(30);
     loop {
         let log = watch_log(log_path);
-        let rearm_count = log.matches("CLI checkpoint blocker rearmed").count();
-        let snapshot_count = log.matches("LTX snapshot uploaded").count();
-        if rearm_count >= 6 && snapshot_count >= 2 {
+        let snapshot_count = log
+            .matches("native HADBP snapshot admitted to durable local spool")
+            .count();
+        if snapshot_count >= 2 {
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
             anyhow::bail!(
-                "watch exited before both startup snapshots and their blocker rearms \
-                 ({status}, snapshots={snapshot_count}, rearms={rearm_count}):\n{log}"
+                "watch exited before both native startup snapshots were locally admitted \
+                 ({status}, snapshots={snapshot_count}):\n{log}"
             );
         }
         anyhow::ensure!(
             Instant::now() < deadline,
-            "timed out waiting for both startup snapshots and their blocker rearms \
-             (snapshots={snapshot_count}, rearms={rearm_count}):\n{log}"
+            "timed out waiting for both native startup snapshots to be locally admitted \
+             (snapshots={snapshot_count}):\n{log}"
         );
         std::thread::sleep(Duration::from_millis(25));
     }
@@ -498,7 +503,9 @@ fn assert_no_shadow_reanchors_or_snapshot_storm(log_path: &Path) -> Result<()> {
             "lossless shadow watch must not need safety re-anchors ({forbidden:?} found):\n{log}"
         );
     }
-    let snapshot_count = log.matches("LTX snapshot uploaded").count();
+    let snapshot_count = log
+        .matches("native HADBP snapshot admitted to durable local spool")
+        .count();
     // Shadow watch currently takes the explicit on-startup snapshot and the
     // snapshot timer's immediate first tick. That two-snapshot startup baseline
     // predates this test; a third snapshot means the writer triggered a storm.
@@ -716,6 +723,130 @@ fn e2e_cli_watch_restore_round_trips_64kb_pages() -> Result<()> {
 }
 
 #[test]
+fn e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put() -> Result<()> {
+    require_s3!("e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-local-first");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+    let pause_file = temp.path().join("pause-native-uploader");
+    std::fs::write(&pause_file, b"paused")?;
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "native-local-first")?;
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: None,
+        checkpoint_interval: 1,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: Some(&pause_file),
+    })?;
+    wait_for_shadow_blocker(&db_path, &mut child)?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+    append_wide_rows(&writer, 6, 80, "native-local-first")?;
+    let expected = rows(&db_path)?;
+
+    let deadline = Instant::now() + e2e_poll_deadline(30);
+    while !watch_log(&log_path)
+        .contains("controlled SQLite checkpoint completed after native spool admission")
+    {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "local-first watcher exited before checkpoint ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for local-first checkpoint:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let spool_parent = temp.path().join(".walrust-spool/native-v1");
+    let spool_root = std::fs::read_dir(&spool_parent)?
+        .next()
+        .context("native spool stream directory missing")??
+        .path();
+    let identity = walrust::walrust_core::native_spool::NativeSpool::read_identity(&spool_root)?
+        .context("native spool identity missing")?;
+    let spool = walrust::walrust_core::native_spool::NativeSpool::create_or_open(
+        &spool_root,
+        identity,
+        walrust::walrust_core::native_spool::CapacityPolicy {
+            warning_bytes: u64::MAX - 1,
+            hard_bytes: u64::MAX,
+            minimum_free_bytes: 0,
+        },
+    )?;
+    anyhow::ensure!(
+        spool.objects().count() >= 3,
+        "snapshot(s) + delta must be durable locally"
+    );
+    anyhow::ensure!(
+        spool
+            .objects()
+            .all(|object| object.payload_file_name().ends_with(".hadbp")),
+        "default spool must contain only native HADBP payload names"
+    );
+    drop(spool);
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let native_remote_prefix = format!("{prefix}/{name}/native/v1/");
+    let remote_before = runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(test_bucket(), endpoint.as_deref()).await?;
+        hadb_storage::StorageBackend::list(storage.as_ref(), &native_remote_prefix, None).await
+    })?;
+    anyhow::ensure!(
+        remote_before.is_empty(),
+        "paused live uploader must leave native remote layout absent: {remote_before:?}"
+    );
+    anyhow::ensure!(
+        std::fs::metadata(db_path.with_extension("db-wal"))?.len() < 1024 * 1024,
+        "local checkpoint should bound the live WAL while S3 is paused"
+    );
+    let probe = Connection::open(&db_path)?;
+    probe.execute_batch("PRAGMA busy_timeout=0;")?;
+    anyhow::ensure!(
+        force_truncate_checkpoint(&probe)?.0 != 0,
+        "checkpoint blocker must be reacquired while uploader remains paused"
+    );
+
+    std::fs::remove_file(&pause_file)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    stop_child(&mut child);
+
+    runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(test_bucket(), endpoint.as_deref()).await?;
+        let keys =
+            hadb_storage::StorageBackend::list(storage.as_ref(), &format!("{prefix}/"), None)
+                .await?;
+        for key in keys {
+            hadb_storage::StorageBackend::delete(storage.as_ref(), &key).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
+#[test]
 fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     require_s3!("e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows");
     let temp = TempDir::new()?;
@@ -791,6 +922,7 @@ fn e2e_cli_watch_survives_ephemeral_writer_without_reanchor() -> Result<()> {
         checkpoint_interval: 2,
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
     })?;
     wait_for_shadow_blocker(&db_path, &mut child)?;
     wait_for_cli_startup_rearms(&log_path, &mut child)?;
@@ -861,6 +993,7 @@ fn e2e_cli_watch_replicates_ephemeral_writes_after_startup_without_reanchor() ->
         checkpoint_interval: 999_999,
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
     })?;
     wait_for_shadow_blocker(&db_path, &mut child)?;
     wait_for_restore_exact(
@@ -873,7 +1006,7 @@ fn e2e_cli_watch_replicates_ephemeral_writes_after_startup_without_reanchor() ->
     .with_context(|| format!("startup snapshot did not settle:\n{}", watch_log(&log_path)))?;
     let startup_deadline = Instant::now() + e2e_poll_deadline(30);
     while watch_log(&log_path)
-        .matches("LTX snapshot uploaded")
+        .matches("native HADBP snapshot admitted to durable local spool")
         .count()
         < 2
     {
@@ -1297,6 +1430,7 @@ fn e2e_cli_watch_blocks_app_checkpoint_underneath_without_data_loss() -> Result<
         checkpoint_interval: 999_999,
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
     })?;
     // Wait for the blocker to actually attach. A fixed sleep races the watcher's
     // startup (S3 discovery + initial snapshot); if the blocker is not yet up, the
@@ -1387,6 +1521,7 @@ fn e2e_cli_watch_wal_backpressure_alarms_and_preserves_data() -> Result<()> {
         checkpoint_interval: 999_999,
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 20,
+        native_upload_pause_file: None,
     })?;
     wait_for_shadow_blocker(&db_path, &mut child)?;
     wait_for_cli_startup_rearms(&log_path, &mut child)?;
