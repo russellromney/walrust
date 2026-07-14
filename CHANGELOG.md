@@ -70,7 +70,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Native migration prune gate:** legacy pruning now requires the same
   descriptor-selected contiguous native snapshot base used by restore. A stray
   publish record beyond a gap cannot unlock deletion of the legacy recovery
-  base.
+  base. Scheduled shadow-watch retention now uses this same native-aware path
+  instead of its former legacy-only helper. Before `stream.json` exists, the
+  watcher additionally consults its durable migration journal and preserves the
+  legacy base until a retained native snapshot is published through the
+  contiguous remote cursor; safe local cleanup of the original first snapshot
+  does not disable later retention. Negative live-storage proofs cover both the
+  pending-local/pre-descriptor and descriptor-without-visible-base windows. A
+  live watcher proof advances the verified native floor across repeated
+  snapshots and preserves row-exact latest restore with a clean integrity
+  check.
 - **Native spool crash recovery:** restart now validates and completes a
   fsynced HADBP payload temporary when its durable install intent exists,
   instead of deleting the intent and leaving a temp that blocks every retry.
@@ -130,7 +139,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   new-generation delta and that an application TRUNCATE remains blocked at the
   native snapshot copy handoff while a post-copy commit restores exactly.
   Injected unit failures cover partial write, pre-fsync, post-marker, and WAL
-  checksum-cursor rollback paths.
+  checksum-cursor rollback paths. CI fixture hardening now constructs legacy
+  cursor generations and their durable-tail marker explicitly, and the
+  snapshot-handoff E2E uses a bounded durable-delta observation so exact remote
+  restore cannot race the watcher log assertion.
 - Pinned the checkpoint-blocker contract against real SQLite databases across
   every supported page size and synchronous level: a concurrent
   `wal_checkpoint(TRUNCATE)` reports busy and preserves the WAL until walrust

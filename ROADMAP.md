@@ -543,6 +543,26 @@ full-size destination rollback-journal transient. Live Tigris tests prove the
 markerless snapshot→new-generation-delta path and a blocked application
 TRUNCATE plus exact restore at the former snapshot handoff.
 
+The closing scheduled-retention audit found one more call-site gap: both shadow
+watch retention timers still invoked a legacy-only helper even though the
+interactive prune command already enforced native migration and floor rules.
+Both timers now call the same native-aware implementation. A valid native
+descriptor with no contiguous published snapshot base preserves every legacy
+object (disabling that guard deletes an asserted recovery object), while a live
+Tigris watcher producing repeated native snapshots automatically advances a
+verified native floor and still restores latest row-exact with
+`integrity_check = ok` (disabling the watcher call site leaves the floor at 1
+and fails). The watcher also checks its durable local migration journal before
+either remote prune call: while the first native snapshot is pending and even
+`stream.json` is absent, it preserves the legacy base. The gate opens only once
+the contiguous remote cursor covers native publication and a retained published
+snapshot exists; it remains open after safe local cleanup removes the original
+first snapshot. Neutering this pre-descriptor guard deletes the asserted legacy
+object. Replacement-CI hardening also made the legacy cursor fixtures write
+fsynced generation files plus their durable-tail marker, and made the snapshot
+handoff proof wait boundedly for the durable-delta observation after exact
+remote restore instead of racing log visibility.
+
 ---
 
 ## Compaction (shipped — default off)
