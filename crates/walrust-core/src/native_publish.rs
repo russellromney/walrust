@@ -1,6 +1,8 @@
 //! Ordered, idempotent remote publication for the native CLI spool.
 
-use crate::native_spool::{NativeSpool, ObjectKind, RemoteUploadState, SpoolIdentity, SpoolObject};
+use crate::native_spool::{
+    durability_failpoint, NativeSpool, ObjectKind, RemoteUploadState, SpoolIdentity, SpoolObject,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use hadb_storage::StorageBackend;
 use serde::{Deserialize, Serialize};
@@ -310,6 +312,7 @@ impl NativeUploader {
         self.ensure_descriptor().await?;
         let upload_started = std::time::Instant::now();
         self.ensure_remote_object(&object, &payload).await?;
+        durability_failpoint("remote_put_verified");
         if let Ok(mut lag) = self.lag.lock() {
             lag.last_upload_duration_ms = upload_started
                 .elapsed()
@@ -334,6 +337,7 @@ impl NativeUploader {
                 .unwrap_or(false)
             {
                 guard.mark_uploaded(object.seq)?;
+                durability_failpoint("uploaded_state_committed");
             }
         }
 
@@ -347,12 +351,14 @@ impl NativeUploader {
             "native publish record",
         )
         .await?;
+        durability_failpoint("publish_record_committed");
 
         let mut guard = self
             .spool
             .lock()
             .map_err(|_| anyhow!("native spool lock poisoned"))?;
         guard.mark_published(object.seq, &record_bytes)?;
+        durability_failpoint("published_state_committed");
         Ok(true)
     }
 

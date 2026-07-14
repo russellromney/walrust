@@ -19,6 +19,26 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const SPOOL_VERSION: u32 = 1;
 const JOURNAL_VERSION: u32 = 2;
 
+pub fn durability_failpoint(name: &str) {
+    if !cfg!(debug_assertions)
+        || std::env::var("WALRUST_TEST_DURABILITY_FAILPOINT").as_deref() != Ok(name)
+    {
+        return;
+    }
+    let marker = std::env::var_os("WALRUST_TEST_DURABILITY_FAILPOINT_MARKER")
+        .map(PathBuf::from)
+        .expect("durability failpoint requires a marker path");
+    let mut file = File::create(&marker).expect("create durability failpoint marker");
+    file.write_all(name.as_bytes())
+        .expect("write durability failpoint marker");
+    file.sync_all().expect("fsync durability failpoint marker");
+    sync_dir(marker.parent().unwrap_or_else(|| Path::new(".")))
+        .expect("fsync durability failpoint marker directory");
+    loop {
+        std::thread::park_timeout(std::time::Duration::from_secs(1));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObjectKind {
@@ -530,6 +550,7 @@ impl NativeSpool {
                     bail!("native snapshot intent expected seq {expected}, got {seq}");
                 }
                 persist_json(&self.root, &self.snapshot_intent_path, &proposed)?;
+                durability_failpoint("snapshot_intent_committed");
                 proposed
             }
         };
@@ -570,6 +591,7 @@ impl NativeSpool {
         };
         persist_json(&self.root, &self.snapshot_intent_path, &intent)?;
         sync_dir(&self.snapshots_dir)?;
+        durability_failpoint("snapshot_stable_committed");
         Ok(SnapshotPreparation {
             seq: intent.seq,
             previous_chain_checksum: intent.previous_chain_checksum,
@@ -758,6 +780,7 @@ impl NativeSpool {
                 object: object.clone(),
             },
         )?;
+        durability_failpoint("object_intent_committed");
 
         let payload_path = self.payload_path(&object);
         match fs::read(&payload_path) {
@@ -770,6 +793,7 @@ impl NativeSpool {
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 install_payload(&self.objects_dir, &payload_path, stage.payload)?;
+                durability_failpoint("payload_renamed");
             }
             Err(e) => return Err(e.into()),
         }
@@ -782,6 +806,7 @@ impl NativeSpool {
             self.journal.admitted_seq = previous_admitted;
             return Err(error);
         }
+        durability_failpoint("object_journal_committed");
 
         remove_and_sync(&intent_path, &self.intents_dir)?;
         self.last_stage_duration_ms = stage_started
@@ -815,6 +840,7 @@ impl NativeSpool {
             self.journal = old;
             return Err(error);
         }
+        durability_failpoint("checkpoint_window_committed");
         Ok(())
     }
 
@@ -845,6 +871,7 @@ impl NativeSpool {
             self.journal = old;
             return Err(error);
         }
+        durability_failpoint("checkpoint_window_rearmed_dirty");
         Ok(())
     }
 
@@ -888,6 +915,7 @@ impl NativeSpool {
             self.journal = old;
             return Err(error);
         }
+        durability_failpoint("checkpoint_window_closed");
         Ok(())
     }
 
@@ -918,6 +946,7 @@ impl NativeSpool {
             self.journal = old;
             return Err(error);
         }
+        durability_failpoint("checkpoint_reanchor_closed");
         Ok(())
     }
 
@@ -1055,10 +1084,12 @@ impl NativeSpool {
             self.journal = old;
             return Err(error);
         }
+        durability_failpoint("cleanup_marked_deleting");
         for seq in &victims {
             let path = self.payload_path(self.journal.objects.get(seq).unwrap());
             remove_and_sync(&path, &self.objects_dir)?;
         }
+        durability_failpoint("cleanup_payloads_deleted");
         for seq in &victims {
             self.journal.objects.remove(seq);
         }

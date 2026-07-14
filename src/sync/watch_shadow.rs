@@ -33,8 +33,8 @@ use walrust_core::legacy_shadow_watch::{
 use walrust_core::native_publish::{object_key as native_object_key, NativeUploader, UploadWake};
 use walrust_core::native_shadow::{encode_shadow_to_hadbp, NativeShadowInput};
 use walrust_core::native_spool::{
-    filesystem_available_bytes, CapacityPolicy, CapacityState, NativeSpool, ObjectKind,
-    RecoveryHead, SourceCursor, SpoolIdentity, StageObject,
+    durability_failpoint, filesystem_available_bytes, CapacityPolicy, CapacityState, NativeSpool,
+    ObjectKind, RecoveryHead, SourceCursor, SpoolIdentity, StageObject,
 };
 
 use super::manifest::discover_state_from_s3;
@@ -457,6 +457,7 @@ async fn stage_native_snapshot(
             source_cursor: preparation.source_cursor.clone(),
             payload: &encoded.bytes,
         })?;
+        durability_failpoint("snapshot_object_admitted");
         spool.finish_snapshot(seq)?;
         Ok(())
     })();
@@ -584,6 +585,7 @@ async fn checkpoint_with_state_blocker_attempt(
             }
             Ok(completed)
         });
+    durability_failpoint("sqlite_checkpoint_returned");
 
     // Sample before opening the replacement blocker because its heartbeat is
     // itself an other-connection commit. Commits through this point are dirty;
@@ -602,6 +604,9 @@ async fn checkpoint_with_state_blocker_attempt(
         Ok(()) => checkpoint_blocker_heartbeat_is_live(state),
         Err(_) => Ok(false),
     };
+    if rearm_result.is_ok() {
+        durability_failpoint("blocker_reacquired");
+    }
     match (checkpoint_result, rearm_result) {
         (Ok(completed), Ok(())) => Ok(CheckpointAttempt {
             completed,
@@ -2372,6 +2377,7 @@ pub async fn watch_with_shadow(
         });
     }
     apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
+    durability_failpoint("shutdown_local_admission_complete");
 
     shutdown_shadow_uploaders(&cache_states, &db_states, uploader_handles).await?;
     let cloud_drain_deadline =

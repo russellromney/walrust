@@ -415,6 +415,8 @@ struct LoggedWatchArgs<'a> {
     min_checkpoint_pages: u64,
     wal_truncate_threshold: u64,
     native_upload_pause_file: Option<&'a Path>,
+    durability_failpoint: Option<&'a str>,
+    durability_failpoint_marker: Option<&'a Path>,
 }
 
 fn spawn_cli_watch_logged(args: LoggedWatchArgs<'_>) -> Result<Child> {
@@ -451,6 +453,12 @@ fn spawn_cli_watch_logged(args: LoggedWatchArgs<'_>) -> Result<Child> {
     if let Some(path) = args.native_upload_pause_file {
         watch.env("WALRUST_TEST_NATIVE_UPLOAD_PAUSE_FILE", path);
     }
+    if let Some(name) = args.durability_failpoint {
+        watch.env("WALRUST_TEST_DURABILITY_FAILPOINT", name);
+    }
+    if let Some(path) = args.durability_failpoint_marker {
+        watch.env("WALRUST_TEST_DURABILITY_FAILPOINT_MARKER", path);
+    }
     watch.spawn().context("spawn logged walrust watch")
 }
 
@@ -463,6 +471,29 @@ fn ephemeral_exec(db_path: &Path, sql: &str) -> Result<()> {
 
 fn watch_log(log_path: &Path) -> String {
     std::fs::read_to_string(log_path).unwrap_or_default()
+}
+
+fn wait_for_durability_failpoint(marker: &Path, log_path: &Path, child: &mut Child) -> Result<()> {
+    let deadline = Instant::now() + e2e_poll_deadline(30);
+    loop {
+        if marker.exists() {
+            let value = std::fs::read_to_string(marker)?;
+            anyhow::ensure!(!value.is_empty(), "durability failpoint marker is empty");
+            return Ok(());
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watch exited before durability failpoint ({status}):\n{}",
+                watch_log(log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for durability failpoint:\n{}",
+            watch_log(log_path)
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn wait_for_cli_startup_rearms(log_path: &Path, child: &mut Child) -> Result<()> {
@@ -607,6 +638,18 @@ fn run_cli_restore(
     run_cmd(restore, "walrust restore")
 }
 
+fn cleanup_remote_prefix(prefix: &str, endpoint: Option<&str>) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(test_bucket(), endpoint).await?;
+        let keys = hadb_storage::StorageBackend::list(storage.as_ref(), prefix, None).await?;
+        for key in keys {
+            hadb_storage::StorageBackend::delete(storage.as_ref(), &key).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+}
+
 fn wait_for_cli_restore_rows(
     name: &str,
     bucket_arg: &str,
@@ -749,6 +792,8 @@ fn e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put() -> Result<()
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
         native_upload_pause_file: Some(&pause_file),
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
     })?;
     wait_for_shadow_blocker(&db_path, &mut child)?;
     wait_for_cli_startup_rearms(&log_path, &mut child)?;
@@ -799,6 +844,15 @@ fn e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put() -> Result<()
             .all(|object| object.payload_file_name().ends_with(".hadbp")),
         "default spool must contain only native HADBP payload names"
     );
+    let exact_staged_objects = spool
+        .objects()
+        .map(|object| {
+            Ok::<_, anyhow::Error>((
+                object.intended_remote_key.clone(),
+                spool.read_payload(object.seq)?,
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
     drop(spool);
 
     let runtime = tokio::runtime::Runtime::new()?;
@@ -831,6 +885,19 @@ fn e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put() -> Result<()
         &expected,
     )?;
     assert_integrity_ok(&restored_path)?;
+    runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(test_bucket(), endpoint.as_deref()).await?;
+        for (key, staged) in &exact_staged_objects {
+            let remote = hadb_storage::StorageBackend::get(storage.as_ref(), key)
+                .await?
+                .with_context(|| format!("uploaded native object missing at {key}"))?;
+            anyhow::ensure!(
+                &remote == staged,
+                "live object bytes differ from the exact fsynced spool payload at {key}"
+            );
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
     stop_child(&mut child);
 
     runtime.block_on(async {
@@ -889,6 +956,258 @@ fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
 }
 
 #[test]
+fn e2e_cli_sigkill_restarts_every_local_snapshot_admission_boundary() -> Result<()> {
+    require_s3!("e2e_cli_sigkill_restarts_every_local_snapshot_admission_boundary");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-snapshot-crash-matrix");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let setup = create_source_db(&db_path, 5)?;
+    write_pin_frame(&setup, "snapshot-crash-matrix")?;
+
+    for (index, boundary) in [
+        "snapshot_intent_committed",
+        "snapshot_stable_committed",
+        "object_intent_committed",
+        "payload_renamed",
+        "object_journal_committed",
+        "snapshot_object_admitted",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ephemeral_exec(
+            &db_path,
+            &format!(
+                "INSERT INTO items(id, value) VALUES ({}, 'crash-{boundary}');",
+                1000 + index
+            ),
+        )?;
+        let marker = temp.path().join(format!("{boundary}.marker"));
+        let log = temp.path().join(format!("{boundary}.log"));
+        let mut crashed = spawn_cli_watch_logged(LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &log,
+            config_path: None,
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: Some(boundary),
+            durability_failpoint_marker: Some(&marker),
+        })?;
+        wait_for_durability_failpoint(&marker, &log, &mut crashed)?;
+        stop_child(&mut crashed);
+
+        let restart_log = temp.path().join(format!("{boundary}-restart.log"));
+        let mut restarted = spawn_cli_watch_logged(LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &restart_log,
+            config_path: None,
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        })?;
+        let expected = rows(&db_path)?;
+        wait_for_cli_restore_rows(
+            &name,
+            &bucket_arg,
+            endpoint.as_deref(),
+            &restored_path,
+            &expected,
+        )?;
+        assert_integrity_ok(&restored_path)?;
+        anyhow::ensure!(
+            restarted.try_wait()?.is_none(),
+            "watcher died after recovering {boundary}:\n{}",
+            watch_log(&restart_log)
+        );
+        stop_child(&mut restarted);
+    }
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_sigkill_restarts_every_controlled_checkpoint_boundary() -> Result<()> {
+    require_s3!("e2e_cli_sigkill_restarts_every_controlled_checkpoint_boundary");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-checkpoint-crash-matrix");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "checkpoint-crash-matrix")?;
+
+    let initial_log = temp.path().join("initial.log");
+    let mut initial = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &initial_log,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_startup_rearms(&initial_log, &mut initial)?;
+    stop_child(&mut initial);
+
+    for (index, boundary) in [
+        "checkpoint_window_committed",
+        "sqlite_checkpoint_returned",
+        "blocker_reacquired",
+        "checkpoint_window_closed",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        append_wide_rows(
+            &writer,
+            2000 + index as i64 * 20,
+            2019 + index as i64 * 20,
+            boundary,
+        )?;
+        let marker = temp.path().join(format!("{boundary}.marker"));
+        let log = temp.path().join(format!("{boundary}.log"));
+        let mut crashed = spawn_cli_watch_logged(LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &log,
+            config_path: None,
+            checkpoint_interval: 1,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: Some(boundary),
+            durability_failpoint_marker: Some(&marker),
+        })?;
+        wait_for_durability_failpoint(&marker, &log, &mut crashed)?;
+        stop_child(&mut crashed);
+
+        let restart_log = temp.path().join(format!("{boundary}-restart.log"));
+        let mut restarted = spawn_cli_watch_logged(LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &restart_log,
+            config_path: None,
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        })?;
+        let expected = rows(&db_path)?;
+        wait_for_cli_restore_rows(
+            &name,
+            &bucket_arg,
+            endpoint.as_deref(),
+            &restored_path,
+            &expected,
+        )?;
+        assert_integrity_ok(&restored_path)?;
+        stop_child(&mut restarted);
+    }
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_sigkill_restarts_every_remote_publication_boundary() -> Result<()> {
+    require_s3!("e2e_cli_sigkill_restarts_every_remote_publication_boundary");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-publish-crash-matrix");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let setup = create_source_db(&db_path, 5)?;
+    write_pin_frame(&setup, "publish-crash-matrix")?;
+
+    for (index, boundary) in [
+        "remote_put_verified",
+        "uploaded_state_committed",
+        "publish_record_committed",
+        "published_state_committed",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        ephemeral_exec(
+            &db_path,
+            &format!(
+                "INSERT INTO items(id, value) VALUES ({}, 'remote-{boundary}');",
+                3000 + index
+            ),
+        )?;
+        let marker = temp.path().join(format!("{boundary}.marker"));
+        let log = temp.path().join(format!("{boundary}.log"));
+        let mut crashed = spawn_cli_watch_logged(LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &log,
+            config_path: None,
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: Some(boundary),
+            durability_failpoint_marker: Some(&marker),
+        })?;
+        wait_for_durability_failpoint(&marker, &log, &mut crashed)?;
+        stop_child(&mut crashed);
+
+        let restart_log = temp.path().join(format!("{boundary}-restart.log"));
+        let mut restarted = spawn_cli_watch_logged(LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &restart_log,
+            config_path: None,
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        })?;
+        let expected = rows(&db_path)?;
+        wait_for_cli_restore_rows(
+            &name,
+            &bucket_arg,
+            endpoint.as_deref(),
+            &restored_path,
+            &expected,
+        )?;
+        assert_integrity_ok(&restored_path)?;
+        stop_child(&mut restarted);
+    }
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
 fn e2e_cli_offline_restart_stages_locally_then_reconnects_in_order() -> Result<()> {
     require_s3!("e2e_cli_offline_restart_stages_locally_then_reconnects_in_order");
     let temp = TempDir::new()?;
@@ -915,6 +1234,8 @@ fn e2e_cli_offline_restart_stages_locally_then_reconnects_in_order() -> Result<(
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
         native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
     })?;
     wait_for_cli_startup_rearms(&first_log, &mut first)?;
     let initial_rows = rows(&db_path)?;
@@ -937,6 +1258,8 @@ fn e2e_cli_offline_restart_stages_locally_then_reconnects_in_order() -> Result<(
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
         native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
     })?;
     wait_for_cli_startup_rearms(&offline_log, &mut offline)?;
     append_rows(&writer, 6, 14, "offline-staged")?;
@@ -969,6 +1292,8 @@ fn e2e_cli_offline_restart_stages_locally_then_reconnects_in_order() -> Result<(
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
         native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
     })?;
     wait_for_cli_restore_rows(
         &name,
@@ -991,6 +1316,72 @@ fn e2e_cli_offline_restart_stages_locally_then_reconnects_in_order() -> Result<(
         }
         Ok::<_, anyhow::Error>(())
     })?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_offline_restart_refuses_identity_only_spool() -> Result<()> {
+    require_s3!("e2e_cli_offline_restart_refuses_identity_only_spool");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-offline-no-base");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let db_path = temp.path().join(format!("{name}.db"));
+    create_source_db(&db_path, 5)?;
+    let identity = walrust::walrust_core::native_spool::SpoolIdentity::new(
+        &db_path,
+        test_bucket(),
+        format!("{prefix}/"),
+        name.clone(),
+        "identity-only-lineage",
+        1,
+        None,
+        true,
+    )?;
+    let spool_base = temp.path().join(".walrust-spool");
+    let root = walrust::walrust_core::native_spool::NativeSpool::path_for(&spool_base, &identity);
+    walrust::walrust_core::native_spool::NativeSpool::create_or_open(
+        &root,
+        identity,
+        walrust::walrust_core::native_spool::CapacityPolicy {
+            warning_bytes: u64::MAX - 1,
+            hard_bytes: u64::MAX,
+            minimum_free_bytes: 0,
+        },
+    )?;
+
+    let log = temp.path().join("offline-no-base.log");
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: Some("http://127.0.0.1:9"),
+        log_path: &log,
+        config_path: None,
+        checkpoint_interval: 1,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    let deadline = Instant::now() + e2e_poll_deadline(20);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "identity-only offline watcher did not refuse startup:\n{}",
+            watch_log(&log)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    anyhow::ensure!(!status.success(), "identity-only offline startup succeeded");
+    anyhow::ensure!(
+        watch_log(&log).contains("local native spool has no complete snapshot base"),
+        "offline refusal did not name the missing local base:\n{}",
+        watch_log(&log)
+    );
     Ok(())
 }
 
@@ -1029,6 +1420,8 @@ fn e2e_cli_watch_survives_ephemeral_writer_without_reanchor() -> Result<()> {
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
         native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
     })?;
     wait_for_shadow_blocker(&db_path, &mut child)?;
     wait_for_cli_startup_rearms(&log_path, &mut child)?;
@@ -1100,6 +1493,8 @@ fn e2e_cli_watch_replicates_ephemeral_writes_after_startup_without_reanchor() ->
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
         native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
     })?;
     wait_for_shadow_blocker(&db_path, &mut child)?;
     wait_for_restore_exact(
@@ -1537,6 +1932,8 @@ fn e2e_cli_watch_blocks_app_checkpoint_underneath_without_data_loss() -> Result<
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 100_000,
         native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
     })?;
     // Wait for the blocker to actually attach. A fixed sleep races the watcher's
     // startup (S3 discovery + initial snapshot); if the blocker is not yet up, the
@@ -1628,6 +2025,8 @@ fn e2e_cli_watch_wal_backpressure_alarms_and_preserves_data() -> Result<()> {
         min_checkpoint_pages: 1,
         wal_truncate_threshold: 20,
         native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
     })?;
     wait_for_shadow_blocker(&db_path, &mut child)?;
     wait_for_cli_startup_rearms(&log_path, &mut child)?;
