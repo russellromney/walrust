@@ -2225,18 +2225,12 @@ pub async fn watch_with_shadow(
             // Checkpoint timer - copy, sync, verify durability, then checkpoint.
             _ = checkpoint_timer.tick(), if global_sync.checkpoint_interval > 0 => {
                 for (db_path, state) in db_states.iter_mut() {
-                    // Check if shadow has accumulated enough data
-                    let segments = match state.shadow.list_segments(state.shadow.generation()).await {
-                        Ok(s) => s,
-                        Err(_) => continue,
-                    };
-
-                    let total_segment_size: u64 = segments.iter().map(|s| s.size).sum();
-                    let page_size = state.shadow.page_size() as u64;
-                    let frame_size = 24 + page_size; // header + page
-                    let estimated_frames = if frame_size > 0 { total_segment_size / frame_size } else { 0 };
-
                     let sync_config = sync_configs.get(&state.db_path).unwrap_or(&global_sync);
+                    let Some(spool_state) = native_spools.get(db_path) else {
+                        return Err(anyhow!("{}: native spool missing", state.name));
+                    };
+                    let estimated_frames =
+                        spool_lock(&spool_state.0)?.admitted_frames_since_checkpoint();
 
                     if estimated_frames >= sync_config.min_checkpoint_page_count {
                         tracing::info!(
@@ -2245,9 +2239,6 @@ pub async fn watch_with_shadow(
                             estimated_frames
                         );
 
-                        let Some(spool_state) = native_spools.get(db_path) else {
-                            return Err(anyhow!("{}: native spool missing", state.name));
-                        };
                         let checkpoint_started = std::time::Instant::now();
                         let checkpoint_result = checkpoint_shadow_after_native_admission(
                             state,

@@ -2836,23 +2836,12 @@ fn e2e_cli_local_restore_rejects_ambiguous_native_spools_without_s3() -> Result<
         let local_db = temp.path().join(format!("{lineage}.sqlite"));
         std::fs::File::create(&local_db)?;
         let identity = walrust::walrust_core::native_spool::SpoolIdentity::new(
-            &local_db,
-            bucket,
-            prefix,
-            database,
-            lineage,
-            1,
-            None,
-            true,
+            &local_db, bucket, prefix, database, lineage, 1, None, true,
         )?;
-        let root = walrust::walrust_core::native_spool::NativeSpool::path_for(
-            &spool_base,
-            &identity,
-        );
+        let root =
+            walrust::walrust_core::native_spool::NativeSpool::path_for(&spool_base, &identity);
         walrust::walrust_core::native_spool::NativeSpool::create_or_open(
-            &root,
-            identity,
-            capacity,
+            &root, identity, capacity,
         )?;
     }
 
@@ -2868,7 +2857,10 @@ fn e2e_cli_local_restore_rejects_ambiguous_native_spools_without_s3() -> Result<
         .arg("--endpoint")
         .arg("http://127.0.0.1:9")
         .output()?;
-    anyhow::ensure!(!result.status.success(), "ambiguous local restore succeeded");
+    anyhow::ensure!(
+        !result.status.success(),
+        "ambiguous local restore succeeded"
+    );
     let stderr = String::from_utf8_lossy(&result.stderr);
     let stdout = String::from_utf8_lossy(&result.stdout);
     anyhow::ensure!(
@@ -3086,6 +3078,90 @@ fn e2e_cli_watch_replicates_ephemeral_writes_after_startup_without_reanchor() ->
     assert_eq!(expected.len(), 15);
     assert_integrity_ok(&restored_path)?;
     assert_no_shadow_reanchors_or_snapshot_storm(&log_path)?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_idle_blocker_heartbeat_does_not_cause_checkpoint_storm() -> Result<()> {
+    require_s3!("e2e_cli_idle_blocker_heartbeat_does_not_cause_checkpoint_storm");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-no-checkpoint-storm");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "checkpoint-storm")?;
+
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: None,
+        checkpoint_interval: 1,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+    append_wide_rows(&writer, 5000, 5030, "one-checkpoint")?;
+
+    let deadline = Instant::now() + e2e_poll_deadline(20);
+    let completed = loop {
+        let count = watch_log(&log_path)
+            .matches("controlled SQLite checkpoint completed after native spool admission")
+            .count();
+        if count > 0 {
+            break count;
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watcher exited before controlled checkpoint ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "timed out waiting for controlled checkpoint:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    // Observe three more timer periods with no application writes. The
+    // replacement blocker's committed heartbeat is already behind the durable
+    // shadow cursor and cannot justify another checkpoint.
+    std::thread::sleep(Duration::from_millis(3500));
+    let after_idle = watch_log(&log_path)
+        .matches("controlled SQLite checkpoint completed after native spool admission")
+        .count();
+    anyhow::ensure!(
+        after_idle == completed,
+        "idle blocker heartbeat caused repeated controlled checkpoints ({completed} -> {after_idle}):\n{}",
+        watch_log(&log_path)
+    );
+    anyhow::ensure!(
+        child.try_wait()?.is_none(),
+        "watcher exited during idle period"
+    );
+
+    let expected = rows(&db_path)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    stop_child(&mut child);
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())
 }
 

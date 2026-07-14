@@ -234,6 +234,8 @@ struct Journal {
     local_base_seq: u64,
     admitted_seq: Option<u64>,
     checkpointed_seq: Option<u64>,
+    #[serde(default)]
+    checkpointed_source_cursor: Option<SourceCursor>,
     remote_published_seq: Option<u64>,
     checkpoint_window: CheckpointWindow,
 }
@@ -453,6 +455,7 @@ impl NativeSpool {
                     local_base_seq,
                     admitted_seq: None,
                     checkpointed_seq: None,
+                    checkpointed_source_cursor: None,
                     remote_published_seq: None,
                     checkpoint_window: CheckpointWindow::Closed,
                 };
@@ -528,6 +531,44 @@ impl NativeSpool {
 
     pub fn checkpointed_seq(&self) -> Option<u64> {
         self.journal.checkpointed_seq
+    }
+
+    /// Number of durably admitted source frames not yet covered by a completed
+    /// SQLite checkpoint. The persisted cursor remains valid even after local
+    /// cleanup removes the checkpointed object's payload record.
+    pub fn admitted_frames_since_checkpoint(&self) -> u64 {
+        let Some(head) = self
+            .journal
+            .admitted_seq
+            .and_then(|seq| self.journal.objects.get(&seq))
+        else {
+            return 0;
+        };
+        let checkpoint_cursor = self
+            .journal
+            .checkpointed_source_cursor
+            .as_ref()
+            .or_else(|| {
+                self.journal
+                    .checkpointed_seq
+                    .and_then(|seq| self.journal.objects.get(&seq))
+                    .map(|object| &object.source_cursor)
+            });
+        let Some(checkpoint_cursor) = checkpoint_cursor else {
+            return head.source_cursor.shadow_frame_index;
+        };
+        match head
+            .source_cursor
+            .shadow_generation
+            .cmp(&checkpoint_cursor.shadow_generation)
+        {
+            std::cmp::Ordering::Less => u64::MAX,
+            std::cmp::Ordering::Equal => head
+                .source_cursor
+                .shadow_frame_index
+                .saturating_sub(checkpoint_cursor.shadow_frame_index),
+            std::cmp::Ordering::Greater => u64::MAX,
+        }
     }
 
     pub fn snapshot_in_progress(&self) -> Result<bool> {
@@ -907,13 +948,23 @@ impl NativeSpool {
         checkpoint_completed: bool,
         reanchor_seq: Option<u64>,
     ) -> Result<()> {
-        match &self.journal.checkpoint_window {
+        let checkpoint_cursor = match &self.journal.checkpoint_window {
             CheckpointWindow::Opening { seq: open_seq, .. } if *open_seq == seq => {
                 if reanchor_seq.is_some() {
                     bail!("clean checkpoint window cannot claim a re-anchor");
                 }
+                self.journal
+                    .objects
+                    .get(&seq)
+                    .expect("open checkpoint object exists")
+                    .source_cursor
+                    .clone()
             }
-            CheckpointWindow::RearmedDirty { seq: open_seq, .. } if *open_seq == seq => {
+            CheckpointWindow::RearmedDirty {
+                seq: open_seq,
+                source_cursor,
+                ..
+            } if *open_seq == seq => {
                 let reanchor_seq = reanchor_seq.ok_or_else(|| {
                     anyhow!(
                         "dirty checkpoint window seq {seq} requires a native snapshot re-anchor"
@@ -927,12 +978,14 @@ impl NativeSpool {
                         "checkpoint re-anchor must be a later native snapshot (window {seq}, got {reanchor_seq})"
                     );
                 }
+                source_cursor.clone()
             }
             other => bail!("cannot close native checkpoint seq {seq} from window state {other:?}"),
-        }
+        };
         let old = self.journal.clone();
         if checkpoint_completed {
             self.journal.checkpointed_seq = Some(seq);
+            self.journal.checkpointed_source_cursor = Some(checkpoint_cursor);
         }
         self.journal.checkpoint_window = CheckpointWindow::Closed;
         if let Err(error) = self.persist_journal() {
@@ -944,13 +997,16 @@ impl NativeSpool {
     }
 
     pub fn complete_checkpoint_reanchor(&mut self, reanchor_seq: u64) -> Result<()> {
-        let (seq, checkpoint_completed) = match self.journal.checkpoint_window {
-            CheckpointWindow::Opening { seq, .. } => (seq, false),
+        let (seq, source_cursor, checkpoint_completed) = match &self.journal.checkpoint_window {
+            CheckpointWindow::Opening { seq, source_cursor } => {
+                (*seq, source_cursor.clone(), false)
+            }
             CheckpointWindow::RearmedDirty {
                 seq,
+                source_cursor,
                 checkpoint_completed,
                 ..
-            } => (seq, checkpoint_completed),
+            } => (*seq, source_cursor.clone(), *checkpoint_completed),
             CheckpointWindow::Closed => return Ok(()),
         };
         let reanchor = self.journal.objects.get(&reanchor_seq).ok_or_else(|| {
@@ -964,6 +1020,7 @@ impl NativeSpool {
         let old = self.journal.clone();
         if checkpoint_completed {
             self.journal.checkpointed_seq = Some(seq);
+            self.journal.checkpointed_source_cursor = Some(source_cursor);
         }
         self.journal.checkpoint_window = CheckpointWindow::Closed;
         if let Err(error) = self.persist_journal() {
@@ -1199,12 +1256,27 @@ impl NativeSpool {
         if self.journal.admitted_seq != self.journal.objects.last_key_value().map(|(seq, _)| *seq) {
             bail!("native spool admitted cursor does not equal the journal object head");
         }
-        if self
-            .journal
-            .checkpointed_seq
-            .is_some_and(|seq| !self.journal.objects.contains_key(&seq))
-        {
-            bail!("native spool checkpoint cursor names a missing local object");
+        match (
+            self.journal.checkpointed_seq,
+            self.journal.checkpointed_source_cursor.as_ref(),
+        ) {
+            (None, None) => {}
+            (None, Some(_)) => {
+                bail!("native spool has a checkpoint source cursor without a sequence")
+            }
+            (Some(seq), None) if !self.journal.objects.contains_key(&seq) => {
+                bail!("native spool checkpoint cursor names a missing local object")
+            }
+            (Some(seq), Some(cursor)) => match self.journal.objects.get(&seq) {
+                Some(object) if &object.source_cursor != cursor => {
+                    bail!("native spool checkpoint source cursor differs from seq {seq}")
+                }
+                None if seq >= self.journal.local_base_seq => {
+                    bail!("native spool checkpoint cursor names a missing retained object")
+                }
+                _ => {}
+            },
+            (Some(_), None) => {}
         }
         match &self.journal.checkpoint_window {
             CheckpointWindow::Closed => {}
@@ -1516,6 +1588,10 @@ fn load_journal(bytes: &[u8], path: &Path) -> Result<(Journal, bool)> {
         SPOOL_VERSION => {
             let old: JournalV1 = serde_json::from_slice(bytes)
                 .with_context(|| format!("parse legacy local journal {}", path.display()))?;
+            let checkpointed_source_cursor = old
+                .checkpointed_seq
+                .and_then(|seq| old.objects.get(&seq))
+                .map(|object| object.source_cursor.clone());
             let checkpoint_window = match old.objects.last_key_value() {
                 Some((seq, object)) => CheckpointWindow::Opening {
                     seq: *seq,
@@ -1535,6 +1611,7 @@ fn load_journal(bytes: &[u8], path: &Path) -> Result<(Journal, bool)> {
                     local_base_seq: old.local_base_seq,
                     admitted_seq: old.admitted_seq,
                     checkpointed_seq: old.checkpointed_seq,
+                    checkpointed_source_cursor,
                     remote_published_seq: old.remote_published_seq,
                     checkpoint_window,
                 },
@@ -2229,6 +2306,8 @@ mod tests {
         let id = identity(&db);
         let root = NativeSpool::path_for(dir.path(), &id);
         let mut spool = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        let mut first_cursor = SourceCursor::snapshot();
+        first_cursor.shadow_frame_index = 5;
         spool
             .stage(StageObject {
                 seq: 1,
@@ -2237,12 +2316,14 @@ mod tests {
                 ending_chain_checksum: first_checksum,
                 end_page_count: first_pages,
                 intended_remote_key: "one.hadbp".into(),
-                source_cursor: SourceCursor::snapshot(),
+                source_cursor: first_cursor,
                 payload: &first,
             })
             .unwrap();
         spool.mark_uploaded(1).unwrap();
         spool.mark_published(1, b"record-one").unwrap();
+        spool.begin_checkpoint_window(1).unwrap();
+        spool.close_checkpoint_window(1, true, None).unwrap();
 
         let conn = rusqlite::Connection::open(&db).unwrap();
         conn.execute("INSERT INTO t(v) VALUES ('second')", [])
@@ -2254,6 +2335,8 @@ mod tests {
             .unwrap();
         let second = ltx::encode_snapshot_with_checksum(&db, page_size, 2, first_checksum).unwrap();
         let second_pages = fs::metadata(&db).unwrap().len() / page_size as u64;
+        let mut second_cursor = SourceCursor::snapshot();
+        second_cursor.shadow_frame_index = 10;
         spool
             .stage(StageObject {
                 seq: 2,
@@ -2262,7 +2345,7 @@ mod tests {
                 ending_chain_checksum: second.checksum,
                 end_page_count: second_pages,
                 intended_remote_key: "two.hadbp".into(),
-                source_cursor: SourceCursor::snapshot(),
+                source_cursor: second_cursor,
                 payload: &second.bytes,
             })
             .unwrap();
@@ -2272,10 +2355,16 @@ mod tests {
         assert_eq!(spool.cleanup_published_before_latest_snapshot().unwrap(), 1);
         assert!(spool.get(1).is_none());
         assert!(spool.get(2).is_some());
+        assert_eq!(
+            spool.admitted_frames_since_checkpoint(),
+            5,
+            "checkpoint source cursor must survive cleanup of its object record"
+        );
         assert_eq!(spool.read_payload(2).unwrap(), second.bytes);
         drop(spool);
         let reopened = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
         assert!(reopened.get(2).is_some());
+        assert_eq!(reopened.admitted_frames_since_checkpoint(), 5);
         let restored = dir.path().join("local-restore.sqlite");
         assert_eq!(
             crate::native_restore::restore_local_spool(&reopened, &restored, None).unwrap(),
