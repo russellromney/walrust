@@ -5,6 +5,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use hadb_storage::StorageBackend;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
@@ -138,6 +139,7 @@ pub struct NativeUploader {
     lag: Arc<Mutex<RemoteLagState>>,
     scan_interval: Duration,
     max_backoff: Duration,
+    test_pause_file: Option<PathBuf>,
 }
 
 impl NativeUploader {
@@ -146,7 +148,9 @@ impl NativeUploader {
         spool: Arc<Mutex<NativeSpool>>,
     ) -> Result<(Self, UploadWake, Arc<Mutex<RemoteLagState>>)> {
         let descriptor = {
-            let guard = spool.lock().map_err(|_| anyhow!("native spool lock poisoned"))?;
+            let guard = spool
+                .lock()
+                .map_err(|_| anyhow!("native spool lock poisoned"))?;
             StreamDescriptor::from(guard.identity())
         };
         let (sender, wake_rx) = mpsc::channel(1);
@@ -160,6 +164,11 @@ impl NativeUploader {
                 lag: lag.clone(),
                 scan_interval: Duration::from_secs(5),
                 max_backoff: Duration::from_secs(30),
+                test_pause_file: if cfg!(debug_assertions) {
+                    std::env::var_os("WALRUST_TEST_NATIVE_UPLOAD_PAUSE_FILE").map(PathBuf::from)
+                } else {
+                    None
+                },
             },
             UploadWake { sender },
             lag,
@@ -172,6 +181,19 @@ impl NativeUploader {
         loop {
             if *shutdown.borrow() {
                 return;
+            }
+            if self
+                .test_pause_file
+                .as_ref()
+                .is_some_and(|path| path.exists())
+            {
+                self.refresh_lag(Some("test uploader pause is active".to_string()));
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+                    _ = self.wake_rx.recv() => {}
+                    _ = shutdown.changed() => {}
+                }
+                continue;
             }
             match self.publish_pending_once().await {
                 Ok(progress) => {
@@ -211,7 +233,9 @@ impl NativeUploader {
                 .lock()
                 .map_err(|_| anyhow!("native spool lock poisoned"))?;
             let next = match guard.remote_published_seq() {
-                Some(seq) => seq.checked_add(1).ok_or_else(|| anyhow!("publish seq overflow"))?,
+                Some(seq) => seq
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow!("publish seq overflow"))?,
                 None => guard.identity().first_native_seq,
             };
             let Some(object) = guard.get(next).cloned() else {
@@ -223,7 +247,12 @@ impl NativeUploader {
                 guard
                     .get(next - 1)
                     .and_then(|o| o.publish_record_sha256.clone())
-                    .ok_or_else(|| anyhow!("local published predecessor record missing at seq {}", next - 1))?
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "local published predecessor record missing at seq {}",
+                            next - 1
+                        )
+                    })?
                     .into()
             };
             let payload = guard.read_payload(next)?;
@@ -231,7 +260,15 @@ impl NativeUploader {
         };
 
         self.ensure_descriptor().await?;
+        let upload_started = std::time::Instant::now();
         self.ensure_remote_object(&object, &payload).await?;
+        tracing::info!(
+            database = %object.database,
+            seq = object.seq,
+            bytes = payload.len(),
+            remote_upload_ms = upload_started.elapsed().as_millis() as u64,
+            "uploaded exact native HADBP spool object"
+        );
         {
             let mut guard = self
                 .spool
@@ -289,7 +326,10 @@ impl NativeUploader {
                 object.seq,
             )
         {
-            bail!("native object intended key is not canonical at seq {}", object.seq);
+            bail!(
+                "native object intended key is not canonical at seq {}",
+                object.seq
+            );
         }
         put_immutable_exact(
             self.storage.as_ref(),
@@ -312,11 +352,9 @@ impl NativeUploader {
             "{}{}/native/v1/lineages/{}/published/{previous_seq:016x}.json",
             self.descriptor.prefix, self.descriptor.database, self.descriptor.lineage_id
         );
-        let bytes = self
-            .storage
-            .get(&previous_key)
-            .await?
-            .ok_or_else(|| anyhow!("remote native predecessor record is absent at seq {previous_seq}"))?;
+        let bytes = self.storage.get(&previous_key).await?.ok_or_else(|| {
+            anyhow!("remote native predecessor record is absent at seq {previous_seq}")
+        })?;
         let digest = sha256_hex(&bytes);
         if record.previous_publish_sha256.as_deref() != Some(digest.as_str()) {
             bail!(
@@ -354,7 +392,11 @@ impl NativeUploader {
             *lag = RemoteLagState {
                 pending_objects,
                 pending_bytes,
-                oldest_age_ms: if pending_objects == 0 { 0 } else { oldest_age_ms },
+                oldest_age_ms: if pending_objects == 0 {
+                    0
+                } else {
+                    oldest_age_ms
+                },
                 last_error,
             };
         }
@@ -426,15 +468,28 @@ mod tests {
             Ok(())
         }
         async fn list(&self, prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
-            Ok(self.0.lock().unwrap().keys().filter(|k| k.starts_with(prefix)).cloned().collect())
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|k| k.starts_with(prefix))
+                .cloned()
+                .collect())
         }
         async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
             let mut map = self.0.lock().unwrap();
             if map.contains_key(key) {
-                Ok(CasResult { success: false, etag: None })
+                Ok(CasResult {
+                    success: false,
+                    etag: None,
+                })
             } else {
                 map.insert(key.into(), data.into());
-                Ok(CasResult { success: true, etag: Some("1".into()) })
+                Ok(CasResult {
+                    success: true,
+                    etag: Some("1".into()),
+                })
             }
         }
         async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
@@ -445,28 +500,39 @@ mod tests {
     fn staged_spool(dir: &Path) -> Arc<Mutex<NativeSpool>> {
         let db = dir.join("db.sqlite");
         let conn = rusqlite::Connection::open(&db).unwrap();
-        conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t DEFAULT VALUES;").unwrap();
-        let page_size = conn.query_row("PRAGMA page_size", [], |r| r.get::<_, u32>(0)).unwrap();
+        conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t DEFAULT VALUES;")
+            .unwrap();
+        let page_size = conn
+            .query_row("PRAGMA page_size", [], |r| r.get::<_, u32>(0))
+            .unwrap();
         drop(conn);
-        let identity = SpoolIdentity::new(&db, "bucket", "p/", "db", "lineage", 1, None, true).unwrap();
+        let identity =
+            SpoolIdentity::new(&db, "bucket", "p/", "db", "lineage", 1, None, true).unwrap();
         let encoded = ltx::encode_snapshot_with_checksum(&db, page_size, 1, 0).unwrap();
         let pages = std::fs::metadata(&db).unwrap().len() / page_size as u64;
         let root = NativeSpool::path_for(dir, &identity);
-        let mut spool = NativeSpool::create_or_open(&root, identity.clone(), CapacityPolicy {
-            warning_bytes: u64::MAX - 1,
-            hard_bytes: u64::MAX,
-            minimum_free_bytes: 0,
-        }).unwrap();
-        spool.stage(StageObject {
-            seq: 1,
-            kind: ObjectKind::Snapshot,
-            previous_chain_checksum: 0,
-            ending_chain_checksum: encoded.checksum,
-            end_page_count: pages,
-            intended_remote_key: object_key(&identity, ObjectKind::Snapshot, 1),
-            source_cursor: SourceCursor::snapshot(),
-            payload: &encoded.bytes,
-        }).unwrap();
+        let mut spool = NativeSpool::create_or_open(
+            &root,
+            identity.clone(),
+            CapacityPolicy {
+                warning_bytes: u64::MAX - 1,
+                hard_bytes: u64::MAX,
+                minimum_free_bytes: 0,
+            },
+        )
+        .unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: encoded.checksum,
+                end_page_count: pages,
+                intended_remote_key: object_key(&identity, ObjectKind::Snapshot, 1),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &encoded.bytes,
+            })
+            .unwrap();
         Arc::new(Mutex::new(spool))
     }
 
@@ -489,7 +555,13 @@ mod tests {
         let dir = tempdir().unwrap();
         let spool = staged_spool(dir.path());
         let storage = Arc::new(MemoryStorage::default());
-        let key = spool.lock().unwrap().get(1).unwrap().intended_remote_key.clone();
+        let key = spool
+            .lock()
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .intended_remote_key
+            .clone();
         storage.put(&key, b"divergent").await.unwrap();
         let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool).unwrap();
         let err = uploader.publish_pending_once().await.unwrap_err();
@@ -507,5 +579,94 @@ mod tests {
         wake.notify(); // full, coalesced
         drop(uploader); // receiver closed
         wake.notify();
+    }
+
+    #[tokio::test]
+    async fn published_native_snapshot_restores_row_exact_and_integrity_clean() {
+        let dir = tempdir().unwrap();
+        let spool = staged_spool(dir.path());
+        let storage = Arc::new(MemoryStorage::default());
+        let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool).unwrap();
+        uploader.publish_pending_once().await.unwrap();
+        let output = dir.path().join("restored.sqlite");
+        let result =
+            crate::native_restore::restore_native_v1(storage.as_ref(), "p/", "db", &output, None)
+                .await
+                .unwrap();
+        assert_eq!(
+            result,
+            crate::native_restore::NativeRestoreAvailability::Restored { seq: 1 }
+        );
+        let conn = rusqlite::Connection::open(output).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM t", [], |row| row.get(0))
+            .unwrap();
+        let integrity: String = conn
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn offline_reconnect_divergent_remote_head_is_rejected_and_retained() {
+        let dir = tempdir().unwrap();
+        let spool = staged_spool(dir.path());
+        let storage = Arc::new(MemoryStorage::default());
+        let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool.clone()).unwrap();
+        uploader.publish_pending_once().await.unwrap();
+
+        // This object is staged locally while the remote is notionally offline.
+        let (identity, previous) = {
+            let guard = spool.lock().unwrap();
+            (
+                guard.identity().clone(),
+                guard.get(1).unwrap().ending_chain_checksum,
+            )
+        };
+        let (payload, ending) = ltx::encode_wal_changes_with_end_page_count(
+            &[(1, vec![0u8; 4096])],
+            4096,
+            2,
+            previous,
+            1,
+        )
+        .unwrap();
+        spool
+            .lock()
+            .unwrap()
+            .stage(StageObject {
+                seq: 2,
+                kind: ObjectKind::Delta,
+                previous_chain_checksum: previous,
+                ending_chain_checksum: ending,
+                end_page_count: 1,
+                intended_remote_key: object_key(&identity, ObjectKind::Delta, 2),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &payload,
+            })
+            .unwrap();
+
+        // A second writer advances the same remote sequence incompatibly.
+        let marker_key = format!(
+            "p/db/native/v1/lineages/{}/published/{:016x}.json",
+            identity.lineage_id, 2
+        );
+        storage
+            .put(&marker_key, b"divergent-writer-head")
+            .await
+            .unwrap();
+        let error = uploader.publish_pending_once().await.unwrap_err();
+        assert!(error.to_string().contains("split brain/equivocation"));
+        let guard = spool.lock().unwrap();
+        assert_eq!(guard.remote_published_seq(), Some(1));
+        assert!(
+            guard.get(2).is_some(),
+            "conflicting offline descendant must be retained"
+        );
+        assert_ne!(
+            guard.get(2).unwrap().remote_upload_state,
+            RemoteUploadState::Published
+        );
     }
 }

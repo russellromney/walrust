@@ -76,7 +76,10 @@ pub fn encode_shadow_to_hadbp(input: &NativeShadowInput) -> Result<Option<Native
         }
         let readable = segment_size.saturating_sub(relative);
         if readable % frame_size != 0 {
-            bail!("fsynced shadow segment {} has a torn frame", entry.path().display());
+            bail!(
+                "fsynced shadow segment {} has a torn frame",
+                entry.path().display()
+            );
         }
         let mut file = fs::File::open(entry.path())?;
         file.seek(SeekFrom::Start(relative))?;

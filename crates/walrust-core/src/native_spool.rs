@@ -38,7 +38,7 @@ pub struct SourceCursor {
     pub shadow_generation: u64,
     pub shadow_frame_index: u64,
     pub wal_offset: u64,
-    pub wal_salt: Option<[u32; 2]>,
+    pub wal_salt: Option<(u32, u32)>,
     pub wal_checksum_chain: Option<(u32, u32)>,
 }
 
@@ -79,9 +79,8 @@ impl SpoolIdentity {
         legacy_boundary_txid: Option<u64>,
         remote_base_verified: bool,
     ) -> Result<Self> {
-        let canonical = fs::canonicalize(db_path).with_context(|| {
-            format!("canonicalize spool database path {}", db_path.display())
-        })?;
+        let canonical = fs::canonicalize(db_path)
+            .with_context(|| format!("canonicalize spool database path {}", db_path.display()))?;
         Ok(Self {
             version: SPOOL_VERSION,
             canonical_db_path: canonical.to_string_lossy().into_owned(),
@@ -127,6 +126,7 @@ impl SpoolIdentity {
 #[serde(rename_all = "snake_case")]
 pub enum LocalCreationState {
     Installed,
+    Deleting,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,6 +209,7 @@ struct Journal {
     version: u32,
     identity: SpoolIdentity,
     objects: BTreeMap<u64, SpoolObject>,
+    local_base_seq: u64,
     admitted_seq: Option<u64>,
     checkpointed_seq: Option<u64>,
     remote_published_seq: Option<u64>,
@@ -237,7 +238,6 @@ impl NativeSpool {
         base.join("native-v1").join(identity.local_path_digest())
     }
 
-
     pub fn read_identity(root: &Path) -> Result<Option<SpoolIdentity>> {
         let path = root.join("journal.json");
         let bytes = match fs::read(&path) {
@@ -245,10 +245,13 @@ impl NativeSpool {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
         };
-        let journal: Journal = serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse {}", path.display()))?;
+        let journal: Journal =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
         if journal.version != SPOOL_VERSION || journal.identity.version != SPOOL_VERSION {
-            bail!("unsupported native spool journal/identity version at {}", path.display());
+            bail!(
+                "unsupported native spool journal/identity version at {}",
+                path.display()
+            );
         }
         Ok(Some(journal.identity))
     }
@@ -259,7 +262,10 @@ impl NativeSpool {
         capacity: CapacityPolicy,
     ) -> Result<Self> {
         if identity.version != SPOOL_VERSION {
-            bail!("unsupported native spool identity version {}", identity.version);
+            bail!(
+                "unsupported native spool identity version {}",
+                identity.version
+            );
         }
         if capacity.warning_bytes > capacity.hard_bytes {
             bail!("spool warning watermark exceeds hard capacity");
@@ -279,7 +285,10 @@ impl NativeSpool {
                 let journal: Journal = serde_json::from_slice(&bytes)
                     .with_context(|| format!("parse {}", journal_path.display()))?;
                 if journal.version != SPOOL_VERSION {
-                    bail!("unsupported native spool journal version {}", journal.version);
+                    bail!(
+                        "unsupported native spool journal version {}",
+                        journal.version
+                    );
                 }
                 if journal.identity != identity {
                     bail!(
@@ -290,10 +299,12 @@ impl NativeSpool {
                 journal
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let local_base_seq = identity.first_native_seq;
                 let journal = Journal {
                     version: SPOOL_VERSION,
                     identity,
                     objects: BTreeMap::new(),
+                    local_base_seq,
                     admitted_seq: None,
                     checkpointed_seq: None,
                     remote_published_seq: None,
@@ -312,6 +323,7 @@ impl NativeSpool {
             journal,
             capacity,
         };
+        spool.complete_interrupted_cleanup()?;
         spool.verify_journal_payloads()?;
         spool.reconcile_orphans()?;
         Ok(spool)
@@ -439,11 +451,28 @@ impl NativeSpool {
         )?;
 
         let payload_path = self.payload_path(&object);
-        install_payload(&self.objects_dir, &payload_path, stage.payload)?;
+        match fs::read(&payload_path) {
+            Ok(existing) if existing == stage.payload => {
+                validate_payload(&object, &existing, &self.root)?;
+            }
+            Ok(_) => bail!(
+                "native spool equivocation: divergent installed payload at sequence {}",
+                stage.seq
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                install_payload(&self.objects_dir, &payload_path, stage.payload)?;
+            }
+            Err(e) => return Err(e.into()),
+        }
 
+        let previous_admitted = self.journal.admitted_seq;
         self.journal.objects.insert(stage.seq, object.clone());
         self.journal.admitted_seq = Some(stage.seq);
-        self.persist_journal()?;
+        if let Err(error) = self.persist_journal() {
+            self.journal.objects.remove(&stage.seq);
+            self.journal.admitted_seq = previous_admitted;
+            return Err(error);
+        }
 
         remove_and_sync(&intent_path, &self.intents_dir)?;
         Ok(object)
@@ -453,11 +482,17 @@ impl NativeSpool {
         if !self.journal.objects.contains_key(&seq) {
             bail!("cannot checkpoint unadmitted native spool sequence {seq}");
         }
+        let old = self.journal.clone();
         self.journal.checkpointed_seq = Some(seq);
-        self.persist_journal()
+        if let Err(error) = self.persist_journal() {
+            self.journal = old;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn mark_uploaded(&mut self, seq: u64) -> Result<()> {
+        let old = self.journal.clone();
         let object = self
             .journal
             .objects
@@ -468,7 +503,11 @@ impl NativeSpool {
         }
         object.remote_upload_state = RemoteUploadState::Uploaded;
         object.uploaded_unix_ms = Some(unix_ms());
-        self.persist_journal()
+        if let Err(error) = self.persist_journal() {
+            self.journal = old;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn mark_published(&mut self, seq: u64, publish_record: &[u8]) -> Result<()> {
@@ -481,6 +520,7 @@ impl NativeSpool {
         if seq != expected {
             bail!("cannot publish native seq {seq}; contiguous next seq is {expected}");
         }
+        let old = self.journal.clone();
         let object = self
             .journal
             .objects
@@ -493,7 +533,11 @@ impl NativeSpool {
         object.published_unix_ms = Some(unix_ms());
         object.publish_record_sha256 = Some(sha256_hex(publish_record));
         self.journal.remote_published_seq = Some(seq);
-        self.persist_journal()
+        if let Err(error) = self.persist_journal() {
+            self.journal = old;
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn admitted_seq(&self) -> Option<u64> {
@@ -526,6 +570,63 @@ impl NativeSpool {
         }
     }
 
+    /// Reclaim only remotely published history older than the newest published
+    /// snapshot. The newest snapshot and every descendant remain a complete
+    /// locally restorable chain; pending/unpublished objects are never victims.
+    pub fn cleanup_published_before_latest_snapshot(&mut self) -> Result<u64> {
+        let Some(base_seq) = self
+            .journal
+            .objects
+            .values()
+            .filter(|object| {
+                object.kind == ObjectKind::Snapshot
+                    && object.remote_upload_state == RemoteUploadState::Published
+                    && object.local_creation_state == LocalCreationState::Installed
+            })
+            .map(|object| object.seq)
+            .max()
+        else {
+            return Ok(0);
+        };
+        if base_seq <= self.journal.local_base_seq {
+            return Ok(0);
+        }
+        let victims = self
+            .journal
+            .objects
+            .values()
+            .filter(|object| object.seq < base_seq)
+            .map(|object| object.seq)
+            .collect::<Vec<_>>();
+        if victims.iter().any(|seq| {
+            self.journal.objects[seq].remote_upload_state != RemoteUploadState::Published
+        }) {
+            bail!("native spool cleanup would delete pending/unpublished recovery data");
+        }
+        let old = self.journal.clone();
+        for seq in &victims {
+            self.journal
+                .objects
+                .get_mut(seq)
+                .unwrap()
+                .local_creation_state = LocalCreationState::Deleting;
+        }
+        if let Err(error) = self.persist_journal() {
+            self.journal = old;
+            return Err(error);
+        }
+        for seq in &victims {
+            let path = self.payload_path(self.journal.objects.get(seq).unwrap());
+            remove_and_sync(&path, &self.objects_dir)?;
+        }
+        for seq in &victims {
+            self.journal.objects.remove(seq);
+        }
+        self.journal.local_base_seq = base_seq;
+        self.persist_journal()?;
+        Ok(victims.len() as u64)
+    }
+
     fn ensure_capacity(&self, additional_peak_bytes: u64) -> Result<()> {
         if self.capacity_state(additional_peak_bytes)? == CapacityState::Full {
             bail!(
@@ -554,7 +655,7 @@ impl NativeSpool {
                 seq.checked_add(1)
                     .ok_or_else(|| anyhow!("native spool sequence overflow"))?
             }
-            None => self.journal.identity.first_native_seq,
+            None => self.journal.local_base_seq,
         };
         if object.seq != expected_seq {
             bail!(
@@ -576,24 +677,53 @@ impl NativeSpool {
                 bail!("native spool journal key/object sequence mismatch");
             }
             validate_object_identity(&self.journal.identity, object)?;
+            if object.local_creation_state != LocalCreationState::Installed {
+                bail!("native spool cleanup state was not reconciled at seq {seq}");
+            }
             if let Some(previous) = prior {
                 if object.seq != previous.seq + 1
                     || object.previous_chain_checksum != previous.ending_chain_checksum
                 {
                     bail!("native spool journal contains a sequence/checksum gap at {seq}");
                 }
-            } else if object.seq != self.journal.identity.first_native_seq
+            } else if object.seq != self.journal.local_base_seq
                 || object.kind != ObjectKind::Snapshot
             {
                 bail!("native spool journal does not begin at its snapshot base");
             }
-            let bytes = fs::read(self.payload_path(object)).with_context(|| {
-                format!("read admitted native payload for sequence {seq}")
-            })?;
+            let bytes = fs::read(self.payload_path(object))
+                .with_context(|| format!("read admitted native payload for sequence {seq}"))?;
             validate_payload(object, &bytes, &self.root)?;
             prior = Some(object);
         }
         Ok(())
+    }
+
+    fn complete_interrupted_cleanup(&mut self) -> Result<()> {
+        let deleting = self
+            .journal
+            .objects
+            .values()
+            .filter(|object| object.local_creation_state == LocalCreationState::Deleting)
+            .map(|object| object.seq)
+            .collect::<Vec<_>>();
+        if deleting.is_empty() {
+            return Ok(());
+        }
+        for seq in deleting {
+            let object = self.journal.objects.get(&seq).unwrap().clone();
+            remove_and_sync(&self.payload_path(&object), &self.objects_dir)?;
+            self.journal.objects.remove(&seq);
+        }
+        let first_remaining =
+            self.journal.objects.values().next().ok_or_else(|| {
+                anyhow!("native spool cleanup removed its only local snapshot base")
+            })?;
+        if first_remaining.kind != ObjectKind::Snapshot {
+            bail!("native spool interrupted cleanup would leave no local snapshot base");
+        }
+        self.journal.local_base_seq = first_remaining.seq;
+        self.persist_journal()
     }
 
     fn reconcile_orphans(&mut self) -> Result<()> {
@@ -675,14 +805,20 @@ fn validate_object_identity(identity: &SpoolIdentity, object: &SpoolObject) -> R
         || object.prefix != identity.prefix
         || object.database != identity.database
     {
-        bail!("native spool object identity/destination mismatch at seq {}", object.seq);
+        bail!(
+            "native spool object identity/destination mismatch at seq {}",
+            object.seq
+        );
     }
     Ok(())
 }
 
 fn validate_payload(object: &SpoolObject, bytes: &[u8], scratch_root: &Path) -> Result<()> {
     if bytes.len() as u64 != object.payload_length || sha256_hex(bytes) != object.payload_sha256 {
-        bail!("native spool payload length/digest mismatch at seq {}", object.seq);
+        bail!(
+            "native spool payload length/digest mismatch at seq {}",
+            object.seq
+        );
     }
     let decoded = ltx::decode_sqlite_changeset(bytes)
         .with_context(|| format!("decode native spool payload seq {}", object.seq))?;
@@ -697,7 +833,10 @@ fn validate_payload(object: &SpoolObject, bytes: &[u8], scratch_root: &Path) -> 
             if end_page_count != Some(object.end_page_count)
                 || decoded.checksum != object.ending_chain_checksum
             {
-                bail!("native spool delta checksum/page-count mismatch at seq {}", object.seq);
+                bail!(
+                    "native spool delta checksum/page-count mismatch at seq {}",
+                    object.seq
+                );
             }
         }
         ObjectKind::Snapshot => {
@@ -719,7 +858,10 @@ fn validate_payload(object: &SpoolObject, bytes: &[u8], scratch_root: &Path) -> 
             let result = decoded_result?;
             remove_result?;
             if result.checksum != object.ending_chain_checksum {
-                bail!("native spool snapshot ending checksum mismatch at seq {}", object.seq);
+                bail!(
+                    "native spool snapshot ending checksum mismatch at seq {}",
+                    object.seq
+                );
             }
             if fs::metadata(&tmp).is_ok() {
                 bail!("native spool snapshot verification temporary was not removed");
@@ -811,11 +953,21 @@ fn filesystem_free_bytes(path: &Path) -> Result<u64> {
     Ok((stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
 }
 
+#[cfg(unix)]
+pub fn filesystem_available_bytes(path: &Path) -> Result<u64> {
+    filesystem_free_bytes(path)
+}
+
 #[cfg(not(unix))]
 fn filesystem_free_bytes(_path: &Path) -> Result<u64> {
     // Windows support needs a platform API before local-first watch is enabled
     // there. Failing closed prevents a false capacity claim.
     bail!("native spool filesystem free-space accounting is unsupported on this platform")
+}
+
+#[cfg(not(unix))]
+pub fn filesystem_available_bytes(path: &Path) -> Result<u64> {
+    filesystem_free_bytes(path)
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -844,14 +996,15 @@ mod tests {
     use tempfile::tempdir;
 
     fn identity(db: &Path) -> SpoolIdentity {
-        SpoolIdentity::new(db, "bucket", "prefix/", "db", "lineage-a", 1, None, true)
-            .unwrap()
+        SpoolIdentity::new(db, "bucket", "prefix/", "db", "lineage-a", 1, None, true).unwrap()
     }
 
     fn snapshot(db: &Path, seq: u64, prev: u64) -> (Vec<u8>, u64, u64) {
         let conn = rusqlite::Connection::open(db).unwrap();
         conn.execute_batch("CREATE TABLE IF NOT EXISTS t(id INTEGER PRIMARY KEY, v TEXT); INSERT INTO t(v) VALUES ('a');").unwrap();
-        let page_size = conn.query_row("PRAGMA page_size", [], |r| r.get::<_, u32>(0)).unwrap();
+        let page_size = conn
+            .query_row("PRAGMA page_size", [], |r| r.get::<_, u32>(0))
+            .unwrap();
         drop(conn);
         let encoded = ltx::encode_snapshot_with_checksum(db, page_size, seq, prev).unwrap();
         let pages = fs::metadata(db).unwrap().len() / page_size as u64;
@@ -873,16 +1026,19 @@ mod tests {
         let (bytes, checksum, pages) = snapshot(&db, 1, 0);
         let root = NativeSpool::path_for(dir.path(), &identity(&db));
         let mut spool = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
-        spool.stage(StageObject {
-            seq: 1,
-            kind: ObjectKind::Snapshot,
-            previous_chain_checksum: 0,
-            ending_chain_checksum: checksum,
-            end_page_count: pages,
-            intended_remote_key: "prefix/db/native/v1/lineages/lineage-a/0001/0000000000000001.hadbp".into(),
-            source_cursor: SourceCursor::snapshot(),
-            payload: &bytes,
-        }).unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: checksum,
+                end_page_count: pages,
+                intended_remote_key:
+                    "prefix/db/native/v1/lineages/lineage-a/0001/0000000000000001.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &bytes,
+            })
+            .unwrap();
         assert_eq!(spool.admitted_seq(), Some(1));
         drop(spool);
         let reopened = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
@@ -909,7 +1065,11 @@ mod tests {
         spool.stage(base.clone()).unwrap();
         let mut divergent = base;
         divergent.intended_remote_key = "key-b.hadbp".into();
-        assert!(spool.stage(divergent).unwrap_err().to_string().contains("equivocation"));
+        assert!(spool
+            .stage(divergent)
+            .unwrap_err()
+            .to_string()
+            .contains("equivocation"));
     }
 
     #[test]
@@ -920,8 +1080,12 @@ mod tests {
         File::create(&db1).unwrap();
         File::create(&db2).unwrap();
         let a = identity(&db1);
-        let b = SpoolIdentity::new(&db2, "bucket", "prefix/", "db", "lineage-a", 1, None, true).unwrap();
-        assert_ne!(NativeSpool::path_for(dir.path(), &a), NativeSpool::path_for(dir.path(), &b));
+        let b = SpoolIdentity::new(&db2, "bucket", "prefix/", "db", "lineage-a", 1, None, true)
+            .unwrap();
+        assert_ne!(
+            NativeSpool::path_for(dir.path(), &a),
+            NativeSpool::path_for(dir.path(), &b)
+        );
         let root = NativeSpool::path_for(dir.path(), &a);
         NativeSpool::create_or_open(&root, a, generous()).unwrap();
         assert!(NativeSpool::create_or_open(&root, b, generous()).is_err());
@@ -934,21 +1098,28 @@ mod tests {
         let (bytes, checksum, pages) = snapshot(&db, 1, 0);
         let id = identity(&db);
         let root = NativeSpool::path_for(dir.path(), &id);
-        let mut spool = NativeSpool::create_or_open(&root, id, CapacityPolicy {
-            warning_bytes: 0,
-            hard_bytes: 1,
-            minimum_free_bytes: 0,
-        }).unwrap();
-        let err = spool.stage(StageObject {
-            seq: 1,
-            kind: ObjectKind::Snapshot,
-            previous_chain_checksum: 0,
-            ending_chain_checksum: checksum,
-            end_page_count: pages,
-            intended_remote_key: "key.hadbp".into(),
-            source_cursor: SourceCursor::snapshot(),
-            payload: &bytes,
-        }).unwrap_err();
+        let mut spool = NativeSpool::create_or_open(
+            &root,
+            id,
+            CapacityPolicy {
+                warning_bytes: 0,
+                hard_bytes: 1,
+                minimum_free_bytes: 0,
+            },
+        )
+        .unwrap();
+        let err = spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: checksum,
+                end_page_count: pages,
+                intended_remote_key: "key.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &bytes,
+            })
+            .unwrap_err();
         assert!(err.to_string().contains("local_spool_full"));
         assert_eq!(spool.admitted_seq(), None);
     }
@@ -1020,5 +1191,62 @@ mod tests {
         };
         assert!(error.to_string().contains("unproven native HADBP orphan"));
         assert!(orphan.exists(), "unproven recovery data must be retained");
+    }
+
+    #[test]
+    fn cleanup_never_deletes_newest_local_snapshot_base_or_descendants() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (first, first_checksum, first_pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: first_checksum,
+                end_page_count: first_pages,
+                intended_remote_key: "one.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &first,
+            })
+            .unwrap();
+        spool.mark_uploaded(1).unwrap();
+        spool.mark_published(1, b"record-one").unwrap();
+
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("INSERT INTO t(v) VALUES ('second')", [])
+            .unwrap();
+        drop(conn);
+        let page_size = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA page_size", [], |r| r.get::<_, u32>(0))
+            .unwrap();
+        let second = ltx::encode_snapshot_with_checksum(&db, page_size, 2, first_checksum).unwrap();
+        let second_pages = fs::metadata(&db).unwrap().len() / page_size as u64;
+        spool
+            .stage(StageObject {
+                seq: 2,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: first_checksum,
+                ending_chain_checksum: second.checksum,
+                end_page_count: second_pages,
+                intended_remote_key: "two.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &second.bytes,
+            })
+            .unwrap();
+        spool.mark_uploaded(2).unwrap();
+        spool.mark_published(2, b"record-two").unwrap();
+
+        assert_eq!(spool.cleanup_published_before_latest_snapshot().unwrap(), 1);
+        assert!(spool.get(1).is_none());
+        assert!(spool.get(2).is_some());
+        assert_eq!(spool.read_payload(2).unwrap(), second.bytes);
+        drop(spool);
+        let reopened = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
+        assert!(reopened.get(2).is_some());
     }
 }
