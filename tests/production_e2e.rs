@@ -1826,6 +1826,174 @@ fn e2e_cli_fresh_native_stream_restores_latest_and_exact_pitr() -> Result<()> {
 }
 
 #[test]
+fn e2e_cli_native_prune_publishes_floor_preserves_latest_and_expires_old_pitr() -> Result<()> {
+    require_s3!("e2e_cli_native_prune_publishes_floor_preserves_latest_and_expires_old_pitr");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-prune");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let expired_path = temp.path().join("expired.db");
+    let log_path = temp.path().join("watch.log");
+    let setup = create_source_db(&db_path, 12)?;
+    write_pin_frame(&setup, "native-prune")?;
+    let expected = rows(&db_path)?;
+    let mut child = spawn_cli_watch_logged_with_triggers(
+        LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &log_path,
+            config_path: None,
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        },
+        TriggerOptions {
+            snapshot_interval: 1,
+            max_changes: 0,
+            max_interval: 0,
+            on_idle: 0,
+        },
+    )?;
+    let snapshot_deadline = Instant::now() + e2e_poll_deadline(30);
+    while watch_log(&log_path)
+        .matches("native HADBP snapshot admitted to durable local spool")
+        .count()
+        < 5
+    {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "native prune watcher exited ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < snapshot_deadline,
+            "native prune did not create repeated snapshots:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    stop_child(&mut child);
+
+    let mut prune = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    prune
+        .arg("prune")
+        .arg(&name)
+        .arg("--bucket")
+        .arg(&bucket_arg)
+        .arg("--hourly")
+        .arg("1")
+        .arg("--daily")
+        .arg("0")
+        .arg("--weekly")
+        .arg("0")
+        .arg("--monthly")
+        .arg("0")
+        .arg("--force");
+    if let Some(endpoint) = endpoint.as_deref() {
+        prune.arg("--endpoint").arg(endpoint);
+    }
+    let prune_output = prune.output()?;
+    anyhow::ensure!(
+        prune_output.status.success(),
+        "native prune failed:\n{}{}",
+        String::from_utf8_lossy(&prune_output.stdout),
+        String::from_utf8_lossy(&prune_output.stderr)
+    );
+    anyhow::ensure!(
+        String::from_utf8_lossy(&prune_output.stdout).contains("Native HADBP prune complete"),
+        "native prune did not advance a retention floor:\n{}",
+        String::from_utf8_lossy(&prune_output.stdout)
+    );
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let visible = runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(test_bucket(), endpoint.as_deref()).await?;
+        walrust::walrust_core::native_restore::inspect_native_v1(
+            storage.as_ref(),
+            &test_bucket(),
+            &format!("{prefix}/"),
+            &name,
+        )
+        .await?
+        .context("native stream vanished after prune")
+    })?;
+    anyhow::ensure!(
+        visible.retention_floor_seq > 1 && visible.head_seq >= visible.retention_floor_seq,
+        "native prune did not select a newer verified snapshot floor: {visible:?}"
+    );
+    let _ = std::fs::remove_file(&restored_path);
+    run_cli_restore(&name, &bucket_arg, endpoint.as_deref(), &restored_path)?;
+    assert_integrity_ok(&restored_path)?;
+    anyhow::ensure!(
+        rows(&restored_path)? == expected,
+        "latest changed after native prune"
+    );
+
+    let expired =
+        run_cli_restore_pit_output(&name, &bucket_arg, endpoint.as_deref(), &expired_path, 1)?;
+    anyhow::ensure!(
+        !expired.status.success(),
+        "PIT below native floor unexpectedly restored"
+    );
+    anyhow::ensure!(
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&expired.stdout),
+            String::from_utf8_lossy(&expired.stderr)
+        )
+        .contains("intentionally expired below retention floor"),
+        "expired PIT was not distinguished from corruption:\n{}{}",
+        String::from_utf8_lossy(&expired.stdout),
+        String::from_utf8_lossy(&expired.stderr)
+    );
+
+    let mut compact = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    compact
+        .arg("compact")
+        .arg(&name)
+        .arg("--bucket")
+        .arg(&bucket_arg)
+        .arg("--hourly")
+        .arg("1")
+        .arg("--daily")
+        .arg("0")
+        .arg("--weekly")
+        .arg("0")
+        .arg("--monthly")
+        .arg("0")
+        .arg("--force");
+    if let Some(endpoint) = endpoint.as_deref() {
+        compact.arg("--endpoint").arg(endpoint);
+    }
+    let compact_output = compact.output()?;
+    anyhow::ensure!(
+        compact_output.status.success(),
+        "native compact alias failed"
+    );
+    anyhow::ensure!(
+        String::from_utf8_lossy(&compact_output.stderr).contains("deprecated"),
+        "compact alias did not identify its prune semantics"
+    );
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
 fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     require_s3!("e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows");
     let temp = TempDir::new()?;

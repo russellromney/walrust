@@ -14,6 +14,37 @@ use crate::s3::{self, create_client, parse_bucket};
 
 use super::manifest::discover_snapshots_from_s3;
 
+fn native_retention_floor(
+    snapshots: &[SnapshotEntry],
+    policy: &RetentionPolicy,
+    now: chrono::DateTime<Utc>,
+) -> Option<u64> {
+    // hadb-io's generic safety minimum fills from the oldest entry because
+    // some formats need their original base. Every native-v1 entry here is a
+    // complete HADBP snapshot, so retaining the oldest would pin the immutable
+    // floor forever. Preserve all GFS tier selections, then satisfy the same
+    // minimum with the newest complete snapshots.
+    let mut tier_policy = policy.clone();
+    tier_policy.minimum = 0;
+    let tier_plan = crate::retention::analyze_retention(snapshots, &tier_policy, now);
+    let mut keep = tier_plan
+        .keep
+        .iter()
+        .map(|entry| entry.sequence)
+        .collect::<std::collections::BTreeSet<_>>();
+    if keep.len() < policy.minimum {
+        let mut newest = snapshots.iter().collect::<Vec<_>>();
+        newest.sort_by_key(|entry| std::cmp::Reverse(entry.sequence));
+        for entry in newest {
+            keep.insert(entry.sequence);
+            if keep.len() >= policy.minimum {
+                break;
+            }
+        }
+    }
+    keep.into_iter().next()
+}
+
 pub async fn prune(
     name: &str,
     bucket: &str,
@@ -88,13 +119,7 @@ pub async fn prune(
                 size: meta.size,
             });
         }
-        let native_plan =
-            crate::retention::analyze_retention(&native_snapshots, policy, Utc::now());
-        let floor = native_plan
-            .keep
-            .iter()
-            .map(|entry| entry.sequence)
-            .min()
+        let floor = native_retention_floor(&native_snapshots, policy, Utc::now())
             .unwrap_or(native.retention_floor_seq);
         let delete_count = floor.saturating_sub(native.retention_floor_seq) as usize;
         println!(
@@ -346,6 +371,21 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn native_minimum_selects_newest_complete_snapshot_bases() {
+        let now = Utc::now();
+        let snapshots = (1..=7)
+            .map(|sequence| SnapshotEntry {
+                key: format!("snapshot-{sequence}"),
+                created_at: now - chrono::Duration::minutes((7 - sequence) as i64),
+                sequence,
+                size: 1,
+            })
+            .collect::<Vec<_>>();
+        let policy = RetentionPolicy::new(1, 0, 0, 0);
+        assert_eq!(native_retention_floor(&snapshots, &policy, now), Some(6));
+    }
 
     /// E6: when a watcher holds the single-writer lock, `snapshot` must return
     /// an actionable error naming the watcher — before it ever reaches the
