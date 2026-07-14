@@ -2438,6 +2438,97 @@ fn e2e_cli_native_prune_publishes_floor_preserves_latest_and_expires_old_pitr() 
 }
 
 #[test]
+fn e2e_cli_watch_auto_retention_advances_native_floor_and_preserves_latest() -> Result<()> {
+    require_s3!("e2e_cli_watch_auto_retention_advances_native_floor_and_preserves_latest");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-watch-retention");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+    let config_path = temp.path().join("walrust.toml");
+    std::fs::write(
+        &config_path,
+        "[sync]\nprune_after_snapshot = true\n\n[retention]\nhourly = 1\ndaily = 0\nweekly = 0\nmonthly = 0\n",
+    )?;
+    let setup = create_source_db(&db_path, 12)?;
+    write_pin_frame(&setup, "native-watch-retention")?;
+    let expected = rows(&db_path)?;
+    let mut child = spawn_cli_watch_logged_with_triggers(
+        LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &log_path,
+            config_path: Some(&config_path),
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        },
+        TriggerOptions {
+            snapshot_interval: 1,
+            max_changes: 0,
+            max_interval: 0,
+            on_idle: 0,
+        },
+    )?;
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    let storage = runtime.block_on(walrust::s3_backend_from_env(
+        test_bucket(),
+        endpoint.as_deref(),
+    ))?;
+    let floor_deadline = Instant::now() + e2e_poll_deadline(45);
+    let visible = loop {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watch exited before automatic native retention advanced ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        let visible =
+            runtime.block_on(walrust::walrust_core::native_restore::inspect_native_v1(
+                storage.as_ref(),
+                &test_bucket(),
+                &format!("{prefix}/"),
+                &name,
+            ))?;
+        if let Some(visible) = visible {
+            if visible.retention_floor_seq > 1 {
+                break visible;
+            }
+        }
+        anyhow::ensure!(
+            Instant::now() < floor_deadline,
+            "watch automatic retention never advanced the verified native floor:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    anyhow::ensure!(
+        visible.head_seq >= visible.retention_floor_seq,
+        "watch published an invalid native retention floor: {visible:?}"
+    );
+
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    stop_child_gracefully(&mut child, &log_path)?;
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
 fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() -> Result<()> {
     require_s3!("e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained");
     let temp = TempDir::new()?;
@@ -4197,10 +4288,21 @@ fn e2e_cli_snapshot_keeps_lifetime_source_and_blocker_through_handoff() -> Resul
         &expected,
     )?;
     assert_integrity_ok(&restored_path)?;
-    anyhow::ensure!(
-        watch_log(&log_path).contains("native HADBP delta admitted to durable local spool"),
-        "commit after snapshot copy was not preserved as a native delta"
-    );
+    let delta_deadline = Instant::now() + e2e_poll_deadline(20);
+    while !watch_log(&log_path).contains("native HADBP delta admitted to durable local spool") {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watch exited before the post-copy delta admission was observable ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < delta_deadline,
+            "commit after snapshot copy restored remotely but its durable native-delta admission was not observed:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
     stop_child_gracefully(&mut child, &log_path)?;
     cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())

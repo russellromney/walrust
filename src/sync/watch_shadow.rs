@@ -38,9 +38,8 @@ use walrust_core::native_spool::{
 };
 
 use super::manifest::discover_state_from_s3;
-use super::shadow::{
-    run_prune, sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry,
-};
+use super::prune::prune_with_client;
+use super::shadow::{sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry};
 #[cfg(test)]
 use super::types::Manifest;
 use super::types::{DbState, ShadowDbState, ShadowSyncInput, TriggerState};
@@ -2391,7 +2390,7 @@ pub async fn watch_with_shadow(
                 if global_sync.compact_after_snapshot {
                     if let Some(ref policy) = compact_policy {
                         for state in db_states.values() {
-                            if let Err(e) = run_prune(&client, &bucket_name, &prefix, &state.name, policy).await {
+                            if let Err(e) = prune_with_client(&client, &bucket_name, &prefix, &state.name, policy, true).await {
                                 tracing::error!("Failed to prune {}: {}", state.name, e);
                             }
                         }
@@ -2404,7 +2403,7 @@ pub async fn watch_with_shadow(
             _ = compact_timer.tick(), if global_sync.compact_interval > 0 => {
                 if let Some(ref policy) = compact_policy {
                     for state in db_states.values() {
-                        if let Err(e) = run_prune(&client, &bucket_name, &prefix, &state.name, policy).await {
+                        if let Err(e) = prune_with_client(&client, &bucket_name, &prefix, &state.name, policy, true).await {
                             tracing::error!("Failed to prune {}: {}", state.name, e);
                         }
                     }

@@ -1,21 +1,17 @@
 use anyhow::Result;
-use chrono::Utc;
 use hadb_storage_s3::S3Storage;
 use std::sync::Arc;
-use walrust_core::legacy_manifest::plan_legacy_prune;
 use walrust_core::legacy_shadow;
 #[cfg(test)]
 use walrust_core::legacy_shadow::ShadowEncodeResult;
 
 use crate::cache::LocalCache;
-use crate::errors::{classify_or_else, WalrustError};
-use crate::retention::{RetentionPolicy, SnapshotEntry};
 use crate::retry::{classify_error, ErrorKind, RetryPolicy};
+#[cfg(test)]
 use crate::s3;
 use crate::uploader::UploadMessage;
 use crate::webhook::WebhookSender;
 
-use super::manifest::discover_snapshots_from_s3;
 use super::types::{ShadowSyncInput, ShadowSyncOutput};
 
 #[cfg(test)]
@@ -190,86 +186,14 @@ pub(crate) async fn sync_shadow_concurrent_with_retry(
     .await
 }
 
-/// Internal retention pruning for watch mode (non-interactive, always force)
-pub(crate) async fn run_prune(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    prefix: &str,
-    name: &str,
-    policy: &RetentionPolicy,
-) -> Result<()> {
-    let discovered = discover_snapshots_from_s3(client, bucket, prefix, name)
-        .await
-        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
-
-    if discovered.is_empty() {
-        return Ok(());
-    }
-
-    let mut snapshot_entries: Vec<SnapshotEntry> = Vec::with_capacity(discovered.len());
-    for (key, _gen, _min, max) in &discovered {
-        let meta = s3::head_object_meta(client, bucket, key)
-            .await
-            .map_err(|e| classify_or_else(e, WalrustError::s3))?;
-        snapshot_entries.push(SnapshotEntry {
-            key: key.clone(),
-            created_at: meta.last_modified,
-            sequence: *max,
-            size: meta.size,
-        });
-    }
-
-    let now = Utc::now();
-    let storage = S3Storage::new(client.clone(), bucket.to_string());
-    let plan_before_reachability =
-        crate::retention::analyze_retention(&snapshot_entries, policy, now);
-    let plan = plan_legacy_prune(&storage, prefix, name, &snapshot_entries, policy, now)
-        .await
-        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
-    let before = plan.delete.len();
-    let rescued = plan_before_reachability.delete.len().saturating_sub(before);
-    if rescued > 0 {
-        tracing::info!(
-            "{}: pruning retained {} snapshot(s) as reachability base for the incremental chain",
-            name,
-            rescued
-        );
-    }
-
-    if !plan.has_deletions() {
-        tracing::debug!("Pruning for {}: nothing to delete", name);
-        return Ok(());
-    }
-
-    tracing::info!(
-        "Pruning {}: deleting {} snapshots, keeping {}",
-        name,
-        plan.delete.len(),
-        plan.keep.len()
-    );
-
-    let keys_to_delete: Vec<String> = plan.delete.iter().map(|entry| entry.key.clone()).collect();
-
-    let deleted_count = s3::delete_objects(client, bucket, &keys_to_delete)
-        .await
-        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
-
-    tracing::info!(
-        "Prune complete for {}: deleted {} snapshots, freed {:.2} MB",
-        name,
-        deleted_count,
-        plan.bytes_freed as f64 / (1024.0 * 1024.0)
-    );
-
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::cache::LocalCache;
     use crate::ltx;
+    use crate::retention::RetentionPolicy;
     use crate::sync::manifest::build_ltx_key;
+    use crate::sync::prune::prune_with_client;
     use crate::uploader::UploadMessage;
     use std::io::Write;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -403,7 +327,7 @@ mod tests {
         }
 
         let policy = RetentionPolicy::new(0, 0, 0, 0);
-        run_prune(&client, &bucket, &prefix, &name, &policy)
+        prune_with_client(&client, &bucket, &prefix, &name, &policy, true)
             .await
             .unwrap();
 
@@ -413,6 +337,74 @@ mod tests {
         );
         assert!(s3::exists(&client, &bucket, &keep_old).await.unwrap());
         assert!(s3::exists(&client, &bucket, &keep_latest).await.unwrap());
+
+        let _ = s3::delete_objects(&client, &bucket, &keys).await;
+    }
+
+    #[tokio::test]
+    async fn test_watch_auto_prune_preserves_legacy_history_until_native_base_is_visible() {
+        if std::env::var("AWS_ENDPOINT_URL_S3").is_err()
+            && std::env::var("AWS_ENDPOINT_URL").is_err()
+            && std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        {
+            eprintln!("SKIP test_watch_auto_prune_preserves_legacy_history_until_native_base_is_visible: no S3 endpoint/credentials configured");
+            return;
+        }
+        let (bucket_arg, endpoint) = test_bucket_config();
+        let (bucket, prefix) = s3::parse_bucket(&bucket_arg);
+        let client = s3::create_client(endpoint.as_deref()).await.unwrap();
+        let name = unique_s3_name("watch-prune-native-not-visible");
+
+        let keep_old = build_ltx_key(&prefix, &name, 1, 1, 1);
+        let would_delete = build_ltx_key(&prefix, &name, 2, 1, 2);
+        let keep_latest = build_ltx_key(&prefix, &name, 3, 1, 3);
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join("source.db");
+        std::fs::write(&db_path, []).unwrap();
+        let identity = walrust_core::native_spool::SpoolIdentity::new(
+            &db_path,
+            bucket.clone(),
+            prefix.clone(),
+            name.clone(),
+            "lineage-without-visible-base",
+            4,
+            Some(3),
+            true,
+        )
+        .unwrap();
+        let descriptor = walrust_core::native_publish::StreamDescriptor::from(&identity);
+        let descriptor_key = descriptor.key();
+        let keys = vec![
+            keep_old.clone(),
+            would_delete.clone(),
+            keep_latest.clone(),
+            descriptor_key.clone(),
+        ];
+        for key in [&keep_old, &would_delete, &keep_latest] {
+            s3::upload_bytes(&client, &bucket, key, b"snapshot".to_vec())
+                .await
+                .unwrap();
+        }
+        s3::upload_bytes(
+            &client,
+            &bucket,
+            &descriptor_key,
+            descriptor.bytes().unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let policy = RetentionPolicy::new(0, 0, 0, 0);
+        prune_with_client(&client, &bucket, &prefix, &name, &policy, true)
+            .await
+            .unwrap();
+
+        for key in [&keep_old, &would_delete, &keep_latest] {
+            assert!(
+                s3::exists(&client, &bucket, key).await.unwrap(),
+                "watch retention deleted legacy recovery object {key} before a contiguous native snapshot became visible"
+            );
+        }
 
         let _ = s3::delete_objects(&client, &bucket, &keys).await;
     }
