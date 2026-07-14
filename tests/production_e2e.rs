@@ -2303,7 +2303,8 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
             hard_bytes: u64::MAX,
             minimum_free_bytes: 0,
         },
-    )?;
+    )
+    .context("open split-brain spool after offline shutdown")?;
     let pending_seq = spool
         .pending_objects()
         .next()
@@ -2360,6 +2361,18 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
         reconnect.try_wait()?.is_none(),
         "split brain released the watcher"
     );
+    let checkpoint_probe = Connection::open(&db_path)?;
+    checkpoint_probe.execute_batch("PRAGMA busy_timeout=0;")?;
+    anyhow::ensure!(
+        force_truncate_checkpoint(&checkpoint_probe)?.0 != 0,
+        "split-brain publication failure dropped the SQLite checkpoint blocker"
+    );
+    drop(checkpoint_probe);
+    // NativeSpool is single-writer state owned by the watcher. Stop that owner
+    // before the parent process opens the journal for byte-retention checks;
+    // otherwise this diagnostic read can race the intentional
+    // payload-before-journal admission window and manufacture an orphan.
+    stop_child_gracefully(&mut reconnect, &reconnect_log)?;
     let reopened_identity =
         walrust::walrust_core::native_spool::NativeSpool::read_identity(&stream_root)?
             .context("split-brain identity vanished")?;
@@ -2405,7 +2418,6 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
         rows(&local_restore)? == expected_local,
         "local recovery chain changed after split brain"
     );
-    stop_child(&mut reconnect);
     cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())
 }
