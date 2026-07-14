@@ -230,12 +230,16 @@ async fn stage_native_snapshot(
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(e.into()),
         }
-        let destination = stable_for_encode
-            .to_str()
-            .ok_or_else(|| anyhow!("native snapshot path is not UTF-8"))?;
-        let conn = Connection::open(&db_path)?;
-        conn.busy_timeout(Duration::from_secs(30))?;
-        conn.execute("VACUUM INTO ?1", [destination])?;
+        let source = Connection::open(&db_path)?;
+        source.busy_timeout(Duration::from_secs(30))?;
+        let mut destination = Connection::open(&stable_for_encode)?;
+        destination.busy_timeout(Duration::from_secs(30))?;
+        {
+            let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
+            backup.run_to_completion(256, Duration::from_millis(10), None)?;
+        }
+        drop(destination);
+        drop(source);
         let stable = std::fs::File::open(&stable_for_encode)?;
         stable.sync_all()?;
         std::fs::File::open(&stable_parent)?.sync_all()?;
@@ -653,6 +657,7 @@ async fn checkpoint_shadow_after_native_admission(
     let admitted_seq = spool_lock(&spool_state.0)?
         .admitted_seq()
         .ok_or_else(|| anyhow!("{}: native spool has no admitted snapshot base", state.name))?;
+    spool_lock(&spool_state.0)?.verify_durable_admission(admitted_seq)?;
     if checkpoint_release == crate::config::CheckpointRelease::Remote {
         wait_for_remote_publish(&spool_state.0, &state.name, admitted_seq, drain_timeout).await?;
     }
@@ -662,6 +667,7 @@ async fn checkpoint_shadow_after_native_admission(
         checkpoint_with_state_blocker_attempt(state, checkpoint_mode, data_version_before)
             .await
             .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
+    skip_rearm_heartbeat_transaction(state).await?;
     if !attempt.completed {
         return Ok(attempt);
     }
@@ -679,6 +685,41 @@ async fn checkpoint_shadow_after_native_admission(
         state.shadow.cleanup_segments(cleanup_before_gen).await?;
     }
     Ok(attempt)
+}
+
+/// The blocker heartbeat is an internal WAL transaction used only to acquire a
+/// non-zero read mark. It must be the final SQLite operation, but it must not
+/// cause walrust to checkpoint, rearm, and replicate another heartbeat forever.
+/// Copy it through the checked/fsynced shadow path, then advance only across
+/// that first committed transaction. Any app transaction racing behind it
+/// remains after the shadow sync cursor for normal admission.
+async fn skip_rearm_heartbeat_transaction(state: &mut ShadowDbState) -> Result<()> {
+    let generation_before = state.shadow.generation();
+    let (frames, new_offset) = state.shadow.copy_frames(state.wal_copy_offset).await?;
+    state.wal_copy_offset = new_offset;
+    if frames.is_empty() {
+        return Ok(());
+    }
+    let heartbeat_end = frames
+        .iter()
+        .position(|frame| frame.db_size != 0)
+        .ok_or_else(|| anyhow!("{}: blocker heartbeat has no WAL commit marker", state.name))?
+        + 1;
+    if state.shadow.generation() != generation_before {
+        state.shadow_sync_generation = state.shadow.generation();
+        state.shadow_sync_offset = 0;
+    }
+    let frame_size = 24 + state.shadow.page_size() as u64;
+    state.shadow_sync_offset = state
+        .shadow_sync_offset
+        .saturating_add((heartbeat_end as u64).saturating_mul(frame_size));
+    anyhow::ensure!(
+        state.shadow_sync_offset <= state.shadow.segment_offset(),
+        "{}: blocker heartbeat cursor exceeds fsynced shadow tail",
+        state.name
+    );
+    save_shadow_progress(state)?;
+    Ok(())
 }
 
 async fn live_wal_page_count(wal_path: &std::path::Path) -> Result<u64> {
@@ -2749,7 +2790,21 @@ mod tests {
             walrust_core::native_spool::RemoteUploadState::Pending
         );
         assert!(spool.read_payload(2).unwrap().starts_with(b"HADBP"));
+        let durable_root = spool.root().to_path_buf();
+        let durable_identity = spool.identity().clone();
         drop(spool);
+        let reopened = NativeSpool::create_or_open(
+            &durable_root,
+            durable_identity,
+            CapacityPolicy {
+                warning_bytes: u64::MAX - 1,
+                hard_bytes: u64::MAX,
+                minimum_free_bytes: 0,
+            },
+        )
+        .expect("checkpoint admission must survive a process restart from its journal");
+        assert_eq!(reopened.admitted_seq(), Some(2));
+        assert!(reopened.read_payload(2).unwrap().starts_with(b"HADBP"));
         assert!(
             state
                 .checkpoint_blocker
@@ -2808,6 +2863,135 @@ mod tests {
                 .is_some_and(|blocker| !blocker.is_autocommit()),
             "remote policy timeout must not release the blocker"
         );
+    }
+
+    #[tokio::test]
+    async fn partial_passive_checkpoint_rearms_blocker_and_retries_without_advancing() {
+        let (temp, db_path, conn) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: "native-partial-passive".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let spool_state = test_native_spool_state(&db_path, temp.path());
+        stage_native_snapshot(&mut state, &spool_state)
+            .await
+            .unwrap();
+
+        let reader = Connection::open(&db_path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM items;")
+            .unwrap();
+        conn.execute("INSERT INTO items(value) VALUES ('reader-pinned')", [])
+            .unwrap();
+        let attempt = checkpoint_shadow_after_native_admission(
+            &mut state,
+            &spool_state,
+            crate::config::CheckpointRelease::Local,
+            Duration::from_millis(50),
+            ShadowCheckpointMode::Passive,
+        )
+        .await
+        .unwrap();
+        assert!(!attempt.completed, "reader pin must make PASSIVE partial");
+        assert!(
+            state
+                .checkpoint_blocker
+                .as_ref()
+                .is_some_and(|blocker| !blocker.is_autocommit()),
+            "partial PASSIVE must immediately rearm the blocker"
+        );
+        assert_eq!(
+            spool_lock(&spool_state.0).unwrap().admitted_seq(),
+            Some(2),
+            "local admission remains durable for the later checkpoint retry"
+        );
+        reader.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[tokio::test]
+    async fn spool_full_refuses_checkpoint_and_keeps_blocker() {
+        let (temp, db_path, conn) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: "native-spool-full".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let initial = test_native_spool_state(&db_path, temp.path());
+        stage_native_snapshot(&mut state, &initial).await.unwrap();
+        let (root, identity, hard_bytes) = {
+            let spool = spool_lock(&initial.0).unwrap();
+            (
+                spool.root().to_path_buf(),
+                spool.identity().clone(),
+                spool.used_bytes().unwrap().saturating_add(1),
+            )
+        };
+        drop(initial);
+        let spool = Arc::new(Mutex::new(
+            NativeSpool::create_or_open(
+                &root,
+                identity,
+                CapacityPolicy {
+                    warning_bytes: 0,
+                    hard_bytes,
+                    minimum_free_bytes: 0,
+                },
+            )
+            .unwrap(),
+        ));
+        let (uploader, wake, _lag) =
+            NativeUploader::new(Arc::new(NoRemoteIo), Arc::clone(&spool)).unwrap();
+        drop(uploader);
+        let spool_state = (spool, wake);
+
+        conn.execute(
+            "INSERT INTO items(value) VALUES ('must-not-checkpoint')",
+            [],
+        )
+        .unwrap();
+        let error = checkpoint_shadow_after_native_admission(
+            &mut state,
+            &spool_state,
+            crate::config::CheckpointRelease::Local,
+            Duration::from_millis(50),
+            ShadowCheckpointMode::Truncate,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("local_spool_full"));
+        assert!(
+            state
+                .checkpoint_blocker
+                .as_ref()
+                .is_some_and(|blocker| !blocker.is_autocommit()),
+            "capacity exhaustion must retain the checkpoint blocker"
+        );
+        assert_eq!(spool_lock(&spool_state.0).unwrap().admitted_seq(), Some(1));
     }
 
     #[tokio::test]

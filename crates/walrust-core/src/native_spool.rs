@@ -365,6 +365,38 @@ impl NativeSpool {
         Ok(bytes)
     }
 
+    /// Re-read the on-disk journal and payload as the checkpoint-release
+    /// admission proof. In-memory state or a successful channel notification
+    /// is intentionally insufficient here.
+    pub fn verify_durable_admission(&self, seq: u64) -> Result<()> {
+        let bytes = fs::read(&self.journal_path)
+            .with_context(|| format!("re-read durable journal for native seq {seq}"))?;
+        let durable: Journal = serde_json::from_slice(&bytes)
+            .with_context(|| format!("parse durable journal for native seq {seq}"))?;
+        if durable.version != SPOOL_VERSION || durable.identity != self.journal.identity {
+            bail!("durable native spool journal identity/version mismatch");
+        }
+        if durable.admitted_seq.map_or(true, |admitted| admitted < seq) {
+            bail!("native seq {seq} is not committed in the durable spool journal");
+        }
+        let durable_object = durable
+            .objects
+            .get(&seq)
+            .ok_or_else(|| anyhow!("native seq {seq} has no durable journal object"))?;
+        let memory_object = self
+            .journal
+            .objects
+            .get(&seq)
+            .ok_or_else(|| anyhow!("native seq {seq} has no in-memory journal object"))?;
+        if durable_object != memory_object
+            || durable_object.local_creation_state != LocalCreationState::Installed
+        {
+            bail!("native seq {seq} durable journal object differs from admitted state");
+        }
+        let payload = fs::read(self.payload_path(durable_object))?;
+        validate_payload(durable_object, &payload, &self.root)
+    }
+
     /// Install immutable HADBP bytes and atomically admit the matching object
     /// record. Returning success is the local checkpoint-release proof.
     pub fn stage(&mut self, stage: StageObject<'_>) -> Result<SpoolObject> {
