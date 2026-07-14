@@ -320,6 +320,26 @@ async fn stage_native_shadow(
     })
 }
 
+async fn snapshot_source_lifetime_pause() -> Result<()> {
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_SNAPSHOT_SOURCE_PAUSE_FILE") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    let used = path.with_extension("used");
+    if used.exists() {
+        return Ok(());
+    }
+    std::fs::write(&path, b"lifetime-source-held")?;
+    while path.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    std::fs::write(used, b"consumed")?;
+    Ok(())
+}
+
 async fn stage_native_snapshot(
     state: &mut ShadowDbState,
     spool_state: &NativeSpoolState,
@@ -367,7 +387,6 @@ async fn stage_native_snapshot(
     let previous_chain_checksum = preparation.previous_chain_checksum;
     let stable_path = preparation.stable_path.clone();
     let intended_remote_key = preparation.intended_remote_key.clone();
-    let db_path = state.db_path.clone();
     let stable_parent = stable_path
         .parent()
         .ok_or_else(|| anyhow!("native snapshot path has no parent"))?
@@ -375,67 +394,77 @@ async fn stage_native_snapshot(
     let preparation = if preparation.stable {
         preparation
     } else {
-        let stable_for_create = stable_path.clone();
-        let spool_for_capacity = Arc::clone(&spool_state.0);
         let source_footprint = {
             let spool = spool_lock(&spool_state.0)?;
             source_footprint_on_spool_filesystem(state, &spool)?
         };
-        let database_name = state.name.clone();
-        let copy_result = tokio::task::spawn_blocking(move || -> Result<()> {
-            match std::fs::remove_file(&stable_for_create) {
+        let source = state
+            .data_version_monitor
+            .as_ref()
+            .ok_or_else(|| anyhow!("{}: lifetime snapshot source is missing", state.name))?;
+        let copy_result = (|| -> Result<()> {
+            match std::fs::remove_file(&stable_path) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e.into()),
             }
-            let source = Connection::open(&db_path)?;
             source.busy_timeout(Duration::from_secs(30))?;
             source.execute_batch("BEGIN DEFERRED;")?;
-            // Establish and hold the exact SQLite snapshot before capacity
-            // admission. page_count includes WAL-visible logical growth, unlike
-            // main-file metadata.
-            let logical_pages: u64 = source.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-            let _: i64 = source.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
-            let logical_bytes = logical_pages.saturating_mul(page_size as u64);
-            let payload_upper = logical_bytes
-                .saturating_add(logical_pages.saturating_mul(64))
-                .saturating_add(4096);
-            let peak = {
-                let spool = spool_lock(&spool_for_capacity)?;
-                logical_bytes
-                    .saturating_add(payload_upper.saturating_mul(2))
-                    .saturating_add(spool.next_journal_rewrite_peak_bytes()?)
-                    .saturating_add(source_footprint)
-            };
-            if spool_lock(&spool_for_capacity)?.capacity_state(peak)? == CapacityState::Full {
-                bail!(
-                    "local_spool_full: {} lacks peak capacity/reserve for WAL-visible native snapshot stable copy + temp + payload + journal",
-                    database_name
-                );
+            let operation = (|| -> Result<()> {
+                // Establish and hold the exact WAL-visible SQLite snapshot
+                // before capacity admission. This uses the lifetime monitor
+                // opened before the blocker; it is never closed here, so POSIX
+                // checkpoint locks cannot disappear at snapshot handoff.
+                let logical_pages: u64 =
+                    source.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+                let _: i64 =
+                    source.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
+                let logical_bytes = logical_pages.saturating_mul(page_size as u64);
+                let payload_upper = logical_bytes
+                    .saturating_add(logical_pages.saturating_mul(64))
+                    .saturating_add(4096);
+                let peak = {
+                    let spool = spool_lock(&spool_state.0)?;
+                    // Reserve the stable DB plus a full-size destination
+                    // rollback journal even though SQLite Backup commonly
+                    // avoids one for a new destination. Correctness does not
+                    // rely on that implementation detail.
+                    logical_bytes
+                        .saturating_mul(2)
+                        .saturating_add(payload_upper.saturating_mul(2))
+                        .saturating_add(spool.next_journal_rewrite_peak_bytes()?)
+                        .saturating_add(source_footprint)
+                };
+                if spool_lock(&spool_state.0)?.capacity_state(peak)? == CapacityState::Full {
+                    bail!(
+                        "local_spool_full: {} lacks peak capacity/reserve for WAL-visible native snapshot stable copy + rollback journal + payload + journal",
+                        state.name
+                    );
+                }
+                let mut destination = Connection::open(&stable_path)?;
+                destination.busy_timeout(Duration::from_secs(30))?;
+                {
+                    let backup = rusqlite::backup::Backup::new(source, &mut destination)?;
+                    backup.run_to_completion(256, Duration::from_millis(10), None)?;
+                }
+                drop(destination);
+                let stable = std::fs::File::open(&stable_path)?;
+                stable.sync_all()?;
+                std::fs::File::open(&stable_parent)?.sync_all()?;
+                Ok(())
+            })();
+            let rollback = source.execute_batch("ROLLBACK;");
+            match (operation, rollback) {
+                (Ok(()), Ok(())) => Ok(()),
+                (Err(error), Ok(())) => Err(error),
+                (Ok(()), Err(error)) => Err(error.into()),
+                (Err(operation_error), Err(rollback_error)) => Err(anyhow!(
+                    "{operation_error:#}; additionally failed to end lifetime snapshot read transaction: {rollback_error}"
+                )),
             }
-            let mut destination = Connection::open(&stable_for_create)?;
-            destination.busy_timeout(Duration::from_secs(30))?;
-            {
-                let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
-                backup.run_to_completion(256, Duration::from_millis(10), None)?;
-            }
-            drop(destination);
-            source.execute_batch("ROLLBACK;")?;
-            drop(source);
-            let stable = std::fs::File::open(&stable_for_create)?;
-            stable.sync_all()?;
-            std::fs::File::open(&stable_parent)?.sync_all()?;
-            Ok(())
-        })
-        .await;
-        // The backup source close can release process-scoped POSIX locks even
-        // though the long-lived blocker transaction remains open. Always rearm
-        // before propagating success or failure; this is the final SQLite
-        // operation in the snapshot path.
-        let rearm_result = rearm_checkpoint_blocker(state)
-            .with_context(|| format!("{}: rearm blocker after snapshot copy", state.name));
-        copy_result??;
-        rearm_result?;
+        })();
+        copy_result?;
+        snapshot_source_lifetime_pause().await?;
         spool_lock(&spool_state.0)?.mark_snapshot_stable(seq)?
     };
     let stable_for_encode = stable_path.clone();
@@ -1266,6 +1295,8 @@ async fn initial_shadow_copy(
                 database = %state.name,
                 "shadow startup discarded bytes beyond the durable fsync marker; scheduling conservative snapshot re-anchor"
             );
+            state.shadow_sync_generation = state.shadow.generation();
+            state.shadow_sync_offset = 0;
             eager_snapshot.insert(state.db_path.clone());
         }
         if !state.wal_path.exists() {
@@ -1330,6 +1361,7 @@ pub async fn watch_with_shadow(
     let mut startup_blockers: HashMap<PathBuf, Connection> = HashMap::new();
     let mut startup_shadows: HashMap<PathBuf, ShadowWal> = HashMap::new();
     let mut startup_data_version_monitors: HashMap<PathBuf, Connection> = HashMap::new();
+    let mut startup_db_checksums: HashMap<PathBuf, Result<ltx::Checksum>> = HashMap::new();
     for db_config in &databases {
         if !db_config.path.exists() {
             return Err(WalrustError::database(format!(
@@ -1358,6 +1390,12 @@ pub async fn watch_with_shadow(
             )
         })?;
         data_version_monitor.busy_timeout(Duration::from_secs(5))?;
+        // This plain-file open targets the SQLite inode too. Complete it before
+        // the final blocker operation so its close cannot release POSIX locks.
+        startup_db_checksums.insert(
+            db_config.path.clone(),
+            ltx::compute_checksum_from_file(&db_config.path),
+        );
         let blocker = ShadowWal::open_checkpoint_blocker(&db_config.path).with_context(|| {
             format!(
                 "{}: failed to pin CLI checkpoint blocker before remote startup",
@@ -1651,7 +1689,10 @@ pub async fn watch_with_shadow(
                 tracing::debug!("{}: Using checksum from manifest: {:#x}", name, cs);
                 Some(cs)
             }
-            None => match ltx::compute_checksum_from_file(db_path) {
+            None => match startup_db_checksums
+                .remove(db_path)
+                .ok_or_else(|| anyhow!("{}: startup database checksum missing", name))?
+            {
                 Ok(cs) => {
                     tracing::debug!(
                         "{}: Computed initial checksum: {:#x}",
@@ -3039,6 +3080,19 @@ mod tests {
 
         write_shadow_segment(&shadow_dir, 0, page_size, &page);
         write_shadow_segment(&shadow_dir, 1, page_size, &page);
+        let frame_len = (24 + page_size) as u64;
+        std::fs::write(
+            shadow_dir.join("durable-tail-v1.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "version": 1,
+                "segments": {
+                    format_segment_name(0, 0): frame_len,
+                    format_segment_name(1, 0): frame_len,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
 
         let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
             .await

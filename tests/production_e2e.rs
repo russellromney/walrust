@@ -460,21 +460,48 @@ fn spawn_cli_watch_logged_with_checkpoint_pause(
     args: LoggedWatchArgs<'_>,
     checkpoint_pause_file: Option<&Path>,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, None, None, None, checkpoint_pause_file, None)
+    spawn_cli_watch_logged_with_options(
+        args,
+        None,
+        None,
+        None,
+        None,
+        checkpoint_pause_file,
+        None,
+        None,
+    )
 }
 
 fn spawn_cli_watch_logged_with_checkpoint_release(
     args: LoggedWatchArgs<'_>,
     checkpoint_release: Option<&str>,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, checkpoint_release, None, None, None, None, None)
+    spawn_cli_watch_logged_with_options(
+        args,
+        checkpoint_release,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 fn spawn_cli_watch_logged_with_upload_crash_once(
     args: LoggedWatchArgs<'_>,
     crash_once_file: &Path,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, Some(crash_once_file), None, None, None, None)
+    spawn_cli_watch_logged_with_options(
+        args,
+        None,
+        Some(crash_once_file),
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 fn spawn_cli_watch_logged_with_cleanup_interval(
@@ -489,6 +516,7 @@ fn spawn_cli_watch_logged_with_cleanup_interval(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -496,7 +524,7 @@ fn spawn_cli_watch_logged_with_triggers(
     args: LoggedWatchArgs<'_>,
     triggers: TriggerOptions,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, None, None, Some(triggers), None, None)
+    spawn_cli_watch_logged_with_options(args, None, None, None, Some(triggers), None, None, None)
 }
 
 fn spawn_cli_watch_logged_with_startup_pause(
@@ -512,7 +540,15 @@ fn spawn_cli_watch_logged_with_startup_pause(
         None,
         None,
         Some((startup_pause_file, on_startup)),
+        None,
     )
+}
+
+fn spawn_cli_watch_logged_with_snapshot_source_pause(
+    args: LoggedWatchArgs<'_>,
+    pause_file: &Path,
+) -> Result<Child> {
+    spawn_cli_watch_logged_with_options(args, None, None, None, None, None, None, Some(pause_file))
 }
 
 fn spawn_cli_watch_logged_with_options(
@@ -523,6 +559,7 @@ fn spawn_cli_watch_logged_with_options(
     triggers: Option<TriggerOptions>,
     checkpoint_pause_file: Option<&Path>,
     startup_pause: Option<(&Path, bool)>,
+    snapshot_source_pause: Option<&Path>,
 ) -> Result<Child> {
     let log = std::fs::File::create(args.log_path)?;
     let log_err = log.try_clone()?;
@@ -581,6 +618,9 @@ fn spawn_cli_watch_logged_with_options(
     }
     if let Some((path, _)) = startup_pause {
         watch.env("WALRUST_TEST_STARTUP_DISCOVERY_PAUSE_FILE", path);
+    }
+    if let Some(path) = snapshot_source_pause {
+        watch.env("WALRUST_TEST_NATIVE_SNAPSHOT_SOURCE_PAUSE_FILE", path);
     }
     if let Some(path) = crash_once_file {
         watch.env("WALRUST_TEST_NATIVE_UPLOAD_CRASH_ONCE_FILE", path);
@@ -4103,6 +4143,170 @@ fn e2e_cli_startup_pins_wal_before_remote_discovery() -> Result<()> {
     )?;
     stop_child_gracefully(&mut restarted, &restart_log)?;
     cleanup_remote_prefix(&prefix, endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_snapshot_keeps_lifetime_source_and_blocker_through_handoff() -> Result<()> {
+    require_s3!("e2e_cli_snapshot_keeps_lifetime_source_and_blocker_through_handoff");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-snapshot-lifetime");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+    let pause_file = temp.path().join("snapshot-source.pause");
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "snapshot-lifetime-seed")?;
+    let mut child = spawn_cli_watch_logged_with_snapshot_source_pause(
+        LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &log_path,
+            config_path: None,
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        },
+        &pause_file,
+    )?;
+    wait_for_file_or_child_exit(
+        &mut child,
+        &pause_file,
+        "native snapshot lifetime-source handoff",
+    )?;
+    append_wide_rows(&writer, 6, 45, "snapshot-after-copy")?;
+    anyhow::ensure!(
+        force_truncate_checkpoint(&writer)?.0 != 0,
+        "snapshot source handoff closed a source inode and dropped the blocker"
+    );
+    let expected = rows(&db_path)?;
+    std::fs::remove_file(&pause_file)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    anyhow::ensure!(
+        watch_log(&log_path).contains("native HADBP delta admitted to durable local spool"),
+        "commit after snapshot copy was not preserved as a native delta"
+    );
+    stop_child_gracefully(&mut child, &log_path)?;
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_markerless_upgrade_reanchors_then_emits_new_generation_delta() -> Result<()> {
+    require_s3!("e2e_cli_markerless_upgrade_reanchors_then_emits_new_generation_delta");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-markerless-upgrade");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let seed_log = temp.path().join("seed.log");
+    let restart_log = temp.path().join("restart.log");
+    let startup_pause = temp.path().join("restart.pause");
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "markerless-seed")?;
+    let mut seed = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &seed_log,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_startup_rearms(&seed_log, &mut seed)?;
+    append_wide_rows(&writer, 6, 30, "markerless-before-upgrade")?;
+    let before_upgrade = rows(&db_path)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &before_upgrade,
+    )?;
+    stop_child_gracefully(&mut seed, &seed_log)?;
+
+    let shadow_dir = temp.path().join(format!(".walrust-{name}"));
+    std::fs::remove_file(shadow_dir.join("durable-tail-v1.json"))?;
+    let corrupt = shadow_dir.join("000000000000000a-0000000000000000.wal");
+    std::fs::write(&corrupt, vec![0xDE; 24 + 4096])?;
+
+    let mut restarted = spawn_cli_watch_logged_with_startup_pause(
+        LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &restart_log,
+            config_path: None,
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        },
+        &startup_pause,
+        false,
+    )?;
+    wait_for_file_or_child_exit(
+        &mut restarted,
+        &startup_pause,
+        "markerless restart pre-discovery",
+    )?;
+    std::fs::remove_file(&startup_pause)?;
+    let reanchor_deadline = Instant::now() + e2e_poll_deadline(30);
+    while !(watch_log(&restart_log).contains("discarded bytes beyond the durable fsync marker")
+        && watch_log(&restart_log)
+            .contains("native HADBP snapshot admitted to durable local spool"))
+    {
+        anyhow::ensure!(restarted.try_wait()?.is_none(), "markerless restart exited");
+        anyhow::ensure!(
+            Instant::now() < reanchor_deadline,
+            "markerless reanchor timed out"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(
+        !corrupt.exists(),
+        "markerless corrupt tail survived upgrade"
+    );
+    append_wide_rows(&writer, 31, 55, "markerless-after-reanchor")?;
+    let expected = rows(&db_path)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    anyhow::ensure!(
+        watch_log(&restart_log).contains("native HADBP delta admitted to durable local spool"),
+        "post-upgrade generation never emitted a native delta"
+    );
+    stop_child_gracefully(&mut restarted, &restart_log)?;
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())
 }
 
