@@ -503,64 +503,17 @@ independent reviewer/fixer on this worktree, run replacement CI and required
 unique-prefix live-Tigris gates, clean only those prefixes, and stop for the user
 to merge.
 
-### PR #43 adversarial remediation gate (must be empty before merge)
+### PR #43 adversarial remediation gate — complete 2026-07-14
 
-The 2026-07-14 adversarial review found the following implementation gaps. This
-list is the acceptance template for the remainder of PR #43. An item leaves the
-list only when its production call site has a revert-proof test and the relevant
-MinIO/live-Tigris user path is green.
-
-- Make the spool journal authoritative on restart. Reconcile each admitted
-  object's `source_cursor` with durable shadow progress, consume
-  `checkpointed_seq`, and durably record a `closed`/`opening` controlled-
-  checkpoint window. A restart with an open window must re-anchor through a
-  native snapshot before admitting another delta; impossible cursor/sequence
-  relationships are hard errors.
-- Give native snapshot construction a durable intent state machine covering the
-  stable SQLite copy, encoded temporary, admitted object, and cleanup. Startup
-  must validate/reuse complete artifacts, remove proven partial artifacts, and
-  reclaim stale snapshot temporaries before applying capacity limits.
-- Define remote visibility by both the contiguous publish-record chain and the
-  exact referenced HADBP payloads. One shared validator must bind the expected
-  bucket/prefix/database, verify payload length/digest/header/chain/page count,
-  and serve inspect/list/verify/restore/replicate/prune/compaction. A missing or
-  corrupt payload below a published record is corruption, never a shorter head.
-- Offline restart requires a complete journal-verified local snapshot base and
-  its verified remote/legacy predecessor, not an identity-only journal. Local
-  restore must enumerate all matching spools and reject ambiguous or divergent
-  candidates instead of accepting filesystem enumeration order.
-- Design a versioned native retention floor before deleting native history. It
-  must distinguish intentional PITR expiry from corruption and be understood by
-  every reader. Wire native-v1 prune and compaction without reusing legacy LTX
-  identities or exposing deltas without a retained snapshot base.
-- Supervise the native uploader during watch, restart recoverable task exits from
-  disk, and surface unrecoverable exits as error-level remote lag without
-  stopping local admission. Correct the live-WAL metric and add stage/fsync,
-  checkpoint, upload, remote-lag, shadow/spool/free-space, high-watermark, and
-  full-watermark metrics.
-- Add deterministic parent/child failpoints for SIGKILL before/after every
-  journal, payload, snapshot, checkpoint-window, PUT, publish, cleanup, and
-  shutdown boundary. Complete positive and negative user-path coverage for
-  remote release, exact live object bytes, every snapshot trigger, dead/full
-  uploader wake channels, capacity/restart, custom-spool multi-database
-  isolation, fresh native latest/PITR, legacy boundary PITR/latest, local restore
-  ambiguity, first-start offline refusal, reconnect split brain, graceful
-  shutdown, native prune/compaction, and S3-latency-independent local checkpoint
-  timing. Neuter each load-bearing production gate, observe failure, restore it,
-  and rerun green.
-- After all preceding items pass, use a genuinely fresh reviewer/fixer (not the
-  implementation author or the earlier reviewer), apply fixes on this branch,
-  run replacement CI, run all required live-Tigris gates with unique prefixes,
-  delete only those prefixes, and stop without merging.
-
-### Exact commands (for the executor)
-
-- Worktree: `git -C /Users/russellromney/Documents/Github/walrust worktree add
-  ../walrust-lossless -b feat/lossless-watch-blocker origin/main`
-- Wrapper-only `.cargo/config.toml`; `CARGO_TARGET_DIR=/Users/russellromney/Documents/Github/walrust/target`,
-  `RUSTC_WRAPPER=sccache`, `--offline`; narrowest targets
-  (`cargo test -p walrust --lib watch_shadow`, `-p walrust-core --lib`).
-- Live S3: `~/.soup/bin/soup run -p turbolite -e development -- <cmd>`.
+The authoritative journal/cursor, snapshot intent, exact remote visibility,
+offline ownership, local restore ambiguity, native retention, uploader
+supervision/metrics, crash failpoint, capacity, migration, and user-path gaps
+from the 2026-07-14 review are closed. Each load-bearing production gate was
+neutered and observed failing before its restored green run. A genuinely fresh
+reviewer then found and fixed additional blocker-rearm, journal validation,
+cleanup pre-validation, predecessor/base publication, and retained-floor base
+selection gaps. See `CHANGELOG.md` and PR #43's atomic commit history for the
+completed proof ledger. The user retains merge authority.
 
 ---
 
