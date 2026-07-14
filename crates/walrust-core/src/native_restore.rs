@@ -494,3 +494,94 @@ fn sha256_hex(bytes: &[u8]) -> String {
     }
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::native_spool::{ObjectKind, SpoolIdentity};
+    use async_trait::async_trait;
+    use hadb_storage::CasResult;
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use tempfile::tempdir;
+
+    #[derive(Default)]
+    struct MemoryStorage(Mutex<BTreeMap<String, Vec<u8>>>);
+
+    #[async_trait]
+    impl StorageBackend for MemoryStorage {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(self.0.lock().unwrap().get(key).cloned())
+        }
+
+        async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+            self.0.lock().unwrap().insert(key.into(), data.into());
+            Ok(())
+        }
+
+        async fn delete(&self, key: &str) -> Result<()> {
+            self.0.lock().unwrap().remove(key);
+            Ok(())
+        }
+
+        async fn list(&self, prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+            Ok(self
+                .0
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+
+        async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<CasResult> {
+            bail!("unused")
+        }
+
+        async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
+            bail!("unused")
+        }
+    }
+
+    #[tokio::test]
+    async fn record_beyond_missing_snapshot_base_does_not_create_visible_head() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        File::create(&db).unwrap();
+        let identity =
+            SpoolIdentity::new(&db, "bucket", "p/", "db", "lineage", 1, None, true).unwrap();
+        let descriptor = StreamDescriptor::from(&identity);
+        let storage = MemoryStorage::default();
+        storage
+            .put(&descriptor.key(), &descriptor.bytes().unwrap())
+            .await
+            .unwrap();
+        let stray = PublishRecord {
+            version: REMOTE_LAYOUT_VERSION,
+            stream_digest: descriptor.stream_digest.clone(),
+            lineage_id: descriptor.lineage_id.clone(),
+            seq: 2,
+            kind: ObjectKind::Delta,
+            previous_publish_sha256: Some("missing-base".into()),
+            previous_chain_checksum: 1,
+            ending_chain_checksum: 2,
+            end_page_count: 1,
+            object_key: format!(
+                "p/db/native/v1/lineages/{}/0000/0000000000000002.hadbp",
+                descriptor.lineage_id
+            ),
+            payload_length: 1,
+            payload_sha256: "00".repeat(32),
+        };
+        storage
+            .put(
+                &stray.key(&descriptor.prefix, &descriptor.database),
+                &stray.bytes().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(inspect_native_v1(&storage, "p/", "db").await.unwrap(), None);
+    }
+}

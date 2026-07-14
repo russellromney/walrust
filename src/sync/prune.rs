@@ -32,17 +32,19 @@ pub async fn prune(
     // point and pruning it could strand unpublished local descendants.
     let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
     match s3::download_bytes(&client, &bucket_name, &descriptor_key).await {
-        Ok(bytes) => {
-            let descriptor: walrust_core::native_publish::StreamDescriptor =
-                serde_json::from_slice(&bytes)?;
-            let published_prefix = format!(
-                "{}{}/native/v1/lineages/{}/published/",
-                prefix, name, descriptor.lineage_id
-            );
+        Ok(_) => {
             let storage = S3Storage::new(client.clone(), bucket_name.clone());
-            if storage.list(&published_prefix, None).await?.is_empty() {
+            // A non-empty `published/` listing is not a visibility proof: the
+            // only record may be beyond a gap, malformed, or belong to an
+            // incompatible chain. Use the same contiguous descriptor-selected
+            // head calculation as restore/list before allowing destructive
+            // legacy retention.
+            if walrust_core::native_restore::inspect_native_v1(&storage, &prefix, name)
+                .await?
+                .is_none()
+            {
                 println!(
-                    "Native migration for '{}' has no published snapshot base; refusing legacy prune",
+                    "Native migration for '{}' has no contiguous published snapshot base; refusing legacy prune",
                     name
                 );
                 return Ok(());

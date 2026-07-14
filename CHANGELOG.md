@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Native migration prune gate:** legacy pruning now requires the same
+  descriptor-selected contiguous native snapshot base used by restore. A stray
+  publish record beyond a gap cannot unlock deletion of the legacy recovery
+  base.
 - **Native spool crash recovery:** restart now validates and completes a
   fsynced HADBP payload temporary when its durable install intent exists,
   instead of deleting the intent and leaving a temp that blocks every retry.
