@@ -3282,6 +3282,97 @@ fn e2e_cli_idle_blocker_heartbeat_does_not_cause_checkpoint_storm() -> Result<()
 }
 
 #[test]
+fn e2e_cli_partial_passive_checkpoint_rearms_and_retries_without_exit() -> Result<()> {
+    require_s3!("e2e_cli_partial_passive_checkpoint_rearms_and_retries_without_exit");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-partial-passive");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "partial-passive")?;
+
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: None,
+        checkpoint_interval: 1,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+
+    let reader = Connection::open(&db_path)?;
+    reader.execute_batch("BEGIN; SELECT count(*) FROM items;")?;
+    append_wide_rows(&writer, 6000, 6060, "partial-passive")?;
+    let expected = rows(&db_path)?;
+    let partial_deadline = Instant::now() + e2e_poll_deadline(20);
+    while !watch_log(&log_path).contains("SQLite checkpoint was partial/busy") {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watcher exited on partial PASSIVE checkpoint ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < partial_deadline,
+            "timed out waiting for partial PASSIVE checkpoint:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let checkpoint_probe = Connection::open(&db_path)?;
+    checkpoint_probe.execute_batch("PRAGMA busy_timeout=0;")?;
+    anyhow::ensure!(
+        force_truncate_checkpoint(&checkpoint_probe)?.0 != 0,
+        "partial PASSIVE path dropped the checkpoint blocker"
+    );
+    anyhow::ensure!(
+        child.try_wait()?.is_none(),
+        "watcher exited after partial PASSIVE"
+    );
+
+    reader.execute_batch("ROLLBACK")?;
+    let retry_deadline = Instant::now() + e2e_poll_deadline(20);
+    while !watch_log(&log_path)
+        .contains("controlled SQLite checkpoint completed after native spool admission")
+    {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watcher exited before PASSIVE retry ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < retry_deadline,
+            "partial PASSIVE checkpoint did not retry:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    stop_child(&mut child);
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
 fn e2e_prune_during_restore_keeps_backup_restorable() -> Result<()> {
     require_s3!("e2e_prune_during_restore_keeps_backup_restorable");
     let temp = TempDir::new()?;
