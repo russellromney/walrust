@@ -834,6 +834,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publication_uses_newest_snapshot_after_remote_retention_floor() {
+        let dir = tempdir().unwrap();
+        let spool = staged_spool(dir.path());
+        let storage = Arc::new(MemoryStorage::default());
+        let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool.clone()).unwrap();
+        assert!(uploader.publish_pending_once().await.unwrap());
+
+        let db = dir.path().join("db.sqlite");
+        let (identity, first_checksum) = {
+            let guard = spool.lock().unwrap();
+            (
+                guard.identity().clone(),
+                guard.get(1).unwrap().ending_chain_checksum,
+            )
+        };
+        let page_size = rusqlite::Connection::open(&db)
+            .unwrap()
+            .query_row("PRAGMA page_size", [], |row| row.get::<_, u32>(0))
+            .unwrap();
+        let second = ltx::encode_snapshot_with_checksum(&db, page_size, 2, first_checksum).unwrap();
+        let second_pages = std::fs::metadata(&db).unwrap().len() / page_size as u64;
+        spool
+            .lock()
+            .unwrap()
+            .stage(StageObject {
+                seq: 2,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: first_checksum,
+                ending_chain_checksum: second.checksum,
+                end_page_count: second_pages,
+                intended_remote_key: object_key(&identity, ObjectKind::Snapshot, 2),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &second.bytes,
+            })
+            .unwrap();
+        assert!(uploader.publish_pending_once().await.unwrap());
+        crate::native_restore::prune_native_before_snapshot(
+            storage.as_ref(),
+            "bucket",
+            "p/",
+            "db",
+            2,
+        )
+        .await
+        .unwrap();
+
+        let (delta, ending) = ltx::encode_wal_changes_with_end_page_count(
+            &[(1, vec![0u8; page_size as usize])],
+            page_size,
+            3,
+            second.checksum,
+            second_pages,
+        )
+        .unwrap();
+        spool
+            .lock()
+            .unwrap()
+            .stage(StageObject {
+                seq: 3,
+                kind: ObjectKind::Delta,
+                previous_chain_checksum: second.checksum,
+                ending_chain_checksum: ending,
+                end_page_count: second_pages,
+                intended_remote_key: object_key(&identity, ObjectKind::Delta, 3),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &delta,
+            })
+            .unwrap();
+        assert!(
+            uploader.publish_pending_once().await.unwrap(),
+            "remote retention must not pin publication to a pruned older local snapshot"
+        );
+        assert_eq!(spool.lock().unwrap().remote_published_seq(), Some(3));
+    }
+
+    #[tokio::test]
     async fn full_or_closed_wake_channel_never_blocks() {
         let dir = tempdir().unwrap();
         let spool = staged_spool(dir.path());
