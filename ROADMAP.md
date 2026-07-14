@@ -457,6 +457,34 @@ Remote restore exposes only descriptor-selected contiguous publish records.
 Pruning cannot remove a legacy/native base referenced by unpublished local
 descendants. Graceful shutdown never deletes pending work.
 
+Native-v1 retention uses immutable, versioned snapshot-floor records:
+
+```
+{prefix}{db}/native/v1/retention/v1/{snapshot_seq:016x}.json
+```
+
+A floor record binds the stream digest, lineage, snapshot sequence, exact
+snapshot publish-record digest, and that snapshot record's predecessor digest.
+Readers select the highest canonical floor, verify its publish record and exact
+HADBP snapshot payload, then traverse the normal contiguous publish chain from
+that snapshot. Publishing a floor is create-if-absent and exact-idempotent.
+Only after the new floor reproduces the prior visible head may prune delete
+older publish records and their payloads. A crash before the floor leaves the
+old chain authoritative; a crash after the floor leaves either extra old bytes
+or a complete new recovery base. A missing object at or above the selected
+floor remains corruption. A PIT below the floor is reported as intentionally
+expired, not as a chain gap.
+
+For CLI native-v1, a full native snapshot is the compaction output. The
+`compact` compatibility command already routes to retention pruning, so native
+compaction means: publish a normal durable spool snapshot, advance a verified
+retention floor according to policy, then delete history below it. Native-v1
+does not write `levels/L*`, merge immutable publish records, reuse legacy LTX
+identities, or mutate a delta in place. The `[compaction]` leveled-engine knob
+remains rejected in default shadow mode because it controls a different layout;
+the normal snapshot triggers plus native retention implement this stream's
+compaction model without changing Phase 2 semantics.
+
 ### Mandatory proof and PR disposition
 
 Add call-site-revert-proof tests for local admission versus the old remote gate,
