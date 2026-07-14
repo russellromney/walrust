@@ -112,6 +112,7 @@ walrust watch [OPTIONS] --bucket <BUCKET> <DATABASES>...
 | `--min-checkpoint-pages <N>` | Min WAL pages before checkpoint (default: 1000, ~4MB) |
 | `--wal-truncate-threshold <N>` | Emergency truncate threshold in pages (default: 121359, ~500MB) |
 | `--checkpoint-release <local\|remote>` | Checkpoint after durable local HADBP admission (default), or additionally wait for contiguous remote publication |
+| `--spool-dir <PATH>` | Override the mandatory native spool root (`--cache-dir` remains a compatibility alias) |
 | `--validation-interval <SECONDS>` | Backup validation interval (default: 0, disabled) |
 | `--retain-hourly <N>` | Hourly snapshots to retain (default: 24) |
 | `--retain-daily <N>` | Daily snapshots to retain (default: 7) |

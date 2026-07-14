@@ -185,9 +185,6 @@ pub async fn restore(
     webhook: Option<std::sync::Arc<crate::webhook::WebhookSender>>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint)
-        .await
-        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     // Try to open local cache if provided
     let cache = if let Some(dir) = cache_dir {
@@ -261,6 +258,12 @@ pub async fn restore(
             }
         }
     }
+
+    // A complete local native spool is a self-contained recovery source. Do
+    // not initialize an S3 client until local restore has been exhausted.
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     let storage = CachedLegacyStorage {
         s3: S3Storage::new(client.clone(), bucket_name.clone()),

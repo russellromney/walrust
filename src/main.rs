@@ -178,10 +178,10 @@ enum Commands {
         #[arg(long)]
         enable_cache: bool,
 
-        /// Override cache directory location
+        /// Override native spool root (legacy alias: --cache-dir)
         ///
         /// Default: .{db_name}-walrust/ next to each database file
-        #[arg(long)]
+        #[arg(long = "spool-dir", visible_alias = "cache-dir")]
         cache_dir: Option<PathBuf>,
 
         /// Cache retention duration (default: 24h)
@@ -228,11 +228,11 @@ enum Commands {
         #[arg(long)]
         point_in_time: Option<String>,
 
-        /// Local cache directory for fast restore
+        /// Local native spool root or legacy cache directory for fast restore
         ///
-        /// If provided, checks local cache first before fetching from S3.
-        /// Uses LTX files from cache when available, falling back to S3 for missing files.
-        #[arg(long)]
+        /// Native HADBP restore requires no S3 client when the local chain is complete.
+        /// Legacy LTX cache entries fall back to S3 for missing history.
+        #[arg(long = "spool-dir", visible_alias = "cache-dir")]
         cache_dir: Option<PathBuf>,
     },
 
