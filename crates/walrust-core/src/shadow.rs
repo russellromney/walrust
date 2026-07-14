@@ -422,8 +422,10 @@ impl ShadowWal {
         }
 
         file.flush().await?;
+        crate::native_spool::durability_failpoint("shadow_before_fsync");
         file.sync_all().await?;
         Self::fsync_dir(&self.shadow_dir).await?;
+        crate::native_spool::durability_failpoint("shadow_fsync_complete");
         Ok(())
     }
 

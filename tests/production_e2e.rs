@@ -2289,6 +2289,8 @@ fn e2e_cli_sigkill_restarts_every_local_snapshot_admission_boundary() -> Result<
     write_pin_frame(&setup, "snapshot-crash-matrix")?;
 
     for (index, boundary) in [
+        "shadow_before_fsync",
+        "shadow_fsync_complete",
         "snapshot_intent_committed",
         "snapshot_stable_committed",
         "object_intent_committed",
