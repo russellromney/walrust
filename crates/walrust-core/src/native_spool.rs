@@ -1125,6 +1125,26 @@ mod tests {
     }
 
     #[test]
+    fn warning_watermark_is_distinct_from_hard_capacity() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        File::create(&db).unwrap();
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let spool = NativeSpool::create_or_open(
+            &root,
+            id,
+            CapacityPolicy {
+                warning_bytes: 1,
+                hard_bytes: u64::MAX,
+                minimum_free_bytes: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(spool.capacity_state(0).unwrap(), CapacityState::High);
+    }
+
+    #[test]
     fn valid_payload_orphan_with_durable_intent_is_adopted() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
@@ -1248,5 +1268,17 @@ mod tests {
         drop(spool);
         let reopened = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
         assert!(reopened.get(2).is_some());
+        let restored = dir.path().join("local-restore.sqlite");
+        assert_eq!(
+            crate::native_restore::restore_local_spool(&reopened, &restored, None).unwrap(),
+            Some(2)
+        );
+        let restored = rusqlite::Connection::open(restored).unwrap();
+        assert_eq!(
+            restored
+                .query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
     }
 }

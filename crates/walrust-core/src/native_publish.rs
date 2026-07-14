@@ -551,6 +551,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn restart_adopts_exact_remote_put_and_publish_before_local_state_commit() {
+        let dir = tempdir().unwrap();
+        let spool = staged_spool(dir.path());
+        let storage = Arc::new(MemoryStorage::default());
+        let (descriptor, object, payload) = {
+            let guard = spool.lock().unwrap();
+            (
+                StreamDescriptor::from(guard.identity()),
+                guard.get(1).unwrap().clone(),
+                guard.read_payload(1).unwrap(),
+            )
+        };
+        let record = PublishRecord::from_object(&object, None);
+        storage
+            .put(&descriptor.key(), &descriptor.bytes().unwrap())
+            .await
+            .unwrap();
+        storage
+            .put(&object.intended_remote_key, &payload)
+            .await
+            .unwrap();
+        storage
+            .put(
+                &record.key(&descriptor.prefix, &descriptor.database),
+                &record.bytes().unwrap(),
+            )
+            .await
+            .unwrap();
+
+        // Simulates SIGKILL after both remote immutable writes but before
+        // either matching local uploaded/published journal commit.
+        assert_eq!(spool.lock().unwrap().remote_published_seq(), None);
+        let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool.clone()).unwrap();
+        assert!(uploader.publish_pending_once().await.unwrap());
+        assert_eq!(spool.lock().unwrap().remote_published_seq(), Some(1));
+        assert_eq!(
+            storage.get(&object.intended_remote_key).await.unwrap(),
+            Some(payload)
+        );
+    }
+
+    #[tokio::test]
     async fn divergent_existing_object_is_never_overwritten() {
         let dir = tempdir().unwrap();
         let spool = staged_spool(dir.path());
@@ -606,6 +648,102 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn published_native_snapshot_and_delta_restore_latest_and_pitr() {
+        let dir = tempdir().unwrap();
+        let spool = staged_spool(dir.path());
+        let db = dir.path().join("db.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("INSERT INTO t DEFAULT VALUES", []).unwrap();
+        let page_size = conn
+            .query_row("PRAGMA page_size", [], |row| row.get::<_, u32>(0))
+            .unwrap();
+        drop(conn);
+        let db_bytes = std::fs::read(&db).unwrap();
+        let pages = db_bytes
+            .chunks_exact(page_size as usize)
+            .enumerate()
+            .map(|(index, page)| ((index + 1) as u32, page.to_vec()))
+            .collect::<Vec<_>>();
+        let (identity, previous) = {
+            let guard = spool.lock().unwrap();
+            (
+                guard.identity().clone(),
+                guard.get(1).unwrap().ending_chain_checksum,
+            )
+        };
+        let (delta, ending) = ltx::encode_wal_changes_with_end_page_count(
+            &pages,
+            page_size,
+            2,
+            previous,
+            pages.len() as u64,
+        )
+        .unwrap();
+        spool
+            .lock()
+            .unwrap()
+            .stage(StageObject {
+                seq: 2,
+                kind: ObjectKind::Delta,
+                previous_chain_checksum: previous,
+                ending_chain_checksum: ending,
+                end_page_count: pages.len() as u64,
+                intended_remote_key: object_key(&identity, ObjectKind::Delta, 2),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &delta,
+            })
+            .unwrap();
+
+        let storage = Arc::new(MemoryStorage::default());
+        let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool.clone()).unwrap();
+        assert!(uploader.publish_pending_once().await.unwrap());
+        assert!(uploader.publish_pending_once().await.unwrap());
+        assert_eq!(
+            crate::native_restore::verify_native_v1(storage.as_ref(), "p/", "db")
+                .await
+                .unwrap(),
+            Some(2)
+        );
+
+        for (target, expected_count) in [(Some(1), 1i64), (None, 2i64)] {
+            let output = dir.path().join(format!(
+                "restore-{}.sqlite",
+                target
+                    .map(|seq| seq.to_string())
+                    .unwrap_or_else(|| "head".into())
+            ));
+            let result = crate::native_restore::restore_native_v1(
+                storage.as_ref(),
+                "p/",
+                "db",
+                &output,
+                target,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                result,
+                crate::native_restore::NativeRestoreAvailability::Restored {
+                    seq: target.unwrap_or(2)
+                }
+            );
+            let restored = rusqlite::Connection::open(output).unwrap();
+            assert_eq!(
+                restored
+                    .query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0))
+                    .unwrap(),
+                expected_count
+            );
+            assert_eq!(
+                restored
+                    .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                    .unwrap(),
+                "ok"
+            );
+        }
     }
 
     #[tokio::test]
