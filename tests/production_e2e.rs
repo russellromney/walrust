@@ -1994,6 +1994,202 @@ fn e2e_cli_native_prune_publishes_floor_preserves_latest_and_expires_old_pitr() 
 }
 
 #[test]
+fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() -> Result<()> {
+    require_s3!("e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-offline-split-brain");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let initial_restore = temp.path().join("initial.db");
+    let local_restore = temp.path().join("local.db");
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "offline-split-brain")?;
+
+    let initial_log = temp.path().join("initial.log");
+    let mut initial = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &initial_log,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_startup_rearms(&initial_log, &mut initial)?;
+    let initial_rows = rows(&db_path)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &initial_restore,
+        &initial_rows,
+    )?;
+    stop_child(&mut initial);
+
+    let offline_log = temp.path().join("offline.log");
+    let mut offline = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: Some("http://127.0.0.1:9"),
+        log_path: &offline_log,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_startup_rearms(&offline_log, &mut offline)?;
+    append_wide_rows(&writer, 6, 40, "offline-conflicting-descendant")?;
+    let expected_local = rows(&db_path)?;
+    let admission_deadline = Instant::now() + e2e_poll_deadline(30);
+    while !watch_log(&offline_log).contains("native HADBP delta admitted to durable local spool") {
+        if let Some(status) = offline.try_wait()? {
+            anyhow::bail!(
+                "offline watcher exited ({status}):\n{}",
+                watch_log(&offline_log)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < admission_deadline,
+            "offline descendant was not admitted:\n{}",
+            watch_log(&offline_log)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    stop_child(&mut offline);
+
+    let spool_base = temp.path().join(".walrust-spool");
+    let stream_root = std::fs::read_dir(spool_base.join("native-v1"))?
+        .next()
+        .context("split-brain spool stream missing")??
+        .path();
+    let identity = walrust::walrust_core::native_spool::NativeSpool::read_identity(&stream_root)?
+        .context("split-brain spool identity missing")?;
+    let spool = walrust::walrust_core::native_spool::NativeSpool::create_or_open(
+        &stream_root,
+        identity.clone(),
+        walrust::walrust_core::native_spool::CapacityPolicy {
+            warning_bytes: u64::MAX - 1,
+            hard_bytes: u64::MAX,
+            minimum_free_bytes: 0,
+        },
+    )?;
+    let pending_seq = spool
+        .pending_objects()
+        .next()
+        .context("offline spool has no pending descendant")?
+        .seq;
+    let local_payload = spool.read_payload(pending_seq)?;
+    drop(spool);
+    let divergent_marker_key = format!(
+        "{}{}/native/v1/lineages/{}/published/{pending_seq:016x}.json",
+        identity.prefix, identity.database, identity.lineage_id
+    );
+    let divergent_marker = b"divergent-writer-head".to_vec();
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(test_bucket(), endpoint.as_deref()).await?;
+        hadb_storage::StorageBackend::put(
+            storage.as_ref(),
+            &divergent_marker_key,
+            &divergent_marker,
+        )
+        .await
+    })?;
+
+    let reconnect_log = temp.path().join("reconnect.log");
+    let mut reconnect = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &reconnect_log,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    let conflict_deadline = Instant::now() + e2e_poll_deadline(30);
+    while !watch_log(&reconnect_log).contains("split brain/equivocation") {
+        if let Some(status) = reconnect.try_wait()? {
+            anyhow::bail!(
+                "reconnect watcher exited on conflict ({status}):\n{}",
+                watch_log(&reconnect_log)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < conflict_deadline,
+            "reconnect did not reject divergent writer head:\n{}",
+            watch_log(&reconnect_log)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(
+        reconnect.try_wait()?.is_none(),
+        "split brain released the watcher"
+    );
+    let reopened_identity =
+        walrust::walrust_core::native_spool::NativeSpool::read_identity(&stream_root)?
+            .context("split-brain identity vanished")?;
+    let reopened = walrust::walrust_core::native_spool::NativeSpool::create_or_open(
+        &stream_root,
+        reopened_identity,
+        walrust::walrust_core::native_spool::CapacityPolicy {
+            warning_bytes: u64::MAX - 1,
+            hard_bytes: u64::MAX,
+            minimum_free_bytes: 0,
+        },
+    )?;
+    anyhow::ensure!(
+        reopened.read_payload(pending_seq)? == local_payload && reopened.get(pending_seq).is_some(),
+        "conflicting publication discarded the offline local descendant"
+    );
+    drop(reopened);
+    runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(test_bucket(), endpoint.as_deref()).await?;
+        anyhow::ensure!(
+            hadb_storage::StorageBackend::get(storage.as_ref(), &divergent_marker_key).await?
+                == Some(divergent_marker),
+            "reconnect overwrote the divergent writer marker"
+        );
+        Ok::<_, anyhow::Error>(())
+    })?;
+
+    let mut restore = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    restore
+        .arg("restore")
+        .arg(&name)
+        .arg("--output")
+        .arg(&local_restore)
+        .arg("--bucket")
+        .arg(&bucket_arg)
+        .arg("--cache-dir")
+        .arg(&spool_base)
+        .arg("--endpoint")
+        .arg("http://127.0.0.1:9");
+    run_cmd(restore, "offline local native restore after split brain")?;
+    assert_integrity_ok(&local_restore)?;
+    anyhow::ensure!(
+        rows(&local_restore)? == expected_local,
+        "local recovery chain changed after split brain"
+    );
+    stop_child(&mut reconnect);
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
 fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     require_s3!("e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows");
     let temp = TempDir::new()?;
