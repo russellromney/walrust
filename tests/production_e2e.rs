@@ -420,6 +420,13 @@ struct LoggedWatchArgs<'a> {
 }
 
 fn spawn_cli_watch_logged(args: LoggedWatchArgs<'_>) -> Result<Child> {
+    spawn_cli_watch_logged_with_checkpoint_release(args, None)
+}
+
+fn spawn_cli_watch_logged_with_checkpoint_release(
+    args: LoggedWatchArgs<'_>,
+    checkpoint_release: Option<&str>,
+) -> Result<Child> {
     let log = std::fs::File::create(args.log_path)?;
     let log_err = log.try_clone()?;
     let mut watch = Command::new(env!("CARGO_BIN_EXE_walrust"));
@@ -447,6 +454,9 @@ fn spawn_cli_watch_logged(args: LoggedWatchArgs<'_>) -> Result<Child> {
         .arg("--no-cache")
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err));
+    if let Some(policy) = checkpoint_release {
+        watch.arg("--checkpoint-release").arg(policy);
+    }
     if let Some(endpoint) = args.endpoint {
         watch.arg("--endpoint").arg(endpoint);
     }
@@ -910,6 +920,118 @@ fn e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put() -> Result<()
         }
         Ok::<_, anyhow::Error>(())
     })?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_remote_checkpoint_release_waits_for_contiguous_live_publish() -> Result<()> {
+    require_s3!("e2e_cli_remote_checkpoint_release_waits_for_contiguous_live_publish");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-remote-release");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+    let pause_file = temp.path().join("pause-native-uploader");
+    std::fs::write(&pause_file, b"paused")?;
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "native-remote-release")?;
+    let mut child = spawn_cli_watch_logged_with_checkpoint_release(
+        LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &log_path,
+            config_path: None,
+            checkpoint_interval: 1,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: Some(&pause_file),
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        },
+        Some("remote"),
+    )?;
+    wait_for_shadow_blocker(&db_path, &mut child)?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+    let checkpoint_count_before = watch_log(&log_path)
+        .matches("controlled SQLite checkpoint completed after native spool admission")
+        .count();
+
+    append_wide_rows(&writer, 6, 80, "native-remote-release")?;
+    let expected = rows(&db_path)?;
+    let admission_deadline = Instant::now() + e2e_poll_deadline(30);
+    while !watch_log(&log_path).contains("native HADBP delta admitted to durable local spool") {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "remote-release watcher exited before local admission ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < admission_deadline,
+            "timed out waiting for local admission in remote mode:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    std::thread::sleep(Duration::from_secs(2));
+    anyhow::ensure!(
+        child.try_wait()?.is_none(),
+        "remote-release watcher exited while upload was paused"
+    );
+    let checkpoint_count_paused = watch_log(&log_path)
+        .matches("controlled SQLite checkpoint completed after native spool admission")
+        .count();
+    anyhow::ensure!(
+        checkpoint_count_paused == checkpoint_count_before,
+        "checkpoint_release=remote checkpointed before contiguous remote publication:\n{}",
+        watch_log(&log_path)
+    );
+    let probe = Connection::open(&db_path)?;
+    probe.execute_batch("PRAGMA busy_timeout=0;")?;
+    anyhow::ensure!(
+        force_truncate_checkpoint(&probe)?.0 != 0,
+        "remote-release wait must retain the checkpoint blocker"
+    );
+
+    std::fs::remove_file(&pause_file)?;
+    let checkpoint_deadline = Instant::now() + e2e_poll_deadline(30);
+    loop {
+        let count = watch_log(&log_path)
+            .matches("controlled SQLite checkpoint completed after native spool admission")
+            .count();
+        if count > checkpoint_count_before {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "remote-release watcher exited before checkpoint ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < checkpoint_deadline,
+            "timed out waiting for remote publication to release checkpoint:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    stop_child(&mut child);
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())
 }
 
