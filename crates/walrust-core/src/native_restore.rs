@@ -601,7 +601,7 @@ fn validate_record(
     Ok(())
 }
 
-async fn get_verified_object(
+pub(crate) async fn get_verified_object(
     storage: &dyn StorageBackend,
     descriptor: &StreamDescriptor,
     record: &PublishRecord,

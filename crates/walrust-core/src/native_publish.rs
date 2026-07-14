@@ -277,7 +277,7 @@ impl NativeUploader {
     /// Publish at most one contiguous object. This deliberately serializes the
     /// visible chain even if object transfer is parallelized in the future.
     pub async fn publish_pending_once(&self) -> Result<bool> {
-        let (object, payload, previous_publish_sha256) = {
+        let (object, payload, previous_publish_sha256, previous_object, retained_base) = {
             let guard = self
                 .spool
                 .lock()
@@ -305,8 +305,36 @@ impl NativeUploader {
                     })?
                     .into()
             };
+            let previous_object = if next == guard.identity().first_native_seq {
+                None
+            } else {
+                Some(
+                    guard
+                        .get(next - 1)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("local native predecessor object is missing"))?,
+                )
+            };
+            let retained_base = if previous_object.is_some() {
+                Some(
+                    guard
+                        .objects()
+                        .next()
+                        .filter(|object| object.kind == ObjectKind::Snapshot)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("local native retained snapshot base is missing"))?,
+                )
+            } else {
+                None
+            };
             let payload = guard.read_payload(next)?;
-            (object, payload, previous_publish_sha256)
+            (
+                object,
+                payload,
+                previous_publish_sha256,
+                previous_object,
+                retained_base,
+            )
         };
 
         self.ensure_descriptor().await?;
@@ -343,7 +371,8 @@ impl NativeUploader {
 
         let record = PublishRecord::from_object(&object, previous_publish_sha256);
         let record_bytes = record.bytes()?;
-        self.verify_predecessor(&record).await?;
+        self.verify_predecessor(&record, previous_object.as_ref(), retained_base.as_ref())
+            .await?;
         put_immutable_exact(
             self.storage.as_ref(),
             &record.key(&self.descriptor.prefix, &self.descriptor.database),
@@ -400,14 +429,29 @@ impl NativeUploader {
         .await
     }
 
-    async fn verify_predecessor(&self, record: &PublishRecord) -> Result<()> {
+    async fn verify_predecessor(
+        &self,
+        record: &PublishRecord,
+        previous_object: Option<&SpoolObject>,
+        retained_base: Option<&SpoolObject>,
+    ) -> Result<()> {
         if record.seq == self.descriptor.first_native_seq {
-            if record.kind != ObjectKind::Snapshot || record.previous_publish_sha256.is_some() {
+            if record.kind != ObjectKind::Snapshot
+                || record.previous_publish_sha256.is_some()
+                || previous_object.is_some()
+                || retained_base.is_some()
+            {
                 bail!("native remote chain must start with its declared snapshot base");
             }
             return Ok(());
         }
         let previous_seq = record.seq - 1;
+        let previous_object = previous_object.ok_or_else(|| {
+            anyhow!("local native predecessor object is missing at seq {previous_seq}")
+        })?;
+        if previous_object.seq != previous_seq {
+            bail!("local native predecessor sequence differs from {previous_seq}");
+        }
         let previous_key = format!(
             "{}{}/native/v1/lineages/{}/published/{previous_seq:016x}.json",
             self.descriptor.prefix, self.descriptor.database, self.descriptor.lineage_id
@@ -430,6 +474,59 @@ impl NativeUploader {
         {
             bail!("split brain: incompatible remote native predecessor at seq {previous_seq}");
         }
+        self.verify_remote_published_object(previous_object).await?;
+        let retained_base = retained_base
+            .ok_or_else(|| anyhow!("local native retained snapshot base is missing"))?;
+        if retained_base.kind != ObjectKind::Snapshot {
+            bail!("local native retained base is not a snapshot");
+        }
+        if retained_base.seq != previous_seq {
+            self.verify_remote_published_object(retained_base).await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_remote_published_object(&self, object: &SpoolObject) -> Result<()> {
+        let key = format!(
+            "{}{}/native/v1/lineages/{}/published/{:016x}.json",
+            self.descriptor.prefix,
+            self.descriptor.database,
+            self.descriptor.lineage_id,
+            object.seq
+        );
+        let bytes = self.storage.get(&key).await?.ok_or_else(|| {
+            anyhow!(
+                "remote native published record is absent at seq {}",
+                object.seq
+            )
+        })?;
+        let record: PublishRecord = serde_json::from_slice(&bytes).with_context(|| {
+            format!("decode remote native publish record at seq {}", object.seq)
+        })?;
+        let expected_digest = object.publish_record_sha256.as_deref().ok_or_else(|| {
+            anyhow!(
+                "local native published object {} has no record digest",
+                object.seq
+            )
+        })?;
+        if sha256_hex(&bytes) != expected_digest {
+            bail!(
+                "split brain: remote native publish record digest changed at seq {}",
+                object.seq
+            );
+        }
+        if record != PublishRecord::from_object(object, record.previous_publish_sha256.clone()) {
+            bail!(
+                "split brain: remote native publish record differs from local object at seq {}",
+                object.seq
+            );
+        }
+        crate::native_restore::get_verified_object(
+            self.storage.as_ref(),
+            &self.descriptor,
+            &record,
+        )
+        .await?;
         Ok(())
     }
 
@@ -671,6 +768,63 @@ mod tests {
         let err = uploader.publish_pending_once().await.unwrap_err();
         assert!(err.to_string().contains("split brain/equivocation"));
         assert_eq!(storage.get(&key).await.unwrap().unwrap(), b"divergent");
+    }
+
+    #[tokio::test]
+    async fn missing_remote_snapshot_base_blocks_descendant_publication() {
+        let dir = tempdir().unwrap();
+        let spool = staged_spool(dir.path());
+        let storage = Arc::new(MemoryStorage::default());
+        let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool.clone()).unwrap();
+        assert!(uploader.publish_pending_once().await.unwrap());
+
+        let (identity, previous, base_key) = {
+            let guard = spool.lock().unwrap();
+            let base = guard.get(1).unwrap();
+            (
+                guard.identity().clone(),
+                base.ending_chain_checksum,
+                base.intended_remote_key.clone(),
+            )
+        };
+        let (payload, ending) = ltx::encode_wal_changes_with_end_page_count(
+            &[(1, vec![0u8; 4096])],
+            4096,
+            2,
+            previous,
+            1,
+        )
+        .unwrap();
+        spool
+            .lock()
+            .unwrap()
+            .stage(StageObject {
+                seq: 2,
+                kind: ObjectKind::Delta,
+                previous_chain_checksum: previous,
+                ending_chain_checksum: ending,
+                end_page_count: 1,
+                intended_remote_key: object_key(&identity, ObjectKind::Delta, 2),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &payload,
+            })
+            .unwrap();
+
+        storage.delete(&base_key).await.unwrap();
+        let error = uploader.publish_pending_once().await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("published native object is missing"),
+            "unexpected publish error: {error:#}"
+        );
+        assert_eq!(spool.lock().unwrap().remote_published_seq(), Some(1));
+        let descendant_record = format!(
+            "p/db/native/v1/lineages/{}/published/0000000000000002.json",
+            identity.lineage_id
+        );
+        assert!(
+            storage.get(&descendant_record).await.unwrap().is_none(),
+            "descendant publish record must remain invisible without its snapshot base"
+        );
     }
 
     #[tokio::test]
