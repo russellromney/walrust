@@ -34,7 +34,7 @@ use walrust_core::native_publish::{object_key as native_object_key, NativeUpload
 use walrust_core::native_shadow::{encode_shadow_to_hadbp, NativeShadowInput};
 use walrust_core::native_spool::{
     durability_failpoint, filesystem_available_bytes, CapacityPolicy, CapacityState, NativeSpool,
-    ObjectKind, RecoveryHead, SourceCursor, SpoolIdentity, StageObject,
+    ObjectKind, RecoveryHead, RemoteUploadState, SourceCursor, SpoolIdentity, StageObject,
 };
 
 use super::manifest::discover_state_from_s3;
@@ -124,6 +124,44 @@ fn spool_lock(spool: &Arc<Mutex<NativeSpool>>) -> Result<std::sync::MutexGuard<'
     spool
         .lock()
         .map_err(|_| anyhow!("native spool lock poisoned"))
+}
+
+fn watcher_retention_has_published_native_base(spool_state: &NativeSpoolState) -> Result<bool> {
+    let spool = spool_lock(&spool_state.0)?;
+    let identity = spool.identity();
+    if identity.legacy_boundary_txid.is_none() {
+        return Ok(true);
+    }
+    let Some(remote_seq) = spool.remote_published_seq() else {
+        return Ok(false);
+    };
+    if remote_seq < identity.first_native_seq {
+        return Ok(false);
+    }
+    let has_retained_base = spool.objects().any(|object| {
+        object.seq <= remote_seq
+            && object.kind == ObjectKind::Snapshot
+            && object.remote_upload_state == RemoteUploadState::Published
+    });
+    Ok(has_retained_base)
+}
+
+async fn prune_watcher_database(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    state: &ShadowDbState,
+    spool_state: &NativeSpoolState,
+    policy: &RetentionPolicy,
+) -> Result<()> {
+    if !watcher_retention_has_published_native_base(spool_state)? {
+        tracing::warn!(
+            database = %state.name,
+            "native migration snapshot is not yet contiguously published; preserving legacy recovery history"
+        );
+        return Ok(());
+    }
+    prune_with_client(client, bucket, prefix, &state.name, policy, true).await
 }
 
 fn shadow_storage_bytes(state: &ShadowDbState) -> u64 {
@@ -2389,8 +2427,12 @@ pub async fn watch_with_shadow(
                 // Run retention pruning after snapshots if enabled
                 if global_sync.compact_after_snapshot {
                     if let Some(ref policy) = compact_policy {
-                        for state in db_states.values() {
-                            if let Err(e) = prune_with_client(&client, &bucket_name, &prefix, &state.name, policy, true).await {
+                        for (db_path, state) in &db_states {
+                            let Some(spool_state) = native_spools.get(db_path) else {
+                                tracing::error!("Failed to prune {}: native spool missing", state.name);
+                                continue;
+                            };
+                            if let Err(e) = prune_watcher_database(&client, &bucket_name, &prefix, state, spool_state, policy).await {
                                 tracing::error!("Failed to prune {}: {}", state.name, e);
                             }
                         }
@@ -2402,8 +2444,12 @@ pub async fn watch_with_shadow(
             // Pruning timer
             _ = compact_timer.tick(), if global_sync.compact_interval > 0 => {
                 if let Some(ref policy) = compact_policy {
-                    for state in db_states.values() {
-                        if let Err(e) = prune_with_client(&client, &bucket_name, &prefix, &state.name, policy, true).await {
+                    for (db_path, state) in &db_states {
+                        let Some(spool_state) = native_spools.get(db_path) else {
+                            tracing::error!("Failed to prune {}: native spool missing", state.name);
+                            continue;
+                        };
+                        if let Err(e) = prune_watcher_database(&client, &bucket_name, &prefix, state, spool_state, policy).await {
                             tracing::error!("Failed to prune {}: {}", state.name, e);
                         }
                     }
@@ -2736,6 +2782,203 @@ mod tests {
         // can acknowledge the staged object.
         drop(uploader);
         (spool, wake)
+    }
+
+    fn test_migrated_native_spool_state(
+        db_path: &std::path::Path,
+        root: &std::path::Path,
+        bucket: &str,
+        prefix: &str,
+        database: &str,
+        legacy_boundary_txid: u64,
+    ) -> NativeSpoolState {
+        let identity = SpoolIdentity::new(
+            db_path,
+            bucket,
+            prefix,
+            database,
+            "pending-migration-lineage",
+            legacy_boundary_txid + 1,
+            Some(legacy_boundary_txid),
+            true,
+        )
+        .unwrap();
+        let root = NativeSpool::path_for(root, &identity);
+        let spool = Arc::new(Mutex::new(
+            NativeSpool::create_or_open(
+                &root,
+                identity,
+                CapacityPolicy {
+                    warning_bytes: u64::MAX - 1,
+                    hard_bytes: u64::MAX,
+                    minimum_free_bytes: 0,
+                },
+            )
+            .unwrap(),
+        ));
+        let (uploader, wake, _lag) =
+            NativeUploader::new(Arc::new(NoRemoteIo), Arc::clone(&spool)).unwrap();
+        drop(uploader);
+        (spool, wake)
+    }
+
+    #[tokio::test]
+    async fn watcher_retention_preserves_legacy_base_before_descriptor_publication() {
+        if std::env::var("AWS_ENDPOINT_URL_S3").is_err()
+            && std::env::var("AWS_ENDPOINT_URL").is_err()
+            && std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        {
+            eprintln!("SKIP watcher_retention_preserves_legacy_base_before_descriptor_publication: no S3 endpoint/credentials configured");
+            return;
+        }
+        let bucket_arg = std::env::var("WALRUST_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026/verify-test".to_string());
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        let (bucket, prefix) = s3::parse_bucket(&bucket_arg);
+        let client = s3::create_client(endpoint.as_deref()).await.unwrap();
+        let name = format!(
+            "watch-pending-migration-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let keep_old = crate::sync::manifest::build_ltx_key(&prefix, &name, 1, 1, 1);
+        let would_delete = crate::sync::manifest::build_ltx_key(&prefix, &name, 2, 1, 2);
+        let keep_latest = crate::sync::manifest::build_ltx_key(&prefix, &name, 3, 1, 3);
+        let keys = vec![keep_old.clone(), would_delete.clone(), keep_latest.clone()];
+        for key in &keys {
+            s3::upload_bytes(&client, &bucket, key, b"snapshot".to_vec())
+                .await
+                .unwrap();
+        }
+
+        let (_sqlite_temp, db_path, _writer) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: name.clone(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 3,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let spool_temp = TempDir::new().unwrap();
+        let spool_state = test_migrated_native_spool_state(
+            &db_path,
+            spool_temp.path(),
+            &bucket,
+            &prefix,
+            &name,
+            3,
+        );
+        assert_eq!(
+            stage_native_snapshot(&mut state, &spool_state)
+                .await
+                .unwrap(),
+            4
+        );
+        assert!(
+            spool_lock(&spool_state.0)
+                .unwrap()
+                .get(4)
+                .is_some_and(|object| object.remote_upload_state == RemoteUploadState::Pending),
+            "migration snapshot must be durably pending locally"
+        );
+        assert!(
+            !watcher_retention_has_published_native_base(&spool_state).unwrap(),
+            "pending first migration snapshot must keep watcher retention closed"
+        );
+        let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
+        assert!(
+            !s3::exists(&client, &bucket, &descriptor_key).await.unwrap(),
+            "test requires the pre-descriptor publication window"
+        );
+
+        let policy = RetentionPolicy::new(0, 0, 0, 0);
+        prune_watcher_database(&client, &bucket, &prefix, &state, &spool_state, &policy)
+            .await
+            .unwrap();
+        for key in &keys {
+            assert!(
+                s3::exists(&client, &bucket, key).await.unwrap(),
+                "watcher retention deleted legacy recovery object {key} while its native migration snapshot was only local"
+            );
+        }
+        let _ = s3::delete_objects(&client, &bucket, &keys).await;
+    }
+
+    #[tokio::test]
+    async fn watcher_retention_accepts_retained_published_snapshot_after_local_cleanup() {
+        let (_sqlite_temp, db_path, _writer) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: "cleanup-migration".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 3,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let spool_temp = TempDir::new().unwrap();
+        let spool_state = test_migrated_native_spool_state(
+            &db_path,
+            spool_temp.path(),
+            "bucket",
+            "tests/",
+            "cleanup-migration",
+            3,
+        );
+
+        assert_eq!(
+            stage_native_snapshot(&mut state, &spool_state)
+                .await
+                .unwrap(),
+            4
+        );
+        {
+            let mut spool = spool_lock(&spool_state.0).unwrap();
+            spool.mark_uploaded(4).unwrap();
+            spool.mark_published(4, b"published-four").unwrap();
+        }
+        assert!(watcher_retention_has_published_native_base(&spool_state).unwrap());
+
+        assert_eq!(
+            stage_native_snapshot(&mut state, &spool_state)
+                .await
+                .unwrap(),
+            5
+        );
+        {
+            let mut spool = spool_lock(&spool_state.0).unwrap();
+            spool.mark_uploaded(5).unwrap();
+            spool.mark_published(5, b"published-five").unwrap();
+            assert_eq!(spool.cleanup_published_before_latest_snapshot().unwrap(), 1);
+            assert!(spool.get(4).is_none(), "first snapshot should be cleaned");
+            assert!(spool.get(5).is_some(), "latest snapshot must remain");
+        }
+        assert!(
+            watcher_retention_has_published_native_base(&spool_state).unwrap(),
+            "a retained published snapshot and contiguous cursor keep watcher retention live after first-snapshot cleanup"
+        );
     }
 
     // ── H8 cousin: manifest-fetch seeding never silently starts fresh ────────
