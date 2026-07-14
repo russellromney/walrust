@@ -592,13 +592,18 @@ async fn checkpoint_with_state_blocker_attempt(
     // the primitive's final heartbeat-to-BEGIN micro-window is the documented
     // residual release/reacquire boundary.
     let data_version_after = checkpoint_data_version(state);
-    let monitor_refresh_result = refresh_checkpoint_data_version_monitor(state);
-    if let Err(error) = monitor_refresh_result {
-        return Err(error.context(format!(
-            "{}: failed to refresh checkpoint data_version monitor",
-            state.name
-        )));
-    }
+    // Test-only injection exercises the production ordering below: a monitor
+    // reopen failure must still reacquire the checkpoint blocker before this
+    // function returns to the watch loop.
+    let monitor_refresh_result = if cfg!(debug_assertions)
+        && std::env::var_os("WALRUST_TEST_CHECKPOINT_MONITOR_REFRESH_FAILURE_DB")
+            .is_some_and(|path| std::path::Path::new(&path) == state.db_path)
+    {
+        drop(state.data_version_monitor.take());
+        Err(anyhow!("test-only checkpoint monitor refresh failure"))
+    } else {
+        refresh_checkpoint_data_version_monitor(state)
+    };
     let rearm_result = rearm_checkpoint_blocker(state);
     let heartbeat_live = match &rearm_result {
         Ok(()) => checkpoint_blocker_heartbeat_is_live(state),
@@ -607,20 +612,28 @@ async fn checkpoint_with_state_blocker_attempt(
     if rearm_result.is_ok() {
         durability_failpoint("blocker_reacquired");
     }
+    let checkpoint_result = checkpoint_result.and_then(|completed| {
+        let data_version_after = data_version_after?;
+        monitor_refresh_result.with_context(|| {
+            format!(
+                "{}: failed to refresh checkpoint data_version monitor",
+                state.name
+            )
+        })?;
+        Ok((completed, data_version_after != data_version_before))
+    });
     match (checkpoint_result, rearm_result) {
-        (Ok(completed), Ok(())) => Ok(CheckpointAttempt {
+        (Ok((completed, data_version_dirty)), Ok(())) => Ok(CheckpointAttempt {
             completed,
-            dirty: data_version_after? != data_version_before || !heartbeat_live?,
+            dirty: data_version_dirty || !heartbeat_live?,
         }),
         (Err(checkpoint_error), Ok(())) => Err(checkpoint_error),
         (Ok(_), Err(rearm_error)) => Err(rearm_error),
-        (Err(checkpoint_error), Err(rearm_error)) => {
-            return Err(anyhow!(
-                "{}; additionally failed to rearm CLI checkpoint blocker: {}",
-                checkpoint_error,
-                rearm_error
-            ));
-        }
+        (Err(checkpoint_error), Err(rearm_error)) => Err(anyhow!(
+            "{}; additionally failed to rearm CLI checkpoint blocker: {}",
+            checkpoint_error,
+            rearm_error
+        )),
     }
 }
 
@@ -3238,6 +3251,62 @@ mod tests {
             "local admission remains durable for the later checkpoint retry"
         );
         reader.execute_batch("ROLLBACK").unwrap();
+    }
+
+    #[tokio::test]
+    async fn monitor_refresh_failure_still_rearms_checkpoint_blocker() {
+        struct RemoveEnv(&'static str);
+        impl Drop for RemoveEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(self.0) };
+            }
+        }
+
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: "native-monitor-refresh-failure".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let data_version_before = checkpoint_data_version(&state).unwrap();
+        const INJECT: &str = "WALRUST_TEST_CHECKPOINT_MONITOR_REFRESH_FAILURE_DB";
+        unsafe { std::env::set_var(INJECT, &db_path) };
+        let _remove = RemoveEnv(INJECT);
+
+        let error = checkpoint_with_state_blocker_attempt(
+            &mut state,
+            ShadowCheckpointMode::Passive,
+            data_version_before,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("failed to refresh checkpoint data_version monitor"),
+            "unexpected checkpoint error: {error:#}"
+        );
+        assert!(
+            state
+                .checkpoint_blocker
+                .as_ref()
+                .is_some_and(|blocker| !blocker.is_autocommit()),
+            "monitor refresh failure returned to the watch loop without a live blocker"
+        );
+        assert!(
+            checkpoint_blocker_heartbeat_is_live(&state).unwrap(),
+            "replacement blocker heartbeat must remain pinned"
+        );
     }
 
     #[tokio::test]
