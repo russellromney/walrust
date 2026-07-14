@@ -270,6 +270,211 @@ litestream does — call it out plainly for operators).
 - **PR #40 (fresh-user drill)** can merge independently — its DF2 known-issue note
   and version-gated probe are accurate while 0.7.0 is the shipped (lossy) binary.
 
+## Local-first native HADBP spool for lossless CLI watch (required Phase 1 refinement)
+
+**Do not merge PR #43 as it stands.** Its real SQLite checkpoint blocker is the
+right primitive, but its checkpoint gate still waits for a confirmed S3 PUT. The
+default CLI shadow-watch pipeline must instead be:
+
+```
+SQLite WAL -> fsynced shadow frames -> fsynced native HADBP object + journal
+           -> controlled SQLite checkpoint + immediate blocker reacquisition
+           -> asynchronous upload of those exact HADBP bytes
+```
+
+`crates/walrust-core/src/ltx.rs` is the native HADBP codec despite its historical
+module name. `legacy_ltx.rs`, `legacy_shadow*`, `legacy_wal_sync`, `LocalCache`,
+and `.ltx` spool files are actual Litestream-heritage compatibility machinery.
+They remain readers for published 0.7 history, not the new write architecture.
+
+### Proven current format map
+
+- Fresh CLI snapshots are actual LTX1 snapshot files at
+  `{prefix}{db}/{generation:04x}/0000000000000001-{txid:016x}.ltx`.
+  CLI incrementals are actual LTX1 files in generation `0000` named
+  `{min_txid:016x}-{max_txid:016x}.ltx`. `manifest.json`, legacy discovery,
+  verify, pruning, replication, and CLI restore all use this TXID/checksum
+  domain. `LocalCache` stores the same LTX1 bytes as `ltx/{txid:08}.ltx`.
+- CLI compaction's RangeLayout consumes those LTX1 objects. Its `levels/L*`
+  merged payloads are HADBP but retain the historical `.ltx` key suffix; the
+  legacy restore path sniffs their `HADBP` magic and bridges them in the LTX
+  checksum domain. This frozen compatibility seam is not a precedent for new
+  HADBP keys.
+- Owned/library replication uses native HADBP snapshots and deltas under
+  generation directories with `.hadbp` suffixes (and optional `lineages/`
+  scope). SeqLayout compaction also writes HADBP under `levels/L*/*.hadbp`.
+  Native restore enforces HADBP sequence, predecessor, checksum, page-count,
+  lineage, and fencing rules.
+- Published 0.7 CLI restore-to-latest/PITR therefore remains the legacy reader;
+  published 0.7 owned buckets remain the native reader. New CLI restore first
+  resolves the versioned native boundary below, and uses the legacy reader for
+  targets before that boundary.
+
+### Versioned remote layout and visibility
+
+New CLI-native streams use this disjoint namespace:
+
+```
+{prefix}{db}/native/v1/stream.json
+{prefix}{db}/native/v1/lineages/{lineage}/0001/{seq:016x}.hadbp  # snapshot
+{prefix}{db}/native/v1/lineages/{lineage}/0000/{seq:016x}.hadbp  # delta
+{prefix}{db}/native/v1/lineages/{lineage}/published/{seq:016x}.json
+```
+
+`stream.json` is an immutable, create-if-absent descriptor binding the canonical
+stream/destination identity, lineage, first native snapshot sequence, and an
+optional verified legacy-LTX boundary TXID. A full native snapshot is always the
+migration boundary; no LTX-to-HADBP incremental checksum seam is invented.
+
+Each `published/` record is immutable and binds the exact object key, kind,
+sequence, predecessor publish-record digest, HADBP predecessor/ending checksums,
+declared end-page count, payload length, and SHA-256 payload digest. Publication
+uses create-if-absent and verifies exact existing bytes after a failed CAS. The
+visible remote head is the highest contiguous verified publish-record chain
+starting at the descriptor's snapshot base. A raw object PUT without its record
+is not a recovery point. Restore, verify, prune, replicate, and compaction must
+never traverse past that visible head. This makes PUT-before-record crashes
+retryable and prevents a delta from becoming visible before its base.
+
+The namespace cannot collide with legacy LTX: legacy object discovery accepts
+`.ltx` generation/range shapes, while this layout uses an extra `native/v1`
+scope and `.hadbp`. It cannot collide with compaction levels because no path has
+the structural `levels/L{n}` pair. Frozen legacy and `levels/L*` readers remain
+unchanged except for combined boundary selection in current CLI commands.
+
+### Durable local identities and object record
+
+The spool is independent of `LocalCache` and is rooted in a collision-safe hash
+of canonical database path plus destination bucket/prefix/database identity.
+Its immutable payload filenames end in `.hadbp`, never `.ltx`. The versioned
+stream journal binds canonical local and remote identity, lineage, verified
+remote base/boundary, local source cursor, local admitted cursor, and contiguous
+remote publish cursor. Every immutable object record binds at least:
+
+- journal/object schema version and canonical stream/lineage identity;
+- destination bucket, prefix, and database identity;
+- native sequence and snapshot/delta kind;
+- previous and ending chain checksums and declared end-page count;
+- intended remote key, payload length, and SHA-256 payload digest;
+- source shadow/WAL cursor covered by the object;
+- local creation state and remote upload/publication state.
+
+Payload installation is: write a same-directory temporary file, fsync it,
+rename atomically, fsync the directory, then atomically write/fsync/rename the
+journal and fsync its directory. A channel message is only a coalesced wake hint.
+An existing sequence is accepted only after header, lineage, predecessor,
+sequence, source cursor, length, and digest all match; any divergence is a hard
+equivocation error.
+
+### Exact crash/restart state machine
+
+The blocker is held except for the bounded controlled-checkpoint window.
+
+1. **Before shadow fsync:** the live WAL remains pinned; restart recopies only a
+   validated committed frame prefix. No cursor advances.
+2. **After shadow fsync, before HADBP encode:** the durable shadow cursor is
+   replayed into the next native object; SQLite is not checkpointed.
+3. **After payload rename, before journal commit:** startup validates the orphan
+   HADBP header/body, intended identity derived from its sidecar/temp intent,
+   predecessor, sequence, source cursor, and digest. It adopts a uniquely proven
+   object by committing the journal; otherwise it retains it and fails loudly.
+   It is never blindly overwritten or discarded.
+4. **After journal commit, before SQLite checkpoint:** the object is locally
+   admitted. Restart may checkpoint that exact admitted cursor without S3.
+5. **After SQLite checkpoint, before blocker reacquisition:** startup opens and
+   pins the blocker before any other mutable work, compares `data_version`, WAL
+   salt/cursor, shadow/admitted cursor, and main DB. A dirty controlled window
+   creates a full native snapshot re-anchor through the same spool before any
+   delta continuation. On POSIX, blocker reacquisition is the final SQLite
+   operation in the successful checkpoint path.
+6. **After PUT, before uploaded-state commit:** the uploader GET-verifies exact
+   remote bytes and idempotently records the object uploaded locally. Divergent
+   remote bytes are split brain/equivocation and are never overwritten.
+7. **After uploaded-state commit, before visible-head advance:** the uploader
+   verifies the descriptor, remote predecessor publish record, base snapshot,
+   and object, then create-if-absent publishes the exact next record. Restart
+   repeats this operation; a divergent record is split brain.
+8. **During local cleanup:** journal state is authoritative. Temporary/orphan
+   files are removed only after validation; pending/unpublished objects and the
+   only locally restorable snapshot base are never removed. Each delete is
+   followed by directory fsync and is restart-idempotent.
+9. **During snapshot creation:** snapshots use a stable SQLite copy in the
+   spool filesystem, fsync that copy, encode/install/fsync native HADBP, commit
+   its journal record, and only then close the checkpoint window or retire the
+   stable copy. Partial copies/encodes are validated or removed on restart; an
+   admitted snapshot is never regenerated at the same sequence.
+10. **During shutdown:** stop admitting new checkpoint windows, keep/reacquire
+    the blocker, durably finish any in-progress local admission, persist pending
+    uploader state, and optionally drain cloud for a bounded time. Timeout does
+    not delete pending work. SIGKILL follows the same startup reconciliation.
+
+### Checkpoint release policy
+
+The explicit setting is `checkpoint_release = "local" | "remote"`.
+
+- `local` is the default. Release requires durable native HADBP bytes and the
+  matching durable local cursor/lineage record. It never waits for S3 PUT,
+  LIST/GET, retries, uploader channel capacity, or remote-head advancement.
+- `remote` stages locally first, then waits for the contiguous remote publish
+  cursor covering the admitted object before release. This adds cloud latency
+  to walrust-controlled checkpoints; it does **not** make every SQLite commit
+  synchronously cloud-durable.
+
+PASSIVE busy/partial results are contention: record progress, rearm, and retry.
+Emergency TRUNCATE is bounded and observable. Failure rearms the blocker and
+leaves watch alive in a degraded non-checkpointing state.
+
+### Startup, ownership, and publication
+
+First startup must successfully verify remote absence or the existing legacy or
+native head before creating local identity. With a complete matching spool, a
+watcher may restart and stage offline only atop its last verified remote
+base/lineage. Missing or mismatched identity/base is a loud offline refusal.
+Reconnect verifies the recorded remote predecessor before every publication.
+An incompatible advanced head retains the spool and hard-fails publication as
+split brain; it is never rebased or overwritten. This is crash fencing and CAS
+equivocation protection, not a distributed lease, and does not make concurrent
+offline multi-host ownership safe.
+
+The uploader scans pending disk records at startup and periodically, retries
+with bounded backoff, and accepts only nonblocking/coalesced wake notifications.
+Dead/full notification channels cannot impede local admission. Cloud errors set
+a loud `remote_lag` state while local capture continues. Initial, periodic,
+max-changes, idle/max-interval, downtime, and dirty-window snapshots all enter
+this same native spool before upload.
+
+### Capacity, restore, pruning, and shutdown invariants
+
+Capacity accounts for the live WAL, fsynced shadow, HADBP encode temporary,
+installed payload, stable snapshot temporary, journal, and a filesystem free
+space reserve (on the actual custom spool filesystem). A warning watermark emits
+`local_spool_high`; hard capacity/reserve emits `local_spool_full`, retains the
+blocker, stops checkpointing, and keeps watch alive. `remote_lag` is separate.
+Pending objects and the only local snapshot base are never capacity victims.
+
+Local restore may traverse a complete journal-verified native chain without S3.
+Remote restore exposes only descriptor-selected contiguous publish records.
+Pruning cannot remove a legacy/native base referenced by unpublished local
+descendants. Graceful shutdown never deletes pending work.
+
+### Mandatory proof and PR disposition
+
+Add call-site-revert-proof tests for local admission versus the old remote gate,
+remote policy, every crash boundary, orphan adoption/divergence, paused/dead
+uploader, offline restart/reconnect conflict, repeated snapshots, PASSIVE busy,
+capacity/custom paths, native latest/PITR, legacy migration latest/old PITR, and
+exact restore/integrity. Preserve DF1/DF2, app checkpoint, WAL backpressure,
+two-writer/fencing, racing checkpoint, SIGKILL, strict WAL header, native chain,
+S3 gating, and frozen 0.7 fixtures unchanged. Measure local stage/fsync,
+checkpoint time, upload time, remote lag, WAL bytes, spool bytes, and free space;
+injected PUT delay may increase lag but not local checkpoint latency.
+
+Amend PR #43 with atomic commits. Do not change Phase 2 independent semantics,
+PR #42, or PRs #40/#41; do not merge. After implementation, use a fresh
+independent reviewer/fixer on this worktree, run replacement CI and required
+unique-prefix live-Tigris gates, clean only those prefixes, and stop for the user
+to merge.
+
 ### Exact commands (for the executor)
 
 - Worktree: `git -C /Users/russellromney/Documents/Github/walrust worktree add
