@@ -867,6 +867,7 @@ fn e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put() -> Result<()
     })?;
     wait_for_shadow_blocker(&db_path, &mut child)?;
     wait_for_cli_startup_rearms(&log_path, &mut child)?;
+    let local_checkpoint_started = Instant::now();
     append_wide_rows(&writer, 6, 80, "native-local-first")?;
     let expected = rows(&db_path)?;
 
@@ -887,6 +888,12 @@ fn e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put() -> Result<()
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+    let local_checkpoint_elapsed = local_checkpoint_started.elapsed();
+    anyhow::ensure!(
+        local_checkpoint_elapsed < Duration::from_secs(10),
+        "an indefinitely paused S3 PUT inflated local checkpoint latency to {:?}",
+        local_checkpoint_elapsed
+    );
 
     let spool_parent = temp.path().join(".walrust-spool/native-v1");
     let spool_root = std::fs::read_dir(&spool_parent)?
@@ -923,7 +930,40 @@ fn e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put() -> Result<()
             ))
         })
         .collect::<Result<Vec<_>>>()?;
+    let remote_lag_objects = spool.pending_objects().count();
+    let remote_lag_bytes = spool
+        .pending_objects()
+        .map(|object| object.payload_length)
+        .sum::<u64>();
+    let spool_bytes = spool.used_bytes()?;
+    let spool_free_bytes = spool.free_bytes()?;
     drop(spool);
+    let live_wal_bytes = std::fs::metadata(db_path.with_extension("db-wal"))?.len();
+    let shadow_bytes = walkdir::WalkDir::new(temp.path().join(format!(".walrust-{name}")))
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum::<u64>();
+    eprintln!(
+        "local-first latency proof: checkpoint={:?} lag_objects={} lag_bytes={} live_wal_bytes={} shadow_bytes={} spool_bytes={} spool_free_bytes={}",
+        local_checkpoint_elapsed,
+        remote_lag_objects,
+        remote_lag_bytes,
+        live_wal_bytes,
+        shadow_bytes,
+        spool_bytes,
+        spool_free_bytes
+    );
+    anyhow::ensure!(
+        remote_lag_objects > 0 && remote_lag_bytes > 0,
+        "paused PUT did not create measurable remote lag"
+    );
+    anyhow::ensure!(
+        watch_log(&log_path).contains("local_hadbp_stage_ms")
+            && watch_log(&log_path).contains("sqlite_checkpoint_ms"),
+        "stage/fsync and checkpoint durations were not recorded"
+    );
 
     let runtime = tokio::runtime::Runtime::new()?;
     let native_remote_prefix = format!("{prefix}/{name}/native/v1/");
@@ -955,6 +995,10 @@ fn e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put() -> Result<()
         &expected,
     )?;
     assert_integrity_ok(&restored_path)?;
+    anyhow::ensure!(
+        watch_log(&log_path).contains("remote_upload_ms"),
+        "remote upload duration was not recorded after resume"
+    );
     runtime.block_on(async {
         let storage = walrust::s3_backend_from_env(test_bucket(), endpoint.as_deref()).await?;
         for (key, staged) in &exact_staged_objects {
