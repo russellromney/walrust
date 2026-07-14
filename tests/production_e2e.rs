@@ -420,12 +420,35 @@ struct LoggedWatchArgs<'a> {
 }
 
 fn spawn_cli_watch_logged(args: LoggedWatchArgs<'_>) -> Result<Child> {
-    spawn_cli_watch_logged_with_checkpoint_release(args, None)
+    spawn_cli_watch_logged_with_options(args, None, None, None)
 }
 
 fn spawn_cli_watch_logged_with_checkpoint_release(
     args: LoggedWatchArgs<'_>,
     checkpoint_release: Option<&str>,
+) -> Result<Child> {
+    spawn_cli_watch_logged_with_options(args, checkpoint_release, None, None)
+}
+
+fn spawn_cli_watch_logged_with_upload_crash_once(
+    args: LoggedWatchArgs<'_>,
+    crash_once_file: &Path,
+) -> Result<Child> {
+    spawn_cli_watch_logged_with_options(args, None, Some(crash_once_file), None)
+}
+
+fn spawn_cli_watch_logged_with_cleanup_interval(
+    args: LoggedWatchArgs<'_>,
+    cleanup_interval_ms: u64,
+) -> Result<Child> {
+    spawn_cli_watch_logged_with_options(args, None, None, Some(cleanup_interval_ms))
+}
+
+fn spawn_cli_watch_logged_with_options(
+    args: LoggedWatchArgs<'_>,
+    checkpoint_release: Option<&str>,
+    crash_once_file: Option<&Path>,
+    cleanup_interval_ms: Option<u64>,
 ) -> Result<Child> {
     let log = std::fs::File::create(args.log_path)?;
     let log_err = log.try_clone()?;
@@ -462,6 +485,15 @@ fn spawn_cli_watch_logged_with_checkpoint_release(
     }
     if let Some(path) = args.native_upload_pause_file {
         watch.env("WALRUST_TEST_NATIVE_UPLOAD_PAUSE_FILE", path);
+    }
+    if let Some(path) = crash_once_file {
+        watch.env("WALRUST_TEST_NATIVE_UPLOAD_CRASH_ONCE_FILE", path);
+    }
+    if let Some(interval_ms) = cleanup_interval_ms {
+        watch.env(
+            "WALRUST_TEST_NATIVE_CLEANUP_INTERVAL_MS",
+            interval_ms.to_string(),
+        );
     }
     if let Some(name) = args.durability_failpoint {
         watch.env("WALRUST_TEST_DURABILITY_FAILPOINT", name);
@@ -1032,6 +1064,219 @@ fn e2e_cli_remote_checkpoint_release_waits_for_contiguous_live_publish() -> Resu
     assert_integrity_ok(&restored_path)?;
     stop_child(&mut child);
     cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_native_uploader_crash_restarts_from_durable_spool() -> Result<()> {
+    require_s3!("e2e_cli_native_uploader_crash_restarts_from_durable_spool");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-uploader-supervisor");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("watch.log");
+    let crash_once_file = temp.path().join("crash-uploader-once");
+    std::fs::write(&crash_once_file, b"crash once")?;
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "native-uploader-supervisor")?;
+    let mut child = spawn_cli_watch_logged_with_upload_crash_once(
+        LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &log_path,
+            config_path: None,
+            checkpoint_interval: 1,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        },
+        &crash_once_file,
+    )?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+    append_wide_rows(&writer, 6, 80, "native-uploader-supervisor")?;
+    let expected = rows(&db_path)?;
+
+    let restart_deadline = Instant::now() + e2e_poll_deadline(30);
+    while !watch_log(&log_path)
+        .contains("remote_lag: native uploader died; restarting from durable spool")
+    {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watcher exited with its uploader ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < restart_deadline,
+            "uploader crash was not supervised:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    anyhow::ensure!(
+        child.try_wait()?.is_none(),
+        "watcher must remain alive after uploader restart:\n{}",
+        watch_log(&log_path)
+    );
+    stop_child(&mut child);
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_sigkill_during_graceful_shutdown_recovers_pending_native_work() -> Result<()> {
+    require_s3!("e2e_cli_sigkill_during_graceful_shutdown_recovers_pending_native_work");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-shutdown-crash");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let log_path = temp.path().join("shutdown.log");
+    let marker = temp.path().join("shutdown.marker");
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "native-shutdown-crash")?;
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: Some("shutdown_local_admission_complete"),
+        durability_failpoint_marker: Some(&marker),
+    })?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+    append_wide_rows(&writer, 6, 80, "native-shutdown-crash")?;
+    let expected = rows(&db_path)?;
+    let signal = Command::new("kill")
+        .arg("-TERM")
+        .arg(child.id().to_string())
+        .status()?;
+    anyhow::ensure!(signal.success(), "failed to send SIGTERM to watch child");
+    wait_for_durability_failpoint(&marker, &log_path, &mut child)?;
+    stop_child(&mut child);
+
+    let restart_log = temp.path().join("restart.log");
+    let mut restarted = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &restart_log,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    anyhow::ensure!(
+        restarted.try_wait()?.is_none(),
+        "watcher died after shutdown-boundary recovery:\n{}",
+        watch_log(&restart_log)
+    );
+    stop_child(&mut restarted);
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_sigkill_restarts_every_native_cleanup_boundary() -> Result<()> {
+    require_s3!("e2e_cli_sigkill_restarts_every_native_cleanup_boundary");
+    let endpoint = test_endpoint();
+    for boundary in ["cleanup_marked_deleting", "cleanup_payloads_deleted"] {
+        let temp = TempDir::new()?;
+        let name = unique_name(&format!("cli-native-{boundary}"));
+        let prefix = format!("e2e/{name}");
+        let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+        let db_path = temp.path().join(format!("{name}.db"));
+        let restored_path = temp.path().join("restored.db");
+        let log_path = temp.path().join("cleanup.log");
+        let marker = temp.path().join("cleanup.marker");
+
+        let setup = create_source_db(&db_path, 5)?;
+        write_pin_frame(&setup, boundary)?;
+        let expected = rows(&db_path)?;
+        let mut crashed = spawn_cli_watch_logged_with_cleanup_interval(
+            LoggedWatchArgs {
+                db_path: &db_path,
+                bucket_arg: &bucket_arg,
+                endpoint: endpoint.as_deref(),
+                log_path: &log_path,
+                config_path: None,
+                checkpoint_interval: 999_999,
+                min_checkpoint_pages: 1,
+                wal_truncate_threshold: 100_000,
+                native_upload_pause_file: None,
+                durability_failpoint: Some(boundary),
+                durability_failpoint_marker: Some(&marker),
+            },
+            250,
+        )?;
+        wait_for_durability_failpoint(&marker, &log_path, &mut crashed)?;
+        stop_child(&mut crashed);
+
+        let restart_log = temp.path().join("restart.log");
+        let mut restarted = spawn_cli_watch_logged(LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &restart_log,
+            config_path: None,
+            checkpoint_interval: 999_999,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        })?;
+        wait_for_cli_restore_rows(
+            &name,
+            &bucket_arg,
+            endpoint.as_deref(),
+            &restored_path,
+            &expected,
+        )?;
+        assert_integrity_ok(&restored_path)?;
+        anyhow::ensure!(
+            restarted.try_wait()?.is_none(),
+            "watcher died after cleanup recovery at {boundary}:\n{}",
+            watch_log(&restart_log)
+        );
+        stop_child(&mut restarted);
+        cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    }
     Ok(())
 }
 

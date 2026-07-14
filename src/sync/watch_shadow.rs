@@ -1771,8 +1771,20 @@ pub async fn watch_with_shadow(
     let mut validation_timer = tokio::time::interval(validation_interval_duration);
     validation_timer.tick().await;
 
-    // Cache cleanup timer (every 5 minutes when cache is enabled)
-    let mut cache_cleanup_timer = tokio::time::interval(Duration::from_secs(300));
+    // Cache/native-spool cleanup timer (every 5 minutes in production). The
+    // debug-only override lets parent/child durability tests SIGKILL the two
+    // cleanup journal boundaries without waiting five minutes.
+    let cleanup_interval = if cfg!(debug_assertions) {
+        std::env::var("WALRUST_TEST_NATIVE_CLEANUP_INTERVAL_MS")
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|millis| *millis > 0)
+            .map(Duration::from_millis)
+            .unwrap_or_else(|| Duration::from_secs(300))
+    } else {
+        Duration::from_secs(300)
+    };
+    let mut cache_cleanup_timer = tokio::time::interval(cleanup_interval);
     cache_cleanup_timer.tick().await; // Skip first immediate tick
 
     // Parse cache retention for cleanup

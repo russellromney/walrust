@@ -369,14 +369,38 @@ impl NativeSpool {
         if &journal.identity != expected_identity {
             bail!("native spool identity mismatch while validating local base");
         }
-        let Some(base) = journal.objects.get(&journal.local_base_seq) else {
-            return Ok(false);
+        let base = match journal.objects.get(&journal.local_base_seq) {
+            Some(base)
+                if base.kind == ObjectKind::Snapshot
+                    && base.local_creation_state == LocalCreationState::Installed =>
+            {
+                base
+            }
+            _ => {
+                // cleanup_published_before_latest_snapshot first commits every
+                // victim as Deleting, then removes payloads, and only in its
+                // final journal commit advances local_base_seq. Preflight runs
+                // before create_or_open completes that transaction, so accept
+                // only this exact, deterministic interrupted-cleanup shape.
+                let Some(candidate) = journal
+                    .objects
+                    .values()
+                    .find(|object| object.local_creation_state != LocalCreationState::Deleting)
+                else {
+                    return Ok(false);
+                };
+                if candidate.kind != ObjectKind::Snapshot
+                    || candidate.local_creation_state != LocalCreationState::Installed
+                    || candidate.seq <= journal.local_base_seq
+                    || journal.objects.range(..candidate.seq).any(|(_, object)| {
+                        object.local_creation_state != LocalCreationState::Deleting
+                    })
+                {
+                    return Ok(false);
+                }
+                candidate
+            }
         };
-        if base.kind != ObjectKind::Snapshot
-            || base.local_creation_state != LocalCreationState::Installed
-        {
-            return Ok(false);
-        }
         let payload = fs::read(root.join("objects").join(base.payload_file_name()))
             .with_context(|| format!("read local native snapshot base seq {}", base.seq))?;
         validate_payload(base, &payload, &std::env::temp_dir())?;
@@ -2263,6 +2287,71 @@ mod tests {
                 .query_row("SELECT count(*) FROM t", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    #[test]
+    fn complete_base_preflight_accepts_only_proven_interrupted_cleanup() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (first, first_checksum, first_pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: first_checksum,
+                end_page_count: first_pages,
+                intended_remote_key: "one.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &first,
+            })
+            .unwrap();
+        let (second, second_checksum, second_pages) = snapshot(&db, 2, first_checksum);
+        spool
+            .stage(StageObject {
+                seq: 2,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: first_checksum,
+                ending_chain_checksum: second_checksum,
+                end_page_count: second_pages,
+                intended_remote_key: "two.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &second,
+            })
+            .unwrap();
+        spool
+            .journal
+            .objects
+            .get_mut(&1)
+            .unwrap()
+            .local_creation_state = LocalCreationState::Deleting;
+        spool.persist_journal().unwrap();
+
+        assert!(NativeSpool::validate_existing_complete_base(&root, &id).unwrap());
+        remove_and_sync(
+            &spool.payload_path(spool.journal.objects.get(&1).unwrap()),
+            &spool.objects_dir,
+        )
+        .unwrap();
+        assert!(
+            NativeSpool::validate_existing_complete_base(&root, &id).unwrap(),
+            "the newer installed snapshot remains complete after victim payload deletion"
+        );
+
+        spool
+            .journal
+            .objects
+            .get_mut(&1)
+            .unwrap()
+            .local_creation_state = LocalCreationState::Installed;
+        spool.persist_journal().unwrap();
+        assert!(
+            NativeSpool::validate_existing_complete_base(&root, &id).is_err(),
+            "a missing ordinary base payload must fail loudly"
         );
     }
 }
