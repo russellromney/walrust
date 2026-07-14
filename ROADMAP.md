@@ -532,6 +532,17 @@ image and adversarial identity segmentation collision. Each new call site was
 neutered and failed before restoration. See `CHANGELOG.md` and the atomic PR
 history for the proof ledger. The user retains merge authority.
 
+The final independent follow-up also closes upgrade and live-error boundaries:
+markerless shadow directories are never adopted as durable merely because they
+are aligned, but are discarded and rotated into a full-snapshot cursor domain;
+failed live appends restore both the fsynced marker/file boundary and the WAL
+checksum/generation cursor before retry; and native SQLite Backup reads through
+the lifetime source connection opened before the blocker, so no source close
+creates a snapshot handoff checkpoint window. Snapshot capacity includes a
+full-size destination rollback-journal transient. Live Tigris tests prove the
+markerless snapshot→new-generation-delta path and a blocked application
+TRUNCATE plus exact restore at the former snapshot handoff.
+
 ---
 
 ## Compaction (shipped — default off)

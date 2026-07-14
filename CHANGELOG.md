@@ -51,6 +51,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reserves install-intent and journal rewrite peaks. SIGTERM retries local
   admission indefinitely with the blocker held when capacity or local I/O is
   unhealthy; SIGKILL remains the explicit forced-stop route.
+- **Shadow proof-boundary follow-up:** markerless pre-upgrade shadow segments
+  are no longer fsynced and adopted during startup; they are discarded, the
+  source-cursor generation is rotated, and a full native snapshot is required
+  before later deltas. Live append write/sync/marker failures restore the prior
+  durable marker, truncate and fsync the prior length, and roll back all
+  in-memory WAL cursor state before retry; rollback failure poisons admission
+  until restart. Native snapshots now use the lifetime SQLite source handle
+  opened before the checkpoint blocker, eliminating the source-close lock gap,
+  and capacity reserves a full destination rollback journal as well.
 - **Native spool ownership and collision safety:** an advisory ownership lock
   prevents local restore or a second mutating recovery opener from racing the
   watcher's payload-before-journal and cleanup windows. Active local restore
@@ -117,6 +126,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   shadow tails, journal/intent rewrite peaks, ownership contention, and
   adversarial path-component collisions. Each new production gate was disabled
   at its call site and observed failing before its restored green run.
+- Added live-S3 proofs that markerless upgrade re-anchors before emitting a
+  new-generation delta and that an application TRUNCATE remains blocked at the
+  native snapshot copy handoff while a post-copy commit restores exactly.
+  Injected unit failures cover partial write, pre-fsync, post-marker, and WAL
+  checksum-cursor rollback paths.
 - Pinned the checkpoint-blocker contract against real SQLite databases across
   every supported page size and synchronous level: a concurrent
   `wal_checkpoint(TRUNCATE)` reports busy and preserves the WAL until walrust
