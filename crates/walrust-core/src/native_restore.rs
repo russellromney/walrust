@@ -32,6 +32,7 @@ pub struct NativeVisibleState {
 /// point. Raw objects or records beyond a gap are deliberately invisible.
 pub async fn inspect_native_v1(
     storage: &dyn StorageBackend,
+    bucket: &str,
     prefix: &str,
     database: &str,
 ) -> Result<Option<NativeVisibleState>> {
@@ -40,7 +41,7 @@ pub async fn inspect_native_v1(
         return Ok(None);
     };
     let descriptor: StreamDescriptor = serde_json::from_slice(&bytes)?;
-    validate_descriptor(&descriptor, prefix, database)?;
+    validate_descriptor(&descriptor, bucket, prefix, database)?;
     let records = load_visible_records(storage, &descriptor).await?;
     let Some((head, _)) = records.last() else {
         return Ok(None);
@@ -122,6 +123,7 @@ pub fn restore_local_spool(
 /// when no native descriptor/base is visible.
 pub async fn verify_native_v1(
     storage: &dyn StorageBackend,
+    bucket: &str,
     prefix: &str,
     database: &str,
 ) -> Result<Option<usize>> {
@@ -130,7 +132,7 @@ pub async fn verify_native_v1(
         return Ok(None);
     };
     let descriptor: StreamDescriptor = serde_json::from_slice(&bytes)?;
-    validate_descriptor(&descriptor, prefix, database)?;
+    validate_descriptor(&descriptor, bucket, prefix, database)?;
     let records = load_visible_records(storage, &descriptor).await?;
     if records.is_empty() {
         return Ok(None);
@@ -184,6 +186,7 @@ pub async fn verify_native_v1(
 
 pub async fn restore_native_v1(
     storage: &dyn StorageBackend,
+    bucket: &str,
     prefix: &str,
     database: &str,
     output: &Path,
@@ -195,7 +198,7 @@ pub async fn restore_native_v1(
     };
     let descriptor: StreamDescriptor =
         serde_json::from_slice(&descriptor_bytes).context("decode native CLI stream descriptor")?;
-    validate_descriptor(&descriptor, prefix, database)?;
+    validate_descriptor(&descriptor, bucket, prefix, database)?;
 
     if let (Some(target), Some(boundary)) = (point_in_time, descriptor.legacy_boundary_txid) {
         if target <= boundary {
@@ -325,6 +328,10 @@ async fn load_visible_records(
             previous_publish_digest.as_deref(),
             previous_chain_checksum,
         )?;
+        // A publish record without its exact immutable payload is corruption,
+        // not a shorter visible chain. Every metadata-only consumer (inspect,
+        // list, prune) therefore gets the same payload proof as restore.
+        get_verified_object(storage, descriptor, &record).await?;
         previous_publish_digest = Some(sha256_hex(&bytes));
         previous_chain_checksum = Some(record.ending_chain_checksum);
         records.push((record, bytes));
@@ -336,8 +343,14 @@ async fn load_visible_records(
     Ok(records)
 }
 
-fn validate_descriptor(descriptor: &StreamDescriptor, prefix: &str, database: &str) -> Result<()> {
+fn validate_descriptor(
+    descriptor: &StreamDescriptor,
+    bucket: &str,
+    prefix: &str,
+    database: &str,
+) -> Result<()> {
     if descriptor.version != REMOTE_LAYOUT_VERSION
+        || descriptor.bucket != bucket
         || descriptor.prefix != prefix
         || descriptor.database != database
         || descriptor.first_native_seq == 0
@@ -432,13 +445,44 @@ async fn get_verified_object(
     }
     let marker = ltx::changeset_end_page_count(&decoded)?;
     match record.kind {
-        ObjectKind::Snapshot if marker.is_some() => {
-            bail!("published native snapshot has delta marker")
+        ObjectKind::Snapshot => {
+            if marker.is_some() {
+                bail!("published native snapshot has delta marker");
+            }
+            let scratch = std::env::temp_dir().join(format!(
+                ".walrust-native-object-verify-{}-{}.db",
+                std::process::id(),
+                uuid::Uuid::new_v4()
+            ));
+            remove_if_exists(&scratch)?;
+            let decoded_result = ltx::decode_to_db(&bytes, &scratch);
+            let page_count = decoded_result.as_ref().ok().and_then(|result| {
+                fs::metadata(&scratch)
+                    .ok()
+                    .map(|metadata| metadata.len() / result.header.page_size as u64)
+            });
+            let cleanup_result = remove_if_exists(&scratch);
+            let result = decoded_result?;
+            cleanup_result?;
+            if result.checksum != record.ending_chain_checksum
+                || page_count != Some(record.end_page_count)
+            {
+                bail!(
+                    "published native snapshot checksum/page-count mismatch at seq {}",
+                    record.seq
+                );
+            }
         }
-        ObjectKind::Delta if marker != Some(record.end_page_count) => {
-            bail!("published native delta end-page mismatch")
+        ObjectKind::Delta => {
+            if marker != Some(record.end_page_count)
+                || decoded.checksum != record.ending_chain_checksum
+            {
+                bail!(
+                    "published native delta checksum/end-page mismatch at seq {}",
+                    record.seq
+                );
+            }
         }
-        _ => {}
     }
     if record.lineage_id != descriptor.lineage_id {
         bail!("published native object lineage mismatch");
@@ -582,6 +626,11 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(inspect_native_v1(&storage, "p/", "db").await.unwrap(), None);
+        assert_eq!(
+            inspect_native_v1(&storage, "bucket", "p/", "db")
+                .await
+                .unwrap(),
+            None
+        );
     }
 }

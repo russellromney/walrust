@@ -631,10 +631,16 @@ mod tests {
         let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool).unwrap();
         uploader.publish_pending_once().await.unwrap();
         let output = dir.path().join("restored.sqlite");
-        let result =
-            crate::native_restore::restore_native_v1(storage.as_ref(), "p/", "db", &output, None)
-                .await
-                .unwrap();
+        let result = crate::native_restore::restore_native_v1(
+            storage.as_ref(),
+            "bucket",
+            "p/",
+            "db",
+            &output,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             result,
             crate::native_restore::NativeRestoreAvailability::Restored { seq: 1 }
@@ -648,6 +654,58 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
         assert_eq!(integrity, "ok");
+    }
+
+    #[tokio::test]
+    async fn published_record_with_missing_or_corrupt_payload_is_not_visible() {
+        let dir = tempdir().unwrap();
+        let spool = staged_spool(dir.path());
+        let storage = Arc::new(MemoryStorage::default());
+        let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool.clone()).unwrap();
+        uploader.publish_pending_once().await.unwrap();
+        let object_key = spool
+            .lock()
+            .unwrap()
+            .get(1)
+            .unwrap()
+            .intended_remote_key
+            .clone();
+
+        storage.delete(&object_key).await.unwrap();
+        let missing =
+            crate::native_restore::inspect_native_v1(storage.as_ref(), "bucket", "p/", "db")
+                .await
+                .unwrap_err();
+        assert!(missing
+            .to_string()
+            .contains("published native object is missing"));
+
+        storage.put(&object_key, b"divergent").await.unwrap();
+        let corrupt =
+            crate::native_restore::inspect_native_v1(storage.as_ref(), "bucket", "p/", "db")
+                .await
+                .unwrap_err();
+        assert!(corrupt.to_string().contains("length/digest mismatch"));
+    }
+
+    #[tokio::test]
+    async fn descriptor_bucket_must_match_the_actual_cli_destination() {
+        let dir = tempdir().unwrap();
+        let spool = staged_spool(dir.path());
+        let storage = Arc::new(MemoryStorage::default());
+        let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool).unwrap();
+        uploader.publish_pending_once().await.unwrap();
+        let error = crate::native_restore::inspect_native_v1(
+            storage.as_ref(),
+            "different-bucket",
+            "p/",
+            "db",
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("descriptor identity/layout mismatch"));
     }
 
     #[tokio::test]
@@ -702,7 +760,7 @@ mod tests {
         assert!(uploader.publish_pending_once().await.unwrap());
         assert!(uploader.publish_pending_once().await.unwrap());
         assert_eq!(
-            crate::native_restore::verify_native_v1(storage.as_ref(), "p/", "db")
+            crate::native_restore::verify_native_v1(storage.as_ref(), "bucket", "p/", "db")
                 .await
                 .unwrap(),
             Some(2)
@@ -717,6 +775,7 @@ mod tests {
             ));
             let result = crate::native_restore::restore_native_v1(
                 storage.as_ref(),
+                "bucket",
                 "p/",
                 "db",
                 &output,

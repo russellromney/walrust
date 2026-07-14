@@ -271,6 +271,7 @@ pub async fn restore(
     };
     match walrust_core::native_restore::restore_native_v1(
         &storage,
+        &bucket_name,
         &prefix,
         name,
         output,
@@ -363,7 +364,7 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
         for db in &dbs {
             let storage = S3Storage::new(client.clone(), bucket_name.clone());
             if let Some(native) =
-                walrust_core::native_restore::inspect_native_v1(&storage, &prefix, db)
+                walrust_core::native_restore::inspect_native_v1(&storage, &bucket_name, &prefix, db)
                     .await
                     .map_err(|e| classify_or_else(e, WalrustError::s3))?
             {

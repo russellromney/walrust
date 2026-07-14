@@ -233,7 +233,7 @@ pub(crate) async fn validate_backup_integrity(
 ) -> Result<ValidationResult> {
     let native_storage = ClassifiedS3Storage(S3Storage::new(client.clone(), bucket.to_string()));
     let native_verified =
-        walrust_core::native_restore::verify_native_v1(&native_storage, prefix, db_name)
+        walrust_core::native_restore::verify_native_v1(&native_storage, bucket, prefix, db_name)
             .await?
             .unwrap_or(0);
     let discovered = discover_all_ltx_from_s3(client, bucket, prefix, db_name)
@@ -583,11 +583,15 @@ pub async fn verify(
     println!();
 
     let native_storage = ClassifiedS3Storage(S3Storage::new(client.clone(), bucket_name.clone()));
-    let native_verified =
-        walrust_core::native_restore::verify_native_v1(&native_storage, &prefix, name)
-            .await
-            .map_err(|error| classify_or_else(error, WalrustError::integrity))?
-            .unwrap_or(0);
+    let native_verified = walrust_core::native_restore::verify_native_v1(
+        &native_storage,
+        &bucket_name,
+        &prefix,
+        name,
+    )
+    .await
+    .map_err(|error| classify_or_else(error, WalrustError::integrity))?
+    .unwrap_or(0);
     if native_verified > 0 {
         println!(
             "Native HADBP: verified {} contiguous published object(s)",

@@ -39,9 +39,14 @@ pub async fn prune(
             // incompatible chain. Use the same contiguous descriptor-selected
             // head calculation as restore/list before allowing destructive
             // legacy retention.
-            if walrust_core::native_restore::inspect_native_v1(&storage, &prefix, name)
-                .await?
-                .is_none()
+            if walrust_core::native_restore::inspect_native_v1(
+                &storage,
+                &bucket_name,
+                &prefix,
+                name,
+            )
+            .await?
+            .is_none()
             {
                 println!(
                     "Native migration for '{}' has no contiguous published snapshot base; refusing legacy prune",

@@ -143,6 +143,7 @@ async fn replicate_poll(
     let native_storage = S3Storage::new(client.clone(), bucket.to_string());
     match walrust_core::native_restore::restore_native_v1(
         &native_storage,
+        bucket,
         prefix,
         db_name,
         &native_tmp,
