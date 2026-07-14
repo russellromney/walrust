@@ -2818,6 +2818,75 @@ fn e2e_cli_offline_restart_refuses_identity_only_spool() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn e2e_cli_local_restore_rejects_ambiguous_native_spools_without_s3() -> Result<()> {
+    let temp = TempDir::new()?;
+    let spool_base = temp.path().join("spool");
+    let output_path = temp.path().join("must-not-exist.db");
+    let bucket = "offline-ambiguity-bucket";
+    let prefix = "restore-prefix/";
+    let database = "ambiguous.db";
+    let capacity = walrust::walrust_core::native_spool::CapacityPolicy {
+        warning_bytes: u64::MAX - 1,
+        hard_bytes: u64::MAX,
+        minimum_free_bytes: 0,
+    };
+
+    for lineage in ["lineage-a", "lineage-b"] {
+        let local_db = temp.path().join(format!("{lineage}.sqlite"));
+        std::fs::File::create(&local_db)?;
+        let identity = walrust::walrust_core::native_spool::SpoolIdentity::new(
+            &local_db,
+            bucket,
+            prefix,
+            database,
+            lineage,
+            1,
+            None,
+            true,
+        )?;
+        let root = walrust::walrust_core::native_spool::NativeSpool::path_for(
+            &spool_base,
+            &identity,
+        );
+        walrust::walrust_core::native_spool::NativeSpool::create_or_open(
+            &root,
+            identity,
+            capacity,
+        )?;
+    }
+
+    let result = Command::new(env!("CARGO_BIN_EXE_walrust"))
+        .arg("restore")
+        .arg(database)
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--bucket")
+        .arg(format!("{bucket}/{prefix}"))
+        .arg("--spool-dir")
+        .arg(&spool_base)
+        .arg("--endpoint")
+        .arg("http://127.0.0.1:9")
+        .output()?;
+    anyhow::ensure!(!result.status.success(), "ambiguous local restore succeeded");
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    anyhow::ensure!(
+        (stderr.contains("refusing ambiguous restore")
+            && stderr.contains("lineage-a")
+            && stderr.contains("lineage-b"))
+            || (stdout.contains("refusing ambiguous restore")
+                && stdout.contains("lineage-a")
+                && stdout.contains("lineage-b")),
+        "CLI did not report both ambiguous lineages:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    anyhow::ensure!(
+        !output_path.exists(),
+        "ambiguous restore created an output database"
+    );
+    Ok(())
+}
+
 /// DF1: short-lived application sessions must never become SQLite's last
 /// connection while shadow watch is running. The pinned `_walrust_seq` frame
 /// keeps the WAL alive, so the watcher neither dies on WAL lifecycle states nor
