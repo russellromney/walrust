@@ -14,6 +14,58 @@ use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
 use walrust_core::compaction::{list_merged_ranges, ranges_cover, RangeLayout, SeqRange};
 
+struct ClassifiedS3Storage(S3Storage);
+
+#[async_trait::async_trait]
+impl StorageBackend for ClassifiedS3Storage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.0
+            .get(key)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.0
+            .put(key, data)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.0
+            .delete(key)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.0
+            .list(prefix, after)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<hadb_storage::CasResult> {
+        self.0
+            .put_if_absent(key, data)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+
+    async fn put_if_match(
+        &self,
+        key: &str,
+        data: &[u8],
+        etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        self.0
+            .put_if_match(key, data, etag)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+}
+
 /// Verification issue found during verify
 #[derive(Debug, Clone)]
 pub struct VerifyIssue {
@@ -179,7 +231,7 @@ pub(crate) async fn validate_backup_integrity(
     prefix: &str,
     db_name: &str,
 ) -> Result<ValidationResult> {
-    let native_storage = S3Storage::new(client.clone(), bucket.to_string());
+    let native_storage = ClassifiedS3Storage(S3Storage::new(client.clone(), bucket.to_string()));
     let native_verified =
         walrust_core::native_restore::verify_native_v1(&native_storage, prefix, db_name)
             .await?
@@ -530,7 +582,7 @@ pub async fn verify(
     );
     println!();
 
-    let native_storage = S3Storage::new(client.clone(), bucket_name.clone());
+    let native_storage = ClassifiedS3Storage(S3Storage::new(client.clone(), bucket_name.clone()));
     let native_verified =
         walrust_core::native_restore::verify_native_v1(&native_storage, &prefix, name)
             .await
