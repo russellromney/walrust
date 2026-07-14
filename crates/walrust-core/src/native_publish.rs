@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 
 pub const REMOTE_LAYOUT_VERSION: u32 = 1;
 
@@ -112,22 +112,18 @@ pub struct RemoteLagState {
     pub pending_bytes: u64,
     pub oldest_age_ms: u64,
     pub last_error: Option<String>,
+    pub last_upload_duration_ms: u64,
 }
 
 #[derive(Clone)]
 pub struct UploadWake {
-    sender: mpsc::Sender<()>,
+    notify: Arc<Notify>,
 }
 
 impl UploadWake {
     /// Best effort only: durability is the spool journal, never this channel.
     pub fn notify(&self) {
-        match self.sender.try_send(()) {
-            Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::warn!("native uploader wake channel is closed; disk scan will recover")
-            }
-        }
+        self.notify.notify_one();
     }
 }
 
@@ -135,11 +131,12 @@ pub struct NativeUploader {
     storage: Arc<dyn StorageBackend>,
     spool: Arc<Mutex<NativeSpool>>,
     descriptor: StreamDescriptor,
-    wake_rx: mpsc::Receiver<()>,
+    wake: UploadWake,
     lag: Arc<Mutex<RemoteLagState>>,
     scan_interval: Duration,
     max_backoff: Duration,
     test_pause_file: Option<PathBuf>,
+    test_crash_once_file: Option<PathBuf>,
 }
 
 impl NativeUploader {
@@ -153,14 +150,16 @@ impl NativeUploader {
                 .map_err(|_| anyhow!("native spool lock poisoned"))?;
             StreamDescriptor::from(guard.identity())
         };
-        let (sender, wake_rx) = mpsc::channel(1);
+        let wake = UploadWake {
+            notify: Arc::new(Notify::new()),
+        };
         let lag = Arc::new(Mutex::new(RemoteLagState::default()));
         Ok((
             Self {
                 storage,
                 spool,
                 descriptor,
-                wake_rx,
+                wake: wake.clone(),
                 lag: lag.clone(),
                 scan_interval: Duration::from_secs(5),
                 max_backoff: Duration::from_secs(30),
@@ -169,18 +168,67 @@ impl NativeUploader {
                 } else {
                     None
                 },
+                test_crash_once_file: if cfg!(debug_assertions) {
+                    std::env::var_os("WALRUST_TEST_NATIVE_UPLOAD_CRASH_ONCE_FILE")
+                        .map(PathBuf::from)
+                } else {
+                    None
+                },
             },
-            UploadWake { sender },
+            wake,
             lag,
         ))
     }
 
+    pub fn with_runtime(
+        storage: Arc<dyn StorageBackend>,
+        spool: Arc<Mutex<NativeSpool>>,
+        wake: UploadWake,
+        lag: Arc<Mutex<RemoteLagState>>,
+    ) -> Result<Self> {
+        let descriptor = {
+            let guard = spool
+                .lock()
+                .map_err(|_| anyhow!("native spool lock poisoned"))?;
+            StreamDescriptor::from(guard.identity())
+        };
+        Ok(Self {
+            storage,
+            spool,
+            descriptor,
+            wake,
+            lag,
+            scan_interval: Duration::from_secs(5),
+            max_backoff: Duration::from_secs(30),
+            test_pause_file: if cfg!(debug_assertions) {
+                std::env::var_os("WALRUST_TEST_NATIVE_UPLOAD_PAUSE_FILE").map(PathBuf::from)
+            } else {
+                None
+            },
+            test_crash_once_file: if cfg!(debug_assertions) {
+                std::env::var_os("WALRUST_TEST_NATIVE_UPLOAD_CRASH_ONCE_FILE").map(PathBuf::from)
+            } else {
+                None
+            },
+        })
+    }
+
     /// Run until cancellation. Remote errors are lag state, not watcher-fatal.
-    pub async fn run(mut self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
+    pub async fn run(self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let mut backoff = Duration::from_millis(100);
         loop {
             if *shutdown.borrow() {
                 return;
+            }
+            if self
+                .test_crash_once_file
+                .as_ref()
+                .is_some_and(|path| path.exists())
+            {
+                if let Some(path) = &self.test_crash_once_file {
+                    let _ = std::fs::remove_file(path);
+                }
+                panic!("test-only native uploader crash");
             }
             if self
                 .test_pause_file
@@ -190,7 +238,7 @@ impl NativeUploader {
                 self.refresh_lag(Some("test uploader pause is active".to_string()));
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-                    _ = self.wake_rx.recv() => {}
+                    _ = self.wake.notify.notified() => {}
                     _ = shutdown.changed() => {}
                 }
                 continue;
@@ -208,7 +256,7 @@ impl NativeUploader {
                     self.refresh_lag(Some(format!("{error:#}")));
                     tokio::select! {
                         _ = tokio::time::sleep(backoff) => {}
-                        _ = self.wake_rx.recv() => {}
+                        _ = self.wake.notify.notified() => {}
                         _ = shutdown.changed() => {}
                     }
                     backoff = (backoff * 2).min(self.max_backoff);
@@ -218,7 +266,7 @@ impl NativeUploader {
 
             tokio::select! {
                 _ = tokio::time::sleep(self.scan_interval) => {}
-                _ = self.wake_rx.recv() => {}
+                _ = self.wake.notify.notified() => {}
                 _ = shutdown.changed() => {}
             }
         }
@@ -262,6 +310,12 @@ impl NativeUploader {
         self.ensure_descriptor().await?;
         let upload_started = std::time::Instant::now();
         self.ensure_remote_object(&object, &payload).await?;
+        if let Ok(mut lag) = self.lag.lock() {
+            lag.last_upload_duration_ms = upload_started
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64;
+        }
         tracing::info!(
             database = %object.database,
             seq = object.seq,
@@ -389,6 +443,7 @@ impl NativeUploader {
         if let (Some((pending_objects, pending_bytes, oldest_age_ms)), Ok(mut lag)) =
             (snapshot, self.lag.lock())
         {
+            let last_upload_duration_ms = lag.last_upload_duration_ms;
             *lag = RemoteLagState {
                 pending_objects,
                 pending_bytes,
@@ -398,6 +453,7 @@ impl NativeUploader {
                     oldest_age_ms
                 },
                 last_error,
+                last_upload_duration_ms,
             };
         }
     }

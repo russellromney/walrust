@@ -9,6 +9,7 @@ use crate::ltx;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -297,6 +298,8 @@ pub struct NativeSpool {
     snapshot_intent_path: PathBuf,
     journal: Journal,
     capacity: CapacityPolicy,
+    last_stage_duration_ms: u64,
+    last_capacity_state: Cell<CapacityState>,
 }
 
 impl NativeSpool {
@@ -424,6 +427,8 @@ impl NativeSpool {
             snapshot_intent_path: root.join("snapshot-intent.json"),
             journal,
             capacity,
+            last_stage_duration_ms: 0,
+            last_capacity_state: Cell::new(CapacityState::Healthy),
         };
         if migrated {
             spool.persist_journal()?;
@@ -663,6 +668,7 @@ impl NativeSpool {
     /// Install immutable HADBP bytes and atomically admit the matching object
     /// record. Returning success is the local checkpoint-release proof.
     pub fn stage(&mut self, stage: StageObject<'_>) -> Result<SpoolObject> {
+        let stage_started = std::time::Instant::now();
         if stage.seq == 0 {
             bail!("native spool sequence 0 is invalid");
         }
@@ -724,6 +730,11 @@ impl NativeSpool {
                 let bytes = fs::read(self.payload_path(existing))?;
                 validate_payload(existing, &bytes, &self.root)?;
                 if bytes == stage.payload {
+                    self.last_stage_duration_ms = stage_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u128::from(u64::MAX))
+                        as u64;
                     return Ok(existing.clone());
                 }
             }
@@ -773,6 +784,10 @@ impl NativeSpool {
         }
 
         remove_and_sync(&intent_path, &self.intents_dir)?;
+        self.last_stage_duration_ms = stage_started
+            .elapsed()
+            .as_millis()
+            .min(u128::from(u64::MAX)) as u64;
         Ok(object)
     }
 
@@ -974,15 +989,25 @@ impl NativeSpool {
     pub fn capacity_state(&self, additional_peak_bytes: u64) -> Result<CapacityState> {
         let used = self.used_bytes()?;
         let free = self.free_bytes()?;
-        if used.saturating_add(additional_peak_bytes) > self.capacity.hard_bytes
+        let state = if used.saturating_add(additional_peak_bytes) > self.capacity.hard_bytes
             || free.saturating_sub(additional_peak_bytes) < self.capacity.minimum_free_bytes
         {
-            Ok(CapacityState::Full)
+            CapacityState::Full
         } else if used.saturating_add(additional_peak_bytes) >= self.capacity.warning_bytes {
-            Ok(CapacityState::High)
+            CapacityState::High
         } else {
-            Ok(CapacityState::Healthy)
-        }
+            CapacityState::Healthy
+        };
+        self.last_capacity_state.set(state);
+        Ok(state)
+    }
+
+    pub fn last_stage_duration_ms(&self) -> u64 {
+        self.last_stage_duration_ms
+    }
+
+    pub fn last_capacity_state(&self) -> CapacityState {
+        self.last_capacity_state.get()
     }
 
     /// Reclaim only remotely published history older than the newest published

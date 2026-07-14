@@ -86,6 +86,11 @@ pub struct MetricsState {
     pub sync_latency_seconds: GaugeVec,
     pub spool_bytes: IntGaugeVec,
     pub spool_free_bytes: IntGaugeVec,
+    pub shadow_bytes: IntGaugeVec,
+    pub native_stage_duration_seconds: GaugeVec,
+    pub native_upload_duration_seconds: GaugeVec,
+    pub local_spool_high: IntGaugeVec,
+    pub local_spool_full: IntGaugeVec,
     pub remote_lag_objects: IntGaugeVec,
     pub remote_lag_bytes: IntGaugeVec,
     pub remote_lag_age_seconds: GaugeVec,
@@ -244,6 +249,56 @@ impl MetricsState {
         registry
             .register(Box::new(spool_free_bytes.clone()))
             .unwrap();
+        let shadow_bytes = IntGaugeVec::new(
+            Opts::new("walrust_shadow_bytes", "Fsynced local shadow WAL bytes"),
+            &["database"],
+        )
+        .unwrap();
+        registry.register(Box::new(shadow_bytes.clone())).unwrap();
+        let native_stage_duration_seconds = GaugeVec::new(
+            Opts::new(
+                "walrust_native_stage_duration_seconds",
+                "Last native HADBP payload and journal stage/fsync duration",
+            ),
+            &["database"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(native_stage_duration_seconds.clone()))
+            .unwrap();
+        let native_upload_duration_seconds = GaugeVec::new(
+            Opts::new(
+                "walrust_native_upload_duration_seconds",
+                "Last exact native HADBP remote upload duration",
+            ),
+            &["database"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(native_upload_duration_seconds.clone()))
+            .unwrap();
+        let local_spool_high = IntGaugeVec::new(
+            Opts::new(
+                "walrust_local_spool_high",
+                "1 when native spool last crossed its warning watermark",
+            ),
+            &["database"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(local_spool_high.clone()))
+            .unwrap();
+        let local_spool_full = IntGaugeVec::new(
+            Opts::new(
+                "walrust_local_spool_full",
+                "1 when native spool last hit its hard capacity or free-space reserve",
+            ),
+            &["database"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(local_spool_full.clone()))
+            .unwrap();
         let remote_lag_objects = IntGaugeVec::new(
             Opts::new(
                 "walrust_remote_lag_objects",
@@ -298,6 +353,11 @@ impl MetricsState {
             sync_latency_seconds,
             spool_bytes,
             spool_free_bytes,
+            shadow_bytes,
+            native_stage_duration_seconds,
+            native_upload_duration_seconds,
+            local_spool_high,
+            local_spool_full,
             remote_lag_objects,
             remote_lag_bytes,
             remote_lag_age_seconds,
@@ -773,6 +833,17 @@ mod tests {
 
         // Test sync latency
         state.record_sync_latency("db1", 0.25);
+        state.shadow_bytes.with_label_values(&["db1"]).set(8192);
+        state
+            .native_stage_duration_seconds
+            .with_label_values(&["db1"])
+            .set(0.01);
+        state
+            .native_upload_duration_seconds
+            .with_label_values(&["db1"])
+            .set(0.5);
+        state.local_spool_high.with_label_values(&["db1"]).set(1);
+        state.local_spool_full.with_label_values(&["db1"]).set(0);
 
         // Verify metrics are recorded
         let encoder = prometheus::TextEncoder::new();
@@ -785,5 +856,10 @@ mod tests {
         assert!(output.contains("walrust_checkpoint_duration_seconds"));
         assert!(output.contains("walrust_retry_total"));
         assert!(output.contains("walrust_sync_latency_seconds"));
+        assert!(output.contains("walrust_shadow_bytes"));
+        assert!(output.contains("walrust_native_stage_duration_seconds"));
+        assert!(output.contains("walrust_native_upload_duration_seconds"));
+        assert!(output.contains("walrust_local_spool_high"));
+        assert!(output.contains("walrust_local_spool_full"));
     }
 }

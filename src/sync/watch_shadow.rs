@@ -55,6 +55,72 @@ const WAL_SIZE_EXCEEDED_EVENT: &str = "wal_size_exceeded";
 
 type NativeSpoolState = (Arc<Mutex<NativeSpool>>, UploadWake);
 
+fn spawn_native_uploader_supervisor(
+    initial: NativeUploader,
+    storage: Arc<dyn StorageBackend>,
+    spool: Arc<Mutex<NativeSpool>>,
+    wake: UploadWake,
+    lag: Arc<Mutex<walrust_core::native_publish::RemoteLagState>>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut next = Some(initial);
+        loop {
+            if *shutdown.borrow() {
+                return;
+            }
+            let uploader = match next.take() {
+                Some(uploader) => uploader,
+                None => match NativeUploader::with_runtime(
+                    Arc::clone(&storage),
+                    Arc::clone(&spool),
+                    wake.clone(),
+                    Arc::clone(&lag),
+                ) {
+                    Ok(uploader) => uploader,
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            "remote_lag: failed to reconstruct native uploader; retrying from disk"
+                        );
+                        if let Ok(mut state) = lag.lock() {
+                            state.last_error = Some(format!("{error:#}"));
+                        }
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        continue;
+                    }
+                },
+            };
+            let mut child = tokio::spawn(uploader.run(shutdown.clone()));
+            tokio::select! {
+                result = &mut child => {
+                    if *shutdown.borrow() {
+                        return;
+                    }
+                    let detail = match result {
+                        Ok(()) => "native uploader exited unexpectedly".to_string(),
+                        Err(error) => format!("native uploader task failed: {error}"),
+                    };
+                    tracing::error!(
+                        error = %detail,
+                        "remote_lag: native uploader died; restarting from durable spool"
+                    );
+                    if let Ok(mut state) = lag.lock() {
+                        state.last_error = Some(detail);
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        let _ = child.await;
+                        return;
+                    }
+                }
+            }
+        }
+    })
+}
+
 fn spool_lock(spool: &Arc<Mutex<NativeSpool>>) -> Result<std::sync::MutexGuard<'_, NativeSpool>> {
     spool
         .lock()
@@ -1512,9 +1578,17 @@ pub async fn watch_with_shadow(
         }
         let storage: Arc<dyn StorageBackend> =
             Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
-        let (native_uploader, wake, lag) = NativeUploader::new(storage, Arc::clone(&spool))?;
+        let (native_uploader, wake, lag) =
+            NativeUploader::new(Arc::clone(&storage), Arc::clone(&spool))?;
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-        let handle = tokio::spawn(native_uploader.run(shutdown_rx));
+        let handle = spawn_native_uploader_supervisor(
+            native_uploader,
+            storage,
+            Arc::clone(&spool),
+            wake.clone(),
+            Arc::clone(&lag),
+            shutdown_rx,
+        );
         native_spools.insert(db_path.clone(), (spool, wake));
         native_lag_states.insert(db_path.clone(), lag);
         native_uploader_shutdown.insert(db_path.clone(), shutdown_tx);
@@ -1852,7 +1926,9 @@ pub async fn watch_with_shadow(
                                     name: state.name.clone(),
                                     path: state.db_path.display().to_string(),
                                     last_sync_timestamp: chrono::Utc::now().timestamp(),
-                                    wal_size_bytes: shadow_size,
+                                    wal_size_bytes: std::fs::metadata(&state.wal_path)
+                                        .map(|metadata| metadata.len())
+                                        .unwrap_or(0),
                                     next_snapshot_timestamp: state.last_snapshot.map(|t| t.timestamp() + global_sync.snapshot_interval as i64).unwrap_or(0),
                                     error_count: 0,
                                     snapshot_count: 0,
@@ -1860,6 +1936,10 @@ pub async fn watch_with_shadow(
                                     last_error: None,
                                     errors_last_hour: None,
                                 }).await;
+                                metrics_state
+                                    .shadow_bytes
+                                    .with_label_values(&[&state.name])
+                                    .set(shadow_size.min(i64::MAX as u64) as i64);
 
                                 // Update trigger state
                                 if let Some(trigger) = trigger_states.get_mut(&output.db_path) {
@@ -1917,6 +1997,32 @@ pub async fn watch_with_shadow(
                         .spool_free_bytes
                         .with_label_values(&[&state.name])
                         .set(guard.free_bytes()?.min(i64::MAX as u64) as i64);
+                    metrics_state
+                        .native_stage_duration_seconds
+                        .with_label_values(&[&state.name])
+                        .set(guard.last_stage_duration_ms() as f64 / 1000.0);
+                    let capacity_state = guard.last_capacity_state();
+                    metrics_state
+                        .local_spool_high
+                        .with_label_values(&[&state.name])
+                        .set(i64::from(capacity_state == CapacityState::High));
+                    metrics_state
+                        .local_spool_full
+                        .with_label_values(&[&state.name])
+                        .set(i64::from(capacity_state == CapacityState::Full));
+                    metrics_state
+                        .shadow_bytes
+                        .with_label_values(&[&state.name])
+                        .set(shadow_storage_bytes(state).min(i64::MAX as u64) as i64);
+                    metrics_state
+                        .wal_size
+                        .with_label_values(&[&state.name])
+                        .set(
+                            std::fs::metadata(&state.wal_path)
+                                .map(|metadata| metadata.len())
+                                .unwrap_or(0)
+                                .min(i64::MAX as u64) as i64,
+                        );
                     drop(guard);
                     if let Some(lag) = native_lag_states.get(db_path) {
                         if let Ok(lag) = lag.lock() {
@@ -1932,6 +2038,10 @@ pub async fn watch_with_shadow(
                                 .remote_lag_age_seconds
                                 .with_label_values(&[&state.name])
                                 .set(lag.oldest_age_ms as f64 / 1000.0);
+                            metrics_state
+                                .native_upload_duration_seconds
+                                .with_label_values(&[&state.name])
+                                .set(lag.last_upload_duration_ms as f64 / 1000.0);
                         }
                     }
                 }
