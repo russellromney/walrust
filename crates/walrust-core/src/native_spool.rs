@@ -393,9 +393,14 @@ impl NativeSpool {
                 };
                 if candidate.kind != ObjectKind::Snapshot
                     || candidate.local_creation_state != LocalCreationState::Installed
+                    || candidate.remote_upload_state != RemoteUploadState::Published
                     || candidate.seq <= journal.local_base_seq
                     || journal.objects.range(..candidate.seq).any(|(_, object)| {
                         object.local_creation_state != LocalCreationState::Deleting
+                            || object.remote_upload_state != RemoteUploadState::Published
+                    })
+                    || journal.objects.range(candidate.seq..).any(|(_, object)| {
+                        object.local_creation_state == LocalCreationState::Deleting
                     })
                 {
                     return Ok(false);
@@ -1256,6 +1261,55 @@ impl NativeSpool {
         if self.journal.admitted_seq != self.journal.objects.last_key_value().map(|(seq, _)| *seq) {
             bail!("native spool admitted cursor does not equal the journal object head");
         }
+        if let Some(remote_seq) = self.journal.remote_published_seq {
+            if remote_seq < self.journal.local_base_seq
+                || self
+                    .journal
+                    .admitted_seq
+                    .map_or(true, |admitted| remote_seq > admitted)
+                || !self.journal.objects.contains_key(&remote_seq)
+            {
+                bail!(
+                    "native spool remote publish cursor {} is outside the retained admitted chain",
+                    remote_seq
+                );
+            }
+        }
+        for (seq, object) in &self.journal.objects {
+            let should_be_published = self
+                .journal
+                .remote_published_seq
+                .is_some_and(|remote_seq| *seq <= remote_seq);
+            match object.remote_upload_state {
+                RemoteUploadState::Pending => {
+                    if should_be_published
+                        || object.uploaded_unix_ms.is_some()
+                        || object.published_unix_ms.is_some()
+                        || object.publish_record_sha256.is_some()
+                    {
+                        bail!("native spool pending upload state is inconsistent at seq {seq}");
+                    }
+                }
+                RemoteUploadState::Uploaded => {
+                    if should_be_published
+                        || object.uploaded_unix_ms.is_none()
+                        || object.published_unix_ms.is_some()
+                        || object.publish_record_sha256.is_some()
+                    {
+                        bail!("native spool uploaded state is inconsistent at seq {seq}");
+                    }
+                }
+                RemoteUploadState::Published => {
+                    if !should_be_published
+                        || object.uploaded_unix_ms.is_none()
+                        || object.published_unix_ms.is_none()
+                        || object.publish_record_sha256.is_none()
+                    {
+                        bail!("native spool published state is inconsistent at seq {seq}");
+                    }
+                }
+            }
+        }
         match (
             self.journal.checkpointed_seq,
             self.journal.checkpointed_source_cursor.as_ref(),
@@ -1277,6 +1331,38 @@ impl NativeSpool {
                 _ => {}
             },
             (Some(_), None) => {}
+        }
+        if let Some(checkpointed_seq) = self.journal.checkpointed_seq {
+            let admitted_seq = self.journal.admitted_seq.ok_or_else(|| {
+                anyhow!("native spool checkpoint cursor exists without an admitted head")
+            })?;
+            if checkpointed_seq > admitted_seq {
+                bail!(
+                    "native spool checkpoint cursor {} is ahead of admitted head {}",
+                    checkpointed_seq,
+                    admitted_seq
+                );
+            }
+            if let Some(checkpoint_cursor) = self
+                .journal
+                .checkpointed_source_cursor
+                .as_ref()
+                .or_else(|| {
+                    self.journal
+                        .objects
+                        .get(&checkpointed_seq)
+                        .map(|object| &object.source_cursor)
+                })
+            {
+                let admitted_cursor = &self
+                    .journal
+                    .objects
+                    .get(&admitted_seq)
+                    .expect("admitted head was validated above")
+                    .source_cursor;
+                validate_source_cursor_successor(checkpoint_cursor, admitted_cursor)
+                    .context("native spool admitted cursor is behind its checkpoint cursor")?;
+            }
         }
         match &self.journal.checkpoint_window {
             CheckpointWindow::Closed => {}
@@ -1307,19 +1393,40 @@ impl NativeSpool {
         if deleting.is_empty() {
             return Ok(());
         }
+        let first_remaining = self
+            .journal
+            .objects
+            .values()
+            .find(|object| object.local_creation_state != LocalCreationState::Deleting)
+            .ok_or_else(|| anyhow!("native spool cleanup marked every local object deleting"))?;
+        if first_remaining.kind != ObjectKind::Snapshot
+            || first_remaining.local_creation_state != LocalCreationState::Installed
+            || first_remaining.remote_upload_state != RemoteUploadState::Published
+            || self
+                .journal
+                .objects
+                .range(..first_remaining.seq)
+                .any(|(_, object)| {
+                    object.local_creation_state != LocalCreationState::Deleting
+                        || object.remote_upload_state != RemoteUploadState::Published
+                })
+            || self
+                .journal
+                .objects
+                .range(first_remaining.seq..)
+                .any(|(_, object)| object.local_creation_state == LocalCreationState::Deleting)
+        {
+            bail!(
+                "native spool interrupted cleanup is not a published prefix below a complete snapshot base"
+            );
+        }
+        let new_base_seq = first_remaining.seq;
         for seq in deleting {
             let object = self.journal.objects.get(&seq).unwrap().clone();
             remove_and_sync(&self.payload_path(&object), &self.objects_dir)?;
             self.journal.objects.remove(&seq);
         }
-        let first_remaining =
-            self.journal.objects.values().next().ok_or_else(|| {
-                anyhow!("native spool cleanup removed its only local snapshot base")
-            })?;
-        if first_remaining.kind != ObjectKind::Snapshot {
-            bail!("native spool interrupted cleanup would leave no local snapshot base");
-        }
-        self.journal.local_base_seq = first_remaining.seq;
+        self.journal.local_base_seq = new_base_seq;
         self.persist_journal()
     }
 
@@ -1894,6 +2001,42 @@ mod tests {
     }
 
     #[test]
+    fn reopen_rejects_remote_cursor_ahead_of_object_publication_state() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: checksum,
+                end_page_count: pages,
+                intended_remote_key: "one.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &bytes,
+            })
+            .unwrap();
+
+        // Simulate a torn/corrupt journal cursor that claims remote visibility
+        // while the exact object and publish record remain locally pending.
+        spool.journal.remote_published_seq = Some(1);
+        spool.persist_journal().unwrap();
+        drop(spool);
+
+        let error = NativeSpool::create_or_open(&root, id, generous())
+            .err()
+            .expect("ahead remote cursor must fail spool reopen");
+        assert!(
+            format!("{error:#}").contains("pending upload state is inconsistent"),
+            "unexpected reopen error: {error:#}"
+        );
+    }
+
+    #[test]
     fn identity_only_journal_is_not_an_offline_restart_base() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
@@ -2399,6 +2542,8 @@ mod tests {
                 payload: &first,
             })
             .unwrap();
+        spool.mark_uploaded(1).unwrap();
+        spool.mark_published(1, b"record-one").unwrap();
         let (second, second_checksum, second_pages) = snapshot(&db, 2, first_checksum);
         spool
             .stage(StageObject {
@@ -2412,6 +2557,8 @@ mod tests {
                 payload: &second,
             })
             .unwrap();
+        spool.mark_uploaded(2).unwrap();
+        spool.mark_published(2, b"record-two").unwrap();
         spool
             .journal
             .objects
@@ -2441,6 +2588,62 @@ mod tests {
         assert!(
             NativeSpool::validate_existing_complete_base(&root, &id).is_err(),
             "a missing ordinary base payload must fail loudly"
+        );
+    }
+
+    #[test]
+    fn interrupted_cleanup_never_deletes_a_pending_object() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: checksum,
+                end_page_count: pages,
+                intended_remote_key: "one.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &bytes,
+            })
+            .unwrap();
+        let (second, second_checksum, second_pages) = snapshot(&db, 2, checksum);
+        spool
+            .stage(StageObject {
+                seq: 2,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: checksum,
+                ending_chain_checksum: second_checksum,
+                end_page_count: second_pages,
+                intended_remote_key: "two.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &second,
+            })
+            .unwrap();
+        let payload_path = spool.payload_path(spool.get(1).unwrap());
+        spool
+            .journal
+            .objects
+            .get_mut(&1)
+            .unwrap()
+            .local_creation_state = LocalCreationState::Deleting;
+        spool.persist_journal().unwrap();
+        drop(spool);
+
+        let error = NativeSpool::create_or_open(&root, id, generous())
+            .err()
+            .expect("pending cleanup victim must fail spool reopen");
+        assert!(
+            format!("{error:#}").contains("not a published prefix"),
+            "unexpected reopen error: {error:#}"
+        );
+        assert!(
+            payload_path.exists(),
+            "fail-closed cleanup validation must retain pending HADBP bytes"
         );
     }
 }
