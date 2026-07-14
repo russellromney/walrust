@@ -1421,6 +1421,35 @@ impl NativeSpool {
             );
         }
         let new_base_seq = first_remaining.seq;
+        let mut prior: Option<&SpoolObject> = None;
+        for (seq, object) in self.journal.objects.range(new_base_seq..) {
+            validate_object_identity(&self.journal.identity, object)?;
+            if object.local_creation_state != LocalCreationState::Installed {
+                bail!("native spool retained cleanup chain is not installed at seq {seq}");
+            }
+            if let Some(previous) = prior {
+                if object.seq != previous.seq + 1
+                    || object.previous_chain_checksum != previous.ending_chain_checksum
+                {
+                    bail!("native spool retained cleanup chain has a gap at seq {seq}");
+                }
+                validate_source_cursor_successor(&previous.source_cursor, &object.source_cursor)
+                    .with_context(|| {
+                        format!(
+                            "native spool retained cleanup source cursor regressed at seq {seq}"
+                        )
+                    })?;
+            } else if object.seq != new_base_seq || object.kind != ObjectKind::Snapshot {
+                bail!("native spool retained cleanup chain does not start with its snapshot base");
+            }
+            let payload = fs::read(self.payload_path(object)).with_context(|| {
+                format!("read retained native cleanup payload for sequence {seq}")
+            })?;
+            validate_payload(object, &payload, &self.root).with_context(|| {
+                format!("validate retained native cleanup payload for sequence {seq}")
+            })?;
+            prior = Some(object);
+        }
         for seq in deleting {
             let object = self.journal.objects.get(&seq).unwrap().clone();
             remove_and_sync(&self.payload_path(&object), &self.objects_dir)?;
@@ -2644,6 +2673,68 @@ mod tests {
         assert!(
             payload_path.exists(),
             "fail-closed cleanup validation must retain pending HADBP bytes"
+        );
+    }
+
+    #[test]
+    fn interrupted_cleanup_validates_replacement_chain_before_unlinking_old_base() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (first, first_checksum, first_pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: first_checksum,
+                end_page_count: first_pages,
+                intended_remote_key: "one.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &first,
+            })
+            .unwrap();
+        spool.mark_uploaded(1).unwrap();
+        spool.mark_published(1, b"record-one").unwrap();
+        let (second, second_checksum, second_pages) = snapshot(&db, 2, first_checksum);
+        spool
+            .stage(StageObject {
+                seq: 2,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: first_checksum,
+                ending_chain_checksum: second_checksum,
+                end_page_count: second_pages,
+                intended_remote_key: "two.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &second,
+            })
+            .unwrap();
+        spool.mark_uploaded(2).unwrap();
+        spool.mark_published(2, b"record-two").unwrap();
+        let old_base_path = spool.payload_path(spool.get(1).unwrap());
+        let replacement_path = spool.payload_path(spool.get(2).unwrap());
+        spool
+            .journal
+            .objects
+            .get_mut(&1)
+            .unwrap()
+            .local_creation_state = LocalCreationState::Deleting;
+        spool.persist_journal().unwrap();
+        fs::write(&replacement_path, b"corrupt replacement snapshot").unwrap();
+        drop(spool);
+
+        let error = NativeSpool::create_or_open(&root, id, generous())
+            .err()
+            .expect("corrupt replacement base must fail cleanup recovery");
+        assert!(
+            format!("{error:#}").contains("validate retained native cleanup payload"),
+            "unexpected reopen error: {error:#}"
+        );
+        assert!(
+            old_base_path.exists(),
+            "cleanup must validate the replacement chain before unlinking the old base"
         );
     }
 }
