@@ -1,16 +1,16 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use futures::future::join_all;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::signal;
 use tokio::sync::mpsc;
 
 use crate::cache::LocalCache;
-use crate::config::{CacheConfig, ResolvedDbConfig, SyncConfig, WebhookConfig};
+use crate::config::{CacheConfig, ResolvedDbConfig, SpoolConfig, SyncConfig, WebhookConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::errors::WalrustError;
 use crate::ltx;
@@ -18,7 +18,7 @@ use crate::retention::RetentionPolicy;
 use crate::retry::{RetryConfig, RetryPolicy};
 use crate::s3::{self, create_client, parse_bucket};
 use crate::shadow::ShadowWal;
-use crate::uploader::{spawn_uploader, UploadMessage, Uploader, UploaderStats};
+use crate::uploader::{UploadMessage, UploaderStats};
 use crate::webhook::{WebhookPayload, WebhookSender};
 use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
@@ -30,11 +30,20 @@ use walrust_core::legacy_shadow_watch::{
     save_shadow_watch_progress as save_shadow_progress, shadow_sync_input,
     wait_for_cache_checkpoint_durability,
 };
+use walrust_core::native_publish::{object_key as native_object_key, NativeUploader, UploadWake};
+use walrust_core::native_shadow::{encode_shadow_to_hadbp, NativeShadowInput};
+use walrust_core::native_spool::{
+    filesystem_available_bytes, CapacityPolicy, CapacityState, NativeSpool, ObjectKind,
+    SourceCursor, SpoolIdentity, StageObject,
+};
 
+use super::manifest::discover_state_from_s3;
 use super::shadow::{
     run_prune, sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry,
 };
-use super::types::{DbState, Manifest, ShadowDbState, ShadowSyncInput, TriggerState};
+#[cfg(test)]
+use super::types::Manifest;
+use super::types::{DbState, ShadowDbState, ShadowSyncInput, TriggerState};
 use super::verify::validate_backup_integrity;
 use super::wal_sync::take_snapshot_with_retry_and_rearm;
 
@@ -44,17 +53,340 @@ type ShadowSyncFuture =
 const CHECKPOINT_UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const WAL_SIZE_EXCEEDED_EVENT: &str = "wal_size_exceeded";
 
+type NativeSpoolState = (Arc<Mutex<NativeSpool>>, UploadWake);
+
+fn spool_lock(spool: &Arc<Mutex<NativeSpool>>) -> Result<std::sync::MutexGuard<'_, NativeSpool>> {
+    spool
+        .lock()
+        .map_err(|_| anyhow!("native spool lock poisoned"))
+}
+
+fn shadow_storage_bytes(state: &ShadowDbState) -> u64 {
+    walkdir::WalkDir::new(state.shadow.shadow_dir())
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| entry.metadata().ok())
+        .map(|metadata| metadata.len())
+        .sum()
+}
+
+fn source_footprint_on_spool_filesystem(state: &ShadowDbState, spool: &NativeSpool) -> Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let source = state
+            .db_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        if std::fs::metadata(source)?.dev() != std::fs::metadata(spool.root())?.dev() {
+            return Ok(0);
+        }
+    }
+    Ok(std::fs::metadata(&state.wal_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+        .saturating_add(shadow_storage_bytes(state)))
+}
+
+async fn stage_native_shadow(
+    state: &ShadowDbState,
+    spool_state: &NativeSpoolState,
+) -> Result<super::types::ShadowSyncOutput> {
+    let (seq, previous_chain_checksum) = {
+        let spool = spool_lock(&spool_state.0)?;
+        let seq = spool
+            .admitted_seq()
+            .map(|seq| seq + 1)
+            .unwrap_or(spool.identity().first_native_seq);
+        let previous = spool
+            .objects()
+            .last()
+            .map(|object| object.ending_chain_checksum)
+            .unwrap_or(0);
+        (seq, previous)
+    };
+    let input = NativeShadowInput {
+        seq,
+        previous_chain_checksum,
+        generation: state.shadow_sync_generation,
+        shadow_sync_offset: state.shadow_sync_offset,
+        page_size: state.shadow.page_size(),
+        shadow_dir: state.shadow.shadow_dir().to_path_buf(),
+    };
+    let encoded = tokio::task::spawn_blocking(move || encode_shadow_to_hadbp(&input)).await??;
+    let Some(encoded) = encoded else {
+        return Ok(super::types::ShadowSyncOutput {
+            db_path: state.db_path.clone(),
+            frame_count: 0,
+            new_shadow_sync_offset: state.shadow_sync_offset,
+            new_current_txid: state.current_txid,
+            new_db_checksum: state.db_checksum,
+        });
+    };
+    let cursor = SourceCursor {
+        shadow_generation: state.shadow_sync_generation,
+        shadow_frame_index: encoded.new_shadow_sync_offset / (24 + state.shadow.page_size() as u64),
+        wal_offset: state.wal_copy_offset,
+        wal_salt: state.shadow.wal_read_salt(),
+        wal_checksum_chain: state.shadow.wal_read_chain(),
+    };
+    let intended_remote_key = {
+        let spool = spool_lock(&spool_state.0)?;
+        native_object_key(spool.identity(), ObjectKind::Delta, encoded.seq)
+    };
+    let stage_started = std::time::Instant::now();
+    {
+        let mut spool = spool_lock(&spool_state.0)?;
+        let peak = (encoded.payload.len() as u64)
+            .saturating_mul(2)
+            .saturating_add(source_footprint_on_spool_filesystem(state, &spool)?);
+        match spool.capacity_state(peak)? {
+            CapacityState::High => tracing::error!(
+                database = %state.name,
+                event = "local_spool_high",
+                spool_bytes = spool.used_bytes()?,
+                filesystem_free_bytes = spool.free_bytes()?,
+                "local native spool crossed its warning watermark"
+            ),
+            CapacityState::Full => bail!(
+                "local_spool_full: {} cannot admit native seq {}; blocker remains held",
+                state.name,
+                encoded.seq
+            ),
+            CapacityState::Healthy => {}
+        }
+        spool.stage(StageObject {
+            seq: encoded.seq,
+            kind: ObjectKind::Delta,
+            previous_chain_checksum: encoded.previous_chain_checksum,
+            ending_chain_checksum: encoded.ending_chain_checksum,
+            end_page_count: encoded.end_page_count,
+            intended_remote_key,
+            source_cursor: cursor,
+            payload: &encoded.payload,
+        })?;
+    }
+    tracing::info!(
+        database = %state.name,
+        seq = encoded.seq,
+        frames = encoded.frame_count,
+        unique_pages = encoded.unique_pages,
+        bytes = encoded.payload.len(),
+        local_hadbp_stage_ms = stage_started.elapsed().as_millis() as u64,
+        "native HADBP delta admitted to durable local spool"
+    );
+    spool_state.1.notify();
+    Ok(super::types::ShadowSyncOutput {
+        db_path: state.db_path.clone(),
+        frame_count: encoded.frame_count,
+        new_shadow_sync_offset: encoded.new_shadow_sync_offset,
+        new_current_txid: encoded.seq,
+        new_db_checksum: Some(encoded.ending_chain_checksum),
+    })
+}
+
+async fn stage_native_snapshot(
+    state: &mut ShadowDbState,
+    spool_state: &NativeSpoolState,
+) -> Result<u64> {
+    let (seq, previous_chain_checksum, stable_path, intended_remote_key) = {
+        let spool = spool_lock(&spool_state.0)?;
+        let estimated_db_bytes = std::fs::metadata(&state.db_path)?.len();
+        let estimated_peak = estimated_db_bytes
+            .saturating_mul(3)
+            .saturating_add(source_footprint_on_spool_filesystem(state, &spool)?);
+        if spool.capacity_state(estimated_peak)? == CapacityState::Full {
+            bail!(
+                "local_spool_full: {} lacks peak capacity/reserve for native snapshot stable copy + temp + payload",
+                state.name
+            );
+        }
+        let seq = spool
+            .admitted_seq()
+            .map(|seq| seq + 1)
+            .unwrap_or(spool.identity().first_native_seq);
+        let previous = spool
+            .objects()
+            .last()
+            .map(|object| object.ending_chain_checksum)
+            .unwrap_or(0);
+        (
+            seq,
+            previous,
+            spool.root().join(format!(".snapshot-{seq:016x}.db.tmp")),
+            native_object_key(spool.identity(), ObjectKind::Snapshot, seq),
+        )
+    };
+    let db_path = state.db_path.clone();
+    let page_size = state.shadow.page_size();
+    let stable_parent = stable_path
+        .parent()
+        .ok_or_else(|| anyhow!("native snapshot path has no parent"))?
+        .to_path_buf();
+    let stable_for_encode = stable_path.clone();
+    let encoded_result = tokio::task::spawn_blocking(move || -> Result<_> {
+        match std::fs::remove_file(&stable_for_encode) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        let destination = stable_for_encode
+            .to_str()
+            .ok_or_else(|| anyhow!("native snapshot path is not UTF-8"))?;
+        let conn = Connection::open(&db_path)?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.execute("VACUUM INTO ?1", [destination])?;
+        let stable = std::fs::File::open(&stable_for_encode)?;
+        stable.sync_all()?;
+        std::fs::File::open(&stable_parent)?.sync_all()?;
+        walrust_core::ltx::encode_snapshot_with_checksum(
+            &stable_for_encode,
+            page_size,
+            seq,
+            previous_chain_checksum,
+        )
+    })
+    .await?;
+    let encoded = match encoded_result {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            let _ = std::fs::remove_file(&stable_path);
+            let _ = std::fs::File::open(
+                stable_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new(".")),
+            )
+            .and_then(|dir| dir.sync_all());
+            return Err(error);
+        }
+    };
+    let end_page_count = std::fs::metadata(&stable_path)?.len() / page_size as u64;
+    let cursor = SourceCursor {
+        shadow_generation: state.shadow.generation(),
+        shadow_frame_index: state.shadow.segment_offset() / (24 + page_size as u64),
+        wal_offset: state.wal_copy_offset,
+        wal_salt: state.shadow.wal_read_salt(),
+        wal_checksum_chain: state.shadow.wal_read_chain(),
+    };
+    let stage_started = std::time::Instant::now();
+    let stage_result = (|| -> Result<()> {
+        let mut spool = spool_lock(&spool_state.0)?;
+        let peak = (encoded.bytes.len() as u64)
+            .saturating_mul(2)
+            .saturating_add(source_footprint_on_spool_filesystem(state, &spool)?);
+        match spool.capacity_state(peak)? {
+            CapacityState::High => tracing::error!(
+                database = %state.name,
+                event = "local_spool_high",
+                spool_bytes = spool.used_bytes()?,
+                filesystem_free_bytes = spool.free_bytes()?,
+                "local native spool crossed its warning watermark while snapshotting"
+            ),
+            CapacityState::Full => {
+                return Err(anyhow!(
+                "local_spool_full: {} cannot admit native snapshot seq {}; blocker remains held",
+                state.name, seq
+            ))
+            }
+            CapacityState::Healthy => {}
+        }
+        spool.stage(StageObject {
+            seq,
+            kind: ObjectKind::Snapshot,
+            previous_chain_checksum,
+            ending_chain_checksum: encoded.checksum,
+            end_page_count,
+            intended_remote_key,
+            source_cursor: cursor,
+            payload: &encoded.bytes,
+        })?;
+        Ok(())
+    })();
+    let remove_result = std::fs::remove_file(&stable_path);
+    let sync_result = std::fs::File::open(
+        stable_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    )
+    .and_then(|dir| dir.sync_all());
+    stage_result?;
+    remove_result?;
+    sync_result?;
+    state.current_txid = seq;
+    state.db_checksum = Some(encoded.checksum);
+    state.last_snapshot = Some(chrono::Utc::now());
+    state.shadow_sync_generation = state.shadow.generation();
+    state.shadow_sync_offset = state.shadow.segment_offset();
+    save_shadow_progress(state)?;
+    tracing::info!(
+        database = %state.name,
+        seq,
+        bytes = encoded.bytes.len(),
+        local_hadbp_stage_ms = stage_started.elapsed().as_millis() as u64,
+        "native HADBP snapshot admitted to durable local spool"
+    );
+    spool_state.1.notify();
+    Ok(seq)
+}
+
+async fn require_native_snapshot(
+    state: &mut ShadowDbState,
+    spool_state: &NativeSpoolState,
+    reason: &str,
+) -> Result<u64> {
+    loop {
+        match stage_native_snapshot(state, spool_state).await {
+            Ok(seq) => return Ok(seq),
+            Err(error) if format!("{error:#}").contains("local_spool_full") => {
+                tracing::error!(
+                    database = %state.name,
+                    event = "local_spool_full",
+                    reason,
+                    error = %error,
+                    "required native snapshot cannot be admitted; retaining blocker and retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn wait_for_remote_publish(
+    spool: &Arc<Mutex<NativeSpool>>,
+    database: &str,
+    seq: u64,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if spool_lock(spool)?.remote_published_seq().unwrap_or(0) >= seq {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            bail!("{database}: timed out waiting for contiguous remote publish through native seq {seq}");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ShadowCheckpointMode {
     Passive,
     Truncate,
 }
 
-async fn checkpoint_with_state_blocker(
+#[derive(Debug)]
+struct CheckpointAttempt {
+    completed: bool,
+    dirty: bool,
+}
+
+async fn checkpoint_with_state_blocker_attempt(
     state: &mut ShadowDbState,
     mode: ShadowCheckpointMode,
     data_version_before: i64,
-) -> Result<bool> {
+) -> Result<CheckpointAttempt> {
     // End the blocker read transaction, then run the checkpoint on the
     // lifetime monitor. Its own checkpoint does not change its connection-local
     // data_version; any app commit since the caller's final copy baseline does,
@@ -82,18 +414,18 @@ async fn checkpoint_with_state_blocker(
         )
         .map_err(anyhow::Error::from)
         .and_then(|(busy, log_frames, checkpointed_frames): (i64, i64, i64)| {
-            if busy != 0 || checkpointed_frames < log_frames {
-                Err(anyhow!(
-                    "{}: shadow {} checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
-                    state.db_path.display(),
-                    mode_name,
+            let completed = busy == 0 && checkpointed_frames >= log_frames;
+            if !completed {
+                tracing::warn!(
+                    database = %state.name,
+                    checkpoint_mode = mode_name,
                     busy,
                     log_frames,
-                    checkpointed_frames
-                ))
-            } else {
-                Ok(())
+                    checkpointed_frames,
+                    "SQLite checkpoint was partial/busy; blocker will be rearmed and checkpoint retried later"
+                );
             }
+            Ok(completed)
         });
 
     // Sample before opening the replacement blocker because its heartbeat is
@@ -114,9 +446,12 @@ async fn checkpoint_with_state_blocker(
         Err(_) => Ok(false),
     };
     match (checkpoint_result, rearm_result) {
-        (Ok(()), Ok(())) => Ok(data_version_after? != data_version_before || !heartbeat_live?),
+        (Ok(completed), Ok(())) => Ok(CheckpointAttempt {
+            completed,
+            dirty: data_version_after? != data_version_before || !heartbeat_live?,
+        }),
         (Err(checkpoint_error), Ok(())) => Err(checkpoint_error),
-        (Ok(()), Err(rearm_error)) => Err(rearm_error),
+        (Ok(_), Err(rearm_error)) => Err(rearm_error),
         (Err(checkpoint_error), Err(rearm_error)) => {
             return Err(anyhow!(
                 "{}; additionally failed to rearm CLI checkpoint blocker: {}",
@@ -125,6 +460,18 @@ async fn checkpoint_with_state_blocker(
             ));
         }
     }
+}
+
+async fn checkpoint_with_state_blocker(
+    state: &mut ShadowDbState,
+    mode: ShadowCheckpointMode,
+    data_version_before: i64,
+) -> Result<bool> {
+    let attempt = checkpoint_with_state_blocker_attempt(state, mode, data_version_before).await?;
+    if !attempt.completed {
+        bail!("{}: shadow checkpoint incomplete", state.name);
+    }
+    Ok(attempt.dirty)
 }
 
 #[derive(Clone)]
@@ -284,6 +631,56 @@ async fn checkpoint_shadow_after_durable_sync(
     Ok(checkpoint_window_dirty)
 }
 
+async fn checkpoint_shadow_after_native_admission(
+    state: &mut ShadowDbState,
+    spool_state: &NativeSpoolState,
+    checkpoint_release: crate::config::CheckpointRelease,
+    drain_timeout: Duration,
+    checkpoint_mode: ShadowCheckpointMode,
+) -> Result<CheckpointAttempt> {
+    let data_version_before = checkpoint_data_version(state)?;
+    let (frames, new_offset) = state
+        .shadow
+        .copy_frames(state.wal_copy_offset)
+        .await
+        .with_context(|| format!("{}: shadow copy before checkpoint failed", state.name))?;
+    if !frames.is_empty() {
+        state.wal_copy_offset = new_offset;
+    }
+
+    let output = stage_native_shadow(state, spool_state).await?;
+    apply_shadow_sync_result_to_state(state, &output).await?;
+    let admitted_seq = spool_lock(&spool_state.0)?
+        .admitted_seq()
+        .ok_or_else(|| anyhow!("{}: native spool has no admitted snapshot base", state.name))?;
+    if checkpoint_release == crate::config::CheckpointRelease::Remote {
+        wait_for_remote_publish(&spool_state.0, &state.name, admitted_seq, drain_timeout).await?;
+    }
+
+    let checkpoint_started = std::time::Instant::now();
+    let attempt =
+        checkpoint_with_state_blocker_attempt(state, checkpoint_mode, data_version_before)
+            .await
+            .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
+    if !attempt.completed {
+        return Ok(attempt);
+    }
+    spool_lock(&spool_state.0)?.mark_checkpointed(admitted_seq)?;
+    tracing::info!(
+        database = %state.name,
+        seq = admitted_seq,
+        sqlite_checkpoint_ms = checkpoint_started.elapsed().as_millis() as u64,
+        release = ?checkpoint_release,
+        "controlled SQLite checkpoint completed after native spool admission"
+    );
+
+    let cleanup_before_gen = state.shadow_sync_generation;
+    if cleanup_before_gen > 0 {
+        state.shadow.cleanup_segments(cleanup_before_gen).await?;
+    }
+    Ok(attempt)
+}
+
 async fn live_wal_page_count(wal_path: &std::path::Path) -> Result<u64> {
     use tokio::io::AsyncReadExt;
 
@@ -423,6 +820,57 @@ async fn enforce_wal_backpressure(
     Ok(true)
 }
 
+async fn enforce_native_wal_backpressure(
+    state: &mut ShadowDbState,
+    threshold_pages: u64,
+    spool_state: &NativeSpoolState,
+    checkpoint_release: crate::config::CheckpointRelease,
+    webhook_sender: Arc<WebhookSender>,
+    drain_timeout: Duration,
+) -> Result<bool> {
+    if threshold_pages == 0 {
+        return Ok(false);
+    }
+    let wal_pages = live_wal_page_count(&state.wal_path).await?;
+    if wal_pages < threshold_pages {
+        return Ok(false);
+    }
+    let alarm = format!(
+        "{}: WAL backpressure alarm: live WAL reached {} pages (threshold {}); admitting native HADBP locally before controlled TRUNCATE",
+        state.name, wal_pages, threshold_pages
+    );
+    tracing::error!("{}", alarm);
+    webhook_sender
+        .send(
+            WebhookPayload::custom(WAL_SIZE_EXCEEDED_EVENT, &state.name, &alarm, 1).with_context(
+                serde_json::json!({
+                    "wal_pages": wal_pages,
+                    "threshold_pages": threshold_pages,
+                    "wal_path": state.wal_path.display().to_string(),
+                }),
+            ),
+        )
+        .await;
+    let attempt = checkpoint_shadow_after_native_admission(
+        state,
+        spool_state,
+        checkpoint_release,
+        drain_timeout,
+        ShadowCheckpointMode::Truncate,
+    )
+    .await?;
+    if !attempt.completed {
+        bail!(
+            "{}: controlled TRUNCATE was partial/busy; blocker rearmed and retry scheduled",
+            state.name
+        );
+    }
+    if attempt.dirty {
+        stage_native_snapshot(state, spool_state).await?;
+    }
+    Ok(true)
+}
+
 async fn shutdown_shadow_uploaders(
     cache_states: &HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
     db_states: &HashMap<PathBuf, ShadowDbState>,
@@ -547,6 +995,7 @@ pub async fn watch_with_shadow(
     retry_config: RetryConfig,
     webhooks: Vec<WebhookConfig>,
     cache_config: CacheConfig,
+    spool_config: SpoolConfig,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(
@@ -556,7 +1005,6 @@ pub async fn watch_with_shadow(
     );
 
     // Set up retry policy and webhook sender
-    let retry_policy = RetryPolicy::new(retry_config.clone());
     let webhook_sender = Arc::new(WebhookSender::new(webhooks));
 
     if retry_config.max_retries > 0 {
@@ -581,13 +1029,21 @@ pub async fn watch_with_shadow(
     }
 
     // Initialize cache + uploader per database (if cache enabled)
-    let mut cache_states: HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)> =
+    let cache_states: HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)> =
         HashMap::new();
-    let mut uploader_handles: Vec<(PathBuf, tokio::task::JoinHandle<Result<UploaderStats>>)> =
+    let uploader_handles: Vec<(PathBuf, tokio::task::JoinHandle<Result<UploaderStats>>)> =
         Vec::new();
+    let mut native_spools: HashMap<PathBuf, NativeSpoolState> = HashMap::new();
+    let mut native_uploader_shutdown: HashMap<PathBuf, tokio::sync::watch::Sender<bool>> =
+        HashMap::new();
+    let mut native_uploader_handles: Vec<(PathBuf, tokio::task::JoinHandle<()>)> = Vec::new();
+    let mut native_lag_states: HashMap<
+        PathBuf,
+        Arc<Mutex<walrust_core::native_publish::RemoteLagState>>,
+    > = HashMap::new();
     if cache_config.enabled {
         tracing::info!(
-            "Shadow mode cache enabled (concurrency={}, retention={}, max_size={})",
+            "Legacy LTX cache migration compatibility enabled (concurrency={}, retention={}, max_size={})",
             cache_config.uploader_concurrency,
             cache_config.retention,
             cache_config.max_size,
@@ -598,6 +1054,7 @@ pub async fn watch_with_shadow(
     let mut db_states: HashMap<PathBuf, ShadowDbState> = HashMap::new();
     let mut trigger_states: HashMap<PathBuf, TriggerState> = HashMap::new();
     let mut sync_configs: HashMap<PathBuf, SyncConfig> = HashMap::new();
+    let mut required_native_reanchors: HashSet<PathBuf> = HashSet::new();
     // Single-writer guards, held for the lifetime of this watch (E5).
     let mut db_locks: Vec<crate::lock::DbLock> = Vec::new();
 
@@ -617,7 +1074,28 @@ pub async fn watch_with_shadow(
         let name = db_config.prefix.clone();
         let wal_path = db_path.with_extension("db-wal");
 
-        // Check for existing state in S3 (manifest.json).
+        let spool_base = spool_config.path.clone().unwrap_or_else(|| {
+            db_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."))
+                .join(".walrust-spool")
+        });
+        let binding_identity = SpoolIdentity::new(
+            db_path,
+            bucket_name.clone(),
+            prefix.clone(),
+            name.clone(),
+            "binding-only",
+            1,
+            None,
+            false,
+        )?;
+        let spool_root = NativeSpool::path_for(&spool_base, &binding_identity);
+        let existing_spool_identity = NativeSpool::read_identity(&spool_root)?;
+
+        // A complete matching local spool is sufficient for offline restart.
+        // Without it, startup must verify both the versioned native descriptor
+        // and legacy manifest remotely; ambiguous cloud failure is never fresh.
         //
         // H8 cousin (PR #36 review): a TRANSIENT manifest fetch failure — or a
         // present-but-unparseable manifest — must NOT be silently read as "fresh
@@ -633,15 +1111,134 @@ pub async fn watch_with_shadow(
         // from the TYPED SDK error (`s3::download_error_is_not_found`), never
         // by matching message strings — free text like a DNS "host not found"
         // must not read as a missing manifest and silently start fresh.
-        let manifest_key = format!("{}{}/manifest.json", prefix, name);
-        let (mut current_txid, manifest_checksum) = match seed_state_from_manifest_fetch(
-            s3::download_bytes(&client, &bucket_name, &manifest_key).await,
-            s3::download_error_is_not_found,
-        )
-        .with_context(|| format!("{}: seeding startup state from manifest.json", name))?
+        let (mut current_txid, manifest_checksum, spool_identity) = if let Some(identity) =
+            existing_spool_identity
         {
-            ManifestSeed::Fresh => (0, None),
-            ManifestSeed::Seeded { txid, checksum } => (txid, checksum),
+            if !identity.remote_base_verified
+                || identity.canonical_db_path != binding_identity.canonical_db_path
+                || identity.bucket != bucket_name
+                || identity.prefix != prefix
+                || identity.database != name
+            {
+                bail!("{}: local native spool identity/base mismatch", name);
+            }
+            (0, None, identity)
+        } else {
+            // One-time compatibility migration: drain any durable legacy
+            // LTX cache before pinning the legacy boundary. This preserves
+            // every locally pending 0.7 PITR object, then the native stream
+            // re-anchors with a full snapshot. The new spool never adopts
+            // or rewrites these bytes.
+            let configured_legacy_cache = cache_config.path.as_ref().map(PathBuf::from);
+            let legacy_cache_path = configured_legacy_cache
+                .filter(|path| path.join("manifest.json").exists())
+                .unwrap_or_else(|| LocalCache::cache_dir_for_db(db_path));
+            if let Some(legacy_cache) = LocalCache::open(&legacy_cache_path)? {
+                if !legacy_cache.pending_uploads().is_empty() {
+                    tracing::info!(
+                        database = %name,
+                        cache = %legacy_cache_path.display(),
+                        "draining verified legacy LTX cache before native HADBP migration boundary"
+                    );
+                    let storage: Arc<dyn StorageBackend> =
+                        Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
+                    for txid in legacy_cache.pending_uploads() {
+                        let bytes = legacy_cache.read_ltx(txid)?;
+                        walrust_core::legacy_ltx::verify_ltx(std::io::Cursor::new(&bytes))?;
+                        let (generation, min_txid, max_txid) = legacy_cache.remote_key_parts(txid);
+                        let key = walrust_core::legacy_manifest::build_ltx_key(
+                            &prefix, &name, generation, min_txid, max_txid,
+                        );
+                        let cas = storage.put_if_absent(&key, &bytes).await?;
+                        if !cas.success {
+                            let existing = storage.get(&key).await?.ok_or_else(|| {
+                                anyhow!("legacy migration object vanished after CAS: {key}")
+                            })?;
+                            if existing != bytes {
+                                bail!(
+                                        "{}: divergent legacy LTX already exists at {}; refusing overwrite",
+                                        name,
+                                        key
+                                    );
+                            }
+                        }
+                        legacy_cache.mark_uploaded(txid)?;
+                    }
+                    if !legacy_cache.pending_uploads().is_empty() {
+                        bail!("{}: legacy cache did not drain contiguously; refusing native migration", name);
+                    }
+                }
+            }
+            let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
+            match s3::download_bytes(&client, &bucket_name, &descriptor_key).await {
+                    Ok(_) => bail!(
+                        "{}: remote native stream exists but no matching verified local spool/base is present",
+                        name
+                    ),
+                    Err(error) if s3::download_error_is_not_found(&error) => {}
+                    Err(error) => {
+                        return Err(error).with_context(|| {
+                            format!(
+                                "{}: native stream discovery unavailable and no verified local spool exists",
+                                name
+                            )
+                        })
+                    }
+                }
+            let (legacy_txid, _generation, checksum) =
+                discover_state_from_s3(&client, &bucket_name, &prefix, &name)
+                    .await
+                    .with_context(|| format!("{}: discover verified legacy history", name))?;
+            if legacy_txid > 0 {
+                let verify_path = spool_base.join(format!(
+                    ".legacy-migration-verify-{}-{}.db",
+                    std::process::id(),
+                    uuid::Uuid::new_v4()
+                ));
+                std::fs::create_dir_all(&spool_base)?;
+                let storage = S3Storage::new((*client).clone(), bucket_name.clone());
+                let restored_txid = walrust_core::legacy_restore::restore_legacy_ltx(
+                    &storage,
+                    &prefix,
+                    &name,
+                    &verify_path,
+                    Some(legacy_txid),
+                )
+                .await
+                .with_context(|| format!("{}: verify legacy migration head", name))?;
+                if restored_txid != legacy_txid {
+                    bail!(
+                        "{}: legacy migration verification restored TXID {}, expected {}",
+                        name,
+                        restored_txid,
+                        legacy_txid
+                    );
+                }
+                let verify_connection = Connection::open(&verify_path)?;
+                let integrity: String =
+                    verify_connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+                if integrity != "ok" {
+                    bail!(
+                        "{}: legacy migration head failed SQLite integrity_check: {}",
+                        name,
+                        integrity
+                    );
+                }
+                drop(verify_connection);
+                std::fs::remove_file(&verify_path)?;
+                std::fs::File::open(&spool_base)?.sync_all()?;
+            }
+            let identity = SpoolIdentity::new(
+                db_path,
+                bucket_name.clone(),
+                prefix.clone(),
+                name.clone(),
+                uuid::Uuid::new_v4().to_string(),
+                legacy_txid.saturating_add(1).max(1),
+                (legacy_txid > 0).then_some(legacy_txid),
+                true,
+            )?;
+            (legacy_txid, checksum, identity)
         };
 
         // Get initial checksum: from manifest if available, otherwise compute from db
@@ -715,24 +1312,37 @@ pub async fn watch_with_shadow(
             shadow.shadow_dir().display()
         );
 
-        // Initialize cache + uploader for this database (if cache enabled)
-        if cache_config.enabled {
-            let cache = Arc::new(LocalCache::new(db_path)?);
-            let storage: Arc<dyn StorageBackend> =
-                Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
-            let uploader = Arc::new(Uploader::new(
-                name.clone(),
-                Arc::clone(&cache),
-                storage,
-                prefix.clone(),
-                Arc::new(retry_policy.clone()),
-                Arc::clone(&webhook_sender),
-                cache_config.uploader_concurrency,
-            ));
-            let (upload_tx, handle) = spawn_uploader(uploader);
-            cache_states.insert(db_path.clone(), (cache, upload_tx));
-            uploader_handles.push((db_path.clone(), handle));
+        let capacity = CapacityPolicy {
+            warning_bytes: spool_config.warning_size,
+            hard_bytes: spool_config.max_size,
+            minimum_free_bytes: spool_config.min_free_space,
+        };
+        let spool = Arc::new(Mutex::new(NativeSpool::create_or_open(
+            &spool_root,
+            spool_identity,
+            capacity,
+        )?));
+        {
+            let guard = spool_lock(&spool)?;
+            if let Some(last) = guard.objects().last() {
+                current_txid = last.seq;
+                db_checksum = Some(last.ending_chain_checksum);
+                last_snapshot = guard
+                    .objects()
+                    .filter(|object| object.kind == ObjectKind::Snapshot)
+                    .last()
+                    .map(|_| chrono::Utc::now());
+            }
         }
+        let storage: Arc<dyn StorageBackend> =
+            Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
+        let (native_uploader, wake, lag) = NativeUploader::new(storage, Arc::clone(&spool))?;
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let handle = tokio::spawn(native_uploader.run(shutdown_rx));
+        native_spools.insert(db_path.clone(), (spool, wake));
+        native_lag_states.insert(db_path.clone(), lag);
+        native_uploader_shutdown.insert(db_path.clone(), shutdown_tx);
+        native_uploader_handles.push((db_path.clone(), handle));
 
         db_states.insert(
             db_path.clone(),
@@ -797,51 +1407,19 @@ pub async fn watch_with_shadow(
     // already scheduled for an eager snapshot below.
     for (db_path, state) in db_states.iter_mut() {
         let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
-        if sync_config.on_startup && !eager_snapshot_paths.contains(db_path) {
-            // Convert to DbState temporarily for snapshot
-            let mut db_state = DbState {
-                name: state.name.clone(),
-                db_path: state.db_path.clone(),
-                wal_path: state.wal_path.clone(),
-                wal_offset: 0,
-                wal_generation: state.shadow.generation(),
-                current_txid: state.current_txid,
-                last_snapshot: state.last_snapshot,
-                db_checksum: state.db_checksum,
-                wal_salt: None,
-                wal_checksum_chain: None,
-            };
-            let snapshot_result = take_snapshot_with_retry_and_rearm(
-                &client,
-                &bucket_name,
-                &prefix,
-                &mut db_state,
-                state,
-                &retry_policy,
-                &webhook_sender,
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "{}: failed to rearm blocker after initial snapshot attempt",
-                    state.name
-                )
-            })?;
-            if let Err(e) = snapshot_result {
-                tracing::error!("{}: Initial snapshot failed: {}", state.name, e);
-            } else {
-                state.current_txid = db_state.current_txid;
-                state.last_snapshot = db_state.last_snapshot;
-                state.db_checksum = db_state.db_checksum;
-                state.shadow_sync_generation = state.shadow.generation();
-                state.shadow_sync_offset = state.shadow.segment_offset();
-                state.wal_copy_offset = 0;
-                save_shadow_progress(state)?;
-
-                if let Some(trigger) = trigger_states.get_mut(db_path) {
-                    trigger.frames_since_snapshot = 0;
-                    trigger.first_change_time = None;
-                }
+        let spool_state = native_spools
+            .get(db_path)
+            .ok_or_else(|| anyhow!("{}: native spool was not initialized", state.name))?;
+        let needs_base = spool_lock(&spool_state.0)?.admitted_seq().is_none();
+        if (needs_base || sync_config.on_startup) && !eager_snapshot_paths.contains(db_path) {
+            require_native_snapshot(state, spool_state, "initial_base")
+                .await
+                .with_context(|| {
+                    format!("{}: initial native snapshot admission failed", state.name)
+                })?;
+            if let Some(trigger) = trigger_states.get_mut(db_path) {
+                trigger.frames_since_snapshot = 0;
+                trigger.first_change_time = None;
             }
         }
     }
@@ -853,55 +1431,16 @@ pub async fn watch_with_shadow(
         let state = db_states
             .get_mut(db_path)
             .expect("eager snapshot path must exist in db_states");
-        let mut db_state = DbState {
-            name: state.name.clone(),
-            db_path: state.db_path.clone(),
-            wal_path: state.wal_path.clone(),
-            wal_offset: 0,
-            wal_generation: state.shadow.generation(),
-            current_txid: state.current_txid,
-            last_snapshot: state.last_snapshot,
-            db_checksum: state.db_checksum,
-            wal_salt: None,
-            wal_checksum_chain: None,
-        };
-        let snapshot_result = take_snapshot_with_retry_and_rearm(
-            &client,
-            &bucket_name,
-            &prefix,
-            &mut db_state,
-            state,
-            &retry_policy,
-            &webhook_sender,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "{}: failed to rearm blocker after eager snapshot attempt",
-                state.name
-            )
-        })?;
-        if let Err(e) = snapshot_result {
-            tracing::error!(
-                "{}: Eager snapshot after downtime checkpoint failed: {}",
-                state.name,
-                e
-            );
-            metrics_state.record_error(&state.name);
-        } else {
-            state.current_txid = db_state.current_txid;
-            state.last_snapshot = db_state.last_snapshot;
-            state.db_checksum = db_state.db_checksum;
-            state.shadow_sync_generation = state.shadow.generation();
-            state.shadow_sync_offset = state.shadow.segment_offset();
-            state.wal_copy_offset = 0;
-            save_shadow_progress(state)?;
-            metrics_state.record_snapshot(&state.name);
-
-            if let Some(trigger) = trigger_states.get_mut(db_path) {
-                trigger.frames_since_snapshot = 0;
-                trigger.first_change_time = None;
-            }
+        let spool_state = native_spools
+            .get(db_path)
+            .ok_or_else(|| anyhow!("{}: native spool was not initialized", state.name))?;
+        require_native_snapshot(state, spool_state, "downtime_reanchor")
+            .await
+            .with_context(|| format!("{}: downtime native re-anchor failed", state.name))?;
+        metrics_state.record_snapshot(&state.name);
+        if let Some(trigger) = trigger_states.get_mut(db_path) {
+            trigger.frames_since_snapshot = 0;
+            trigger.first_change_time = None;
         }
     }
 
@@ -943,7 +1482,6 @@ pub async fn watch_with_shadow(
     validation_timer.tick().await;
 
     // Cache cleanup timer (every 5 minutes when cache is enabled)
-    let cache_enabled = !cache_states.is_empty();
     let mut cache_cleanup_timer = tokio::time::interval(Duration::from_secs(300));
     cache_cleanup_timer.tick().await; // Skip first immediate tick
 
@@ -997,6 +1535,23 @@ pub async fn watch_with_shadow(
             _ = wal_sync_timer.tick() => {
                 // Copy any new WAL frames to shadow for all databases
                 for state in db_states.values_mut() {
+                    let source_filesystem = state
+                        .db_path
+                        .parent()
+                        .unwrap_or_else(|| std::path::Path::new("."));
+                    if filesystem_available_bytes(source_filesystem)?
+                        < spool_config.min_free_space
+                    {
+                        tracing::error!(
+                            database = %state.name,
+                            event = "local_spool_full",
+                            filesystem = %source_filesystem.display(),
+                            filesystem_free_bytes = filesystem_available_bytes(source_filesystem)?,
+                            reserve_bytes = spool_config.min_free_space,
+                            "source WAL/shadow filesystem is below its free-space reserve; retaining blocker and pausing admission/checkpoints"
+                        );
+                        continue;
+                    }
                     match state.shadow.copy_frames(state.wal_copy_offset).await {
                         Ok((frames, new_offset)) => {
                             if !frames.is_empty() {
@@ -1015,22 +1570,45 @@ pub async fn watch_with_shadow(
                             webhook_sender
                                 .notify_upload_failed(&state.name, &e.to_string(), 1)
                                 .await;
-                            return Err(e.context(format!("{}: shadow copy failed", state.name)));
+                            // Retain the live-WAL blocker and retry. Exiting here
+                            // would release the only protection for uncopied
+                            // committed frames.
+                            continue;
                         }
                     }
                 }
 
-                let results = run_shadow_syncs(
-                    &db_states,
-                    &cache_states,
-                    Some(DirectShadowSyncTarget {
-                        client: Arc::clone(&client),
-                        bucket_name: bucket_name.clone(),
-                        prefix: prefix.clone(),
-                    }),
-                    &retry_policy,
-                    Arc::clone(&webhook_sender),
-                ).await;
+                for db_path in required_native_reanchors.clone() {
+                    let Some(state) = db_states.get_mut(&db_path) else { continue };
+                    let Some(spool) = native_spools.get(&db_path) else { continue };
+                    match stage_native_snapshot(state, spool).await {
+                        Ok(_) => {
+                            required_native_reanchors.remove(&db_path);
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                database = %state.name,
+                                error = %error,
+                                "native re-anchor still cannot be admitted; retaining blocker and pausing deltas"
+                            );
+                        }
+                    }
+                }
+                let mut results = Vec::with_capacity(db_states.len());
+                for (db_path, state) in &db_states {
+                    if required_native_reanchors.contains(db_path) {
+                        results.push(Err(anyhow!(
+                            "{}: native re-anchor required before delta continuation",
+                            state.name
+                        )));
+                        continue;
+                    }
+                    let result = match native_spools.get(db_path) {
+                        Some(spool) => stage_native_shadow(state, spool).await,
+                        None => Err(anyhow!("{}: native spool missing", state.name)),
+                    };
+                    results.push(result);
+                }
 
                 // Phase 3: Apply results sequentially
                 for result in results {
@@ -1084,28 +1662,14 @@ pub async fn watch_with_shadow(
                                             state.name,
                                             trigger.frames_since_snapshot
                                         );
-                                        // Trigger snapshot
-                                        let mut db_state = DbState {
-                                            name: state.name.clone(),
-                                            db_path: state.db_path.clone(),
-                                            wal_path: state.wal_path.clone(),
-                                            wal_offset: 0,
-                                            wal_generation: state.shadow.generation(),
-                                            current_txid: state.current_txid,
-                                            last_snapshot: state.last_snapshot,
-                                            db_checksum: state.db_checksum,
-                                            wal_salt: None,
-                                            wal_checksum_chain: None,
+                                        let snapshot_result = match native_spools.get(&output.db_path) {
+                                            Some(spool) => stage_native_snapshot(state, spool).await,
+                                            None => Err(anyhow!("{}: native spool missing", state.name)),
                                         };
-                                        let snapshot_result = take_snapshot_with_retry_and_rearm(&client, &bucket_name, &prefix, &mut db_state, state, &retry_policy, &webhook_sender).await.with_context(|| format!("{}: failed to rearm blocker after max_changes snapshot attempt", state.name))?;
                                         if let Err(e) = snapshot_result {
                                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
                                             metrics_state.record_error(&state.name);
                                         } else {
-                                            state.current_txid = db_state.current_txid;
-                                            state.last_snapshot = db_state.last_snapshot;
-                                            state.db_checksum = db_state.db_checksum;
-                                            save_shadow_progress(state)?;
                                             metrics_state.record_snapshot(&state.name);
                                             trigger.frames_since_snapshot = 0;
                                             trigger.first_change_time = None;
@@ -1116,7 +1680,41 @@ pub async fn watch_with_shadow(
                         }
                         Err(e) => {
                             tracing::error!("Shadow sync failed: {}", e);
-                            return Err(e).context("shadow sync failed");
+                            // The checkpoint blocker remains held. Local spool
+                            // capacity/disk warnings are degraded
+                            // non-checkpointing states, never permission to
+                            // exit and release the blocker.
+                            continue;
+                        }
+                    }
+                }
+
+                for (db_path, (spool, _)) in &native_spools {
+                    let Some(state) = db_states.get(db_path) else { continue };
+                    let guard = spool_lock(spool)?;
+                    metrics_state
+                        .spool_bytes
+                        .with_label_values(&[&state.name])
+                        .set(guard.used_bytes()?.min(i64::MAX as u64) as i64);
+                    metrics_state
+                        .spool_free_bytes
+                        .with_label_values(&[&state.name])
+                        .set(guard.free_bytes()?.min(i64::MAX as u64) as i64);
+                    drop(guard);
+                    if let Some(lag) = native_lag_states.get(db_path) {
+                        if let Ok(lag) = lag.lock() {
+                            metrics_state
+                                .remote_lag_objects
+                                .with_label_values(&[&state.name])
+                                .set(lag.pending_objects.min(i64::MAX as u64) as i64);
+                            metrics_state
+                                .remote_lag_bytes
+                                .with_label_values(&[&state.name])
+                                .set(lag.pending_bytes.min(i64::MAX as u64) as i64);
+                            metrics_state
+                                .remote_lag_age_seconds
+                                .with_label_values(&[&state.name])
+                                .set(lag.oldest_age_ms as f64 / 1000.0);
                         }
                     }
                 }
@@ -1127,26 +1725,26 @@ pub async fn watch_with_shadow(
                 // durable storage before opening the controlled TRUNCATE window.
                 for (db_path, state) in db_states.iter_mut() {
                     let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
-                    if let Err(error) = enforce_wal_backpressure(
+                    let Some(spool_state) = native_spools.get(db_path) else {
+                        return Err(anyhow!("{}: native spool missing", state.name));
+                    };
+                    if let Err(error) = enforce_native_wal_backpressure(
                         state,
                         sync_config.wal_truncate_threshold_pages,
-                        cache_states.get(db_path),
-                        Some(DirectShadowSyncTarget {
-                            client: Arc::clone(&client),
-                            bucket_name: bucket_name.clone(),
-                            prefix: prefix.clone(),
-                        }),
-                        &retry_policy,
+                        spool_state,
+                        sync_config.checkpoint_release,
                         Arc::clone(&webhook_sender),
                         CHECKPOINT_UPLOAD_DRAIN_TIMEOUT,
-                    )
-                    .await
-                    {
+                    ).await {
                         tracing::error!("{}: {}", state.name, error);
+                        required_native_reanchors.insert(db_path.clone());
                         webhook_sender
                             .notify_upload_failed(&state.name, &error.to_string(), 1)
                             .await;
-                        return Err(error);
+                        // Retain the blocker and local spool. A recoverable
+                        // capacity/cloud/checkpoint warning must not terminate
+                        // shadow watch and release the pin.
+                        continue;
                     }
                 }
             }
@@ -1198,28 +1796,14 @@ pub async fn watch_with_shadow(
                             trigger.frames_since_snapshot
                         );
 
-                        let mut db_state = DbState {
-                            name: state.name.clone(),
-                            db_path: state.db_path.clone(),
-                            wal_path: state.wal_path.clone(),
-                            wal_offset: 0,
-                            wal_generation: state.shadow.generation(),
-                            current_txid: state.current_txid,
-                            last_snapshot: state.last_snapshot,
-                            db_checksum: state.db_checksum,
-                            wal_salt: None,
-                            wal_checksum_chain: None,
+                        let snapshot_result = match native_spools.get(db_path) {
+                            Some(spool) => stage_native_snapshot(state, spool).await,
+                            None => Err(anyhow!("{}: native spool missing", state.name)),
                         };
-
-                        let snapshot_result = take_snapshot_with_retry_and_rearm(&client, &bucket_name, &prefix, &mut db_state, state, &retry_policy, &webhook_sender).await.with_context(|| format!("{}: failed to rearm blocker after trigger snapshot attempt", state.name))?;
                         if let Err(e) = snapshot_result {
                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
                             metrics_state.record_error(&state.name);
                         } else {
-                            state.current_txid = db_state.current_txid;
-                            state.last_snapshot = db_state.last_snapshot;
-                            state.db_checksum = db_state.db_checksum;
-                            save_shadow_progress(state)?;
                             metrics_state.record_snapshot(&state.name);
                             trigger.frames_since_snapshot = 0;
                             trigger.first_change_time = None;
@@ -1232,20 +1816,10 @@ pub async fn watch_with_shadow(
             // Periodic snapshot timer
             _ = snapshot_timer.tick() => {
                 for (db_path, state) in db_states.iter_mut() {
-                    let mut db_state = DbState {
-                        name: state.name.clone(),
-                        db_path: state.db_path.clone(),
-                        wal_path: state.wal_path.clone(),
-                        wal_offset: 0,
-                        wal_generation: state.shadow.generation(),
-                        current_txid: state.current_txid,
-                        last_snapshot: state.last_snapshot,
-                        db_checksum: state.db_checksum,
-                        wal_salt: None,
-                        wal_checksum_chain: None,
+                    let snapshot_result = match native_spools.get(db_path) {
+                        Some(spool) => stage_native_snapshot(state, spool).await,
+                        None => Err(anyhow!("{}: native spool missing", state.name)),
                     };
-
-                    let snapshot_result = take_snapshot_with_retry_and_rearm(&client, &bucket_name, &prefix, &mut db_state, state, &retry_policy, &webhook_sender).await.with_context(|| format!("{}: failed to rearm blocker after periodic snapshot attempt", state.name))?;
                     anyhow::ensure!(
                         state
                             .checkpoint_blocker
@@ -1258,10 +1832,6 @@ pub async fn watch_with_shadow(
                         tracing::error!("Failed to snapshot {}: {}", state.name, e);
                         metrics_state.record_error(&state.name);
                     } else {
-                        state.current_txid = db_state.current_txid;
-                        state.last_snapshot = db_state.last_snapshot;
-                        state.db_checksum = db_state.db_checksum;
-                        save_shadow_progress(state)?;
                         metrics_state.record_snapshot(&state.name);
 
                         if let Some(trigger) = trigger_states.get_mut(db_path) {
@@ -1318,40 +1888,50 @@ pub async fn watch_with_shadow(
                             estimated_frames
                         );
 
-                        let direct_target = DirectShadowSyncTarget {
-                            client: Arc::clone(&client),
-                            bucket_name: bucket_name.clone(),
-                            prefix: prefix.clone(),
+                        let Some(spool_state) = native_spools.get(db_path) else {
+                            return Err(anyhow!("{}: native spool missing", state.name));
                         };
-                        let checkpoint_result = checkpoint_shadow_after_durable_sync(
+                        let checkpoint_started = std::time::Instant::now();
+                        let checkpoint_result = checkpoint_shadow_after_native_admission(
                             state,
-                            cache_states.get(db_path),
-                            Some(direct_target.clone()),
-                            &retry_policy,
-                            Arc::clone(&webhook_sender),
+                            spool_state,
+                            sync_config.checkpoint_release,
                             CHECKPOINT_UPLOAD_DRAIN_TIMEOUT,
                             ShadowCheckpointMode::Passive,
                         ).await;
                         let checkpoint_window_dirty = match checkpoint_result {
-                            Ok(dirty) => dirty,
+                            Ok(attempt) if attempt.completed => {
+                                metrics_state.record_checkpoint(
+                                    &state.name,
+                                    "passive",
+                                    checkpoint_started.elapsed().as_secs_f64(),
+                                );
+                                attempt.dirty
+                            },
+                            Ok(_) => {
+                                tracing::warn!(
+                                    database = %state.name,
+                                    "PASSIVE checkpoint was partial/busy; blocker is rearmed and the checkpoint will retry later"
+                                );
+                                continue;
+                            },
                             Err(e) => {
                             tracing::error!("{}: Shadow checkpoint failed: {}", state.name, e);
                             webhook_sender
                                 .notify_upload_failed(&state.name, &e.to_string(), 1)
                                 .await;
-                            return Err(e.context(format!(
-                                "{}: shadow checkpoint failed",
-                                state.name
-                            )));
+                            continue;
                             }
                         };
                         if checkpoint_window_dirty {
-                            reanchor_after_dirty_checkpoint(
-                                state,
-                                direct_target,
-                                &retry_policy,
-                                &webhook_sender,
-                            ).await?;
+                            if let Err(error) = stage_native_snapshot(state, spool_state).await {
+                                tracing::error!(
+                                    database = %state.name,
+                                    error = %error,
+                                    "dirty checkpoint window re-anchor is pending; pausing deltas"
+                                );
+                                required_native_reanchors.insert(db_path.clone());
+                            }
                         }
 
                         tracing::debug!("{}: Shadow checkpoint completed", state.name);
@@ -1367,7 +1947,7 @@ pub async fn watch_with_shadow(
             }
 
             // Cache cleanup timer
-            _ = cache_cleanup_timer.tick(), if cache_enabled => {
+            _ = cache_cleanup_timer.tick() => {
                 if let Some(ref retention) = cache_retention {
                     for (db_path, (cache, _)) in cache_states.iter() {
                         let name = db_states.get(db_path).map(|s| s.name.as_str()).unwrap_or("unknown");
@@ -1387,6 +1967,25 @@ pub async fn watch_with_shadow(
                                 tracing::error!("{}: Cache cleanup failed: {}", name, e);
                             }
                         }
+                    }
+                }
+                for (db_path, (spool, _)) in &native_spools {
+                    let name = db_states
+                        .get(db_path)
+                        .map(|state| state.name.as_str())
+                        .unwrap_or("unknown");
+                    match spool_lock(spool)?.cleanup_published_before_latest_snapshot() {
+                        Ok(deleted) if deleted > 0 => tracing::info!(
+                            database = name,
+                            deleted,
+                            "cleaned remotely published native spool history before newest local snapshot base"
+                        ),
+                        Ok(_) => {}
+                        Err(error) => tracing::error!(
+                            database = name,
+                            error = %error,
+                            "native spool cleanup failed; retaining recovery data"
+                        ),
                     }
                 }
             }
@@ -1434,21 +2033,55 @@ pub async fn watch_with_shadow(
     tracing::info!("Shadow mode shutdown: syncing remaining data...");
 
     copy_final_shadow_frames(&mut db_states).await?;
-    let final_results = run_shadow_syncs(
-        &db_states,
-        &cache_states,
-        Some(DirectShadowSyncTarget {
-            client: Arc::clone(&client),
-            bucket_name: bucket_name.clone(),
-            prefix: prefix.clone(),
-        }),
-        &retry_policy,
-        Arc::clone(&webhook_sender),
-    )
-    .await;
+    let mut final_results = Vec::with_capacity(db_states.len());
+    for (db_path, state) in &db_states {
+        final_results.push(match native_spools.get(db_path) {
+            Some(spool) => stage_native_shadow(state, spool).await,
+            None => Err(anyhow!("{}: native spool missing", state.name)),
+        });
+    }
     apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
 
     shutdown_shadow_uploaders(&cache_states, &db_states, uploader_handles).await?;
+    let cloud_drain_deadline =
+        tokio::time::Instant::now() + Duration::from_secs(spool_config.shutdown_drain_seconds);
+    loop {
+        let pending = native_spools
+            .values()
+            .try_fold(0usize, |count, (spool, wake)| {
+                wake.notify();
+                Ok::<_, anyhow::Error>(count + spool_lock(spool)?.pending_objects().count())
+            })?;
+        if pending == 0 || tokio::time::Instant::now() >= cloud_drain_deadline {
+            if pending > 0 {
+                tracing::warn!(
+                    pending,
+                    "bounded shutdown cloud drain expired; native spool remains durable"
+                );
+            }
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for sender in native_uploader_shutdown.values() {
+        let _ = sender.send(true);
+    }
+    for (db_path, mut handle) in native_uploader_handles {
+        let name = db_states
+            .get(&db_path)
+            .map(|state| state.name.as_str())
+            .unwrap_or("unknown");
+        if tokio::time::timeout(Duration::from_secs(2), &mut handle)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "{}: native uploader cloud drain timed out; pending spool remains durable",
+                name
+            );
+            handle.abort();
+        }
+    }
 
     tracing::info!("walrust shadow mode shutdown complete");
     Ok(())
@@ -1456,6 +2089,7 @@ pub async fn watch_with_shadow(
 
 /// How startup state is seeded from the remote `manifest.json`.
 #[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
 enum ManifestSeed {
     /// No remote manifest exists: a brand-new database starts fresh at txid 0.
     Fresh,
@@ -1475,6 +2109,7 @@ enum ManifestSeed {
 ///
 /// Pure and independent of S3 so both directions are unit-tested without a live
 /// backend.
+#[cfg(test)]
 fn seed_state_from_manifest_fetch(
     fetch: Result<Vec<u8>>,
     is_not_found: impl Fn(&anyhow::Error) -> bool,
@@ -1503,10 +2138,72 @@ mod tests {
     use super::*;
     use crate::config::WebhookConfig;
     use crate::shadow::format_segment_name;
+    use async_trait::async_trait;
+    use hadb_storage::CasResult;
     use rusqlite::Connection;
     use std::io::{Read, Write};
     use tempfile::TempDir;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    struct NoRemoteIo;
+
+    #[async_trait]
+    impl StorageBackend for NoRemoteIo {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+            panic!("local checkpoint path performed remote GET")
+        }
+        async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            panic!("local checkpoint path performed remote PUT")
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            panic!("local checkpoint path performed remote DELETE")
+        }
+        async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+            panic!("local checkpoint path performed remote LIST")
+        }
+        async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<CasResult> {
+            panic!("local checkpoint path performed remote CAS")
+        }
+        async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
+            panic!("local checkpoint path performed remote CAS")
+        }
+    }
+
+    fn test_native_spool_state(
+        db_path: &std::path::Path,
+        root: &std::path::Path,
+    ) -> NativeSpoolState {
+        let identity = SpoolIdentity::new(
+            db_path,
+            "bucket",
+            "tests/",
+            "db",
+            "test-lineage",
+            1,
+            None,
+            true,
+        )
+        .unwrap();
+        let root = NativeSpool::path_for(root, &identity);
+        let spool = Arc::new(Mutex::new(
+            NativeSpool::create_or_open(
+                &root,
+                identity,
+                CapacityPolicy {
+                    warning_bytes: u64::MAX - 1,
+                    hard_bytes: u64::MAX,
+                    minimum_free_bytes: 0,
+                },
+            )
+            .unwrap(),
+        ));
+        let (uploader, wake, _lag) =
+            NativeUploader::new(Arc::new(NoRemoteIo), Arc::clone(&spool)).unwrap();
+        // Keep the receiver alive but deliberately paused: no remote operation
+        // can acknowledge the staged object.
+        drop(uploader);
+        (spool, wake)
+    }
 
     // ── H8 cousin: manifest-fetch seeding never silently starts fresh ────────
 
@@ -1999,6 +2696,117 @@ mod tests {
         assert!(
             cache.last_uploaded_txid() >= state.current_txid,
             "confirmed uploaded LTX must cover the checkpointed shadow state"
+        );
+    }
+
+    #[tokio::test]
+    async fn default_local_release_checkpoints_after_native_admission_without_remote_ack() {
+        let (temp, db_path, conn) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: "native-local-release".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let spool_state = test_native_spool_state(&db_path, temp.path());
+        stage_native_snapshot(&mut state, &spool_state)
+            .await
+            .unwrap();
+
+        conn.execute(
+            "INSERT INTO items(value) VALUES ('local-no-remote-ack')",
+            [],
+        )
+        .unwrap();
+        let attempt = checkpoint_shadow_after_native_admission(
+            &mut state,
+            &spool_state,
+            crate::config::CheckpointRelease::Local,
+            Duration::from_millis(50),
+            ShadowCheckpointMode::Truncate,
+        )
+        .await
+        .unwrap();
+        assert!(attempt.completed);
+        assert!(!attempt.dirty);
+        let spool = spool_lock(&spool_state.0).unwrap();
+        assert_eq!(spool.admitted_seq(), Some(2));
+        assert_eq!(spool.remote_published_seq(), None);
+        let object = spool.get(2).unwrap();
+        assert_eq!(
+            object.remote_upload_state,
+            walrust_core::native_spool::RemoteUploadState::Pending
+        );
+        assert!(spool.read_payload(2).unwrap().starts_with(b"HADBP"));
+        drop(spool);
+        assert!(
+            state
+                .checkpoint_blocker
+                .as_ref()
+                .is_some_and(|blocker| !blocker.is_autocommit()),
+            "blocker must be reacquired after local-only checkpoint"
+        );
+        assert!(
+            live_wal_page_count(&state.wal_path).await.unwrap() <= 4,
+            "controlled TRUNCATE plus blocker heartbeat should leave a bounded live WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_release_waits_before_opening_checkpoint_window() {
+        let (temp, db_path, conn) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: "native-remote-release".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let spool_state = test_native_spool_state(&db_path, temp.path());
+        stage_native_snapshot(&mut state, &spool_state)
+            .await
+            .unwrap();
+        conn.execute("INSERT INTO items(value) VALUES ('remote-policy')", [])
+            .unwrap();
+        let error = checkpoint_shadow_after_native_admission(
+            &mut state,
+            &spool_state,
+            crate::config::CheckpointRelease::Remote,
+            Duration::from_millis(50),
+            ShadowCheckpointMode::Truncate,
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("timed out waiting for contiguous remote publish"));
+        assert!(
+            state
+                .checkpoint_blocker
+                .as_ref()
+                .is_some_and(|blocker| !blocker.is_autocommit()),
+            "remote policy timeout must not release the blocker"
         );
     }
 

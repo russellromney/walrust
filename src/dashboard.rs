@@ -84,6 +84,11 @@ pub struct MetricsState {
     pub checkpoint_duration: GaugeVec,
     pub retry_total: IntCounterVec,
     pub sync_latency_seconds: GaugeVec,
+    pub spool_bytes: IntGaugeVec,
+    pub spool_free_bytes: IntGaugeVec,
+    pub remote_lag_objects: IntGaugeVec,
+    pub remote_lag_bytes: IntGaugeVec,
+    pub remote_lag_age_seconds: GaugeVec,
     // S3 health tracking
     pub last_successful_upload: RwLock<Option<chrono::DateTime<chrono::Utc>>>,
     pub s3_connected: RwLock<bool>,
@@ -222,6 +227,57 @@ impl MetricsState {
             .register(Box::new(sync_latency_seconds.clone()))
             .unwrap();
 
+        let spool_bytes = IntGaugeVec::new(
+            Opts::new("walrust_spool_bytes", "Durable native spool bytes"),
+            &["database"],
+        )
+        .unwrap();
+        registry.register(Box::new(spool_bytes.clone())).unwrap();
+        let spool_free_bytes = IntGaugeVec::new(
+            Opts::new(
+                "walrust_spool_filesystem_free_bytes",
+                "Free bytes on the native spool filesystem",
+            ),
+            &["database"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(spool_free_bytes.clone()))
+            .unwrap();
+        let remote_lag_objects = IntGaugeVec::new(
+            Opts::new(
+                "walrust_remote_lag_objects",
+                "Unpublished native spool objects",
+            ),
+            &["database"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(remote_lag_objects.clone()))
+            .unwrap();
+        let remote_lag_bytes = IntGaugeVec::new(
+            Opts::new(
+                "walrust_remote_lag_bytes",
+                "Unpublished native spool payload bytes",
+            ),
+            &["database"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(remote_lag_bytes.clone()))
+            .unwrap();
+        let remote_lag_age_seconds = GaugeVec::new(
+            Opts::new(
+                "walrust_remote_lag_age_seconds",
+                "Age of the oldest unpublished native spool object",
+            ),
+            &["database"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(remote_lag_age_seconds.clone()))
+            .unwrap();
+
         Self {
             start_time: Instant::now(),
             databases: RwLock::new(HashMap::new()),
@@ -240,6 +296,11 @@ impl MetricsState {
             checkpoint_duration,
             retry_total,
             sync_latency_seconds,
+            spool_bytes,
+            spool_free_bytes,
+            remote_lag_objects,
+            remote_lag_bytes,
+            remote_lag_age_seconds,
             last_successful_upload: RwLock::new(None),
             s3_connected: RwLock::new(true),
         }

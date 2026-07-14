@@ -26,6 +26,32 @@ pub async fn prune(
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
+    // During legacy -> native migration the immutable descriptor can be
+    // published before its full native snapshot's visibility record. Until
+    // that record exists, the legacy base/history is the only remote recovery
+    // point and pruning it could strand unpublished local descendants.
+    let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
+    match s3::download_bytes(&client, &bucket_name, &descriptor_key).await {
+        Ok(bytes) => {
+            let descriptor: walrust_core::native_publish::StreamDescriptor =
+                serde_json::from_slice(&bytes)?;
+            let published_prefix = format!(
+                "{}{}/native/v1/lineages/{}/published/",
+                prefix, name, descriptor.lineage_id
+            );
+            let storage = S3Storage::new(client.clone(), bucket_name.clone());
+            if storage.list(&published_prefix, None).await?.is_empty() {
+                println!(
+                    "Native migration for '{}' has no published snapshot base; refusing legacy prune",
+                    name
+                );
+                return Ok(());
+            }
+        }
+        Err(error) if s3::download_error_is_not_found(&error) => {}
+        Err(error) => return Err(classify_or_else(error, WalrustError::s3)),
+    }
+
     // Discover snapshots from the S3 listing — the production watch path never
     // writes a manifest.json, so reading one made prune a silent no-op (F6).
     // The key here is the FULL S3 key (verify/restore use full keys too).

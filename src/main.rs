@@ -111,6 +111,10 @@ enum Commands {
         #[arg(long)]
         validation_interval: Option<u64>,
 
+        /// Checkpoint release boundary: local fsynced HADBP spool (default) or contiguous remote publish
+        #[arg(long, value_enum)]
+        checkpoint_release: Option<config::CheckpointRelease>,
+
         /// Number of hourly snapshots to retain
         #[arg(long)]
         retain_hourly: Option<usize>,
@@ -400,6 +404,7 @@ struct WatchArgs {
     min_checkpoint_pages: Option<u64>,
     wal_truncate_threshold: Option<u64>,
     validation_interval: Option<u64>,
+    checkpoint_release: Option<config::CheckpointRelease>,
     retain_hourly: Option<usize>,
     retain_daily: Option<usize>,
     retain_weekly: Option<usize>,
@@ -559,6 +564,7 @@ fn resolve_watch_config(
                 min_checkpoint_page_count: cli.min_checkpoint_pages.unwrap_or(1000),
                 wal_truncate_threshold_pages: cli.wal_truncate_threshold.unwrap_or(121359),
                 validation_interval: cli.validation_interval.unwrap_or(0),
+                checkpoint_release: cli.checkpoint_release.unwrap_or_default(),
             };
 
             let retention = RetentionConfig {
@@ -620,6 +626,7 @@ fn merge_cli_sync_overrides(base: &SyncConfig, cli: &WatchArgs) -> SyncConfig {
             .wal_truncate_threshold
             .unwrap_or(base.wal_truncate_threshold_pages),
         validation_interval: cli.validation_interval.unwrap_or(base.validation_interval),
+        checkpoint_release: cli.checkpoint_release.unwrap_or(base.checkpoint_release),
     }
 }
 
@@ -792,6 +799,7 @@ async fn run() -> Result<()> {
             min_checkpoint_pages,
             wal_truncate_threshold,
             validation_interval,
+            checkpoint_release,
             retain_hourly,
             retain_daily,
             retain_weekly,
@@ -827,6 +835,7 @@ async fn run() -> Result<()> {
                 min_checkpoint_pages,
                 wal_truncate_threshold,
                 validation_interval,
+                checkpoint_release,
                 retain_hourly,
                 retain_daily,
                 retain_weekly,
@@ -858,6 +867,22 @@ async fn run() -> Result<()> {
 
             // Resolve cache configuration
             let cache_config = resolve_cache_config(&config, &watch_args, watch_matches.unwrap());
+            let mut spool_config = config
+                .as_ref()
+                .map(|config| config.spool.clone())
+                .unwrap_or_default();
+            // Compatibility: existing cache path/size flags now configure the
+            // mandatory native spool in default shadow mode. They retain their
+            // legacy meaning only in independent mode.
+            if let Some(path) = watch_args.cache_dir.clone() {
+                spool_config.path = Some(path);
+            }
+            if let Some(max_size) = watch_args.cache_max_size {
+                spool_config.max_size = max_size;
+                spool_config.warning_size = spool_config
+                    .warning_size
+                    .min(max_size.saturating_mul(4) / 5);
+            }
             if cache_config.enabled {
                 tracing::info!(
                     "Disk cache enabled (experimental): retention={}, max_size={}MB",
@@ -918,6 +943,7 @@ async fn run() -> Result<()> {
                     retry_config,
                     webhooks,
                     cache_config,
+                    spool_config,
                 )
                 .await?;
             }
@@ -1089,6 +1115,7 @@ mod tests {
             min_checkpoint_pages: None,
             wal_truncate_threshold: None,
             validation_interval: None,
+            checkpoint_release: None,
             retain_hourly: None,
             retain_daily: None,
             retain_weekly: None,

@@ -110,12 +110,12 @@ prometheus = "0.13"
 
 # Compaction
 tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
 
 # Memory allocator — returns freed memory to OS (macOS system allocator doesn't)
 mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
-uuid = { version = "1", features = ["v4"] }
 brunch = "0.5"
 tower = "0.5"
 # Construct typed AWS SDK errors in unit tests (the not-found classifier in

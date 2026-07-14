@@ -217,10 +217,85 @@ pub async fn restore(
         None
     };
 
+    if let Some(dir) = cache_dir {
+        let mut roots = Vec::new();
+        if dir.join("journal.json").exists() {
+            roots.push(dir.to_path_buf());
+        }
+        let native_root = dir.join("native-v1");
+        if let Ok(entries) = std::fs::read_dir(&native_root) {
+            roots.extend(entries.filter_map(|entry| entry.ok().map(|entry| entry.path())));
+        }
+        for root in roots {
+            let Some(identity) = walrust_core::native_spool::NativeSpool::read_identity(&root)?
+            else {
+                continue;
+            };
+            if identity.bucket != bucket_name
+                || identity.prefix != prefix
+                || identity.database != name
+            {
+                continue;
+            }
+            let spool = walrust_core::native_spool::NativeSpool::create_or_open(
+                &root,
+                identity,
+                walrust_core::native_spool::CapacityPolicy {
+                    warning_bytes: u64::MAX - 1,
+                    hard_bytes: u64::MAX,
+                    minimum_free_bytes: 0,
+                },
+            )?;
+            if let Some(seq) = walrust_core::native_restore::restore_local_spool(
+                &spool,
+                output,
+                parsed_point_in_time,
+            )? {
+                println!(
+                    "Restored {} to {} from local native HADBP spool (sequence: {})",
+                    name,
+                    output.display(),
+                    seq
+                );
+                return Ok(());
+            }
+        }
+    }
+
     let storage = CachedLegacyStorage {
         s3: S3Storage::new(client.clone(), bucket_name.clone()),
         cache,
     };
+    match walrust_core::native_restore::restore_native_v1(
+        &storage,
+        &prefix,
+        name,
+        output,
+        parsed_point_in_time,
+    )
+    .await
+    {
+        Ok(walrust_core::native_restore::NativeRestoreAvailability::Restored { seq }) => {
+            println!(
+                "Restored {} to {} (native HADBP sequence: {})",
+                name,
+                output.display(),
+                seq
+            );
+            return Ok(());
+        }
+        Ok(
+            walrust_core::native_restore::NativeRestoreAvailability::LegacyOnly
+            | walrust_core::native_restore::NativeRestoreAvailability::LegacyPoint { .. },
+        ) => {}
+        Err(error) => {
+            if let Some(webhook) = webhook {
+                let error_msg = format!("native HADBP restore failed: {error:#}");
+                webhook.notify_corruption(name, &error_msg).await;
+            }
+            return Err(classify_or_else(error, WalrustError::restore));
+        }
+    }
     let result =
         legacy_restore::restore_legacy_ltx(&storage, &prefix, name, output, parsed_point_in_time)
             .await;
@@ -283,6 +358,25 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
     } else {
         println!("Databases in s3://{}/{}:", bucket_name, prefix);
         for db in &dbs {
+            let storage = S3Storage::new(client.clone(), bucket_name.clone());
+            if let Some(native) =
+                walrust_core::native_restore::inspect_native_v1(&storage, &prefix, db)
+                    .await
+                    .map_err(|e| classify_or_else(e, WalrustError::s3))?
+            {
+                println!(
+                    "  {} (native HADBP TXID: {}, {} objects, snapshot TXID {}{})",
+                    db,
+                    native.head_seq,
+                    native.object_count,
+                    native.latest_snapshot_seq,
+                    native
+                        .legacy_boundary_txid
+                        .map(|seq| format!(", legacy PITR through TXID {seq}"))
+                        .unwrap_or_default()
+                );
+                continue;
+            }
             // Discover state from S3 (litestream format)
             let (current_txid, _max_gen, _) =
                 discover_state_from_s3(&client, &bucket_name, &prefix, db)
