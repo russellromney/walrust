@@ -258,8 +258,26 @@ async fn stage_native_snapshot(
     state: &mut ShadowDbState,
     spool_state: &NativeSpoolState,
 ) -> Result<u64> {
-    let (seq, previous_chain_checksum, stable_path, intended_remote_key) = {
-        let spool = spool_lock(&spool_state.0)?;
+    let page_size = state.shadow.page_size();
+    let frame_size = 24 + page_size as u64;
+    anyhow::ensure!(
+        state.shadow_sync_offset.is_multiple_of(frame_size),
+        "{}: snapshot source cursor is not frame-aligned",
+        state.name
+    );
+    let proposed_cursor = SourceCursor {
+        // A SQLite backup can overlap a live transaction. Advancing to the
+        // copied shadow tail could skip its pre-commit frames. Keep the last
+        // already-admitted shadow cursor; replaying an already-snapshotted page
+        // is safe, skipping an unproven transaction is not.
+        shadow_generation: state.shadow_sync_generation,
+        shadow_frame_index: state.shadow_sync_offset / frame_size,
+        wal_offset: state.wal_copy_offset,
+        wal_salt: state.shadow.wal_read_salt(),
+        wal_checksum_chain: state.shadow.wal_read_chain(),
+    };
+    let preparation = {
+        let mut spool = spool_lock(&spool_state.0)?;
         let estimated_db_bytes = std::fs::metadata(&state.db_path)?.len();
         let estimated_peak = estimated_db_bytes
             .saturating_mul(3)
@@ -279,39 +297,55 @@ async fn stage_native_snapshot(
             .last()
             .map(|object| object.ending_chain_checksum)
             .unwrap_or(0);
-        (
+        let intended_remote_key = native_object_key(spool.identity(), ObjectKind::Snapshot, seq);
+        spool.prepare_snapshot(
             seq,
             previous,
-            spool.root().join(format!(".snapshot-{seq:016x}.db.tmp")),
-            native_object_key(spool.identity(), ObjectKind::Snapshot, seq),
+            intended_remote_key,
+            proposed_cursor,
+            page_size,
         )
     };
+    let preparation = preparation?;
+    let seq = preparation.seq;
+    let previous_chain_checksum = preparation.previous_chain_checksum;
+    let stable_path = preparation.stable_path.clone();
+    let intended_remote_key = preparation.intended_remote_key.clone();
     let db_path = state.db_path.clone();
-    let page_size = state.shadow.page_size();
     let stable_parent = stable_path
         .parent()
         .ok_or_else(|| anyhow!("native snapshot path has no parent"))?
         .to_path_buf();
+    let preparation = if preparation.stable {
+        preparation
+    } else {
+        let stable_for_create = stable_path.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            match std::fs::remove_file(&stable_for_create) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            let source = Connection::open(&db_path)?;
+            source.busy_timeout(Duration::from_secs(30))?;
+            let mut destination = Connection::open(&stable_for_create)?;
+            destination.busy_timeout(Duration::from_secs(30))?;
+            {
+                let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
+                backup.run_to_completion(256, Duration::from_millis(10), None)?;
+            }
+            drop(destination);
+            drop(source);
+            let stable = std::fs::File::open(&stable_for_create)?;
+            stable.sync_all()?;
+            std::fs::File::open(&stable_parent)?.sync_all()?;
+            Ok(())
+        })
+        .await??;
+        spool_lock(&spool_state.0)?.mark_snapshot_stable(seq)?
+    };
     let stable_for_encode = stable_path.clone();
     let encoded_result = tokio::task::spawn_blocking(move || -> Result<_> {
-        match std::fs::remove_file(&stable_for_encode) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
-        }
-        let source = Connection::open(&db_path)?;
-        source.busy_timeout(Duration::from_secs(30))?;
-        let mut destination = Connection::open(&stable_for_encode)?;
-        destination.busy_timeout(Duration::from_secs(30))?;
-        {
-            let backup = rusqlite::backup::Backup::new(&source, &mut destination)?;
-            backup.run_to_completion(256, Duration::from_millis(10), None)?;
-        }
-        drop(destination);
-        drop(source);
-        let stable = std::fs::File::open(&stable_for_encode)?;
-        stable.sync_all()?;
-        std::fs::File::open(&stable_parent)?.sync_all()?;
         walrust_core::ltx::encode_snapshot_with_checksum(
             &stable_for_encode,
             page_size,
@@ -322,25 +356,9 @@ async fn stage_native_snapshot(
     .await?;
     let encoded = match encoded_result {
         Ok(encoded) => encoded,
-        Err(error) => {
-            let _ = std::fs::remove_file(&stable_path);
-            let _ = std::fs::File::open(
-                stable_path
-                    .parent()
-                    .unwrap_or_else(|| std::path::Path::new(".")),
-            )
-            .and_then(|dir| dir.sync_all());
-            return Err(error);
-        }
+        Err(error) => return Err(error),
     };
     let end_page_count = std::fs::metadata(&stable_path)?.len() / page_size as u64;
-    let cursor = SourceCursor {
-        shadow_generation: state.shadow.generation(),
-        shadow_frame_index: state.shadow.segment_offset() / (24 + page_size as u64),
-        wal_offset: state.wal_copy_offset,
-        wal_salt: state.shadow.wal_read_salt(),
-        wal_checksum_chain: state.shadow.wal_read_chain(),
-    };
     let stage_started = std::time::Instant::now();
     let stage_result = (|| -> Result<()> {
         let mut spool = spool_lock(&spool_state.0)?;
@@ -370,26 +388,26 @@ async fn stage_native_snapshot(
             ending_chain_checksum: encoded.checksum,
             end_page_count,
             intended_remote_key,
-            source_cursor: cursor,
+            source_cursor: preparation.source_cursor.clone(),
             payload: &encoded.bytes,
         })?;
+        spool.finish_snapshot(seq)?;
         Ok(())
     })();
-    let remove_result = std::fs::remove_file(&stable_path);
-    let sync_result = std::fs::File::open(
-        stable_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new(".")),
-    )
-    .and_then(|dir| dir.sync_all());
     stage_result?;
-    remove_result?;
-    sync_result?;
     state.current_txid = seq;
     state.db_checksum = Some(encoded.checksum);
     state.last_snapshot = Some(chrono::Utc::now());
-    state.shadow_sync_generation = state.shadow.generation();
-    state.shadow_sync_offset = state.shadow.segment_offset();
+    state.shadow_sync_generation = preparation.source_cursor.shadow_generation;
+    state.shadow_sync_offset = preparation
+        .source_cursor
+        .shadow_frame_index
+        .saturating_mul(frame_size);
+    state.wal_copy_offset = preparation.source_cursor.wal_offset;
+    state.shadow.restore_read_cursor(
+        preparation.source_cursor.wal_salt,
+        preparation.source_cursor.wal_checksum_chain,
+    );
     save_shadow_progress(state)?;
     tracing::info!(
         database = %state.name,
@@ -2888,6 +2906,13 @@ mod tests {
         stage_native_snapshot(&mut state, &spool_state)
             .await
             .unwrap();
+        assert!(
+            !spool_lock(&spool_state.0)
+                .unwrap()
+                .snapshot_in_progress()
+                .unwrap(),
+            "snapshot call site must durably admit then retire its stable-copy intent"
+        );
 
         conn.execute(
             "INSERT INTO items(value) VALUES ('local-no-remote-ack')",
