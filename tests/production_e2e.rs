@@ -888,6 +888,112 @@ fn e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn e2e_cli_offline_restart_stages_locally_then_reconnects_in_order() -> Result<()> {
+    require_s3!("e2e_cli_offline_restart_stages_locally_then_reconnects_in_order");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-offline-reconnect");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let first_log = temp.path().join("first.log");
+    let offline_log = temp.path().join("offline.log");
+    let reconnect_log = temp.path().join("reconnect.log");
+
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "offline-base")?;
+    let mut first = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &first_log,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+    })?;
+    wait_for_cli_startup_rearms(&first_log, &mut first)?;
+    let initial_rows = rows(&db_path)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &initial_rows,
+    )?;
+    stop_child(&mut first);
+
+    let mut offline = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: Some("http://127.0.0.1:9"),
+        log_path: &offline_log,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+    })?;
+    wait_for_cli_startup_rearms(&offline_log, &mut offline)?;
+    append_rows(&writer, 6, 14, "offline-staged")?;
+    let offline_deadline = Instant::now() + e2e_poll_deadline(20);
+    while !watch_log(&offline_log).contains("native HADBP delta admitted to durable local spool") {
+        if let Some(status) = offline.try_wait()? {
+            anyhow::bail!("offline watcher exited instead of retaining spool: {status}");
+        }
+        anyhow::ensure!(
+            Instant::now() < offline_deadline,
+            "offline watcher did not durably stage the new delta:\n{}",
+            watch_log(&offline_log)
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    anyhow::ensure!(
+        offline.try_wait()?.is_none(),
+        "cloud outage must not terminate a watcher with a verified local base"
+    );
+    stop_child(&mut offline);
+
+    let expected = rows(&db_path)?;
+    let mut reconnect = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &reconnect_log,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+    })?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected,
+    )?;
+    assert_integrity_ok(&restored_path)?;
+    stop_child(&mut reconnect);
+
+    let runtime = tokio::runtime::Runtime::new()?;
+    runtime.block_on(async {
+        let storage = walrust::s3_backend_from_env(test_bucket(), endpoint.as_deref()).await?;
+        let keys =
+            hadb_storage::StorageBackend::list(storage.as_ref(), &format!("{prefix}/"), None)
+                .await?;
+        for key in keys {
+            hadb_storage::StorageBackend::delete(storage.as_ref(), &key).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })?;
+    Ok(())
+}
+
 /// DF1: short-lived application sessions must never become SQLite's last
 /// connection while shadow watch is running. The pinned `_walrust_seq` frame
 /// keeps the WAL alive, so the watcher neither dies on WAL lifecycle states nor
