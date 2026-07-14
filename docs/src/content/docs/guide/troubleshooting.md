@@ -364,11 +364,14 @@ wal_truncate_threshold_pages = 121359
 ```
 
 Default shadow watch deliberately pins a WAL read mark so application
-checkpoints cannot destroy frames that have not reached S3. That makes walrust
+checkpoints cannot destroy frames that have not reached its fsynced native HADBP
+spool and journal. That makes walrust
 responsible for releasing the WAL. If the threshold is crossed, walrust logs an
-ERROR and sends the optional `wal_size_exceeded` webhook before durably draining
-and running its controlled TRUNCATE checkpoint. Treat repeated alarms as backup
-lag or a wedged watcher; they can precede slow or stalled application writes.
+ERROR and sends the optional `wal_size_exceeded` webhook before durably staging
+and running its controlled TRUNCATE checkpoint. `remote_lag` means S3 is behind;
+`local_spool_high` and `local_spool_full` mean local capacity needs attention.
+At full capacity walrust keeps the blocker and stops checkpointing, so repeated
+alarms can precede slow or stalled application writes.
 
 2. Reduce snapshot interval for memory relief:
 

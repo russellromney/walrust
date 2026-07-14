@@ -111,6 +111,7 @@ walrust watch [OPTIONS] --bucket <BUCKET> <DATABASES>...
 | `--checkpoint-interval <SECONDS>` | PASSIVE checkpoint interval (default: 60) |
 | `--min-checkpoint-pages <N>` | Min WAL pages before checkpoint (default: 1000, ~4MB) |
 | `--wal-truncate-threshold <N>` | Emergency truncate threshold in pages (default: 121359, ~500MB) |
+| `--checkpoint-release <local\|remote>` | Checkpoint after durable local HADBP admission (default), or additionally wait for contiguous remote publication |
 | `--validation-interval <SECONDS>` | Backup validation interval (default: 0, disabled) |
 | `--retain-hourly <N>` | Hourly snapshots to retain (default: 24) |
 | `--retain-daily <N>` | Daily snapshots to retain (default: 7) |
@@ -652,7 +653,13 @@ walrust pragma --comments false
 
 ## Shadow WAL (Default Mode)
 
-Walrust uses shadow WAL by default. Shadow WAL decouples S3 uploads from SQLite's active WAL file by copying WAL frames to a separate shadow file. This matches Litestream's architecture and prevents upload latency from affecting SQLite write performance.
+Walrust uses shadow WAL by default. It fsyncs copied frames, encodes native
+HADBP into a durable local spool, and only then opens a controlled SQLite
+checkpoint window. The exact staged bytes upload asynchronously, so S3 latency
+does not enter the default checkpoint path while local capacity is healthy.
+`--checkpoint-release remote` additionally gates checkpoints on the contiguous
+remote publish cursor; it does not make every SQLite commit synchronously
+cloud-durable.
 
 Shadow directories are created at `.<database>-walrust/` next to each database file.
 
@@ -670,7 +677,7 @@ Each database gets its own task that independently watches for WAL changes and s
 
 ---
 
-## Disk Cache
+## Legacy Disk Cache Compatibility
 
 ```bash
 walrust watch mydb.db --bucket my-bucket \
@@ -679,7 +686,8 @@ walrust watch mydb.db --bucket my-bucket \
   --cache-max-size 5368709120
 ```
 
-When enabled, LTX files are written to disk before uploading to S3. This provides:
+These options retain compatibility with legacy LTX queues. Native HADBP spooling
+is always active in default shadow mode and is configured with `[spool]`.
 
 - Crash recovery (resume uploads after restart)
 - Decoupled encoding from uploads

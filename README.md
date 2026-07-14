@@ -139,7 +139,7 @@ behavior breaks:
   committed inside the final un-synced window can be lost in a hard crash;
   everything synced is restorable. A clean `flush()` before shutdown means zero
   loss.
-- **Checkpoints can't destroy unshipped data.** walrust pins the WAL with a
+- **Checkpoints can't destroy unstaged data.** walrust pins the WAL with a
   read transaction (via the small `_walrust_seq` table it creates in each
   watched database — the same technique Litestream uses), so an external
   `wal_checkpoint` cannot reset the WAL mid-backup. If the database *was*
@@ -151,8 +151,12 @@ behavior breaks:
   is responsible for checkpointing. A stuck or undersized watcher can let the
   WAL grow and eventually slow application writes; `wal_truncate_threshold_pages`
   is the safety ceiling. Crossing it emits an ERROR plus the optional
-  `wal_size_exceeded` webhook, drains the shadow tail durably, then opens a
-  controlled TRUNCATE window and immediately reacquires the blocker.
+  `wal_size_exceeded` webhook, fsyncs the shadow tail as native HADBP plus its
+  local journal, then opens a controlled TRUNCATE window and immediately
+  reacquires the blocker. S3 publication runs asynchronously from that durable
+  spool. Set `checkpoint_release = "remote"` only when checkpoints should also
+  wait for the contiguous remote publish cursor; this does not make each SQLite
+  commit synchronously cloud-durable.
 - **Restart re-anchors with a full snapshot (`--independent-tasks`).** On every
   restart against an existing stream, walrust re-anchors by uploading a fresh
   full snapshot of the current `.db`, not by resuming an incremental. This is a

@@ -59,6 +59,7 @@ compact_interval = 0
 checkpoint_interval = 60
 min_checkpoint_page_count = 1000
 wal_truncate_threshold_pages = 121359
+checkpoint_release = "local"
 
 validation_interval = 86400
 
@@ -75,6 +76,14 @@ enabled = false
 retention = "24h"
 max_size = 5368709120
 path = "/var/cache/walrust"
+
+# Required native HADBP spool used by default shadow watch
+[spool]
+path = "/var/lib/walrust/spool"
+warning_size = 4294967296
+max_size = 5368709120
+min_free_space = 1073741824
+shutdown_drain_seconds = 10
 
 # Retry configuration
 [retry]
@@ -148,6 +157,7 @@ Global sync and snapshot triggers.
 | `checkpoint_interval` | integer | 60 | Run PRAGMA wal_checkpoint(PASSIVE) every N seconds |
 | `min_checkpoint_page_count` | integer | 1000 | Min WAL pages before checkpoint (1000 pages ≈ 4 MB) |
 | `wal_truncate_threshold_pages` | integer | 121359 | ERROR + `wal_size_exceeded` webhook, durable drain, and controlled TRUNCATE at N WAL pages (121359 ≈ 500 MB; 0 disables) |
+| `checkpoint_release` | `"local"` or `"remote"` | `"local"` | Release the checkpoint blocker after durable local HADBP admission, or additionally wait for contiguous remote publication |
 | `validation_interval` | integer | 0 | Automated backup verification interval in seconds (0 = disabled) |
 
 **Snapshot Triggers:**
@@ -170,6 +180,7 @@ Prevents unbounded WAL growth:
 checkpoint_interval = 60                    # Check every 60 seconds
 min_checkpoint_page_count = 1000            # Only if WAL ≥ 1000 pages
 wal_truncate_threshold_pages = 121359       # Emergency truncate at 500 MB
+checkpoint_release = "local"               # S3 latency stays off the checkpoint path
 ```
 
 **Validation:**
@@ -248,9 +259,30 @@ monthly = 24
 
 ---
 
+### [spool]
+
+Default shadow watch always stages native HADBP objects and their journal to a
+durable local spool before it may checkpoint SQLite. This spool is independent
+of the compatibility `[cache]` for legacy LTX streams.
+
+| Field | Type | Default | Description |
+|-------|------|---------|-------------|
+| `path` | string | `.walrust-spool` beside the database | Root for collision-safe per-database spool directories |
+| `warning_size` | integer | 4294967296 | Warning watermark in bytes (4 GiB) |
+| `max_size` | integer | 5368709120 | Hard capacity in bytes (5 GiB); pending objects are never evicted |
+| `min_free_space` | integer | 1073741824 | Required reserve on the actual spool filesystem (1 GiB) |
+| `shutdown_drain_seconds` | integer | 10 | Optional bounded cloud drain on graceful shutdown; pending work remains on disk |
+
+At the hard limit or free-space reserve, walrust retains the checkpoint blocker
+and pauses checkpointing. A cloud outage instead raises `remote_lag` while local
+ingestion continues until these local protections are reached.
+
+---
+
 ### [cache]
 
-Disk cache for LTX upload queue (opt-in feature).
+Compatibility disk cache for legacy LTX upload queues. New default shadow-watch
+objects use the required native HADBP `[spool]` instead.
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
