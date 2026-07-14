@@ -419,29 +419,44 @@ struct LoggedWatchArgs<'a> {
     durability_failpoint_marker: Option<&'a Path>,
 }
 
+#[derive(Clone, Copy)]
+struct TriggerOptions {
+    snapshot_interval: u64,
+    max_changes: u64,
+    max_interval: u64,
+    on_idle: u64,
+}
+
 fn spawn_cli_watch_logged(args: LoggedWatchArgs<'_>) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, None, None)
+    spawn_cli_watch_logged_with_options(args, None, None, None, None)
 }
 
 fn spawn_cli_watch_logged_with_checkpoint_release(
     args: LoggedWatchArgs<'_>,
     checkpoint_release: Option<&str>,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, checkpoint_release, None, None)
+    spawn_cli_watch_logged_with_options(args, checkpoint_release, None, None, None)
 }
 
 fn spawn_cli_watch_logged_with_upload_crash_once(
     args: LoggedWatchArgs<'_>,
     crash_once_file: &Path,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, Some(crash_once_file), None)
+    spawn_cli_watch_logged_with_options(args, None, Some(crash_once_file), None, None)
 }
 
 fn spawn_cli_watch_logged_with_cleanup_interval(
     args: LoggedWatchArgs<'_>,
     cleanup_interval_ms: u64,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, None, Some(cleanup_interval_ms))
+    spawn_cli_watch_logged_with_options(args, None, None, Some(cleanup_interval_ms), None)
+}
+
+fn spawn_cli_watch_logged_with_triggers(
+    args: LoggedWatchArgs<'_>,
+    triggers: TriggerOptions,
+) -> Result<Child> {
+    spawn_cli_watch_logged_with_options(args, None, None, None, Some(triggers))
 }
 
 fn spawn_cli_watch_logged_with_options(
@@ -449,6 +464,7 @@ fn spawn_cli_watch_logged_with_options(
     checkpoint_release: Option<&str>,
     crash_once_file: Option<&Path>,
     cleanup_interval_ms: Option<u64>,
+    triggers: Option<TriggerOptions>,
 ) -> Result<Child> {
     let log = std::fs::File::create(args.log_path)?;
     let log_err = log.try_clone()?;
@@ -456,15 +472,27 @@ fn spawn_cli_watch_logged_with_options(
     if let Some(config_path) = args.config_path {
         watch.arg("--config").arg(config_path);
     }
+    let triggers = triggers.unwrap_or(TriggerOptions {
+        snapshot_interval: 999_999,
+        max_changes: 0,
+        max_interval: 0,
+        on_idle: 0,
+    });
     watch
         .arg("watch")
         .arg(args.db_path)
         .arg("--bucket")
         .arg(args.bucket_arg)
         .arg("--snapshot-interval")
-        .arg("999999")
+        .arg(triggers.snapshot_interval.to_string())
         .arg("--wal-sync-interval")
         .arg("1")
+        .arg("--max-changes")
+        .arg(triggers.max_changes.to_string())
+        .arg("--max-interval")
+        .arg(triggers.max_interval.to_string())
+        .arg("--on-idle")
+        .arg(triggers.on_idle.to_string())
         .arg("--checkpoint-interval")
         .arg(args.checkpoint_interval.to_string())
         .arg("--min-checkpoint-pages")
@@ -1556,6 +1584,243 @@ fn e2e_cli_spool_high_full_retains_blocker_and_recovers_after_restart() -> Resul
     )?;
     assert_integrity_ok(&restored_path)?;
     stop_child(&mut restarted);
+    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_every_snapshot_trigger_stages_native_hadbp_before_upload() -> Result<()> {
+    require_s3!("e2e_cli_every_snapshot_trigger_stages_native_hadbp_before_upload");
+    let endpoint = test_endpoint();
+    for (reason, triggers, expected_log) in [
+        (
+            "periodic",
+            TriggerOptions {
+                snapshot_interval: 2,
+                max_changes: 0,
+                max_interval: 0,
+                on_idle: 0,
+            },
+            None,
+        ),
+        (
+            "max_changes",
+            TriggerOptions {
+                snapshot_interval: 999_999,
+                max_changes: 1,
+                max_interval: 0,
+                on_idle: 0,
+            },
+            Some("max_changes trigger"),
+        ),
+        (
+            "max_interval",
+            TriggerOptions {
+                snapshot_interval: 999_999,
+                max_changes: 0,
+                max_interval: 1,
+                on_idle: 0,
+            },
+            Some("max_interval trigger"),
+        ),
+        (
+            "on_idle",
+            TriggerOptions {
+                snapshot_interval: 999_999,
+                max_changes: 0,
+                max_interval: 0,
+                on_idle: 1,
+            },
+            Some("on_idle trigger"),
+        ),
+    ] {
+        let temp = TempDir::new()?;
+        let name = unique_name(&format!("cli-native-trigger-{reason}"));
+        let prefix = format!("e2e/{name}");
+        let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+        let db_path = temp.path().join(format!("{name}.db"));
+        let restored_path = temp.path().join("restored.db");
+        let log_path = temp.path().join("watch.log");
+        let setup = create_source_db(&db_path, 5)?;
+        let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+        write_pin_frame(&setup, reason)?;
+        let mut child = spawn_cli_watch_logged_with_triggers(
+            LoggedWatchArgs {
+                db_path: &db_path,
+                bucket_arg: &bucket_arg,
+                endpoint: endpoint.as_deref(),
+                log_path: &log_path,
+                config_path: None,
+                checkpoint_interval: 999_999,
+                min_checkpoint_pages: 1,
+                wal_truncate_threshold: 100_000,
+                native_upload_pause_file: None,
+                durability_failpoint: None,
+                durability_failpoint_marker: None,
+            },
+            triggers,
+        )?;
+        wait_for_cli_startup_rearms(&log_path, &mut child)?;
+        if reason != "periodic" {
+            append_wide_rows(&writer, 6, 20, reason)?;
+        }
+        let expected = rows(&db_path)?;
+        let trigger_deadline = Instant::now() + e2e_poll_deadline(30);
+        loop {
+            let log = watch_log(&log_path);
+            let snapshot_count = log
+                .matches("native HADBP snapshot admitted to durable local spool")
+                .count();
+            let reason_seen = expected_log.is_none_or(|needle| log.contains(needle));
+            if snapshot_count >= 3 && reason_seen {
+                break;
+            }
+            if let Some(status) = child.try_wait()? {
+                anyhow::bail!("{reason} snapshot watcher exited ({status}):\n{log}");
+            }
+            anyhow::ensure!(
+                Instant::now() < trigger_deadline,
+                "{reason} did not admit a native snapshot:\n{log}"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+
+        let native_root = temp.path().join(".walrust-spool/native-v1");
+        let stream_root = std::fs::read_dir(native_root)?
+            .next()
+            .context("trigger spool stream missing")??
+            .path();
+        let identity =
+            walrust::walrust_core::native_spool::NativeSpool::read_identity(&stream_root)?
+                .context("trigger spool identity missing")?;
+        let spool = walrust::walrust_core::native_spool::NativeSpool::create_or_open(
+            &stream_root,
+            identity,
+            walrust::walrust_core::native_spool::CapacityPolicy {
+                warning_bytes: u64::MAX - 1,
+                hard_bytes: u64::MAX,
+                minimum_free_bytes: 0,
+            },
+        )?;
+        anyhow::ensure!(
+            spool
+                .objects()
+                .filter(|object| object.kind
+                    == walrust::walrust_core::native_spool::ObjectKind::Snapshot)
+                .count()
+                >= 3
+                && spool
+                    .objects()
+                    .all(|object| object.payload_file_name().ends_with(".hadbp")),
+            "{reason} did not produce durable native snapshot objects"
+        );
+        drop(spool);
+        wait_for_cli_restore_rows(
+            &name,
+            &bucket_arg,
+            endpoint.as_deref(),
+            &restored_path,
+            &expected,
+        )?;
+        assert_integrity_ok(&restored_path)?;
+        stop_child(&mut child);
+        cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
+    }
+    Ok(())
+}
+
+#[test]
+fn e2e_cli_fresh_native_stream_restores_latest_and_exact_pitr() -> Result<()> {
+    require_s3!("e2e_cli_fresh_native_stream_restores_latest_and_exact_pitr");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-native-pitr");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let first_restore = temp.path().join("first-restore.db");
+    let latest_restore = temp.path().join("latest-restore.db");
+    let pitr_restore = temp.path().join("pitr-restore.db");
+    let log_path = temp.path().join("watch.log");
+    let setup = create_source_db(&db_path, 5)?;
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "native-pitr")?;
+    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
+        db_path: &db_path,
+        bucket_arg: &bucket_arg,
+        endpoint: endpoint.as_deref(),
+        log_path: &log_path,
+        config_path: None,
+        checkpoint_interval: 999_999,
+        min_checkpoint_pages: 1,
+        wal_truncate_threshold: 100_000,
+        native_upload_pause_file: None,
+        durability_failpoint: None,
+        durability_failpoint_marker: None,
+    })?;
+    wait_for_cli_startup_rearms(&log_path, &mut child)?;
+
+    append_wide_rows(&writer, 6, 20, "native-pitr-first")?;
+    let first_rows = rows(&db_path)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &first_restore,
+        &first_rows,
+    )?;
+    let stream_root = std::fs::read_dir(temp.path().join(".walrust-spool/native-v1"))?
+        .next()
+        .context("PITR spool stream missing")??
+        .path();
+    let identity = walrust::walrust_core::native_spool::NativeSpool::read_identity(&stream_root)?
+        .context("PITR spool identity missing")?;
+    let spool = walrust::walrust_core::native_spool::NativeSpool::create_or_open(
+        &stream_root,
+        identity,
+        walrust::walrust_core::native_spool::CapacityPolicy {
+            warning_bytes: u64::MAX - 1,
+            hard_bytes: u64::MAX,
+            minimum_free_bytes: 0,
+        },
+    )?;
+    let first_delta_seq = spool
+        .objects()
+        .find(|object| object.kind == walrust::walrust_core::native_spool::ObjectKind::Delta)
+        .context("first native delta missing")?
+        .seq;
+    drop(spool);
+
+    append_wide_rows(&writer, 21, 40, "native-pitr-latest")?;
+    let latest_rows = rows(&db_path)?;
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &latest_restore,
+        &latest_rows,
+    )?;
+    assert_integrity_ok(&latest_restore)?;
+
+    let output = run_cli_restore_pit_output(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &pitr_restore,
+        first_delta_seq,
+    )?;
+    anyhow::ensure!(
+        output.status.success(),
+        "native PITR to seq {first_delta_seq} failed:\n{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_integrity_ok(&pitr_restore)?;
+    anyhow::ensure!(
+        rows(&pitr_restore)? == first_rows,
+        "native PITR did not stop exactly at sequence {first_delta_seq}"
+    );
+    stop_child(&mut child);
     cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())
 }
