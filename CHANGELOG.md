@@ -22,6 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Local-first native HADBP shadow watch:** default CLI watch now stages every
+  initial, periodic, threshold, idle, downtime, and dirty-window snapshot or
+  delta as fsynced native HADBP plus a durable local journal before opening a
+  controlled SQLite checkpoint window. `checkpoint_release = "local"` never
+  waits for cloud I/O; the opt-in `"remote"` policy waits for a contiguous,
+  exact remote publish cursor. The asynchronous disk-scanning uploader uses a
+  versioned `native/v1` namespace, immutable conditional publication, exact
+  payload/header/chain validation, bounded retry, split-brain refusal, and
+  remote visibility records that never expose a delta without its snapshot
+  base. Restart reconciles snapshot/install intents, adopts only proven
+  orphans, re-anchors every dirty checkpoint window, preserves pending work
+  through shutdown and capacity pressure, and supports complete local restore
+  while S3 is unavailable. Native retention advances only through verified
+  snapshot-floor records; legacy 0.7 LTX history remains readable and migrates
+  through a full native snapshot boundary. Independent review additionally
+  closed fail-open monitor-refresh rearm, corrupt remote cursor, pre-validation
+  cleanup unlink, missing predecessor/base publication, and retained-floor base
+  selection gaps.
 - **Native migration prune gate:** legacy pruning now requires the same
   descriptor-selected contiguous native snapshot base used by restore. A stray
   publish record beyond a gap cannot unlock deletion of the legacy recovery
@@ -64,6 +82,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- Added live-S3 call-site proofs for local checkpoint independence from paused
+  uploads, opt-in remote release, exact staged bytes, all snapshot triggers,
+  every shadow/snapshot/journal/checkpoint/PUT/publish/cleanup/shutdown SIGKILL
+  boundary, offline restart/reconnect conflict, custom multi-database spool
+  paths, capacity watermarks, graceful bounded drain, PASSIVE contention,
+  native latest/PITR/prune/compaction, and legacy migration. Load-bearing gates
+  were neutered to observe failure before restored green runs. The preserved
+  DF1/DF2, application checkpoint, WAL backpressure, racing checkpoint,
+  two-writer, fenced follower, core SIGKILL, and frozen 0.7 format-stability
+  gates remain green.
 - Pinned the checkpoint-blocker contract against real SQLite databases across
   every supported page size and synchronous level: a concurrent
   `wal_checkpoint(TRUNCATE)` reports busy and preserves the WAL until walrust
