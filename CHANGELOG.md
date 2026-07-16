@@ -44,10 +44,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pins every SQLite WAL before S3 client construction or remote discovery, so
   application TRUNCATE cannot erase startup-window frames. Shadow segments use
   an atomic, fsynced durable-tail marker and discard even frame-aligned bytes
-  beyond that proof after a crash. Snapshot capacity is computed from a pinned
-  SQLite `page_count` that includes WAL-visible growth and reserves the stable
-  copy, HADBP payloads, full journal rewrite, intents, source footprint, and
-  filesystem reserve before creating the copy. Object admission likewise
+  beyond that proof after a crash. Snapshot capacity is computed from the exact
+  fsynced shadow commit boundary and reserves the direct HADBP
+  temporary/installed payload, full journal rewrite, intents, source footprint,
+  and filesystem reserve before encoding. Object admission likewise
   reserves install-intent and journal rewrite peaks. SIGTERM retries local
   admission indefinitely with the blocker held when capacity or local I/O is
   unhealthy; SIGKILL remains the explicit forced-stop route.
@@ -57,9 +57,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before later deltas. Live append write/sync/marker failures restore the prior
   durable marker, truncate and fsync the prior length, and roll back all
   in-memory WAL cursor state before retry; rollback failure poisons admission
-  until restart. Native snapshots now use the lifetime SQLite source handle
-  opened before the checkpoint blocker, eliminating the source-close lock gap,
-  and capacity reserves a full destination rollback journal as well.
+  until restart. Native watcher snapshots now apply Litestream's physical
+  page-selection rule directly: the latest page at the frozen fsynced shadow
+  commit wins, otherwise the pinned main database supplies the page, and the
+  result streams straight into native HADBP. There is no SQLite online-backup
+  or VACUUM handoff, stable `.db` copy, or destination rollback-journal
+  transient.
 - **Native spool ownership and collision safety:** an advisory ownership lock
   prevents local restore or a second mutating recovery opener from racing the
   watcher's payload-before-journal and cleanup windows. Active local restore
@@ -83,6 +86,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Native spool crash recovery:** restart now validates and completes a
   fsynced HADBP payload temporary when its durable install intent exists,
   instead of deleting the intent and leaving a temp that blocks every retry.
+  Direct snapshots also fsync the temporary's directory entry before their
+  crash boundary and adopt a complete temp from the durable frozen-source
+  intent even when the generic install intent was not yet written. Incomplete
+  pre-admission encodes are validated and removed without cursor advancement;
+  cleanup refuses to remove a temp once durable object installation has begun.
 - **Lossless default CLI watch:** shadow watch retains the same pinned-frame
   `_walrust_seq` checkpoint blocker used by owned/library replication for each
   database, so application autocheckpoints, explicit TRUNCATE checkpoints, and
@@ -137,12 +145,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   at its call site and observed failing before its restored green run.
 - Added live-S3 proofs that markerless upgrade re-anchors before emitting a
   new-generation delta and that an application TRUNCATE remains blocked at the
-  native snapshot copy handoff while a post-copy commit restores exactly.
+  native frozen-shadow snapshot handoff. The test commits after the exact cursor
+  is frozen, proves the local snapshot excludes that commit without any
+  intermediate `.db`, then proves the following native delta and remote latest
+  restore include it exactly.
   Injected unit failures cover partial write, pre-fsync, post-marker, and WAL
   checksum-cursor rollback paths. CI fixture hardening now constructs legacy
   cursor generations and their durable-tail marker explicitly, and the
   snapshot-handoff E2E uses a bounded durable-delta observation so exact remote
   restore cannot race the watcher log assertion.
+- Added direct-snapshot fail-on-revert proofs for shadow-page precedence, exact
+  prewritten HADBP temp installation, durable frozen-source intent admission,
+  complete pre-install-intent orphan adoption, and divergent-valid-temp
+  retention. The live frozen-cursor path additionally caught and fixed Tokio's
+  immediate first periodic-snapshot tick, which otherwise emitted a redundant
+  second snapshot instead of the required next native delta.
+- Markerless shadow upgrade now resets the live-WAL copy offset when durable-tail
+  recovery discards the bytes described by old progress. This recopies the
+  pinned WAL from zero before the direct native snapshot re-anchor instead of
+  incorrectly asking the shorter main DB for a WAL-only page. The marker-file
+  SIGKILL harness also waits for non-empty fsynced marker contents, eliminating
+  a create-before-write observation race without weakening any crash boundary.
 - Pinned the checkpoint-blocker contract against real SQLite databases across
   every supported page size and synchronous level: a concurrent
   `wal_checkpoint(TRUNCATE)` reports busy and preserves the WAL until walrust

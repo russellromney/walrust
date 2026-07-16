@@ -300,7 +300,11 @@ struct InstallIntent {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SnapshotIntentState {
     Creating,
-    Stable { payload_length: u64, sha256: String },
+    /// Compatibility-only state written by pre-direct-snapshot PR #43 builds.
+    Stable {
+        payload_length: u64,
+        sha256: String,
+    },
     Admitted,
 }
 
@@ -313,7 +317,12 @@ pub struct SnapshotIntent {
     pub intended_remote_key: String,
     pub source_cursor: SourceCursor,
     pub page_size: u32,
-    pub stable_file_name: String,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        alias = "stable_file_name"
+    )]
+    pub legacy_stable_file_name: Option<String>,
     pub state: SnapshotIntentState,
 }
 
@@ -324,8 +333,6 @@ pub struct SnapshotPreparation {
     pub intended_remote_key: String,
     pub source_cursor: SourceCursor,
     pub page_size: u32,
-    pub stable_path: PathBuf,
-    pub stable: bool,
 }
 
 pub struct NativeSpool {
@@ -643,7 +650,6 @@ impl NativeSpool {
         source_cursor: SourceCursor,
         page_size: u32,
     ) -> Result<SnapshotPreparation> {
-        let stable_file_name = format!("{seq:016x}.db");
         let proposed = SnapshotIntent {
             version: SPOOL_VERSION,
             stream_digest: self.journal.identity.stream_digest(),
@@ -652,7 +658,7 @@ impl NativeSpool {
             intended_remote_key,
             source_cursor,
             page_size,
-            stable_file_name,
+            legacy_stable_file_name: None,
             state: SnapshotIntentState::Creating,
         };
         let intent = match self.read_snapshot_intent()? {
@@ -680,52 +686,12 @@ impl NativeSpool {
                 proposed
             }
         };
-        let stable_path = self.snapshot_stable_path(&intent)?;
         Ok(SnapshotPreparation {
             seq: intent.seq,
             previous_chain_checksum: intent.previous_chain_checksum,
             intended_remote_key: intent.intended_remote_key,
             source_cursor: intent.source_cursor,
             page_size: intent.page_size,
-            stable_path,
-            stable: matches!(intent.state, SnapshotIntentState::Stable { .. }),
-        })
-    }
-
-    pub fn mark_snapshot_stable(&mut self, seq: u64) -> Result<SnapshotPreparation> {
-        let mut intent = self
-            .read_snapshot_intent()?
-            .ok_or_else(|| anyhow!("no native snapshot intent exists for seq {seq}"))?;
-        if intent.seq != seq || intent.state != SnapshotIntentState::Creating {
-            bail!("native snapshot seq {seq} is not in creating state");
-        }
-        let path = self.snapshot_stable_path(&intent)?;
-        let file = File::open(&path)
-            .with_context(|| format!("open stable native snapshot {}", path.display()))?;
-        file.sync_all()?;
-        let length = file.metadata()?.len();
-        if length == 0 || !length.is_multiple_of(intent.page_size as u64) {
-            bail!(
-                "stable native snapshot seq {seq} has invalid length {length} for page size {}",
-                intent.page_size
-            );
-        }
-        let bytes = fs::read(&path)?;
-        intent.state = SnapshotIntentState::Stable {
-            payload_length: length,
-            sha256: sha256_hex(&bytes),
-        };
-        persist_json(&self.root, &self.snapshot_intent_path, &intent)?;
-        sync_dir(&self.snapshots_dir)?;
-        durability_failpoint("snapshot_stable_committed");
-        Ok(SnapshotPreparation {
-            seq: intent.seq,
-            previous_chain_checksum: intent.previous_chain_checksum,
-            intended_remote_key: intent.intended_remote_key,
-            source_cursor: intent.source_cursor,
-            page_size: intent.page_size,
-            stable_path: path,
-            stable: true,
         })
     }
 
@@ -753,7 +719,36 @@ impl NativeSpool {
         }
         intent.state = SnapshotIntentState::Admitted;
         persist_json(&self.root, &self.snapshot_intent_path, &intent)?;
-        remove_and_sync(&self.snapshot_stable_path(&intent)?, &self.snapshots_dir)?;
+        if let Some(path) = self.legacy_snapshot_stable_path(&intent)? {
+            remove_and_sync(&path, &self.snapshots_dir)?;
+        }
+        remove_and_sync(&self.snapshot_intent_path, &self.root)
+    }
+
+    /// Abandon a source boundary that never reached durable object admission.
+    /// No checkpoint can have been released for it, so retry must freeze a new
+    /// current boundary instead of pretending the old main-DB base is still
+    /// reconstructible after arbitrary application activity.
+    pub fn abandon_unadmitted_snapshot(&mut self, seq: u64) -> Result<()> {
+        let Some(intent) = self.read_snapshot_intent()? else {
+            return Ok(());
+        };
+        if intent.seq != seq {
+            bail!(
+                "cannot abandon native snapshot seq {seq}; intent belongs to {}",
+                intent.seq
+            );
+        }
+        if self.journal.objects.contains_key(&seq) {
+            bail!("cannot abandon durably admitted native snapshot seq {seq}");
+        }
+        if self.intent_path(seq).exists() {
+            bail!(
+                "cannot abandon native snapshot seq {seq}; durable object installation is in progress"
+            );
+        }
+        let tmp = self.payload_temporary_path(ObjectKind::Snapshot, seq);
+        remove_and_sync(&tmp, &self.objects_dir)?;
         remove_and_sync(&self.snapshot_intent_path, &self.root)
     }
 
@@ -770,6 +765,17 @@ impl NativeSpool {
 
     pub fn payload_path(&self, object: &SpoolObject) -> PathBuf {
         self.objects_dir.join(object.payload_file_name())
+    }
+
+    /// Exact same-directory temporary consumed by [`NativeSpool::stage`].
+    /// Snapshot encoders may stream directly here before admission; the
+    /// durable snapshot source intent, not this temporary alone, is its proof.
+    pub fn payload_temporary_path(&self, kind: ObjectKind, seq: u64) -> PathBuf {
+        payload_temp_path(
+            &self
+                .objects_dir
+                .join(format!("{:04x}-{seq:016x}.hadbp", kind.generation())),
+        )
     }
 
     pub fn read_payload(&self, seq: u64) -> Result<Vec<u8>> {
@@ -904,10 +910,15 @@ impl NativeSpool {
             object: object.clone(),
         })?;
         let journal_bytes = serialized_json_len(&projected_journal)?;
-        let additional_peak = (stage.payload.len() as u64)
-            .saturating_mul(2)
-            .saturating_add(intent_bytes)
-            .saturating_add(journal_bytes);
+        let payload_path = self.payload_path(&object);
+        let prepared_temp_exists = payload_temp_path(&payload_path).exists();
+        let additional_peak = (if prepared_temp_exists {
+            0
+        } else {
+            (stage.payload.len() as u64).saturating_mul(2)
+        })
+        .saturating_add(intent_bytes)
+        .saturating_add(journal_bytes);
         self.ensure_capacity(additional_peak)?;
 
         let intent_path = self.intent_path(stage.seq);
@@ -921,7 +932,6 @@ impl NativeSpool {
         )?;
         durability_failpoint("object_intent_committed");
 
-        let payload_path = self.payload_path(&object);
         match fs::read(&payload_path) {
             Ok(existing) if existing == stage.payload => {
                 validate_payload(&object, &existing, &self.root)?;
@@ -931,7 +941,23 @@ impl NativeSpool {
                 stage.seq
             ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                install_payload(&self.objects_dir, &payload_path, stage.payload)?;
+                let tmp = payload_temp_path(&payload_path);
+                match fs::read(&tmp) {
+                    Ok(existing) if existing == stage.payload => {
+                        validate_payload(&object, &existing, &self.root)?;
+                        File::open(&tmp)?.sync_all()?;
+                        fs::rename(&tmp, &payload_path)?;
+                        sync_dir(&self.objects_dir)?;
+                    }
+                    Ok(_) => bail!(
+                        "native spool equivocation: divergent payload temporary at sequence {}",
+                        stage.seq
+                    ),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        install_payload(&self.objects_dir, &payload_path, stage.payload)?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
                 durability_failpoint("payload_renamed");
             }
             Err(e) => return Err(e.into()),
@@ -1645,22 +1671,10 @@ impl NativeSpool {
         Ok(Some(intent))
     }
 
-    fn snapshot_stable_path(&self, intent: &SnapshotIntent) -> Result<PathBuf> {
-        let name = Path::new(&intent.stable_file_name);
-        if name.components().count() != 1
-            || name.file_name().and_then(|value| value.to_str())
-                != Some(intent.stable_file_name.as_str())
-        {
-            bail!("native snapshot intent contains an unsafe stable filename");
-        }
-        Ok(self.snapshots_dir.join(name))
-    }
-
     fn reconcile_snapshot_intent(&mut self) -> Result<()> {
         let Some(mut intent) = self.read_snapshot_intent()? else {
             return Ok(());
         };
-        let stable_path = self.snapshot_stable_path(&intent)?;
         if let Some(object) = self.journal.objects.get(&intent.seq) {
             if object.kind != ObjectKind::Snapshot
                 || object.source_cursor != intent.source_cursor
@@ -1674,32 +1688,96 @@ impl NativeSpool {
             }
             intent.state = SnapshotIntentState::Admitted;
             persist_json(&self.root, &self.snapshot_intent_path, &intent)?;
-            remove_and_sync(&stable_path, &self.snapshots_dir)?;
+            if let Some(path) = self.legacy_snapshot_stable_path(&intent)? {
+                remove_and_sync(&path, &self.snapshots_dir)?;
+            }
             return remove_and_sync(&self.snapshot_intent_path, &self.root);
         }
         match &intent.state {
             SnapshotIntentState::Creating => {
-                // The durable stable marker is written only after the file and
-                // directory fsync. Without it, even a parseable file is not a
-                // durability proof and must be recreated from SQLite.
-                remove_and_sync(&stable_path, &self.snapshots_dir)?;
+                let tmp = self.payload_temporary_path(ObjectKind::Snapshot, intent.seq);
+                let bytes = match fs::read(&tmp) {
+                    Ok(bytes) => bytes,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        // Encoding never made a durable payload. No checkpoint
+                        // can have been released, so a new boundary is safe.
+                        return remove_and_sync(&self.snapshot_intent_path, &self.root);
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                let decoded = match ltx::decode_sqlite_changeset(&bytes) {
+                    Ok(decoded) => decoded,
+                    Err(error) => {
+                        // A create-new temporary with no install intent is an
+                        // interrupted encode, not an admitted recovery point.
+                        // Validate it as incomplete before removing both
+                        // pieces of unadmitted state.
+                        tracing::warn!(
+                            seq = intent.seq,
+                            path = %tmp.display(),
+                            error = %error,
+                            "removing incomplete unadmitted native snapshot temporary"
+                        );
+                        remove_and_sync(&tmp, &self.objects_dir)?;
+                        return remove_and_sync(&self.snapshot_intent_path, &self.root);
+                    }
+                };
+                if decoded.header.seq != intent.seq
+                    || decoded.header.prev_checksum != intent.previous_chain_checksum
+                    || decoded.header.page_size != intent.page_size
+                {
+                    bail!(
+                        "valid native snapshot temporary diverges from durable source intent at seq {}; retaining it",
+                        intent.seq
+                    );
+                }
+                let (ending_chain_checksum, end_page_count) =
+                    ltx::snapshot_checksum_and_page_count(&decoded)?;
+                self.stage(StageObject {
+                    seq: intent.seq,
+                    kind: ObjectKind::Snapshot,
+                    previous_chain_checksum: intent.previous_chain_checksum,
+                    ending_chain_checksum,
+                    end_page_count,
+                    intended_remote_key: intent.intended_remote_key.clone(),
+                    source_cursor: intent.source_cursor.clone(),
+                    payload: &bytes,
+                })?;
+                self.finish_snapshot(intent.seq)
             }
             SnapshotIntentState::Stable {
                 payload_length,
                 sha256,
             } => {
-                let bytes = fs::read(&stable_path).with_context(|| {
-                    format!(
-                        "durable native snapshot intent references missing stable copy {}",
-                        stable_path.display()
-                    )
+                let path = self.legacy_snapshot_stable_path(&intent)?.ok_or_else(|| {
+                    anyhow!("legacy stable snapshot intent is missing its filename")
                 })?;
+                let bytes = fs::read(&path)
+                    .with_context(|| format!("read legacy stable snapshot {}", path.display()))?;
                 if bytes.len() as u64 != *payload_length || sha256_hex(&bytes) != *sha256 {
                     bail!(
-                        "durable native snapshot stable copy failed length/digest validation at seq {}",
+                        "legacy stable snapshot intent failed length/digest validation at seq {}",
                         intent.seq
                     );
                 }
+                let encoded = ltx::encode_snapshot_with_checksum(
+                    &path,
+                    intent.page_size,
+                    intent.seq,
+                    intent.previous_chain_checksum,
+                )?;
+                let pages = bytes.len() as u64 / intent.page_size as u64;
+                self.stage(StageObject {
+                    seq: intent.seq,
+                    kind: ObjectKind::Snapshot,
+                    previous_chain_checksum: intent.previous_chain_checksum,
+                    ending_chain_checksum: encoded.checksum,
+                    end_page_count: pages,
+                    intended_remote_key: intent.intended_remote_key.clone(),
+                    source_cursor: intent.source_cursor.clone(),
+                    payload: &encoded.bytes,
+                })?;
+                self.finish_snapshot(intent.seq)
             }
             SnapshotIntentState::Admitted => {
                 bail!(
@@ -1708,25 +1786,30 @@ impl NativeSpool {
                 );
             }
         }
-        Ok(())
+    }
+
+    fn legacy_snapshot_stable_path(&self, intent: &SnapshotIntent) -> Result<Option<PathBuf>> {
+        let Some(file_name) = &intent.legacy_stable_file_name else {
+            return Ok(None);
+        };
+        let name = Path::new(file_name);
+        if name.components().count() != 1
+            || name.file_name().and_then(|value| value.to_str()) != Some(file_name.as_str())
+        {
+            bail!("legacy native snapshot intent contains an unsafe stable filename");
+        }
+        Ok(Some(self.snapshots_dir.join(name)))
     }
 
     fn cleanup_unbound_snapshot_temporaries(&self) -> Result<()> {
-        let bound = self
-            .read_snapshot_intent()?
-            .map(|intent| intent.stable_file_name);
         for entry in fs::read_dir(&self.snapshots_dir)? {
             let path = entry?.path();
-            if !path.is_file()
-                || bound
-                    .as_deref()
-                    .is_some_and(|name| path.file_name().and_then(|v| v.to_str()) == Some(name))
-            {
+            if !path.is_file() {
                 continue;
             }
             tracing::error!(
                 path = %path.display(),
-                "removing unbound native snapshot temporary; no durable intent can prove its source cursor"
+                "removing obsolete native SQLite stable-copy artifact; snapshots encode directly to HADBP"
             );
             remove_and_sync(&path, &self.snapshots_dir)?;
         }
@@ -1742,6 +1825,20 @@ impl NativeSpool {
                     "removing legacy unbound snapshot temporary before spool capacity accounting"
                 );
                 remove_and_sync(&path, &self.root)?;
+            }
+        }
+        for entry in fs::read_dir(&self.objects_dir)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .is_some_and(|name| name.starts_with("0001-") && name.ends_with(".hadbp.tmp"))
+            {
+                tracing::error!(
+                    path = %path.display(),
+                    "removing unadmitted native snapshot payload temporary after restart"
+                );
+                remove_and_sync(&path, &self.objects_dir)?;
             }
         }
         Ok(())
@@ -1762,8 +1859,8 @@ fn same_snapshot_identity(a: &SnapshotIntent, b: &SnapshotIntent) -> bool {
         && a.seq == b.seq
         && a.previous_chain_checksum == b.previous_chain_checksum
         && a.intended_remote_key == b.intended_remote_key
+        && a.source_cursor == b.source_cursor
         && a.page_size == b.page_size
-        && a.stable_file_name == b.stable_file_name
 }
 
 fn validate_source_cursor_successor(previous: &SourceCursor, next: &SourceCursor) -> Result<()> {
@@ -1849,7 +1946,7 @@ fn validate_object_identity(identity: &SpoolIdentity, object: &SpoolObject) -> R
     Ok(())
 }
 
-fn validate_payload(object: &SpoolObject, bytes: &[u8], scratch_root: &Path) -> Result<()> {
+fn validate_payload(object: &SpoolObject, bytes: &[u8], _scratch_root: &Path) -> Result<()> {
     if bytes.len() as u64 != object.payload_length || sha256_hex(bytes) != object.payload_sha256 {
         bail!(
             "native spool payload length/digest mismatch at seq {}",
@@ -1876,49 +1973,20 @@ fn validate_payload(object: &SpoolObject, bytes: &[u8], scratch_root: &Path) -> 
             }
         }
         ObjectKind::Snapshot => {
-            if end_page_count.is_some() {
-                bail!("native spool snapshot has a delta end-page marker");
-            }
-            // Snapshot continuation uses the raw database checksum, not the
-            // physical changeset checksum. Reconstruct to a private temporary
-            // file so orphan adoption recomputes that value rather than trusting
-            // journal metadata.
-            let tmp = scratch_root.join(format!(
-                ".verify-{:016x}-{}-{}.db",
-                object.seq,
-                std::process::id(),
-                uuid::Uuid::new_v4()
-            ));
-            let _ = fs::remove_file(&tmp);
-            let decoded_result = ltx::decode_to_db(bytes, &tmp);
-            let decoded_page_count = decoded_result.as_ref().ok().and_then(|result| {
-                fs::metadata(&tmp)
-                    .ok()
-                    .map(|metadata| metadata.len() / result.header.page_size as u64)
-            });
-            let remove_result = match fs::remove_file(&tmp) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e),
-            };
-            let result = decoded_result?;
-            remove_result?;
-            if result.checksum != object.ending_chain_checksum {
+            let (checksum, page_count) = ltx::snapshot_checksum_and_page_count(&decoded)?;
+            if checksum != object.ending_chain_checksum {
                 bail!(
                     "native spool snapshot ending checksum mismatch at seq {}",
                     object.seq
                 );
             }
-            if decoded_page_count != Some(object.end_page_count) {
+            if page_count != object.end_page_count {
                 bail!(
-                    "native spool snapshot page-count mismatch at seq {}: record {}, decoded {:?}",
+                    "native spool snapshot page-count mismatch at seq {}: record {}, decoded {}",
                     object.seq,
                     object.end_page_count,
-                    decoded_page_count
+                    page_count
                 );
-            }
-            if fs::metadata(&tmp).is_ok() {
-                bail!("native spool snapshot verification temporary was not removed");
             }
         }
     }
@@ -2143,6 +2211,57 @@ mod tests {
     }
 
     #[test]
+    fn stage_installs_the_exact_prewritten_snapshot_temporary() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
+        let root = NativeSpool::path_for(dir.path(), &identity(&db));
+        let mut spool = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
+        let cursor = SourceCursor::snapshot();
+        spool
+            .prepare_snapshot(1, 0, "one.hadbp".into(), cursor.clone(), 4096)
+            .unwrap();
+        let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)
+            .unwrap();
+        file.write_all(&bytes).unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        #[cfg(unix)]
+        let temp_inode = {
+            use std::os::unix::fs::MetadataExt;
+            fs::metadata(&tmp).unwrap().ino()
+        };
+        let object = spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: checksum,
+                end_page_count: pages,
+                intended_remote_key: "one.hadbp".into(),
+                source_cursor: cursor,
+                payload: &bytes,
+            })
+            .unwrap();
+        assert!(!tmp.exists());
+        let installed = spool.payload_path(&object);
+        assert_eq!(fs::read(&installed).unwrap(), bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                fs::metadata(installed).unwrap().ino(),
+                temp_inode,
+                "admission must rename the encoder's exact fsynced payload, not rewrite it"
+            );
+        }
+    }
+
+    #[test]
     fn reopen_rejects_remote_cursor_ahead_of_object_publication_state() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
@@ -2272,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn stable_snapshot_intent_survives_restart_and_preserves_original_cursor() {
+    fn admitted_snapshot_intent_reconciles_after_restart() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
         let (bytes, checksum, pages) = snapshot(&db, 1, 0);
@@ -2289,53 +2408,34 @@ mod tests {
         let preparing = spool
             .prepare_snapshot(1, 0, "snapshot-1.hadbp".into(), cursor.clone(), 4096)
             .unwrap();
-        fs::copy(&db, &preparing.stable_path).unwrap();
-        File::open(&preparing.stable_path)
-            .unwrap()
-            .sync_all()
-            .unwrap();
-        let stable = spool.mark_snapshot_stable(1).unwrap();
-        assert!(stable.stable);
-        drop(spool);
-
-        let mut reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
-        let resumed = reopened
-            .prepare_snapshot(
-                1,
-                0,
-                "snapshot-1.hadbp".into(),
-                SourceCursor::snapshot(),
-                4096,
-            )
-            .unwrap();
-        assert!(resumed.stable);
-        assert_eq!(resumed.source_cursor, cursor);
-        reopened
+        spool
             .stage(StageObject {
                 seq: 1,
                 kind: ObjectKind::Snapshot,
                 previous_chain_checksum: 0,
                 ending_chain_checksum: checksum,
                 end_page_count: pages,
-                intended_remote_key: resumed.intended_remote_key,
-                source_cursor: resumed.source_cursor,
+                intended_remote_key: preparing.intended_remote_key,
+                source_cursor: preparing.source_cursor,
                 payload: &bytes,
             })
             .unwrap();
-        reopened.finish_snapshot(1).unwrap();
+        drop(spool);
+
+        let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        assert_eq!(reopened.get(1).unwrap().source_cursor, cursor);
         assert!(!reopened.snapshot_intent_path.exists());
-        assert!(!resumed.stable_path.exists());
     }
 
     #[test]
-    fn unmarked_snapshot_copy_is_removed_before_restart_capacity_accounting() {
+    fn pre_direct_snapshot_stable_intent_migrates_once_to_hadbp() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
-        let (_bytes, _checksum, _pages) = snapshot(&db, 1, 0);
+        let (_bytes, expected_checksum, pages) = snapshot(&db, 1, 0);
         let id = identity(&db);
         let root = NativeSpool::path_for(dir.path(), &id);
         let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
-        let preparing = spool
+        spool
             .prepare_snapshot(
                 1,
                 0,
@@ -2344,15 +2444,181 @@ mod tests {
                 4096,
             )
             .unwrap();
-        fs::write(&preparing.stable_path, vec![0xaa; 1024 * 1024]).unwrap();
+        let stable_name = "0000000000000001.db";
+        let stable = spool.snapshots_dir.join(stable_name);
+        fs::copy(&db, &stable).unwrap();
+        File::open(&stable).unwrap().sync_all().unwrap();
+        let stable_bytes = fs::read(&stable).unwrap();
+        let mut intent = spool.read_snapshot_intent().unwrap().unwrap();
+        intent.legacy_stable_file_name = Some(stable_name.into());
+        intent.state = SnapshotIntentState::Stable {
+            payload_length: stable_bytes.len() as u64,
+            sha256: sha256_hex(&stable_bytes),
+        };
+        persist_json(&spool.root, &spool.snapshot_intent_path, &intent).unwrap();
         drop(spool);
 
         let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
-        assert!(!preparing.stable_path.exists());
-        assert!(matches!(
-            reopened.read_snapshot_intent().unwrap().unwrap().state,
-            SnapshotIntentState::Creating
-        ));
+        let object = reopened.get(1).unwrap();
+        assert_eq!(object.ending_chain_checksum, expected_checksum);
+        assert_eq!(object.end_page_count, pages);
+        assert!(reopened.read_payload(1).unwrap().starts_with(b"HADBP"));
+        assert!(!stable.exists());
+        assert!(!reopened.snapshot_intent_path.exists());
+    }
+
+    #[test]
+    fn valid_unadmitted_snapshot_payload_is_adopted_on_restart() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .prepare_snapshot(
+                1,
+                0,
+                "snapshot-1.hadbp".into(),
+                SourceCursor::snapshot(),
+                4096,
+            )
+            .unwrap();
+        let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
+        fs::write(&tmp, &bytes).unwrap();
+        File::open(&tmp).unwrap().sync_all().unwrap();
+        drop(spool);
+
+        let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        assert!(reopened.read_snapshot_intent().unwrap().is_none());
+        assert!(!tmp.exists());
+        let object = reopened.get(1).unwrap();
+        assert_eq!(object.ending_chain_checksum, checksum);
+        assert_eq!(object.end_page_count, pages);
+        assert_eq!(reopened.read_payload(1).unwrap(), bytes);
+    }
+
+    #[test]
+    fn incomplete_unadmitted_snapshot_payload_is_removed_on_restart() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        rusqlite::Connection::open(&db).unwrap();
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .prepare_snapshot(
+                1,
+                0,
+                "snapshot-1.hadbp".into(),
+                SourceCursor::snapshot(),
+                4096,
+            )
+            .unwrap();
+        let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
+        fs::write(&tmp, b"HADBP interrupted").unwrap();
+        File::open(&tmp).unwrap().sync_all().unwrap();
+        sync_dir(&spool.objects_dir).unwrap();
+        drop(spool);
+
+        let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        assert!(reopened.read_snapshot_intent().unwrap().is_none());
+        assert!(!tmp.exists());
+        assert!(reopened.get(1).is_none());
+    }
+
+    #[test]
+    fn snapshot_abandonment_preserves_durable_install_intent_and_payload() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        let source_cursor = SourceCursor::snapshot();
+        spool
+            .prepare_snapshot(1, 0, "snapshot-1.hadbp".into(), source_cursor.clone(), 4096)
+            .unwrap();
+        let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
+        fs::write(&tmp, &bytes).unwrap();
+        File::open(&tmp).unwrap().sync_all().unwrap();
+        sync_dir(&spool.objects_dir).unwrap();
+        let object = SpoolObject {
+            version: SPOOL_VERSION,
+            stream_digest: spool.identity().stream_digest(),
+            lineage_id: spool.identity().lineage_id.clone(),
+            bucket: spool.identity().bucket.clone(),
+            prefix: spool.identity().prefix.clone(),
+            database: spool.identity().database.clone(),
+            seq: 1,
+            kind: ObjectKind::Snapshot,
+            previous_chain_checksum: 0,
+            ending_chain_checksum: checksum,
+            end_page_count: pages,
+            intended_remote_key: "snapshot-1.hadbp".into(),
+            payload_length: bytes.len() as u64,
+            payload_sha256: sha256_hex(&bytes),
+            source_cursor,
+            local_creation_state: LocalCreationState::Installed,
+            remote_upload_state: RemoteUploadState::Pending,
+            created_unix_ms: unix_ms(),
+            uploaded_unix_ms: None,
+            published_unix_ms: None,
+            publish_record_sha256: None,
+        };
+        persist_json(
+            &spool.intents_dir,
+            &spool.intent_path(1),
+            &InstallIntent {
+                version: SPOOL_VERSION,
+                object,
+            },
+        )
+        .unwrap();
+
+        assert!(spool
+            .abandon_unadmitted_snapshot(1)
+            .unwrap_err()
+            .to_string()
+            .contains("installation is in progress"));
+        assert!(tmp.exists());
+        drop(spool);
+
+        let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        assert_eq!(reopened.read_payload(1).unwrap(), bytes);
+        assert!(!tmp.exists());
+    }
+
+    #[test]
+    fn valid_snapshot_temp_divergent_from_source_intent_is_retained_and_rejected() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (wrong_seq_bytes, _, _) = snapshot(&db, 2, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .prepare_snapshot(
+                1,
+                0,
+                "snapshot-1.hadbp".into(),
+                SourceCursor::snapshot(),
+                4096,
+            )
+            .unwrap();
+        let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
+        fs::write(&tmp, wrong_seq_bytes).unwrap();
+        File::open(&tmp).unwrap().sync_all().unwrap();
+        sync_dir(&spool.objects_dir).unwrap();
+        drop(spool);
+
+        let error = NativeSpool::create_or_open(&root, id, generous())
+            .err()
+            .expect("divergent valid temp must fail startup");
+        assert!(error
+            .to_string()
+            .contains("diverges from durable source intent"));
+        assert!(tmp.exists(), "divergent evidence must be retained");
     }
 
     #[test]

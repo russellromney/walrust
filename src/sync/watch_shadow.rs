@@ -28,10 +28,12 @@ use walrust_core::legacy_shadow_watch::{
     checkpoint_blocker_heartbeat_is_live, checkpoint_data_version, load_shadow_progress,
     rearm_checkpoint_blocker, refresh_checkpoint_data_version_monitor,
     save_shadow_watch_progress as save_shadow_progress, shadow_sync_input,
-    wait_for_cache_checkpoint_durability,
+    wait_for_cache_checkpoint_durability, ShadowProgress,
 };
 use walrust_core::native_publish::{object_key as native_object_key, NativeUploader, UploadWake};
-use walrust_core::native_shadow::{encode_shadow_to_hadbp, NativeShadowInput};
+use walrust_core::native_shadow::{
+    encode_shadow_to_hadbp, write_snapshot_from_shadow, NativeShadowInput, NativeSnapshotInput,
+};
 use walrust_core::native_spool::{
     durability_failpoint, filesystem_available_bytes, CapacityPolicy, CapacityState, NativeSpool,
     ObjectKind, RecoveryHead, RemoteUploadState, SourceCursor, SpoolIdentity, StageObject,
@@ -53,6 +55,20 @@ const CHECKPOINT_UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const WAL_SIZE_EXCEEDED_EVENT: &str = "wal_size_exceeded";
 
 type NativeSpoolState = (Arc<Mutex<NativeSpool>>, UploadWake);
+
+fn restore_wal_copy_progress(shadow: &mut ShadowWal, progress: &ShadowProgress) -> u64 {
+    if shadow.discarded_unproven_tail() {
+        // The progress cursor described bytes that recovery just rejected for
+        // lack of a durable-tail marker. Reusing its live WAL offset would skip
+        // those source frames and leave a direct snapshot trying to read
+        // WAL-only pages from the shorter main DB. ShadowWal already carries
+        // the current live header salt, so checked recopy starts at zero.
+        0
+    } else {
+        shadow.restore_read_cursor(progress.wal_salt, progress.wal_checksum_chain);
+        progress.wal_copy_offset
+    }
+}
 
 fn spawn_native_uploader_supervisor(
     initial: NativeUploader,
@@ -357,7 +373,7 @@ async fn stage_native_shadow(
     })
 }
 
-async fn snapshot_source_lifetime_pause() -> Result<()> {
+async fn snapshot_frozen_cursor_pause() -> Result<()> {
     if !cfg!(debug_assertions) {
         return Ok(());
     }
@@ -369,7 +385,7 @@ async fn snapshot_source_lifetime_pause() -> Result<()> {
     if used.exists() {
         return Ok(());
     }
-    std::fs::write(&path, b"lifetime-source-held")?;
+    std::fs::write(&path, b"shadow-cursor-frozen")?;
     while path.exists() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
@@ -381,24 +397,72 @@ async fn stage_native_snapshot(
     state: &mut ShadowDbState,
     spool_state: &NativeSpoolState,
 ) -> Result<u64> {
+    let stage_started = std::time::Instant::now();
+    // Freeze the source at an exact committed, checksum-validated, fsynced
+    // shadow boundary. Application commits after this copy remain only in the
+    // live WAL and are deliberately excluded from this snapshot.
+    #[cfg(unix)]
+    let db_identity_before = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&state.db_path)?;
+        (metadata.dev(), metadata.ino())
+    };
+    let generation_before = state.shadow.generation();
+    let (_, new_wal_offset) = state.shadow.copy_frames(state.wal_copy_offset).await?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&state.db_path)?;
+        anyhow::ensure!(
+            (metadata.dev(), metadata.ino()) == db_identity_before,
+            "{}: SQLite database path was replaced while freezing native snapshot source",
+            state.name
+        );
+    }
+    state.wal_copy_offset = new_wal_offset;
     let page_size = state.shadow.page_size();
     let frame_size = 24 + page_size as u64;
+    if state.shadow.generation() != generation_before {
+        state.shadow_sync_generation = state.shadow.generation();
+        state.shadow_sync_offset = 0;
+    }
+    let snapshot_generation = state.shadow.generation();
+    let shadow_end_offset = state.shadow.segment_offset();
     anyhow::ensure!(
-        state.shadow_sync_offset.is_multiple_of(frame_size),
+        shadow_end_offset.is_multiple_of(frame_size),
         "{}: snapshot source cursor is not frame-aligned",
         state.name
     );
     let proposed_cursor = SourceCursor {
-        // A SQLite backup can overlap a live transaction. Advancing to the
-        // copied shadow tail could skip its pre-commit frames. Keep the last
-        // already-admitted shadow cursor; replaying an already-snapshotted page
-        // is safe, skipping an unproven transaction is not.
-        shadow_generation: state.shadow_sync_generation,
-        shadow_frame_index: state.shadow_sync_offset / frame_size,
+        shadow_generation: snapshot_generation,
+        shadow_frame_index: shadow_end_offset / frame_size,
         wal_offset: state.wal_copy_offset,
         wal_salt: state.shadow.wal_read_salt(),
         wal_checksum_chain: state.shadow.wal_read_chain(),
     };
+    let source_footprint = {
+        let spool = spool_lock(&spool_state.0)?;
+        source_footprint_on_spool_filesystem(state, &spool)?
+    };
+    let main_bytes = std::fs::metadata(&state.db_path)?.len();
+    let shadow_frames = shadow_end_offset / frame_size;
+    let logical_upper = main_bytes.saturating_add(shadow_frames.saturating_mul(page_size as u64));
+    let payload_upper = logical_upper
+        .saturating_add((logical_upper / page_size as u64).saturating_mul(64))
+        .saturating_add(4096);
+    {
+        let spool = spool_lock(&spool_state.0)?;
+        let peak = payload_upper
+            .saturating_mul(2)
+            .saturating_add(spool.next_journal_rewrite_peak_bytes()?)
+            .saturating_add(source_footprint);
+        if spool.capacity_state(peak)? == CapacityState::Full {
+            bail!(
+                "local_spool_full: {} lacks peak capacity/reserve for direct native HADBP snapshot payload + journal",
+                state.name
+            );
+        }
+    }
     let preparation = {
         let mut spool = spool_lock(&spool_state.0)?;
         let seq = spool
@@ -422,108 +486,64 @@ async fn stage_native_snapshot(
     let preparation = preparation?;
     let seq = preparation.seq;
     let previous_chain_checksum = preparation.previous_chain_checksum;
-    let stable_path = preparation.stable_path.clone();
     let intended_remote_key = preparation.intended_remote_key.clone();
-    let stable_parent = stable_path
-        .parent()
-        .ok_or_else(|| anyhow!("native snapshot path has no parent"))?
-        .to_path_buf();
-    let preparation = if preparation.stable {
-        preparation
-    } else {
-        let source_footprint = {
-            let spool = spool_lock(&spool_state.0)?;
-            source_footprint_on_spool_filesystem(state, &spool)?
-        };
-        let source = state
-            .data_version_monitor
-            .as_ref()
-            .ok_or_else(|| anyhow!("{}: lifetime snapshot source is missing", state.name))?;
-        let copy_result = (|| -> Result<()> {
-            match std::fs::remove_file(&stable_path) {
-                Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-            source.busy_timeout(Duration::from_secs(30))?;
-            source.execute_batch("BEGIN DEFERRED;")?;
-            let operation = (|| -> Result<()> {
-                // Establish and hold the exact WAL-visible SQLite snapshot
-                // before capacity admission. This uses the lifetime monitor
-                // opened before the blocker; it is never closed here, so POSIX
-                // checkpoint locks cannot disappear at snapshot handoff.
-                let logical_pages: u64 =
-                    source.query_row("PRAGMA page_count", [], |row| row.get(0))?;
-                let _: i64 =
-                    source.query_row("SELECT count(*) FROM sqlite_master", [], |row| row.get(0))?;
-                let logical_bytes = logical_pages.saturating_mul(page_size as u64);
-                let payload_upper = logical_bytes
-                    .saturating_add(logical_pages.saturating_mul(64))
-                    .saturating_add(4096);
-                let peak = {
-                    let spool = spool_lock(&spool_state.0)?;
-                    // Reserve the stable DB plus a full-size destination
-                    // rollback journal even though SQLite Backup commonly
-                    // avoids one for a new destination. Correctness does not
-                    // rely on that implementation detail.
-                    logical_bytes
-                        .saturating_mul(2)
-                        .saturating_add(payload_upper.saturating_mul(2))
-                        .saturating_add(spool.next_journal_rewrite_peak_bytes()?)
-                        .saturating_add(source_footprint)
-                };
-                if spool_lock(&spool_state.0)?.capacity_state(peak)? == CapacityState::Full {
-                    bail!(
-                        "local_spool_full: {} lacks peak capacity/reserve for WAL-visible native snapshot stable copy + rollback journal + payload + journal",
-                        state.name
-                    );
-                }
-                let mut destination = Connection::open(&stable_path)?;
-                destination.busy_timeout(Duration::from_secs(30))?;
-                {
-                    let backup = rusqlite::backup::Backup::new(source, &mut destination)?;
-                    backup.run_to_completion(256, Duration::from_millis(10), None)?;
-                }
-                drop(destination);
-                let stable = std::fs::File::open(&stable_path)?;
-                stable.sync_all()?;
-                std::fs::File::open(&stable_parent)?.sync_all()?;
-                Ok(())
-            })();
-            let rollback = source.execute_batch("ROLLBACK;");
-            match (operation, rollback) {
-                (Ok(()), Ok(())) => Ok(()),
-                (Err(error), Ok(())) => Err(error),
-                (Ok(()), Err(error)) => Err(error.into()),
-                (Err(operation_error), Err(rollback_error)) => Err(anyhow!(
-                    "{operation_error:#}; additionally failed to end lifetime snapshot read transaction: {rollback_error}"
-                )),
-            }
-        })();
-        copy_result?;
-        snapshot_source_lifetime_pause().await?;
-        spool_lock(&spool_state.0)?.mark_snapshot_stable(seq)?
+    let payload_temp =
+        spool_lock(&spool_state.0)?.payload_temporary_path(ObjectKind::Snapshot, seq);
+    if let Err(error) = snapshot_frozen_cursor_pause().await {
+        spool_lock(&spool_state.0)?.abandon_unadmitted_snapshot(seq)?;
+        return Err(error);
+    }
+    let snapshot_input = NativeSnapshotInput {
+        db_path: state.db_path.clone(),
+        seq,
+        previous_chain_checksum,
+        generation: preparation.source_cursor.shadow_generation,
+        shadow_end_offset: preparation
+            .source_cursor
+            .shadow_frame_index
+            .saturating_mul(frame_size),
+        page_size,
+        shadow_dir: state.shadow.shadow_dir().to_path_buf(),
+        #[cfg(unix)]
+        expected_db_file_identity: db_identity_before,
     };
-    let stable_for_encode = stable_path.clone();
-    let encoded_result = tokio::task::spawn_blocking(move || -> Result<_> {
-        walrust_core::ltx::encode_snapshot_with_checksum(
-            &stable_for_encode,
-            page_size,
-            seq,
-            previous_chain_checksum,
-        )
+    let payload_temp_for_encode = payload_temp.clone();
+    let encoded_result = match tokio::task::spawn_blocking(move || -> Result<_> {
+        write_snapshot_from_shadow(&snapshot_input, &payload_temp_for_encode)
     })
-    .await?;
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            spool_lock(&spool_state.0)?.abandon_unadmitted_snapshot(seq)?;
+            return Err(error.into());
+        }
+    };
     let encoded = match encoded_result {
         Ok(encoded) => encoded,
-        Err(error) => return Err(error),
+        Err(error) => {
+            spool_lock(&spool_state.0)?.abandon_unadmitted_snapshot(seq)?;
+            return Err(error);
+        }
     };
-    let end_page_count = std::fs::metadata(&stable_path)?.len() / page_size as u64;
-    let stage_started = std::time::Instant::now();
+    let encoded_payload = match std::fs::read(&payload_temp) {
+        Ok(payload) if payload.len() as u64 == encoded.payload_length => payload,
+        Ok(_) => {
+            spool_lock(&spool_state.0)?.abandon_unadmitted_snapshot(seq)?;
+            bail!("native snapshot payload temporary length changed after fsync");
+        }
+        Err(error) => {
+            spool_lock(&spool_state.0)?.abandon_unadmitted_snapshot(seq)?;
+            return Err(error.into());
+        }
+    };
     let stage_result = (|| -> Result<()> {
         let mut spool = spool_lock(&spool_state.0)?;
-        let peak = (encoded.bytes.len() as u64)
-            .saturating_mul(2)
+        // The fsynced payload temporary is already included in used_bytes and
+        // admission renames that exact inode. Only journal/intent rewrite and
+        // source-filesystem reserve remain as additional peak here.
+        let peak = spool
+            .next_journal_rewrite_peak_bytes()?
             .saturating_add(source_footprint_on_spool_filesystem(state, &spool)?);
         match spool.capacity_state(peak)? {
             CapacityState::High => tracing::error!(
@@ -534,10 +554,11 @@ async fn stage_native_snapshot(
                 "local native spool crossed its warning watermark while snapshotting"
             ),
             CapacityState::Full => {
+                spool.abandon_unadmitted_snapshot(seq)?;
                 return Err(anyhow!(
-                "local_spool_full: {} cannot admit native snapshot seq {}; blocker remains held",
+                    "local_spool_full: {} cannot admit native snapshot seq {}; blocker remains held",
                 state.name, seq
-            ))
+            ));
             }
             CapacityState::Healthy => {}
         }
@@ -545,19 +566,24 @@ async fn stage_native_snapshot(
             seq,
             kind: ObjectKind::Snapshot,
             previous_chain_checksum,
-            ending_chain_checksum: encoded.checksum,
-            end_page_count,
+            ending_chain_checksum: encoded.ending_chain_checksum,
+            end_page_count: encoded.end_page_count,
             intended_remote_key,
             source_cursor: preparation.source_cursor.clone(),
-            payload: &encoded.bytes,
+            payload: &encoded_payload,
         })?;
         durability_failpoint("snapshot_object_admitted");
         spool.finish_snapshot(seq)?;
         Ok(())
     })();
-    stage_result?;
+    if let Err(error) = stage_result {
+        // `stage` may already have durably installed an object intent or final
+        // payload before a later journal I/O error. Preserve that evidence for
+        // deterministic orphan adoption; never discard it as a generic retry.
+        return Err(error);
+    }
     state.current_txid = seq;
-    state.db_checksum = Some(encoded.checksum);
+    state.db_checksum = Some(encoded.ending_chain_checksum);
     state.last_snapshot = Some(chrono::Utc::now());
     state.shadow_sync_generation = preparation.source_cursor.shadow_generation;
     state.shadow_sync_offset = preparation
@@ -573,7 +599,9 @@ async fn stage_native_snapshot(
     tracing::info!(
         database = %state.name,
         seq,
-        bytes = encoded.bytes.len(),
+        bytes = encoded_payload.len(),
+        shadow_frames = encoded.frame_count,
+        shadow_pages = encoded.unique_shadow_pages,
         local_hadbp_stage_ms = stage_started.elapsed().as_millis() as u64,
         "native HADBP snapshot admitted to durable local spool"
     );
@@ -1774,12 +1802,10 @@ pub async fn watch_with_shadow(
             db_checksum = progress.db_checksum;
             shadow_sync_generation = progress.shadow_sync_generation;
             shadow_sync_offset = progress.shadow_sync_offset;
-            // B4 restart-window: resume the live-WAL read cursor from the
-            // persisted offset, seeding the salt + running checksum chain so
-            // the first post-restart read validates per-frame (and does not
-            // re-append the whole live WAL from offset 0).
-            restored_wal_copy_offset = progress.wal_copy_offset;
-            shadow.restore_read_cursor(progress.wal_salt, progress.wal_checksum_chain);
+            // B4 restart-window: normally resume the persisted WAL cursor and
+            // checksum chain. A discarded markerless shadow must instead
+            // recopy from zero because its progress bytes no longer exist.
+            restored_wal_copy_offset = restore_wal_copy_progress(&mut shadow, &progress);
         }
 
         tracing::info!(
@@ -1976,6 +2002,10 @@ pub async fn watch_with_shadow(
     // Set up periodic timers
     let snapshot_interval = Duration::from_secs(global_sync.snapshot_interval);
     let mut snapshot_timer = tokio::time::interval(snapshot_interval);
+    // Initial-base/on-startup/downtime snapshots were handled above. Consume
+    // Tokio's immediate first tick so startup does not emit a second full
+    // snapshot instead of the first native delta.
+    snapshot_timer.tick().await;
 
     let wal_sync_interval = Duration::from_secs(global_sync.wal_sync_interval);
     let mut wal_sync_timer = tokio::time::interval(wal_sync_interval);
@@ -3180,6 +3210,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn markerless_shadow_recovery_rewinds_live_wal_cursor_before_reanchor() {
+        let (_temp, db_path, _conn) = create_real_wal_db();
+        let shadow_dir = ShadowWal::shadow_dir_for(&db_path);
+        let mut page = vec![0u8; 4096];
+        std::fs::File::open(&db_path)
+            .unwrap()
+            .read_exact(&mut page)
+            .unwrap();
+        write_shadow_segment(&shadow_dir, 7, 4096, &page);
+
+        let mut shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        assert!(shadow.discarded_unproven_tail());
+        let stale_progress = ShadowProgress {
+            version: 2,
+            current_txid: 9,
+            last_snapshot: None,
+            db_checksum: Some(11),
+            shadow_sync_generation: 7,
+            shadow_sync_offset: (24 + 4096) as u64,
+            wal_copy_offset: u64::MAX / 2,
+            wal_salt: Some((1, 2)),
+            wal_checksum_chain: Some((3, 4)),
+        };
+        assert_eq!(
+            restore_wal_copy_progress(&mut shadow, &stale_progress),
+            0,
+            "discarded shadow bytes must force checked WAL recopy from zero"
+        );
+        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
+        assert!(
+            !frames.is_empty(),
+            "pinned live WAL frames must be recopied"
+        );
+        assert!(offset > 0);
+    }
+
+    #[tokio::test]
     async fn test_shadow_shutdown_syncs_final_real_wal_frames_to_cache() {
         let (_temp, db_path, _conn) = create_real_wal_db();
         let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
@@ -3517,7 +3586,7 @@ mod tests {
                 .unwrap()
                 .snapshot_in_progress()
                 .unwrap(),
-            "snapshot call site must durably admit then retire its stable-copy intent"
+            "snapshot call site must durably admit then retire its frozen-source intent"
         );
 
         conn.execute(
@@ -3571,6 +3640,73 @@ mod tests {
         assert!(
             live_wal_page_count(&state.wal_path).await.unwrap() <= 4,
             "controlled TRUNCATE plus blocker heartbeat should leave a bounded live WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_snapshot_is_exact_while_passive_checkpoint_contends() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (temp, db_path, conn) = create_real_wal_db();
+        for id in 10..1010i64 {
+            conn.execute(
+                "INSERT INTO items(id, value) VALUES (?1, ?2)",
+                rusqlite::params![id, format!("passive-{id}")],
+            )
+            .unwrap();
+        }
+        let expected_count: i64 = conn
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: "native-passive-snapshot".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let spool_state = test_native_spool_state(&db_path, temp.path());
+        let running = Arc::new(AtomicBool::new(true));
+        let checkpoint_running = Arc::clone(&running);
+        let checkpoint_db = db_path.clone();
+        let checkpointer = std::thread::spawn(move || {
+            let checkpoint = Connection::open(checkpoint_db).unwrap();
+            while checkpoint_running.load(Ordering::Relaxed) {
+                let _: (i64, i64, i64) = checkpoint
+                    .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                std::thread::yield_now();
+            }
+        });
+        let stage_result = stage_native_snapshot(&mut state, &spool_state).await;
+        running.store(false, Ordering::Relaxed);
+        checkpointer.join().unwrap();
+        stage_result.unwrap();
+        let payload = spool_lock(&spool_state.0).unwrap().read_payload(1).unwrap();
+        let restored_path = temp.path().join("passive-restored.db");
+        walrust_core::ltx::decode_to_db(&payload, &restored_path).unwrap();
+        let restored = Connection::open(restored_path).unwrap();
+        let restored_count: i64 = restored
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(restored_count, expected_count);
+        assert_eq!(
+            restored
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
         );
     }
 

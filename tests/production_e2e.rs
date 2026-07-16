@@ -689,8 +689,9 @@ fn wait_for_durability_failpoint(marker: &Path, log_path: &Path, child: &mut Chi
     loop {
         if marker.exists() {
             let value = std::fs::read_to_string(marker)?;
-            anyhow::ensure!(!value.is_empty(), "durability failpoint marker is empty");
-            return Ok(());
+            if !value.is_empty() {
+                return Ok(());
+            }
         }
         if let Some(status) = child.try_wait()? {
             anyhow::bail!(
@@ -737,18 +738,18 @@ fn wait_for_cli_startup_rearms(log_path: &Path, child: &mut Child) -> Result<()>
         let snapshot_count = log
             .matches("native HADBP snapshot admitted to durable local spool")
             .count();
-        if snapshot_count >= 2 {
+        if snapshot_count >= 1 {
             return Ok(());
         }
         if let Some(status) = child.try_wait()? {
             anyhow::bail!(
-                "watch exited before both native startup snapshots were locally admitted \
+                "watch exited before the native startup snapshot was locally admitted \
                  ({status}, snapshots={snapshot_count}):\n{log}"
             );
         }
         anyhow::ensure!(
             Instant::now() < deadline,
-            "timed out waiting for both native startup snapshots to be locally admitted \
+            "timed out waiting for the native startup snapshot to be locally admitted \
              (snapshots={snapshot_count}):\n{log}"
         );
         std::thread::sleep(Duration::from_millis(25));
@@ -1068,8 +1069,8 @@ fn e2e_cli_default_local_checkpoint_does_not_wait_for_live_s3_put() -> Result<()
         .context("native spool identity missing")?;
     let exact_staged_objects = immutable_native_payloads(&spool_root, &identity)?;
     anyhow::ensure!(
-        exact_staged_objects.len() >= 3,
-        "snapshot(s) + delta must be durable locally"
+        exact_staged_objects.len() >= 2,
+        "startup snapshot + post-startup delta must be durable locally"
     );
     let remote_lag_objects = exact_staged_objects.len();
     let remote_lag_bytes = exact_staged_objects
@@ -2797,7 +2798,7 @@ fn e2e_cli_sigkill_restarts_every_local_snapshot_admission_boundary() -> Result<
         "shadow_before_fsync",
         "shadow_fsync_complete",
         "snapshot_intent_committed",
-        "snapshot_stable_committed",
+        "snapshot_payload_temp_fsynced",
         "object_intent_committed",
         "payload_renamed",
         "object_journal_committed",
@@ -4238,10 +4239,10 @@ fn e2e_cli_startup_pins_wal_before_remote_discovery() -> Result<()> {
 }
 
 #[test]
-fn e2e_cli_snapshot_keeps_lifetime_source_and_blocker_through_handoff() -> Result<()> {
-    require_s3!("e2e_cli_snapshot_keeps_lifetime_source_and_blocker_through_handoff");
+fn e2e_cli_snapshot_freezes_exact_shadow_cursor_and_keeps_blocker() -> Result<()> {
+    require_s3!("e2e_cli_snapshot_freezes_exact_shadow_cursor_and_keeps_blocker");
     let temp = TempDir::new()?;
-    let name = unique_name("cli-snapshot-lifetime");
+    let name = unique_name("cli-snapshot-frozen-cursor");
     let prefix = format!("e2e/{name}");
     let bucket_arg = format!("{}/{}", test_bucket(), prefix);
     let endpoint = test_endpoint();
@@ -4249,6 +4250,8 @@ fn e2e_cli_snapshot_keeps_lifetime_source_and_blocker_through_handoff() -> Resul
     let restored_path = temp.path().join("restored.db");
     let log_path = temp.path().join("watch.log");
     let pause_file = temp.path().join("snapshot-source.pause");
+    let upload_pause = temp.path().join("snapshot-upload.pause");
+    std::fs::write(&upload_pause, b"paused")?;
     let setup = create_source_db(&db_path, 5)?;
     let writer = open_external_no_autocheckpoint_connection(&db_path)?;
     write_pin_frame(&setup, "snapshot-lifetime-seed")?;
@@ -4262,7 +4265,7 @@ fn e2e_cli_snapshot_keeps_lifetime_source_and_blocker_through_handoff() -> Resul
             checkpoint_interval: 999_999,
             min_checkpoint_pages: 1,
             wal_truncate_threshold: 100_000,
-            native_upload_pause_file: None,
+            native_upload_pause_file: Some(&upload_pause),
             durability_failpoint: None,
             durability_failpoint_marker: None,
         },
@@ -4271,15 +4274,74 @@ fn e2e_cli_snapshot_keeps_lifetime_source_and_blocker_through_handoff() -> Resul
     wait_for_file_or_child_exit(
         &mut child,
         &pause_file,
-        "native snapshot lifetime-source handoff",
-    )?;
+        "native snapshot frozen shadow cursor",
+    )
+    .with_context(|| {
+        format!(
+            "watch log while waiting for frozen cursor:\n{}",
+            watch_log(&log_path)
+        )
+    })?;
+    let mut scan = vec![db_path.parent().unwrap().join(".walrust-spool")];
+    while let Some(path) = scan.pop() {
+        for entry in std::fs::read_dir(path)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                scan.push(path);
+            } else {
+                anyhow::ensure!(
+                    path.extension().and_then(|value| value.to_str()) != Some("db"),
+                    "native snapshot created an intermediate SQLite backup inside the spool: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    let snapshot_expected = rows(&db_path)?;
     append_wide_rows(&writer, 6, 45, "snapshot-after-copy")?;
     anyhow::ensure!(
         force_truncate_checkpoint(&writer)?.0 != 0,
-        "snapshot source handoff closed a source inode and dropped the blocker"
+        "direct snapshot handoff dropped the checkpoint blocker"
     );
     let expected = rows(&db_path)?;
     std::fs::remove_file(&pause_file)?;
+    let snapshot_deadline = Instant::now() + e2e_poll_deadline(20);
+    while !watch_log(&log_path).contains("native HADBP snapshot admitted to durable local spool") {
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "watch exited before local snapshot admission ({status}):\n{}",
+                watch_log(&log_path)
+            );
+        }
+        anyhow::ensure!(
+            Instant::now() < snapshot_deadline,
+            "timed out waiting for frozen-cursor snapshot admission:\n{}",
+            watch_log(&log_path)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let native_base = db_path.parent().unwrap().join(".walrust-spool/native-v1");
+    let stream_root = std::fs::read_dir(&native_base)?
+        .next()
+        .context("native spool stream directory is absent")??
+        .path();
+    let snapshot_payload = std::fs::read_dir(stream_root.join("objects"))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("0001-") && name.ends_with(".hadbp"))
+        })
+        .context("durable native snapshot payload is absent")?;
+    let frozen_restore = temp.path().join("frozen-snapshot.db");
+    walrust::walrust_core::ltx::decode_to_db(&std::fs::read(snapshot_payload)?, &frozen_restore)?;
+    anyhow::ensure!(
+        rows(&frozen_restore)? == snapshot_expected,
+        "snapshot admitted rows committed after its frozen source cursor"
+    );
+    assert_integrity_ok(&frozen_restore)?;
+    std::fs::remove_file(&upload_pause)?;
     wait_for_cli_restore_rows(
         &name,
         &bucket_arg,
@@ -4382,10 +4444,15 @@ fn e2e_cli_markerless_upgrade_reanchors_then_emits_new_generation_delta() -> Res
         && watch_log(&restart_log)
             .contains("native HADBP snapshot admitted to durable local spool"))
     {
-        anyhow::ensure!(restarted.try_wait()?.is_none(), "markerless restart exited");
+        anyhow::ensure!(
+            restarted.try_wait()?.is_none(),
+            "markerless restart exited:\n{}",
+            watch_log(&restart_log)
+        );
         anyhow::ensure!(
             Instant::now() < reanchor_deadline,
-            "markerless reanchor timed out"
+            "markerless reanchor timed out:\n{}",
+            watch_log(&restart_log)
         );
         std::thread::sleep(Duration::from_millis(100));
     }

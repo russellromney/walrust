@@ -374,11 +374,15 @@ The blocker is held except for the bounded controlled-checkpoint window.
    validated committed frame prefix. No cursor advances.
 2. **After shadow fsync, before HADBP encode:** the durable shadow cursor is
    replayed into the next native object; SQLite is not checkpointed.
-3. **After payload rename, before journal commit:** startup validates the orphan
-   HADBP header/body, intended identity derived from its sidecar/temp intent,
-   predecessor, sequence, source cursor, and digest. It adopts a uniquely proven
-   object by committing the journal; otherwise it retains it and fails loudly.
-   It is never blindly overwritten or discarded.
+3. **After payload fsync, before or after payload rename, before journal
+   commit:** the snapshot source intent plus the fixed same-directory temporary,
+   or the generic install intent plus temporary/final payload, binds the exact
+   source cursor and object identity. Startup validates the HADBP header/body,
+   predecessor, sequence, page size/count, checksum, source cursor, intended
+   key, length, and digest. It adopts a uniquely proven object by installing the
+   exact bytes and committing the journal; otherwise a complete divergent object
+   is retained and fails loudly. A demonstrably incomplete pre-admission encode
+   may be removed because no checkpoint was released for it.
 4. **After journal commit, before SQLite checkpoint:** the object is locally
    admitted. Restart may checkpoint that exact admitted cursor without S3.
 5. **After SQLite checkpoint, before blocker reacquisition:** startup opens and
@@ -398,10 +402,17 @@ The blocker is held except for the bounded controlled-checkpoint window.
    files are removed only after validation; pending/unpublished objects and the
    only locally restorable snapshot base are never removed. Each delete is
    followed by directory fsync and is restart-idempotent.
-9. **During snapshot creation:** snapshots use a stable SQLite copy in the
-   spool filesystem, fsync that copy, encode/install/fsync native HADBP, commit
-   its journal record, and only then close the checkpoint window or retire the
-   stable copy. Partial copies/encodes are validated or removed on restart; an
+9. **During snapshot creation:** with the checkpoint blocker held, copy and
+   fsync the checked live-WAL committed prefix into shadow, then freeze its
+   generation/frame cursor, WAL salt/checksum chain, page size, and final commit
+   page count in a durable snapshot intent. Resolve each page at that exact
+   boundary from the latest shadow frame or (when absent) the pinned main DB,
+   and encode directly into the native HADBP payload temporary. Fsync/rename
+   the HADBP payload and commit its journal record before checkpoint release.
+   The payload file and its directory entry are fsynced before the named crash
+   boundary. No intermediate SQLite backup/VACUUM database is part of this path.
+   Partial HADBP temporaries are validated or removed on restart; a complete
+   fsynced temporary or installed orphan with a matching intent is adopted; an
    admitted snapshot is never regenerated at the same sequence.
 10. **During shutdown:** stop admitting new checkpoint windows, keep/reacquire
     the blocker, durably finish any in-progress local admission, persist pending
@@ -446,8 +457,9 @@ this same native spool before upload.
 ### Capacity, restore, pruning, and shutdown invariants
 
 Capacity accounts for the live WAL, fsynced shadow, HADBP encode temporary,
-installed payload, stable snapshot temporary, journal, and a filesystem free
-space reserve (on the actual custom spool filesystem). A warning watermark emits
+installed payload, journal/intents, and a filesystem free-space reserve (on the
+actual custom spool filesystem). No full SQLite stable-copy or rollback-journal
+transient is part of native watcher snapshots. A warning watermark emits
 `local_spool_high`; hard capacity/reserve emits `local_spool_full`, retains the
 blocker, stops checkpointing, and keeps watch alive. `remote_lag` is separate.
 Pending objects and the only local snapshot base are never capacity victims.
@@ -514,8 +526,8 @@ proved and fixed seven gaps left by the first completion claim:
   deliberate SIGKILL forces an incomplete local shutdown;
 - an atomic fsynced shadow durable-tail marker, not frame alignment, defines the
   restart-safe prefix;
-- snapshot preflight uses a pinned WAL-visible SQLite page count and reserves
-  stable-copy, HADBP, journal, intent, source, and filesystem peaks before copy;
+- snapshot preflight uses the exact fsynced shadow commit boundary and reserves
+  HADBP temporary/installed, journal, intent, source, and filesystem peaks;
 - ordinary object admission reserves install-intent and complete journal
   rewrite peaks as well as payload bytes;
 - an advisory spool owner lock makes active local restore fail loudly and keeps
@@ -536,12 +548,14 @@ The final independent follow-up also closes upgrade and live-error boundaries:
 markerless shadow directories are never adopted as durable merely because they
 are aligned, but are discarded and rotated into a full-snapshot cursor domain;
 failed live appends restore both the fsynced marker/file boundary and the WAL
-checksum/generation cursor before retry; and native SQLite Backup reads through
-the lifetime source connection opened before the blocker, so no source close
-creates a snapshot handoff checkpoint window. Snapshot capacity includes a
-full-size destination rollback-journal transient. Live Tigris tests prove the
-markerless snapshot→new-generation-delta path and a blocked application
-TRUNCATE plus exact restore at the former snapshot handoff.
+checksum/generation cursor before retry. Native snapshots now use the
+Litestream-shaped page-selection proof directly: latest page from the exact
+fsynced shadow commit prefix, otherwise the main DB, encoded immediately as
+HADBP. This removes the SQLite Backup/VACUUM handoff, its full stable-copy and
+rollback-journal transients, and the possibility of binding a later SQLite
+snapshot to an older shadow cursor. Live gates pin the frozen-cursor exclusion,
+markerless snapshot→new-generation-delta path, and blocked application
+TRUNCATE with exact restore.
 
 The closing scheduled-retention audit found one more call-site gap: both shadow
 watch retention timers still invoked a legacy-only helper even though the
@@ -562,6 +576,23 @@ object. Replacement-CI hardening also made the legacy cursor fixtures write
 fsynced generation files plus their durable-tail marker, and made the snapshot
 handoff proof wait boundedly for the durable-delta observation after exact
 remote restore instead of racing log visibility.
+
+The direct-snapshot pivot has its own call-site proof ledger. Disabling the
+shadow-page-over-main selection made the frozen-boundary restore test fail on a
+page that exists only in WAL. Disabling exact prewritten-temp installation made
+the inode/byte-identity admission test reject a divergent rewrite. Skipping the
+durable snapshot-source intent made the default-local checkpoint test fail
+before release. Deleting a complete fsynced temp instead of adopting it made the
+pre-install-intent crash test fail; restoring production adoption returned it
+green. The first live frozen-cursor run also caught Tokio's immediate first
+snapshot-timer tick producing a second snapshot where the next recovery object
+had to be a delta; consuming that initial tick fixes the production call site
+without weakening the assertion. The live markerless-upgrade gate then exposed
+that discarded shadow bytes still left their old `wal_copy_offset` in progress;
+direct page selection correctly failed when a WAL-only page was absent from the
+shorter main DB. Markerless recovery now ignores that stale offset and
+checksum-recopies the pinned live WAL from zero before its native snapshot
+re-anchor, with a focused unit regression and the unchanged live restore gate.
 
 ---
 

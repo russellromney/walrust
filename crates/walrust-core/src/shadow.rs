@@ -186,6 +186,20 @@ impl ShadowWal {
                 anyhow!("shadow generation exhausted while rotating unproven markerless tail")
             })?;
         }
+        let mut segment_offset = 0u64;
+        let mut entries = fs::read_dir(&shadow_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            let Some((file_generation, _)) = text.trim_end_matches(".wal").split_once('-') else {
+                continue;
+            };
+            if text.ends_with(".wal")
+                && u64::from_str_radix(file_generation, 16).ok() == Some(generation)
+            {
+                segment_offset = segment_offset.saturating_add(entry.metadata().await?.len());
+            }
+        }
 
         let checkpoint_blocker = if hold_checkpoint_blocker {
             Some(Arc::new(Mutex::new(Self::open_checkpoint_blocker(
@@ -200,7 +214,7 @@ impl ShadowWal {
             shadow_dir,
             generation,
             segment_index: 0,
-            segment_offset: 0,
+            segment_offset,
             page_size,
             checkpoint_blocker,
             wal_salt: (salt1, salt2),
@@ -1332,6 +1346,11 @@ mod tests {
             std::fs::metadata(&segment).unwrap().len(),
             durable_len,
             "startup must trust the fsynced marker, not aligned file length"
+        );
+        assert_eq!(
+            restarted.segment_offset(),
+            durable_len,
+            "direct snapshots must freeze the full recovered generation, not only bytes appended after restart"
         );
     }
 
