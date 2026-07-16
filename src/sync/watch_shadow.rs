@@ -333,6 +333,7 @@ async fn stage_native_shadow(
                 database = %state.name,
                 event = "local_spool_high",
                 spool_bytes = spool.used_bytes()?,
+                additional_peak_bytes = peak,
                 filesystem_free_bytes = spool.free_bytes()?,
                 "local native spool crossed its warning watermark"
             ),
@@ -462,14 +463,17 @@ async fn stage_native_snapshot(
         .saturating_add(4096);
     {
         let spool = spool_lock(&spool_state.0)?;
+        let journal_peak = spool.next_journal_rewrite_peak_bytes()?;
         let peak = payload_upper
             .saturating_mul(2)
-            .saturating_add(spool.next_journal_rewrite_peak_bytes()?)
+            .saturating_add(journal_peak)
             .saturating_add(source_footprint);
         if spool.capacity_state(peak)? == CapacityState::Full {
             bail!(
-                "local_spool_full: {} lacks peak capacity/reserve for direct native HADBP snapshot payload + journal",
-                state.name
+                "local_spool_full: {} lacks peak capacity/reserve for direct native HADBP snapshot payload + journal \
+                 (additional_peak={peak}, payload_upper={payload_upper}, journal_peak={journal_peak}, \
+                 source_footprint={source_footprint}, main_bytes={main_bytes}, shadow_frames={shadow_frames})",
+                state.name,
             );
         }
     }
@@ -569,6 +573,7 @@ async fn stage_native_snapshot(
                 database = %state.name,
                 event = "local_spool_high",
                 spool_bytes = spool.used_bytes()?,
+                additional_peak_bytes = peak,
                 filesystem_free_bytes = spool.free_bytes()?,
                 "local native spool crossed its warning watermark while snapshotting"
             ),

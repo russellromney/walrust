@@ -504,22 +504,6 @@ fn spawn_cli_watch_logged_with_upload_crash_once(
     )
 }
 
-fn spawn_cli_watch_logged_with_cleanup_interval(
-    args: LoggedWatchArgs<'_>,
-    cleanup_interval_ms: u64,
-) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(
-        args,
-        None,
-        None,
-        Some(cleanup_interval_ms),
-        None,
-        None,
-        None,
-        None,
-    )
-}
-
 fn spawn_cli_watch_logged_with_triggers(
     args: LoggedWatchArgs<'_>,
     triggers: TriggerOptions,
@@ -1562,7 +1546,7 @@ fn e2e_cli_sigkill_restarts_every_native_cleanup_boundary() -> Result<()> {
         let setup = create_source_db(&db_path, 5)?;
         write_pin_frame(&setup, boundary)?;
         let expected = rows(&db_path)?;
-        let mut crashed = spawn_cli_watch_logged_with_cleanup_interval(
+        let mut crashed = spawn_cli_watch_logged_with_options(
             LoggedWatchArgs {
                 db_path: &db_path,
                 bucket_arg: &bucket_arg,
@@ -1576,7 +1560,18 @@ fn e2e_cli_sigkill_restarts_every_native_cleanup_boundary() -> Result<()> {
                 durability_failpoint: Some(boundary),
                 durability_failpoint_marker: Some(&marker),
             },
-            250,
+            None,
+            None,
+            Some(250),
+            Some(TriggerOptions {
+                snapshot_interval: 1,
+                max_changes: 0,
+                max_interval: 0,
+                on_idle: 0,
+            }),
+            None,
+            None,
+            None,
         )?;
         wait_for_durability_failpoint(&marker, &log_path, &mut crashed)?;
         stop_child(&mut crashed);
@@ -1744,7 +1739,7 @@ fn e2e_cli_spool_high_full_retains_blocker_and_recovers_after_restart() -> Resul
     std::fs::write(
         &config_path,
         format!(
-            "[spool]\npath = {:?}\nwarning_size = 100000\nmax_size = 300000\nmin_free_space = 0\nshutdown_drain_seconds = 0\n",
+            "[spool]\npath = {:?}\nwarning_size = 100000\nmax_size = 400000\nmin_free_space = 0\nshutdown_drain_seconds = 0\n",
             spool_path.to_string_lossy()
         ),
     )?;
@@ -1980,7 +1975,7 @@ fn e2e_cli_wal_visible_snapshot_respects_custom_spool_capacity() -> Result<()> {
         durability_failpoint_marker: None,
     })?;
     let full_deadline = Instant::now() + e2e_poll_deadline(30);
-    while !watch_log(&tight_log).contains("WAL-visible native snapshot") {
+    while !watch_log(&tight_log).contains("local_spool_full") {
         if let Some(status) = tight.try_wait()? {
             cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
             anyhow::bail!("tight-capacity watcher exited with {status}");
@@ -1988,7 +1983,7 @@ fn e2e_cli_wal_visible_snapshot_respects_custom_spool_capacity() -> Result<()> {
         if Instant::now() >= full_deadline {
             stop_child(&mut tight);
             cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
-            anyhow::bail!("snapshot peak refusal timed out");
+            anyhow::bail!("direct native snapshot peak refusal timed out");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2002,7 +1997,7 @@ fn e2e_cli_wal_visible_snapshot_respects_custom_spool_capacity() -> Result<()> {
         stop_child(&mut tight);
         cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
         anyhow::bail!(
-            "snapshot stable copy crossed hard capacity before refusal: before={used_before} after={used_after} hard={tight_hard}"
+            "direct native snapshot payload crossed hard capacity before refusal: before={used_before} after={used_after} hard={tight_hard}"
         );
     }
     let probe = Connection::open(&db_path)?;
