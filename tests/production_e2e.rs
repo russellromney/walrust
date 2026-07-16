@@ -772,12 +772,11 @@ fn assert_no_shadow_reanchors_or_snapshot_storm(log_path: &Path) -> Result<()> {
     let snapshot_count = log
         .matches("native HADBP snapshot admitted to durable local spool")
         .count();
-    // Shadow watch currently takes the explicit on-startup snapshot and the
-    // snapshot timer's immediate first tick. That two-snapshot startup baseline
-    // predates this test; a third snapshot means the writer triggered a storm.
+    // Startup admits exactly one full snapshot. Any later snapshot in these
+    // steady-generation writer tests is a re-anchor/storm regression.
     anyhow::ensure!(
-        snapshot_count <= 2,
-        "ephemeral writers caused a snapshot storm beyond the two-snapshot startup baseline \
+        snapshot_count <= 1,
+        "ephemeral writers caused a snapshot re-anchor/storm beyond the one-snapshot startup baseline \
          ({snapshot_count} snapshots):\n{log}"
     );
     Ok(())
@@ -1671,7 +1670,7 @@ fn e2e_cli_custom_spool_isolates_multiple_databases_collision_safely() -> Result
         if log
             .matches("native HADBP snapshot admitted to durable local spool")
             .count()
-            >= 4
+            >= 2
         {
             break;
         }
@@ -2132,7 +2131,7 @@ fn e2e_cli_every_snapshot_trigger_stages_native_hadbp_before_upload() -> Result<
                 .matches("native HADBP snapshot admitted to durable local spool")
                 .count();
             let reason_seen = expected_log.is_none_or(|needle| log.contains(needle));
-            if snapshot_count >= 3 && reason_seen {
+            if snapshot_count >= 2 && reason_seen {
                 break;
             }
             if let Some(status) = child.try_wait()? {
@@ -2159,7 +2158,7 @@ fn e2e_cli_every_snapshot_trigger_stages_native_hadbp_before_upload() -> Result<
                 .iter()
                 .filter(|(key, _)| key.contains("/0001/"))
                 .count()
-                >= 3,
+                >= 2,
             "{reason} did not produce durable native snapshot objects"
         );
         wait_for_cli_restore_rows(
@@ -3584,17 +3583,17 @@ fn e2e_cli_watch_replicates_ephemeral_writes_after_startup_without_reanchor() ->
     while watch_log(&log_path)
         .matches("native HADBP snapshot admitted to durable local spool")
         .count()
-        < 2
+        < 1
     {
         if let Some(status) = child.try_wait()? {
             anyhow::bail!(
-                "DF2: watch exited before both startup snapshots completed ({status}):\n{}",
+                "DF2: watch exited before the startup snapshot completed ({status}):\n{}",
                 watch_log(&log_path)
             );
         }
         anyhow::ensure!(
             Instant::now() < startup_deadline,
-            "timed out waiting for the two-snapshot startup baseline:\n{}",
+            "timed out waiting for the one-snapshot startup baseline:\n{}",
             watch_log(&log_path)
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -3606,13 +3605,22 @@ fn e2e_cli_watch_replicates_ephemeral_writes_after_startup_without_reanchor() ->
         "INSERT INTO items (id, value) VALUES (4, 'post-startup-4')",
         [],
     )?;
-    let first_busy = force_truncate_checkpoint(&first_writer)?.0;
+    let first_checkpoint = force_truncate_checkpoint(&first_writer)?;
+    let first_busy = first_checkpoint.0;
     anyhow::ensure!(
         first_busy != 0,
         "DF2: blocker did not stop TRUNCATE after the first post-startup commit:\n{}",
         watch_log(&log_path)
     );
     drop(first_writer);
+
+    let wal_path = db_path.with_extension("db-wal");
+    let mut wal_sizes = vec![(
+        4i64,
+        std::fs::metadata(&wal_path)
+            .map(|metadata| metadata.len())
+            .unwrap_or(0),
+    )];
 
     for id in 5..=15i64 {
         ephemeral_exec(
@@ -3625,16 +3633,22 @@ fn e2e_cli_watch_replicates_ephemeral_writes_after_startup_without_reanchor() ->
                 watch_log(&log_path)
             );
         }
+        wal_sizes.push((
+            id,
+            std::fs::metadata(&wal_path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0),
+        ));
         std::thread::sleep(Duration::from_millis(250));
     }
 
-    let wal_path = db_path.with_extension("db-wal");
     let wal_size = std::fs::metadata(&wal_path)
         .map(|metadata| metadata.len())
         .unwrap_or(0);
     anyhow::ensure!(
         wal_size > 32,
-        "DF2: post-boundary short-lived writes did not remain in the WAL (size={wal_size}):\n{}",
+        "DF2: post-boundary short-lived writes did not remain in the WAL \
+         (size={wal_size}, first_checkpoint={first_checkpoint:?}, wal_sizes={wal_sizes:?}):\n{}",
         watch_log(&log_path)
     );
     let checkpoint_probe = Connection::open(&db_path)?;

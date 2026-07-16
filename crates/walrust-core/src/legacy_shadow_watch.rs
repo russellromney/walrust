@@ -60,6 +60,12 @@ pub struct ShadowWatchState {
     /// app commits across controlled release/reacquire windows and is replaced
     /// immediately before the blocker at operation-boundary handoffs.
     pub data_version_monitor: Option<rusqlite::Connection>,
+    /// Long-lived source database descriptor used by direct native snapshots.
+    /// It is opened before the checkpoint blocker and must not be closed until
+    /// every SQLite handle above has released its locks. Reusing this exact
+    /// descriptor avoids the classic POSIX close-releases-process-locks trap on
+    /// systems without open-file-description locks.
+    pub source_db_file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
     pub shadow_sync_generation: u64,
     pub shadow_sync_offset: u64,
     pub wal_copy_offset: u64,
@@ -135,6 +141,7 @@ pub fn refresh_checkpoint_data_version_monitor(state: &mut ShadowWatchState) -> 
     drop(state.data_version_monitor.take());
     let monitor = rusqlite::Connection::open(&state.db_path)?;
     monitor.busy_timeout(Duration::from_secs(5))?;
+    ShadowWal::enable_persistent_wal(&monitor, &state.db_path)?;
     state.data_version_monitor = Some(monitor);
     Ok(())
 }
@@ -667,6 +674,7 @@ mod tests {
             shadow,
             checkpoint_blocker: None,
             data_version_monitor: None,
+            source_db_file: None,
             shadow_sync_generation: 0,
             shadow_sync_offset: gen0_segment.len() as u64,
             wal_copy_offset: 0,

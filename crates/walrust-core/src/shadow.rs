@@ -242,6 +242,8 @@ impl ShadowWal {
 
         ensure_connection_in_wal_mode(&conn, db_path)?;
 
+        Self::enable_persistent_wal(&conn, db_path)?;
+
         // Disable auto-checkpoint on this connection without changing journal_mode.
         conn.execute_batch(
             "
@@ -267,6 +269,28 @@ impl ShadowWal {
         tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
 
         Ok(conn)
+    }
+
+    /// Enable SQLite's connection-level persistent-WAL file control on every
+    /// long-lived watcher handle for a source database.
+    pub fn enable_persistent_wal(conn: &Connection, db_path: &Path) -> Result<()> {
+        let mut persist_wal: std::os::raw::c_int = 1;
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                conn.handle(),
+                b"main\0".as_ptr().cast(),
+                rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+                (&mut persist_wal as *mut std::os::raw::c_int).cast(),
+            )
+        };
+        if rc != rusqlite::ffi::SQLITE_OK {
+            return Err(anyhow!(
+                "failed to enable SQLITE_FCNTL_PERSIST_WAL for {}: SQLite result {}",
+                db_path.display(),
+                rc
+            ));
+        }
+        Ok(())
     }
 
     async fn ensure_database_in_wal_mode(db_path: &Path) -> Result<()> {
@@ -1070,7 +1094,23 @@ mod tests {
                 .execute("VACUUM INTO ?1", [snapshot_path.to_str().unwrap()])
                 .unwrap();
         }
-        for id in 1..=10i64 {
+        {
+            let first_writer = Connection::open(&db_path).unwrap();
+            first_writer
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0;")
+                .unwrap();
+            first_writer
+                .execute(
+                    "INSERT INTO app_data (id, value) VALUES (1, 'ephemeral-1')",
+                    [],
+                )
+                .unwrap();
+            let busy: i64 = first_writer
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(busy, 1, "the pinned blocker must reject the first TRUNCATE");
+        }
+        for id in 2..=10i64 {
             let writer = Connection::open(&db_path).unwrap();
             writer.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
             writer
@@ -1097,6 +1137,62 @@ mod tests {
         );
 
         blocker.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_reopened_checkpoint_blocker_preserves_wal_across_writer_close() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("reopened-ephemeral-writer.db");
+        let setup = Connection::open(&db_path).unwrap();
+        setup
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE app_data (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+        drop(setup);
+
+        let monitor = Connection::open(&db_path).unwrap();
+        let blocker = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+        blocker.execute_batch("ROLLBACK;").unwrap();
+        drop(blocker);
+        let _: (i64, i64, i64) = monitor
+            .query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        drop(monitor);
+
+        // This is the CLI controlled-checkpoint handoff: refresh the lifetime
+        // monitor first, then make replacement blocker acquisition the final
+        // SQLite operation in the watcher process.
+        let monitor = Connection::open(&db_path).unwrap();
+        let replacement = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+        let _: i64 = monitor
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .unwrap();
+        drop(replacement);
+        let replacement = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+        {
+            let writer = Connection::open(&db_path).unwrap();
+            writer
+                .execute("INSERT INTO app_data (value) VALUES ('after-rearm')", [])
+                .unwrap();
+        }
+
+        let wal_path = db_path.with_extension("db-wal");
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > 32,
+            "a short-lived writer close reset the WAL after blocker reacquisition"
+        );
+        let checkpoint = Connection::open(&db_path).unwrap();
+        checkpoint.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        let busy: i64 = checkpoint
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 1, "replacement blocker did not refuse TRUNCATE");
+        replacement.execute_batch("ROLLBACK;").unwrap();
     }
 
     #[test]

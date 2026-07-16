@@ -101,9 +101,24 @@ pub fn write_snapshot_from_shadow(
     input: &NativeSnapshotInput,
     output_path: &Path,
 ) -> Result<NativeSnapshotFileOutput> {
-    let (shadow_pages, frame_count, end_page_count) = snapshot_source(input)?;
     let mut db = fs::File::open(&input.db_path)
         .with_context(|| format!("open native snapshot database {}", input.db_path.display()))?;
+    write_snapshot_from_shadow_file(input, &mut db, output_path)
+}
+
+/// Encode a native snapshot using an already-open source database descriptor.
+///
+/// Watchers on platforms without open-file-description locks must keep this
+/// descriptor open for the entire SQLite blocker lifetime. Opening and closing
+/// another descriptor for the database inode after blocker acquisition can
+/// release the process's SQLite locks even though the blocker transaction is
+/// still represented by a live connection.
+pub fn write_snapshot_from_shadow_file(
+    input: &NativeSnapshotInput,
+    db: &mut fs::File,
+    output_path: &Path,
+) -> Result<NativeSnapshotFileOutput> {
+    let (shadow_pages, frame_count, end_page_count) = snapshot_source(input)?;
     #[cfg(unix)]
     let db_identity = {
         use std::os::unix::fs::MetadataExt;
@@ -130,7 +145,7 @@ pub fn write_snapshot_from_shadow(
         input.page_size,
         input.seq,
         input.previous_chain_checksum,
-        |page| read_resolved_page(input, &shadow_pages, &mut db, page),
+        |page| read_resolved_page(input, &shadow_pages, db, page),
     )?;
     output.sync_all()?;
     let output_dir = output_path

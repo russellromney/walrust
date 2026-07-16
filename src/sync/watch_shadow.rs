@@ -32,7 +32,7 @@ use walrust_core::legacy_shadow_watch::{
 };
 use walrust_core::native_publish::{object_key as native_object_key, NativeUploader, UploadWake};
 use walrust_core::native_shadow::{
-    encode_shadow_to_hadbp, write_snapshot_from_shadow, NativeShadowInput, NativeSnapshotInput,
+    encode_shadow_to_hadbp, write_snapshot_from_shadow_file, NativeShadowInput, NativeSnapshotInput,
 };
 use walrust_core::native_spool::{
     durability_failpoint, filesystem_available_bytes, CapacityPolicy, CapacityState, NativeSpool,
@@ -408,7 +408,17 @@ async fn stage_native_snapshot(
         (metadata.dev(), metadata.ino())
     };
     let generation_before = state.shadow.generation();
-    let (_, new_wal_offset) = state.shadow.copy_frames(state.wal_copy_offset).await?;
+    let wal_offset_before = state.wal_copy_offset;
+    let (frozen_frames, new_wal_offset) = state.shadow.copy_frames(wal_offset_before).await?;
+    tracing::debug!(
+        database = %state.name,
+        frames = frozen_frames.len(),
+        wal_offset_before,
+        wal_offset_after = new_wal_offset,
+        shadow_generation = state.shadow.generation(),
+        shadow_bytes = state.shadow.segment_offset(),
+        "froze native snapshot shadow cursor"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -508,8 +518,17 @@ async fn stage_native_snapshot(
         expected_db_file_identity: db_identity_before,
     };
     let payload_temp_for_encode = payload_temp.clone();
+    let source_db_file = state.source_db_file.as_ref().cloned().ok_or_else(|| {
+        anyhow!(
+            "{}: native snapshot source descriptor was not retained",
+            state.name
+        )
+    })?;
     let encoded_result = match tokio::task::spawn_blocking(move || -> Result<_> {
-        write_snapshot_from_shadow(&snapshot_input, &payload_temp_for_encode)
+        let mut source = source_db_file
+            .lock()
+            .map_err(|_| anyhow!("native snapshot source descriptor lock poisoned"))?;
+        write_snapshot_from_shadow_file(&snapshot_input, &mut source, &payload_temp_for_encode)
     })
     .await
     {
@@ -676,6 +695,16 @@ async fn checkpoint_with_state_blocker_attempt(
         .as_ref()
         .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
     blocker.execute_batch("ROLLBACK;")?;
+
+    if cfg!(debug_assertions) {
+        if let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE") {
+            let path = std::path::PathBuf::from(path);
+            std::fs::write(&path, b"entered")?;
+            while path.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+    }
 
     let monitor = state
         .data_version_monitor
@@ -990,17 +1019,39 @@ async fn checkpoint_shadow_after_native_admission(
     checkpoint_mode: ShadowCheckpointMode,
 ) -> Result<CheckpointAttempt> {
     let data_version_before = checkpoint_data_version(state)?;
+    let shadow_generation_before = state.shadow.generation();
+    let wal_offset_before = state.wal_copy_offset;
     let (frames, new_offset) = state
         .shadow
-        .copy_frames(state.wal_copy_offset)
+        .copy_frames(wal_offset_before)
         .await
         .with_context(|| format!("{}: shadow copy before checkpoint failed", state.name))?;
+    tracing::debug!(
+        database = %state.name,
+        frames = frames.len(),
+        wal_offset_before,
+        wal_offset_after = new_offset,
+        wal_bytes = std::fs::metadata(&state.wal_path).map(|metadata| metadata.len()).unwrap_or(0),
+        shadow_generation = state.shadow.generation(),
+        shadow_bytes = state.shadow.segment_offset(),
+        "froze native checkpoint shadow cursor"
+    );
     if !frames.is_empty() {
         state.wal_copy_offset = new_offset;
     }
 
-    let output = stage_native_shadow(state, spool_state).await?;
-    apply_shadow_sync_result_to_state(state, &output).await?;
+    if state.shadow.generation() != shadow_generation_before {
+        tracing::warn!(
+            database = %state.name,
+            shadow_generation_before,
+            shadow_generation_after = state.shadow.generation(),
+            "checkpoint preflight observed a reset after data_version sampling; admitting a full native re-anchor"
+        );
+        stage_native_snapshot(state, spool_state).await?;
+    } else {
+        let output = stage_native_shadow(state, spool_state).await?;
+        apply_shadow_sync_result_to_state(state, &output).await?;
+    }
     let admitted_seq = spool_lock(&spool_state.0)?
         .admitted_seq()
         .ok_or_else(|| anyhow!("{}: native spool has no admitted snapshot base", state.name))?;
@@ -1009,19 +1060,6 @@ async fn checkpoint_shadow_after_native_admission(
         wait_for_remote_publish(&spool_state.0, &state.name, admitted_seq, drain_timeout).await?;
     }
     spool_lock(&spool_state.0)?.begin_checkpoint_window(admitted_seq)?;
-
-    // Give production E2Es a deterministic way to place an actual application
-    // commit inside the release/reacquire window. This hook is compiled into
-    // debug builds only; release binaries never inspect the test environment.
-    if cfg!(debug_assertions) {
-        if let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE") {
-            let path = std::path::PathBuf::from(path);
-            std::fs::write(&path, b"entered")?;
-            while path.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-    }
 
     let checkpoint_started = std::time::Instant::now();
     let attempt =
@@ -1423,6 +1461,9 @@ pub async fn watch_with_shadow(
     // discovery. Credential resolution and S3 can stall indefinitely; no app
     // checkpoint may erase unread WAL during that startup window.
     let mut db_locks: Vec<crate::lock::DbLock> = Vec::new();
+    // Declared before the SQLite maps so error-path reverse local-drop order
+    // closes blocker/monitor connections before these source descriptors.
+    let mut startup_source_db_files: HashMap<PathBuf, Arc<Mutex<std::fs::File>>> = HashMap::new();
     let mut startup_blockers: HashMap<PathBuf, Connection> = HashMap::new();
     let mut startup_shadows: HashMap<PathBuf, ShadowWal> = HashMap::new();
     let mut startup_data_version_monitors: HashMap<PathBuf, Connection> = HashMap::new();
@@ -1436,6 +1477,12 @@ pub async fn watch_with_shadow(
             .into());
         }
         db_locks.push(crate::lock::DbLock::acquire(&db_config.path)?);
+        let source_db_file = std::fs::File::open(&db_config.path).with_context(|| {
+            format!(
+                "{}: failed to open long-lived native snapshot source descriptor",
+                db_config.prefix
+            )
+        })?;
         // Build every other same-database SQLite handle before the blocker.
         // Closing any handle after taking a POSIX blocker can drop the
         // process-wide inode locks, so blocker acquisition must be the final
@@ -1455,6 +1502,7 @@ pub async fn watch_with_shadow(
             )
         })?;
         data_version_monitor.busy_timeout(Duration::from_secs(5))?;
+        ShadowWal::enable_persistent_wal(&data_version_monitor, &db_config.path)?;
         // This plain-file open targets the SQLite inode too. Complete it before
         // the final blocker operation so its close cannot release POSIX locks.
         startup_db_checksums.insert(
@@ -1470,6 +1518,8 @@ pub async fn watch_with_shadow(
         startup_shadows.insert(db_config.path.clone(), shadow);
         startup_data_version_monitors.insert(db_config.path.clone(), data_version_monitor);
         startup_blockers.insert(db_config.path.clone(), blocker);
+        startup_source_db_files
+            .insert(db_config.path.clone(), Arc::new(Mutex::new(source_db_file)));
     }
     if cfg!(debug_assertions) {
         if let Some(path) = std::env::var_os("WALRUST_TEST_STARTUP_DISCOVERY_PAUSE_FILE") {
@@ -1786,6 +1836,9 @@ pub async fn watch_with_shadow(
         let checkpoint_blocker = startup_blockers
             .remove(db_path)
             .ok_or_else(|| anyhow!("{}: startup checkpoint blocker missing", name))?;
+        let source_db_file = startup_source_db_files
+            .remove(db_path)
+            .ok_or_else(|| anyhow!("{}: startup source descriptor missing", name))?;
 
         let mut restored_wal_copy_offset = 0u64;
         if let Some(progress) = load_shadow_progress(&shadow, &name)? {
@@ -1869,6 +1922,7 @@ pub async fn watch_with_shadow(
                 shadow,
                 checkpoint_blocker: Some(checkpoint_blocker),
                 data_version_monitor: Some(data_version_monitor),
+                source_db_file: Some(source_db_file),
                 shadow_sync_generation,
                 shadow_sync_offset,
                 wal_copy_offset: restored_wal_copy_offset,
@@ -2125,6 +2179,16 @@ pub async fn watch_with_shadow(
                     }
                     match state.shadow.copy_frames(state.wal_copy_offset).await {
                         Ok((frames, new_offset)) => {
+                            tracing::debug!(
+                                database = %state.name,
+                                frames = frames.len(),
+                                wal_offset_before = state.wal_copy_offset,
+                                wal_offset_after = new_offset,
+                                wal_bytes = std::fs::metadata(&state.wal_path).map(|metadata| metadata.len()).unwrap_or(0),
+                                shadow_generation = state.shadow.generation(),
+                                shadow_bytes = state.shadow.segment_offset(),
+                                "polled native live WAL into shadow"
+                            );
                             if !frames.is_empty() {
                                 tracing::debug!(
                                     "{}: Copied {} frames to shadow (offset {} -> {})",
@@ -2692,6 +2756,26 @@ pub async fn watch_with_shadow(
         }
     }
 
+    // On non-OFD systems, close ordering is part of blocker correctness: the
+    // long-lived plain source descriptor must outlive every SQLite connection
+    // that owns or observes the source database locks.
+    for state in db_states.values_mut() {
+        if let Some(blocker) = state.checkpoint_blocker.take() {
+            if !blocker.is_autocommit() {
+                if let Err(error) = blocker.execute_batch("ROLLBACK;") {
+                    tracing::error!(
+                        database = %state.name,
+                        error = %error,
+                        "failed to release checkpoint blocker during shutdown"
+                    );
+                }
+            }
+            drop(blocker);
+        }
+        drop(state.data_version_monitor.take());
+        drop(state.source_db_file.take());
+    }
+
     tracing::info!("walrust shadow mode shutdown complete");
     Ok(())
 }
@@ -2814,6 +2898,10 @@ mod tests {
         (spool, wake)
     }
 
+    fn test_source_db_file(path: &std::path::Path) -> Option<Arc<Mutex<std::fs::File>>> {
+        Some(Arc::new(Mutex::new(std::fs::File::open(path).unwrap())))
+    }
+
     fn test_migrated_native_spool_state(
         db_path: &std::path::Path,
         root: &std::path::Path,
@@ -2899,6 +2987,7 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -2964,6 +3053,7 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -3269,6 +3359,7 @@ mod tests {
                 shadow,
                 checkpoint_blocker: None,
                 data_version_monitor: None,
+                source_db_file: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: 0,
@@ -3337,6 +3428,7 @@ mod tests {
                 shadow,
                 checkpoint_blocker: None,
                 data_version_monitor: None,
+                source_db_file: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: 0,
@@ -3428,6 +3520,7 @@ mod tests {
                 shadow,
                 checkpoint_blocker: None,
                 data_version_monitor: None,
+                source_db_file: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: frame_size,
                 wal_copy_offset: 0,
@@ -3496,6 +3589,7 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -3573,10 +3667,12 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
         };
+        rearm_checkpoint_blocker(&mut state).unwrap();
         let spool_state = test_native_spool_state(&db_path, temp.path());
         stage_native_snapshot(&mut state, &spool_state)
             .await
@@ -3671,6 +3767,7 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -3726,6 +3823,7 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -3773,6 +3871,7 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -3836,6 +3935,7 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -3885,6 +3985,7 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -3967,6 +4068,7 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -4054,6 +4156,7 @@ mod tests {
             shadow,
             checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
             data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
@@ -4127,6 +4230,7 @@ mod tests {
                 shadow,
                 checkpoint_blocker: None,
                 data_version_monitor: None,
+                source_db_file: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: offset,
@@ -4182,6 +4286,7 @@ mod tests {
                 shadow,
                 checkpoint_blocker: None,
                 data_version_monitor: None,
+                source_db_file: None,
                 shadow_sync_generation: 0,
                 shadow_sync_offset: 0,
                 wal_copy_offset: offset,

@@ -488,6 +488,10 @@ async fn format_stability_cli_v0_7_0_migrates_to_native_hadbp_boundary() -> Resu
         let watch_log = std::fs::File::create(&watch_log_path)?;
         let mut watch = Command::new(env!("CARGO_BIN_EXE_walrust"));
         watch
+            .env(
+                "RUST_LOG",
+                "walrust_core::shadow=debug,walrust::sync::watch_shadow=debug,walrust_core::native_publish=info",
+            )
             .arg("watch")
             .arg(&db)
             .arg("--bucket")
@@ -515,13 +519,22 @@ async fn format_stability_cli_v0_7_0_migrates_to_native_hadbp_boundary() -> Resu
                 if let Some(status) = child.try_wait()? {
                     anyhow::bail!("native migration watcher exited during startup: {status}");
                 }
-                let descriptor = format!("{scratch}/{}/native/v1/stream.json", manifest.db_name);
-                if storage.get(&descriptor).await?.is_some() {
-                    break;
+                let descriptor_key =
+                    format!("{scratch}/{}/native/v1/stream.json", manifest.db_name);
+                if let Some(bytes) = storage.get(&descriptor_key).await? {
+                    let descriptor: walrust::walrust_core::native_publish::StreamDescriptor =
+                        serde_json::from_slice(&bytes)?;
+                    let published_base = format!(
+                        "{scratch}/{}/native/v1/lineages/{}/published/{:016x}.json",
+                        manifest.db_name, descriptor.lineage_id, descriptor.first_native_seq
+                    );
+                    if storage.get(&published_base).await?.is_some() {
+                        break;
+                    }
                 }
                 anyhow::ensure!(
                     std::time::Instant::now() < startup_deadline,
-                    "timed out waiting for native migration descriptor"
+                    "timed out waiting for the first published native migration snapshot"
                 );
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -532,6 +545,16 @@ async fn format_stability_cli_v0_7_0_migrates_to_native_hadbp_boundary() -> Resu
                 "INSERT INTO items(value) VALUES ('post-native-migration')",
                 [],
             )?;
+            let journal_mode: String = writer.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            let live_rows: u64 = writer.query_row("SELECT count(*) FROM items", [], |row| row.get(0))?;
+            let wal_path = db.with_extension("db-wal");
+            let wal_before_close = std::fs::metadata(&wal_path).map(|metadata| metadata.len()).unwrap_or(0);
+            anyhow::ensure!(
+                journal_mode.eq_ignore_ascii_case("wal")
+                    && live_rows == manifest.latest.row_count + 1
+                    && wal_before_close > 0,
+                "post-migration commit was not live in WAL mode: mode={journal_mode} rows={live_rows} wal_bytes={wal_before_close}"
+            );
             drop(writer);
 
             let latest = temp.path().join("native-latest.db");

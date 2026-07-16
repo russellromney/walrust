@@ -246,6 +246,12 @@ litestream does — call it out plainly for operators).
   pre-checkpoint) for any residual dirty-check, not a whole-file hash.
 - **Wrong:** treating the blocker as free. It creates `_walrust_seq` and holds a
   read txn — a real, litestream-precedented change to shadow mode's contract.
+- **Wrong:** opening and closing the main database file after taking the
+  blocker. On systems without open-file-description locks, closing any file
+  descriptor for that inode can release the process's SQLite locks while the
+  transaction object still appears live. Open one read-only source descriptor
+  before the blocker, retain it until every SQLite source handle is closed, and
+  reuse that exact descriptor for native snapshot base-page reads.
 - **Wrong:** letting the WAL grow without a loud alarm. Silent bloat that stalls
   the app's writes is a fail-loudly violation.
 - The release/reacquire window around walrust's own checkpoint is the one place a
@@ -409,6 +415,9 @@ The blocker is held except for the bounded controlled-checkpoint window.
    boundary from the latest shadow frame or (when absent) the pinned main DB,
    and encode directly into the native HADBP payload temporary. Fsync/rename
    the HADBP payload and commit its journal record before checkpoint release.
+   Main-database pages use the one descriptor opened before blocker acquisition;
+   snapshot creation never reopens/closes the source database inode, preserving
+   classic POSIX locks on non-OFD platforms.
    The payload file and its directory entry are fsynced before the named crash
    boundary. No intermediate SQLite backup/VACUUM database is part of this path.
    Partial HADBP temporaries are validated or removed on restart; a complete
@@ -593,6 +602,17 @@ direct page selection correctly failed when a WAL-only page was absent from the
 shorter main DB. Markerless recovery now ignores that stale offset and
 checksum-recopies the pinned live WAL from zero before its native snapshot
 re-anchor, with a focused unit regression and the unchanged live restore gate.
+
+The macOS DF2 rerun exposed a further Litestream-shaped lock invariant: direct
+snapshot encoding reopened and closed the main database after blocker
+acquisition. On non-OFD POSIX locks that close invalidated SQLite's process
+locks even though the blocker transaction still appeared live. Watch startup
+now opens one source descriptor before any blocker and native snapshots reuse
+it until shutdown closes blocker, monitor, then descriptor. Neutering only that
+production call site made unchanged live DF2 fail immediately with
+`first_checkpoint=(1,5,4)` and a zero-byte WAL after every short-lived writer;
+restoring descriptor reuse returned DF2, DF1, app-TRUNCATE, paused-uploader,
+remote-release, partial-PASSIVE, and legacy-migration live gates to green.
 
 ---
 

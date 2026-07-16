@@ -380,6 +380,7 @@ async fn shadow_blocker_survives_two_production_snapshots_and_ephemeral_writers(
         shadow,
         checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path)?),
         data_version_monitor: Some(monitor),
+        source_db_file: None,
         shadow_sync_generation: 0,
         shadow_sync_offset: 0,
         wal_copy_offset: 0,
