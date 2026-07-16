@@ -397,6 +397,13 @@ The blocker is held except for the bounded controlled-checkpoint window.
    creates a full native snapshot re-anchor through the same spool before any
    delta continuation. On POSIX, blocker reacquisition is the final SQLite
    operation in the successful checkpoint path.
+   Before opening that window, checkpoint preflight repeats the checked shadow
+   copy and native delta admission until one complete `data_version` sample to
+   sample interval is stable. A commit copied and admitted while the blocker is
+   still held is therefore drained as another delta, not misclassified as a
+   dirty-window re-anchor. Sustained writers bound this preflight and defer the
+   checkpoint with the blocker held; a commit after the stable sample remains a
+   dirty controlled-window event and requires the full snapshot re-anchor.
 6. **After PUT, before uploaded-state commit:** the uploader GET-verifies exact
    remote bytes and idempotently records the object uploaded locally. Divergent
    remote bytes are split brain/equivocation and are never overwritten.

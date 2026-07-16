@@ -1023,44 +1023,79 @@ async fn checkpoint_shadow_after_native_admission(
     drain_timeout: Duration,
     checkpoint_mode: ShadowCheckpointMode,
 ) -> Result<CheckpointAttempt> {
-    let data_version_before = checkpoint_data_version(state)?;
-    let shadow_generation_before = state.shadow.generation();
-    let wal_offset_before = state.wal_copy_offset;
-    let (frames, new_offset) = state
-        .shadow
-        .copy_frames(wal_offset_before)
-        .await
-        .with_context(|| format!("{}: shadow copy before checkpoint failed", state.name))?;
-    tracing::debug!(
-        database = %state.name,
-        frames = frames.len(),
-        wal_offset_before,
-        wal_offset_after = new_offset,
-        wal_bytes = std::fs::metadata(&state.wal_path).map(|metadata| metadata.len()).unwrap_or(0),
-        shadow_generation = state.shadow.generation(),
-        shadow_bytes = state.shadow.segment_offset(),
-        "froze native checkpoint shadow cursor"
-    );
-    if !frames.is_empty() {
-        state.wal_copy_offset = new_offset;
-    }
-
-    if state.shadow.generation() != shadow_generation_before {
-        tracing::warn!(
+    // A commit between the first data_version sample and a successful shadow
+    // admission is already protected by that admission. Do not misclassify it
+    // as a commit from the later unblocked checkpoint window. Drain until one
+    // complete sample -> copy -> admission -> sample interval is stable, then
+    // use that final sample as the checkpoint-window baseline. A commit after
+    // the stable sample is still detected after checkpoint/rearm and forces the
+    // required snapshot re-anchor.
+    const MAX_PREFLIGHT_DRAINS: usize = 8;
+    let mut data_version_before = checkpoint_data_version(state)?;
+    let mut preflight_drain = 0usize;
+    let admitted_seq = loop {
+        preflight_drain += 1;
+        let shadow_generation_before = state.shadow.generation();
+        let wal_offset_before = state.wal_copy_offset;
+        let (frames, new_offset) = state
+            .shadow
+            .copy_frames(wal_offset_before)
+            .await
+            .with_context(|| format!("{}: shadow copy before checkpoint failed", state.name))?;
+        tracing::debug!(
             database = %state.name,
-            shadow_generation_before,
-            shadow_generation_after = state.shadow.generation(),
-            "checkpoint preflight observed a reset after data_version sampling; admitting a full native re-anchor"
+            frames = frames.len(),
+            wal_offset_before,
+            wal_offset_after = new_offset,
+            wal_bytes = std::fs::metadata(&state.wal_path).map(|metadata| metadata.len()).unwrap_or(0),
+            shadow_generation = state.shadow.generation(),
+            shadow_bytes = state.shadow.segment_offset(),
+            "froze native checkpoint shadow cursor"
         );
-        stage_native_snapshot(state, spool_state).await?;
-    } else {
-        let output = stage_native_shadow(state, spool_state).await?;
-        apply_shadow_sync_result_to_state(state, &output).await?;
-    }
-    let admitted_seq = spool_lock(&spool_state.0)?
-        .admitted_seq()
-        .ok_or_else(|| anyhow!("{}: native spool has no admitted snapshot base", state.name))?;
-    spool_lock(&spool_state.0)?.verify_durable_admission(admitted_seq)?;
+        if !frames.is_empty() {
+            state.wal_copy_offset = new_offset;
+        }
+
+        if state.shadow.generation() != shadow_generation_before {
+            tracing::warn!(
+                database = %state.name,
+                shadow_generation_before,
+                shadow_generation_after = state.shadow.generation(),
+                "checkpoint preflight observed a reset after data_version sampling; admitting a full native re-anchor"
+            );
+            stage_native_snapshot(state, spool_state).await?;
+        } else {
+            let output = stage_native_shadow(state, spool_state).await?;
+            apply_shadow_sync_result_to_state(state, &output).await?;
+        }
+        let admitted_seq = spool_lock(&spool_state.0)?
+            .admitted_seq()
+            .ok_or_else(|| anyhow!("{}: native spool has no admitted snapshot base", state.name))?;
+        spool_lock(&spool_state.0)?.verify_durable_admission(admitted_seq)?;
+
+        let data_version_after = checkpoint_data_version(state)?;
+        if data_version_after == data_version_before {
+            break admitted_seq;
+        }
+        tracing::debug!(
+            database = %state.name,
+            data_version_before,
+            data_version_after,
+            "application commit crossed native checkpoint preflight; draining the newly committed WAL frames before release"
+        );
+        data_version_before = data_version_after;
+        if preflight_drain >= MAX_PREFLIGHT_DRAINS {
+            tracing::warn!(
+                database = %state.name,
+                preflight_drains = preflight_drain,
+                "native checkpoint preflight remained busy with application commits; blocker stays held and checkpoint will retry later"
+            );
+            return Ok(CheckpointAttempt {
+                completed: false,
+                dirty: false,
+            });
+        }
+    };
     if checkpoint_release == crate::config::CheckpointRelease::Remote {
         wait_for_remote_publish(&spool_state.0, &state.name, admitted_seq, drain_timeout).await?;
     }
