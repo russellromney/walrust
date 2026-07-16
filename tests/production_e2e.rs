@@ -2679,11 +2679,13 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
         "split-brain publication failure dropped the SQLite checkpoint blocker"
     );
     drop(checkpoint_probe);
-    // NativeSpool is single-writer state owned by the watcher. Stop that owner
-    // before the parent process opens the journal for byte-retention checks;
-    // otherwise this diagnostic read can race the intentional
-    // payload-before-journal admission window and manufacture an orphan.
-    stop_child_gracefully(&mut reconnect, &reconnect_log)?;
+    // NativeSpool is single-writer state owned by the watcher. Crash that owner
+    // before the parent process opens the journal for byte-retention checks.
+    // The uploader is intentionally stuck on a permanent split-brain error, so
+    // this test must not turn graceful-shutdown responsiveness into a second,
+    // unrelated assertion. The dedicated shutdown tests cover bounded drain;
+    // here SIGKILL also proves the conflicting descendant survives a crash.
+    stop_child(&mut reconnect);
     let reopened_identity =
         walrust::walrust_core::native_spool::NativeSpool::read_identity(&stream_root)?
             .context("split-brain identity vanished")?;
