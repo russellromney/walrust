@@ -394,6 +394,26 @@ async fn snapshot_frozen_cursor_pause() -> Result<()> {
     Ok(())
 }
 
+async fn checkpoint_preflight_sample_pause() -> Result<()> {
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PREFLIGHT_PAUSE_FILE") else {
+        return Ok(());
+    };
+    let path = PathBuf::from(path);
+    let used = path.with_extension("used");
+    if used.exists() {
+        return Ok(());
+    }
+    std::fs::write(&path, b"entered")?;
+    while path.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    std::fs::write(used, b"consumed")?;
+    Ok(())
+}
+
 async fn stage_native_snapshot(
     state: &mut ShadowDbState,
     spool_state: &NativeSpoolState,
@@ -1032,6 +1052,7 @@ async fn checkpoint_shadow_after_native_admission(
     // required snapshot re-anchor.
     const MAX_PREFLIGHT_DRAINS: usize = 8;
     let mut data_version_before = checkpoint_data_version(state)?;
+    checkpoint_preflight_sample_pause().await?;
     let mut preflight_drain = 0usize;
     let admitted_seq = loop {
         preflight_drain += 1;

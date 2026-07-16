@@ -469,6 +469,24 @@ fn spawn_cli_watch_logged_with_checkpoint_pause(
         checkpoint_pause_file,
         None,
         None,
+        None,
+    )
+}
+
+fn spawn_cli_watch_logged_with_checkpoint_preflight_pause(
+    args: LoggedWatchArgs<'_>,
+    checkpoint_preflight_pause_file: &Path,
+) -> Result<Child> {
+    spawn_cli_watch_logged_with_options(
+        args,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(checkpoint_preflight_pause_file),
     )
 }
 
@@ -479,6 +497,7 @@ fn spawn_cli_watch_logged_with_checkpoint_release(
     spawn_cli_watch_logged_with_options(
         args,
         checkpoint_release,
+        None,
         None,
         None,
         None,
@@ -501,6 +520,7 @@ fn spawn_cli_watch_logged_with_upload_crash_once(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -508,7 +528,17 @@ fn spawn_cli_watch_logged_with_triggers(
     args: LoggedWatchArgs<'_>,
     triggers: TriggerOptions,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, None, None, Some(triggers), None, None, None)
+    spawn_cli_watch_logged_with_options(
+        args,
+        None,
+        None,
+        None,
+        Some(triggers),
+        None,
+        None,
+        None,
+        None,
+    )
 }
 
 fn spawn_cli_watch_logged_with_startup_pause(
@@ -525,6 +555,7 @@ fn spawn_cli_watch_logged_with_startup_pause(
         None,
         Some((startup_pause_file, on_startup)),
         None,
+        None,
     )
 }
 
@@ -532,7 +563,17 @@ fn spawn_cli_watch_logged_with_snapshot_source_pause(
     args: LoggedWatchArgs<'_>,
     pause_file: &Path,
 ) -> Result<Child> {
-    spawn_cli_watch_logged_with_options(args, None, None, None, None, None, None, Some(pause_file))
+    spawn_cli_watch_logged_with_options(
+        args,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(pause_file),
+        None,
+    )
 }
 
 fn spawn_cli_watch_logged_with_options(
@@ -544,6 +585,7 @@ fn spawn_cli_watch_logged_with_options(
     checkpoint_pause_file: Option<&Path>,
     startup_pause: Option<(&Path, bool)>,
     snapshot_source_pause: Option<&Path>,
+    checkpoint_preflight_pause_file: Option<&Path>,
 ) -> Result<Child> {
     let log = std::fs::File::create(args.log_path)?;
     let log_err = log.try_clone()?;
@@ -599,6 +641,9 @@ fn spawn_cli_watch_logged_with_options(
     }
     if let Some(path) = checkpoint_pause_file {
         watch.env("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE", path);
+    }
+    if let Some(path) = checkpoint_preflight_pause_file {
+        watch.env("WALRUST_TEST_NATIVE_CHECKPOINT_PREFLIGHT_PAUSE_FILE", path);
     }
     if let Some((path, _)) = startup_pause {
         watch.env("WALRUST_TEST_STARTUP_DISCOVERY_PAUSE_FILE", path);
@@ -1569,6 +1614,7 @@ fn e2e_cli_sigkill_restarts_every_native_cleanup_boundary() -> Result<()> {
                 max_interval: 0,
                 on_idle: 0,
             }),
+            None,
             None,
             None,
             None,
@@ -3471,6 +3517,7 @@ fn e2e_cli_watch_survives_ephemeral_writer_without_reanchor() -> Result<()> {
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
     let log_path = temp.path().join("watch.log");
+    let preflight_pause = temp.path().join("checkpoint-preflight.pause");
 
     ephemeral_exec(
         &db_path,
@@ -3481,23 +3528,37 @@ fn e2e_cli_watch_survives_ephemeral_writer_without_reanchor() -> Result<()> {
         "INSERT INTO items (id, value) VALUES (1, 'base-1');",
     )?;
 
-    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
-        db_path: &db_path,
-        bucket_arg: &bucket_arg,
-        endpoint: endpoint.as_deref(),
-        log_path: &log_path,
-        config_path: None,
-        checkpoint_interval: 2,
-        min_checkpoint_pages: 1,
-        wal_truncate_threshold: 100_000,
-        native_upload_pause_file: None,
-        durability_failpoint: None,
-        durability_failpoint_marker: None,
-    })?;
+    let mut child = spawn_cli_watch_logged_with_checkpoint_preflight_pause(
+        LoggedWatchArgs {
+            db_path: &db_path,
+            bucket_arg: &bucket_arg,
+            endpoint: endpoint.as_deref(),
+            log_path: &log_path,
+            config_path: None,
+            checkpoint_interval: 2,
+            min_checkpoint_pages: 1,
+            wal_truncate_threshold: 100_000,
+            native_upload_pause_file: None,
+            durability_failpoint: None,
+            durability_failpoint_marker: None,
+        },
+        &preflight_pause,
+    )?;
     wait_for_shadow_blocker(&db_path, &mut child)?;
     wait_for_cli_startup_rearms(&log_path, &mut child)?;
 
-    for id in 2..=18i64 {
+    ephemeral_exec(
+        &db_path,
+        "INSERT INTO items (id, value) VALUES (2, 'ephemeral-2');",
+    )?;
+    wait_for_checkpoint_pause(&preflight_pause, &log_path, &mut child)?;
+    ephemeral_exec(
+        &db_path,
+        "INSERT INTO items (id, value) VALUES (3, 'ephemeral-3');",
+    )?;
+    std::fs::remove_file(&preflight_pause)?;
+
+    for id in 4..=18i64 {
         ephemeral_exec(
             &db_path,
             &format!("INSERT INTO items (id, value) VALUES ({id}, 'ephemeral-{id}');"),
