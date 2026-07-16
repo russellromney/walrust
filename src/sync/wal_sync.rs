@@ -1,21 +1,16 @@
 use anyhow::Result;
 use chrono::Utc;
 use hadb_storage_s3::S3Storage;
-use std::cell::Cell;
 use std::sync::Arc;
 
 use crate::dashboard::{DbStatus, MetricsState};
 use crate::retry::{classify_error, ErrorKind, RetryPolicy};
 use crate::webhook::WebhookSender;
-use walrust_core::legacy_shadow_watch::{
-    checkpoint_blocker_heartbeat_is_live, checkpoint_data_version, rearm_checkpoint_blocker,
-    refresh_checkpoint_data_version_monitor,
-};
 use walrust_core::legacy_wal_sync::{
     apply_sync_output_to_watched_state, sync_watched_db_once_to_cache, WatchedDbState,
 };
 
-use super::types::{DbState, DbTaskState, ShadowDbState, SyncInput, SyncOutput};
+use super::types::{DbState, DbTaskState, SyncInput, SyncOutput};
 
 // ============================================================================
 // Concurrent WAL sync operations (immutable, for parallel execution)
@@ -320,129 +315,6 @@ pub(crate) async fn take_snapshot_with_retry(
     }
 }
 
-/// Shadow-watch snapshot retry. Rearms the state-owned blocker after every
-/// attempt, before any retry backoff, so a failed upload cannot leave external
-/// writers exposed to a last-close checkpoint.
-pub(crate) async fn take_snapshot_with_retry_and_rearm(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    prefix: &str,
-    state: &mut DbState,
-    shadow_state: &mut ShadowDbState,
-    retry_policy: &RetryPolicy,
-    webhook_sender: &Arc<WebhookSender>,
-) -> Result<Result<()>> {
-    let db_name = state.name.clone();
-    let mut attempts = 0u32;
-
-    loop {
-        attempts += 1;
-        let source_close_rearms = Cell::new(0u8);
-        let safe_data_version = Cell::new(checkpoint_data_version(shadow_state)?);
-        let mut snapshot_result =
-            take_snapshot_with_source_close_hook(client, bucket, prefix, state, || {
-                let rearm_count = source_close_rearms.get() + 1;
-                source_close_rearms.set(rearm_count);
-                let current_data_version = checkpoint_data_version(shadow_state)?;
-                let stable_copy_dirty =
-                    rearm_count == 2 && current_data_version != safe_data_version.get();
-                // Rearm even when the stable-copy window was dirty; retry
-                // classification/backoff must always run with a live blocker.
-                rearm_checkpoint_blocker(shadow_state)?;
-                let heartbeat_live = checkpoint_blocker_heartbeat_is_live(shadow_state)?;
-                if rearm_count == 1 {
-                    // The stable copy starts after this boundary, so commits
-                    // already visible here will be included by VACUUM INTO.
-                    safe_data_version.set(checkpoint_data_version(shadow_state)?);
-                } else {
-                    if stable_copy_dirty || !heartbeat_live {
-                        anyhow::bail!(
-                            "{}: snapshot blocker window was dirty or its heartbeat frame was reset; retrying before upload",
-                            db_name
-                        );
-                    }
-                    // Everything visible through the stable-copy close is now
-                    // represented by the snapshot. Establish the baseline for
-                    // the final operation-boundary handoff below.
-                    safe_data_version.set(checkpoint_data_version(shadow_state)?);
-                }
-                Ok(())
-            })
-            .await;
-
-        // The lower-level hooks cover the PASSIVE and stable-copy SQLite
-        // handles. Rearm once more after the entire wrapper has returned so
-        // any later source/WAL handle close cannot be the last process action
-        // against the database. A commit after the stable copy is not in the
-        // uploaded image; detect it before this handoff and retry loudly.
-        if source_close_rearms.get() == 2 {
-            let final_window_dirty =
-                checkpoint_data_version(shadow_state)? != safe_data_version.get();
-            refresh_checkpoint_data_version_monitor(shadow_state)?;
-            rearm_checkpoint_blocker(shadow_state)?;
-            let heartbeat_live = checkpoint_blocker_heartbeat_is_live(shadow_state)?;
-            if snapshot_result.is_ok() && (final_window_dirty || !heartbeat_live) {
-                snapshot_result = Err(anyhow::anyhow!(
-                    "{}: snapshot operation-boundary blocker window was dirty or its heartbeat frame was reset; retrying",
-                    db_name
-                ));
-            }
-        }
-
-        // A failed checkpoint or stable copy can close a source-DB handle before
-        // its matching callback runs. Restore the blocker immediately, before
-        // classifying the error or sleeping for a retry. Once both callbacks
-        // ran, later encode/upload failures cannot erase the source DB lock.
-        if source_close_rearms.get() < 2 {
-            rearm_checkpoint_blocker(shadow_state)?;
-        }
-
-        match snapshot_result {
-            Ok(()) => return Ok(Ok(())),
-            Err(error) => {
-                let error_kind = classify_error(&error);
-                let is_retryable = matches!(error_kind, ErrorKind::Transient | ErrorKind::Unknown);
-
-                if error_kind == ErrorKind::AuthError {
-                    tracing::error!(
-                        "{}: Authentication error during snapshot: {}",
-                        db_name,
-                        error
-                    );
-                    webhook_sender
-                        .notify_auth_failure(&db_name, &error.to_string())
-                        .await;
-                    return Ok(Err(error));
-                }
-
-                if !is_retryable || attempts > retry_policy.config().max_retries + 1 {
-                    tracing::error!(
-                        "{}: Snapshot failed after {} attempts: {}",
-                        db_name,
-                        attempts,
-                        error
-                    );
-                    webhook_sender
-                        .notify_upload_failed(&db_name, &error.to_string(), attempts)
-                        .await;
-                    return Ok(Err(error));
-                }
-
-                let delay = retry_policy.calculate_delay(attempts - 1);
-                tracing::warn!(
-                    "{}: Snapshot attempt {}/{} failed, retrying in {:?}: {}",
-                    db_name,
-                    attempts,
-                    retry_policy.config().max_retries + 1,
-                    delay,
-                    error
-                );
-                tokio::time::sleep(delay).await;
-            }
-        }
-    }
-}
-
 /// Take a full database snapshot as LTX
 pub(crate) async fn take_snapshot(
     client: &aws_sdk_s3::Client,
@@ -450,26 +322,12 @@ pub(crate) async fn take_snapshot(
     prefix: &str,
     state: &mut DbState,
 ) -> Result<()> {
-    take_snapshot_with_source_close_hook(client, bucket, prefix, state, || Ok(())).await
-}
-
-async fn take_snapshot_with_source_close_hook<F>(
-    client: &aws_sdk_s3::Client,
-    bucket: &str,
-    prefix: &str,
-    state: &mut DbState,
-    source_close_hook: F,
-) -> Result<()>
-where
-    F: FnMut() -> Result<()>,
-{
     let timestamp = Utc::now();
     let storage = S3Storage::new(client.clone(), bucket.to_string());
-    let output = walrust_core::legacy_wal_sync::take_snapshot_to_storage_with_source_close_hook(
+    let output = walrust_core::legacy_wal_sync::take_snapshot_to_storage(
         &storage,
         prefix,
         SyncInput::from(&*state),
-        source_close_hook,
     )
     .await?;
 

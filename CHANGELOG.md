@@ -29,13 +29,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admission; it is queued and handled by the bounded graceful-shutdown path.
   Replacement CI exposed the race in the existing live shutdown-SIGKILL E2E;
   the unchanged test passes against live Tigris after the production fix.
+- **Independent-mode scope isolation:** removed the obsolete shadow-watch
+  source-close hook that had extended the legacy LTX snapshot writer and
+  changed independent-mode snapshot ordering/implementation even though the
+  native watcher no longer called it. The shared legacy snapshot source and
+  its integration tests are byte-for-byte restored to the PR #42 baseline;
+  default shadow watch continues exclusively through the native HADBP spool.
 - **Checkpoint rearm gap and local PIT fallback:** the controlled checkpoint
   heartbeat is now committed by the retained pre-blocker `data_version`
-  monitor, then pinned by a write-free replacement blocker. The monitor's own
+  monitor, then pinned again by the already-last-opened blocker connection.
+  No source handle is closed or opened in the handoff. The monitor's own
   heartbeat cannot hide an application commit, so a commit plus TRUNCATE in
   the former final-sample-to-rearm gap durably marks the window dirty and
-  forces a native snapshot re-anchor. The monitor is no longer closed after
-  blocker acquisition, preserving classic POSIX process locks. Local restore
+  forces a native snapshot re-anchor. Candidate release also requires a
+  bounded 500ms stable `data_version` interval; a commit in that interval is
+  copied and admitted as another native delta, while sustained writers defer
+  checkpointing with the blocker held. Local restore
   now falls through to remote native history for a PIT below a cleaned local
   snapshot base, and failed legacy-migration verification removes and fsyncs
   its live scratch path.

@@ -241,7 +241,7 @@ impl ShadowWal {
         let conn = Connection::open(db_path)?;
 
         Self::write_checkpoint_heartbeat(&conn, db_path)?;
-        Self::begin_checkpoint_blocker(&conn, db_path)?;
+        Self::pin_checkpoint_heartbeat(&conn)?;
 
         tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
 
@@ -277,19 +277,13 @@ impl ShadowWal {
         Ok(())
     }
 
-    /// Open and pin the heartbeat already committed by another retained
-    /// connection. This deliberately performs no write of its own.
-    pub fn open_checkpoint_blocker_after_heartbeat(db_path: &Path) -> Result<Connection> {
-        let conn = Connection::open(db_path)?;
-        ensure_connection_in_wal_mode(&conn, db_path)?;
-        Self::enable_persistent_wal(&conn, db_path)?;
-        conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA wal_autocheckpoint=0;")?;
-        Self::begin_checkpoint_blocker(&conn, db_path)?;
-        tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
-        Ok(conn)
-    }
-
-    fn begin_checkpoint_blocker(conn: &Connection, _db_path: &Path) -> Result<()> {
+    /// Pin a heartbeat already committed by the retained monitor.
+    ///
+    /// Controlled checkpoint handoffs reuse the existing blocker connection
+    /// instead of closing and reopening the source inode. Besides preserving
+    /// classic POSIX process locks, this minimizes the only unblocked interval
+    /// to the monitor heartbeat followed by this read transaction.
+    pub fn pin_checkpoint_heartbeat(conn: &Connection) -> Result<()> {
         // Pin a real WAL frame. Reading sqlite_master can leave the blocker at
         // read-mark 0, which does not prevent walRestartLog on later frames.
         conn.execute_batch("BEGIN DEFERRED;")?;
@@ -1168,7 +1162,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reopened_checkpoint_blocker_preserves_wal_across_writer_close() {
+    fn test_reused_checkpoint_blocker_preserves_wal_across_writer_close() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("reopened-ephemeral-writer.db");
         let setup = Connection::open(&db_path).unwrap();
@@ -1184,24 +1178,17 @@ mod tests {
         let monitor = Connection::open(&db_path).unwrap();
         let blocker = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
         blocker.execute_batch("ROLLBACK;").unwrap();
-        drop(blocker);
         let _: (i64, i64, i64) = monitor
             .query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })
             .unwrap();
-        drop(monitor);
-
-        // This is the CLI controlled-checkpoint handoff: refresh the lifetime
-        // monitor first, then make replacement blocker acquisition the final
-        // SQLite operation in the watcher process.
-        let monitor = Connection::open(&db_path).unwrap();
-        let replacement = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
-        let _: i64 = monitor
-            .query_row("PRAGMA data_version", [], |row| row.get(0))
-            .unwrap();
-        drop(replacement);
-        let replacement = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+        // This is the CLI controlled-checkpoint handoff: retain both handles,
+        // commit the replacement heartbeat on the monitor, then reuse the
+        // already-last-opened blocker connection to pin it. No source handle
+        // is closed or opened across the handoff.
+        ShadowWal::write_checkpoint_heartbeat(&monitor, &db_path).unwrap();
+        ShadowWal::pin_checkpoint_heartbeat(&blocker).unwrap();
         {
             let writer = Connection::open(&db_path).unwrap();
             writer
@@ -1219,8 +1206,8 @@ mod tests {
         let busy: i64 = checkpoint
             .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(busy, 1, "replacement blocker did not refuse TRUNCATE");
-        replacement.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(busy, 1, "reused blocker did not refuse TRUNCATE");
+        blocker.execute_batch("ROLLBACK;").unwrap();
     }
 
     #[test]

@@ -43,9 +43,8 @@ use super::prune::prune_with_client;
 use super::shadow::{sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry};
 #[cfg(test)]
 use super::types::Manifest;
-use super::types::{DbState, ShadowDbState, ShadowSyncInput, TriggerState};
+use super::types::{ShadowDbState, ShadowSyncInput, TriggerState};
 use super::verify::validate_backup_integrity;
-use super::wal_sync::take_snapshot_with_retry_and_rearm;
 
 type ShadowSyncFuture =
     Pin<Box<dyn Future<Output = Result<super::types::ShadowSyncOutput>> + Send>>;
@@ -473,6 +472,31 @@ async fn checkpoint_preflight_sample_pause() -> Result<()> {
     Ok(())
 }
 
+async fn checkpoint_quiet_interval_pause(state: &ShadowDbState) -> Result<()> {
+    if !cfg!(debug_assertions) {
+        return Ok(());
+    }
+    let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_QUIET_PAUSE_FILE") else {
+        return Ok(());
+    };
+    if std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_QUIET_PAUSE_DB")
+        .is_some_and(|selected| std::path::Path::new(&selected) != state.db_path)
+    {
+        return Ok(());
+    }
+    let path = PathBuf::from(path);
+    let used = path.with_extension("used");
+    if used.exists() {
+        return Ok(());
+    }
+    std::fs::write(&path, b"entered")?;
+    while path.exists() {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    std::fs::write(used, b"consumed")?;
+    Ok(())
+}
+
 async fn stage_native_snapshot(
     state: &mut ShadowDbState,
     spool_state: &NativeSpoolState,
@@ -815,11 +839,12 @@ async fn checkpoint_with_state_blocker_attempt(
     // Keep the monitor opened before the blocker for its whole lifetime. Its
     // data_version advances once for every commit from another connection,
     // while the checkpoint above is an operation on the monitor itself. The
-    // replacement blocker's heartbeat is written on that monitor, so it does
+    // blocker's refreshed heartbeat is written on that monitor, so it does
     // not change the monitor's own value. Sampling both sides of rearm catches
     // an app commit anywhere in the
     // release/reacquire window, including the old sample-to-heartbeat gap that
-    // could otherwise be checkpointed away before the new blocker pinned it.
+    // could otherwise be checkpointed away before the retained blocker
+    // repinned it.
     let data_version_before_rearm = checkpoint_data_version(state);
     if cfg!(debug_assertions) {
         if let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE") {
@@ -1105,6 +1130,11 @@ async fn checkpoint_shadow_after_native_admission(
     // the stable sample is still detected after checkpoint/rearm and forces the
     // required snapshot re-anchor.
     const MAX_PREFLIGHT_DRAINS: usize = 8;
+    // Longer than a typical short-lived/periodic writer cadence: an
+    // instantaneous lull between application sessions must not be mistaken
+    // for a safe release boundary. Eight failed intervals remain bounded and
+    // defer the checkpoint with the blocker held.
+    const PREFLIGHT_QUIET_INTERVAL: Duration = Duration::from_millis(500);
     let mut data_version_before = checkpoint_data_version(state)?;
     checkpoint_preflight_sample_pause().await?;
     let mut preflight_drain = 0usize;
@@ -1150,15 +1180,34 @@ async fn checkpoint_shadow_after_native_admission(
 
         let data_version_after = checkpoint_data_version(state)?;
         if data_version_after == data_version_before {
-            break admitted_seq;
+            // One instantaneous equal sample is not a useful quiescence
+            // boundary for periodic/ephemeral writers. Keep the blocker held
+            // for a short bounded interval, then require the version to remain
+            // unchanged before opening the controlled checkpoint window.
+            checkpoint_quiet_interval_pause(state).await?;
+            tokio::time::sleep(PREFLIGHT_QUIET_INTERVAL).await;
+            let data_version_after_quiet = checkpoint_data_version(state)?;
+            if data_version_after_quiet == data_version_after {
+                data_version_before = data_version_after_quiet;
+                break admitted_seq;
+            }
+            tracing::debug!(
+                database = %state.name,
+                data_version_before = data_version_after,
+                data_version_after = data_version_after_quiet,
+                quiet_ms = PREFLIGHT_QUIET_INTERVAL.as_millis() as u64,
+                "application commit crossed native checkpoint quiet interval; draining before release"
+            );
+            data_version_before = data_version_after_quiet;
+        } else {
+            tracing::debug!(
+                database = %state.name,
+                data_version_before,
+                data_version_after,
+                "application commit crossed native checkpoint preflight; draining the newly committed WAL frames before release"
+            );
+            data_version_before = data_version_after;
         }
-        tracing::debug!(
-            database = %state.name,
-            data_version_before,
-            data_version_after,
-            "application commit crossed native checkpoint preflight; draining the newly committed WAL frames before release"
-        );
-        data_version_before = data_version_after;
         if preflight_drain >= MAX_PREFLIGHT_DRAINS {
             tracing::warn!(
                 database = %state.name,
@@ -1265,122 +1314,6 @@ async fn live_wal_page_count(wal_path: &std::path::Path) -> Result<u64> {
     }
 
     Ok(metadata.len().saturating_sub(32) / (page_size + 24))
-}
-
-async fn reanchor_after_dirty_checkpoint(
-    state: &mut ShadowDbState,
-    target: DirectShadowSyncTarget,
-    retry_policy: &RetryPolicy,
-    webhook_sender: &Arc<WebhookSender>,
-) -> Result<()> {
-    tracing::error!(
-        "{}: application commit crossed walrust's controlled checkpoint window; re-anchoring with a fresh snapshot",
-        state.name
-    );
-    let mut db_state = DbState {
-        name: state.name.clone(),
-        db_path: state.db_path.clone(),
-        wal_path: state.wal_path.clone(),
-        wal_offset: 0,
-        wal_generation: state.shadow.generation(),
-        current_txid: state.current_txid,
-        last_snapshot: state.last_snapshot,
-        db_checksum: state.db_checksum,
-        wal_salt: None,
-        wal_checksum_chain: None,
-    };
-    take_snapshot_with_retry_and_rearm(
-        &target.client,
-        &target.bucket_name,
-        &target.prefix,
-        &mut db_state,
-        state,
-        retry_policy,
-        webhook_sender,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "{}: failed to protect dirty controlled-checkpoint window",
-            state.name
-        )
-    })??;
-
-    state.current_txid = db_state.current_txid;
-    state.last_snapshot = db_state.last_snapshot;
-    state.db_checksum = db_state.db_checksum;
-    save_shadow_progress(state)?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn enforce_wal_backpressure(
-    state: &mut ShadowDbState,
-    threshold_pages: u64,
-    cache_state: Option<&(Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
-    direct_target: Option<DirectShadowSyncTarget>,
-    retry_policy: &RetryPolicy,
-    webhook_sender: Arc<WebhookSender>,
-    drain_timeout: Duration,
-) -> Result<bool> {
-    if threshold_pages == 0 {
-        return Ok(false);
-    }
-
-    let wal_pages = live_wal_page_count(&state.wal_path)
-        .await
-        .with_context(|| format!("{}: cannot measure live WAL size", state.name))?;
-    if wal_pages < threshold_pages {
-        return Ok(false);
-    }
-
-    let alarm = format!(
-        "{}: WAL backpressure alarm: live WAL reached {} pages (configured threshold: {}); \
-         walrust may be falling behind and application writes can stall. Draining shadow data \
-         durably before a controlled TRUNCATE checkpoint",
-        state.name, wal_pages, threshold_pages
-    );
-    tracing::error!("{}", alarm);
-    webhook_sender
-        .send(
-            WebhookPayload::custom(WAL_SIZE_EXCEEDED_EVENT, &state.name, &alarm, 1).with_context(
-                serde_json::json!({
-                    "wal_pages": wal_pages,
-                    "threshold_pages": threshold_pages,
-                    "wal_path": state.wal_path.display().to_string(),
-                }),
-            ),
-        )
-        .await;
-
-    let checkpoint_window_dirty = checkpoint_shadow_after_durable_sync(
-        state,
-        cache_state,
-        direct_target.clone(),
-        retry_policy,
-        Arc::clone(&webhook_sender),
-        drain_timeout,
-        ShadowCheckpointMode::Truncate,
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "{}: WAL backpressure checkpoint failed after threshold alarm",
-            state.name
-        )
-    })?;
-
-    if checkpoint_window_dirty {
-        let target = direct_target.ok_or_else(|| {
-            anyhow!(
-                "{}: controlled checkpoint raced an app commit but no direct snapshot target is available",
-                state.name
-            )
-        })?;
-        reanchor_after_dirty_checkpoint(state, target, retry_policy, &webhook_sender).await?;
-    }
-
-    Ok(true)
 }
 
 async fn enforce_native_wal_backpressure(
@@ -4116,7 +4049,7 @@ mod tests {
         );
         assert!(
             checkpoint_blocker_heartbeat_is_live(&state).unwrap(),
-            "replacement blocker heartbeat must remain pinned"
+            "reused blocker heartbeat must remain pinned"
         );
     }
 
@@ -4202,6 +4135,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn app_commit_during_quiet_interval_is_admitted_before_checkpoint_release() {
+        struct RemoveEnv(&'static str);
+        impl Drop for RemoveEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(self.0) };
+            }
+        }
+
+        let (temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: "native-preflight-quiet-commit".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let spool_state = test_native_spool_state(&db_path, temp.path());
+        stage_native_snapshot(&mut state, &spool_state)
+            .await
+            .unwrap();
+        let initial_seq = spool_lock(&spool_state.0).unwrap().admitted_seq().unwrap();
+
+        let pause = temp.path().join("checkpoint-quiet.pause");
+        const PAUSE_ENV: &str = "WALRUST_TEST_NATIVE_CHECKPOINT_QUIET_PAUSE_FILE";
+        const PAUSE_DB_ENV: &str = "WALRUST_TEST_NATIVE_CHECKPOINT_QUIET_PAUSE_DB";
+        unsafe { std::env::set_var(PAUSE_ENV, &pause) };
+        unsafe { std::env::set_var(PAUSE_DB_ENV, &db_path) };
+        let _remove_pause_env = RemoveEnv(PAUSE_ENV);
+        let _remove_db_env = RemoveEnv(PAUSE_DB_ENV);
+
+        let writer_db = db_path.clone();
+        let writer_pause = pause.clone();
+        let writer = std::thread::spawn(move || {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !writer_pause.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "checkpoint never entered its quiet interval"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let app = Connection::open(writer_db).unwrap();
+            app.execute(
+                "INSERT INTO items(value) VALUES ('commit-in-quiet-interval')",
+                [],
+            )
+            .unwrap();
+            std::fs::remove_file(writer_pause).unwrap();
+        });
+
+        let attempt = checkpoint_shadow_after_native_admission(
+            &mut state,
+            &spool_state,
+            crate::config::CheckpointRelease::Local,
+            Duration::from_secs(2),
+            ShadowCheckpointMode::Passive,
+        )
+        .await
+        .unwrap();
+        writer.join().unwrap();
+        assert!(attempt.completed);
+        assert!(
+            !attempt.dirty,
+            "a commit drained while the blocker remains held must not become a dirty-window re-anchor"
+        );
+        let spool = spool_lock(&spool_state.0).unwrap();
+        let admitted_seq = spool.admitted_seq().unwrap();
+        assert!(admitted_seq > initial_seq);
+        assert_eq!(spool.get(admitted_seq).unwrap().kind, ObjectKind::Delta);
+        assert!(checkpoint_blocker_heartbeat_is_live(&state).unwrap());
+    }
+
+    #[tokio::test]
     async fn spool_full_refuses_checkpoint_and_keeps_blocker() {
         let (temp, db_path, conn) = create_real_wal_db();
         let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
@@ -4277,7 +4294,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_wal_backpressure_alarms_drains_truncates_and_reacquires_blocker() {
-        let (_temp, db_path, conn) = create_real_wal_db();
+        let (temp, db_path, conn) = create_real_wal_db();
         let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
             .await
             .unwrap();
@@ -4311,16 +4328,10 @@ mod tests {
             "test must create a meaningfully large WAL"
         );
 
-        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
-        let (upload_tx, mut upload_rx) = mpsc::channel(10);
-        let ack_cache = Arc::clone(&cache);
-        let ack_handle = tokio::spawn(async move {
-            match upload_rx.recv().await {
-                Some(UploadMessage::Upload(txid)) => ack_cache.mark_uploaded(txid).unwrap(),
-                other => panic!("expected upload notification, got {other:?}"),
-            }
-        });
-        let cache_state = (Arc::clone(&cache), upload_tx);
+        let spool_state = test_native_spool_state(&db_path, temp.path());
+        stage_native_snapshot(&mut state, &spool_state)
+            .await
+            .unwrap();
         let (webhook_url, webhook_body) = capture_one_webhook().await;
         let webhook_sender = Arc::new(WebhookSender::new(vec![WebhookConfig {
             url: webhook_url,
@@ -4329,20 +4340,18 @@ mod tests {
         }]));
 
         assert!(
-            enforce_wal_backpressure(
+            enforce_native_wal_backpressure(
                 &mut state,
                 before_pages,
-                Some(&cache_state),
-                None,
-                &RetryPolicy::new(RetryConfig::default()),
+                &spool_state,
+                crate::config::CheckpointRelease::Local,
                 Arc::clone(&webhook_sender),
                 Duration::from_secs(2),
             )
             .await
             .unwrap(),
-            "crossing the threshold must run the backpressure path"
+            "crossing the threshold must run the native backpressure path"
         );
-        ack_handle.await.unwrap();
 
         let payload: serde_json::Value = serde_json::from_str(
             &tokio::time::timeout(Duration::from_secs(2), webhook_body)
@@ -4367,7 +4376,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             busy, 1,
-            "backpressure checkpoint must reacquire the blocker before returning"
+            "native backpressure checkpoint must reacquire the blocker before returning"
         );
     }
 

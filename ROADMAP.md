@@ -626,13 +626,19 @@ path sampled `data_version`, closed and replaced that monitor, then let the new
 blocker connection commit its own heartbeat. An application commit plus
 TRUNCATE in that interval could disappear while the replacement heartbeat made
 the later state look clean. The retained pre-blocker monitor now commits the
-heartbeat itself, so its own `data_version` remains unchanged; a pin-only
-replacement blocker then acquires the read mark, and any application commit
-across the full handoff forces the journaled snapshot re-anchor. A deterministic
-test commits and TRUNCATEs after the final sample and fails when the post-rearm
-comparison is disabled. The same pass made local PIT restore fall through to
-remote history below a cleaned local snapshot base and removed failed
-legacy-migration verification scratch files durably.
+heartbeat itself, so its own `data_version` remains unchanged; the existing
+already-last-opened blocker connection then reacquires the read mark without a
+source-handle close/open, and any application commit across the full handoff
+forces the journaled snapshot re-anchor. Candidate release additionally
+requires `data_version` to remain stable for a bounded 500ms interval; commits
+inside it are drained and admitted before release, and eight busy intervals
+defer checkpointing with the blocker held. Deterministic tests separately
+commit+TRUNCATE after the final sample and commit during the quiet interval;
+neutering either post-rearm detection or the second quiet sample fails its
+gate. Three consecutive live-Tigris DF1 runs then stayed at the single startup
+snapshot. The same pass made local PIT restore fall through to remote history
+below a cleaned local snapshot base and removed failed legacy-migration
+verification scratch files durably.
 
 Replacement CI then exposed one final startup/shutdown ordering gap: the
 watcher installed its SIGTERM stream only after initial native snapshot work.
@@ -643,6 +649,16 @@ snapshot work, so such a signal is queued for the normal bounded shutdown path.
 The pre-fix full-CI run failed the existing live
 `e2e_cli_sigkill_during_graceful_shutdown_recovers_pending_native_work` gate at
 that exact boundary; the same named live-Tigris test is green after the fix.
+
+The final branch-scope comparison against PR #42 also removed an obsolete
+pre-native detour: the original PR #43 blocker work had added source-close
+callbacks and `VACUUM INTO` staging to the shared legacy-LTX snapshot writer.
+Once default shadow watch moved fully to native HADBP those callbacks had no
+production caller, but they still changed Phase 2 independent-mode behavior.
+The legacy writer, wrapper, and integration target are now exactly the PR #42
+versions, and the unused legacy backpressure/re-anchor extension is deleted.
+The restored independent integration target and the native `watch_shadow`
+slice both pass, proving the cleanup changes scope rather than native behavior.
 
 ---
 
