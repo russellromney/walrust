@@ -102,6 +102,20 @@ pub fn restore_local_spool(
     if target < spool.identity().first_native_seq || target > head {
         return Ok(None);
     }
+    let retained_base = spool
+        .objects()
+        .next()
+        .map(|object| object.seq)
+        .ok_or_else(|| {
+            anyhow!("local native spool has an admitted head but no retained objects")
+        })?;
+    if target < retained_base {
+        // Local cleanup may advance to a newer published snapshot before the
+        // remote retention floor expires the older PIT. Let the CLI continue
+        // to remote restore instead of misreporting the intentionally absent
+        // local prefix as a corrupt covered chain.
+        return Ok(None);
+    }
     let objects = spool
         .objects()
         .filter(|object| object.seq <= target)

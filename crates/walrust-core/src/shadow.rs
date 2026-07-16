@@ -240,9 +240,24 @@ impl ShadowWal {
     pub fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
         let conn = Connection::open(db_path)?;
 
-        ensure_connection_in_wal_mode(&conn, db_path)?;
+        Self::write_checkpoint_heartbeat(&conn, db_path)?;
+        Self::begin_checkpoint_blocker(&conn, db_path)?;
 
-        Self::enable_persistent_wal(&conn, db_path)?;
+        tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
+
+        Ok(conn)
+    }
+
+    /// Commit the frame a later blocker transaction will pin.
+    ///
+    /// Controlled checkpoint handoffs call this on the long-lived
+    /// `data_version` monitor. A connection does not advance its own
+    /// `PRAGMA data_version`, so any observed change still proves that an
+    /// application connection committed during the unblocked window.
+    pub fn write_checkpoint_heartbeat(conn: &Connection, db_path: &Path) -> Result<()> {
+        ensure_connection_in_wal_mode(conn, db_path)?;
+
+        Self::enable_persistent_wal(conn, db_path)?;
 
         // Disable auto-checkpoint on this connection without changing journal_mode.
         conn.execute_batch(
@@ -259,16 +274,29 @@ impl ShadowWal {
             ",
         )?;
 
+        Ok(())
+    }
+
+    /// Open and pin the heartbeat already committed by another retained
+    /// connection. This deliberately performs no write of its own.
+    pub fn open_checkpoint_blocker_after_heartbeat(db_path: &Path) -> Result<Connection> {
+        let conn = Connection::open(db_path)?;
+        ensure_connection_in_wal_mode(&conn, db_path)?;
+        Self::enable_persistent_wal(&conn, db_path)?;
+        conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA wal_autocheckpoint=0;")?;
+        Self::begin_checkpoint_blocker(&conn, db_path)?;
+        tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
+        Ok(conn)
+    }
+
+    fn begin_checkpoint_blocker(conn: &Connection, _db_path: &Path) -> Result<()> {
         // Pin a real WAL frame. Reading sqlite_master can leave the blocker at
         // read-mark 0, which does not prevent walRestartLog on later frames.
         conn.execute_batch("BEGIN DEFERRED;")?;
         let _: i64 = conn.query_row("SELECT value FROM _walrust_seq WHERE id = 1", [], |row| {
             row.get(0)
         })?;
-
-        tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
-
-        Ok(conn)
+        Ok(())
     }
 
     /// Enable SQLite's connection-level persistent-WAL file control on every

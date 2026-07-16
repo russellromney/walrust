@@ -26,9 +26,8 @@ use rusqlite::Connection;
 use walrust_core::legacy_shadow_watch::{
     apply_shadow_sync_result_to_state, apply_shadow_sync_results_strict,
     checkpoint_blocker_heartbeat_is_live, checkpoint_data_version, load_shadow_progress,
-    rearm_checkpoint_blocker, refresh_checkpoint_data_version_monitor,
-    save_shadow_watch_progress as save_shadow_progress, shadow_sync_input,
-    wait_for_cache_checkpoint_durability, ShadowProgress,
+    rearm_checkpoint_blocker, save_shadow_watch_progress as save_shadow_progress,
+    shadow_sync_input, wait_for_cache_checkpoint_durability, ShadowProgress,
 };
 use walrust_core::native_publish::{object_key as native_object_key, NativeUploader, UploadWake};
 use walrust_core::native_shadow::{
@@ -205,6 +204,66 @@ fn source_footprint_on_spool_filesystem(state: &ShadowDbState, spool: &NativeSpo
         .map(|metadata| metadata.len())
         .unwrap_or(0)
         .saturating_add(shadow_storage_bytes(state)))
+}
+
+async fn verify_legacy_migration_head(
+    storage: &dyn StorageBackend,
+    prefix: &str,
+    name: &str,
+    verify_path: &std::path::Path,
+    legacy_txid: u64,
+) -> Result<()> {
+    let verification = async {
+        let restored_txid = walrust_core::legacy_restore::restore_legacy_ltx(
+            storage,
+            prefix,
+            name,
+            verify_path,
+            Some(legacy_txid),
+        )
+        .await
+        .with_context(|| format!("{}: verify legacy migration head", name))?;
+        if restored_txid != legacy_txid {
+            bail!(
+                "{}: legacy migration verification restored TXID {}, expected {}",
+                name,
+                restored_txid,
+                legacy_txid
+            );
+        }
+        let verify_connection = Connection::open(verify_path)?;
+        let integrity: String =
+            verify_connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+        if integrity != "ok" {
+            bail!(
+                "{}: legacy migration head failed SQLite integrity_check: {}",
+                name,
+                integrity
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    let cleanup: Result<()> = match std::fs::remove_file(verify_path) {
+        Ok(()) => match verify_path.parent() {
+            Some(parent) => std::fs::File::open(parent)
+                .and_then(|file| file.sync_all())
+                .map_err(Into::into),
+            None => Err(anyhow!("legacy migration scratch path has no parent")),
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    };
+    match (verification, cleanup) {
+        (Err(verification), Err(cleanup)) => Err(anyhow!(
+            "{verification:#}; additionally failed to remove legacy migration scratch {}: {cleanup}",
+            verify_path.display()
+        )),
+        (Err(verification), Ok(())) => Err(verification),
+        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
+        (Ok(()), Ok(())) => Ok(()),
+    }
 }
 
 async fn reconcile_shadow_progress_from_spool(
@@ -721,16 +780,6 @@ async fn checkpoint_with_state_blocker_attempt(
         .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
     blocker.execute_batch("ROLLBACK;")?;
 
-    if cfg!(debug_assertions) {
-        if let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE") {
-            let path = std::path::PathBuf::from(path);
-            std::fs::write(&path, b"entered")?;
-            while path.exists() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        }
-    }
-
     let monitor = state
         .data_version_monitor
         .as_ref()
@@ -763,23 +812,30 @@ async fn checkpoint_with_state_blocker_attempt(
         });
     durability_failpoint("sqlite_checkpoint_returned");
 
-    // Sample before opening the replacement blocker because its heartbeat is
-    // itself an other-connection commit. Commits through this point are dirty;
-    // the primitive's final heartbeat-to-BEGIN micro-window is the documented
-    // residual release/reacquire boundary.
-    let data_version_after = checkpoint_data_version(state);
-    // Test-only injection exercises the production ordering below: a monitor
-    // reopen failure must still reacquire the checkpoint blocker before this
-    // function returns to the watch loop.
-    let monitor_refresh_result = if cfg!(debug_assertions)
-        && std::env::var_os("WALRUST_TEST_CHECKPOINT_MONITOR_REFRESH_FAILURE_DB")
-            .is_some_and(|path| std::path::Path::new(&path) == state.db_path)
-    {
-        drop(state.data_version_monitor.take());
-        Err(anyhow!("test-only checkpoint monitor refresh failure"))
-    } else {
-        refresh_checkpoint_data_version_monitor(state)
-    };
+    // Keep the monitor opened before the blocker for its whole lifetime. Its
+    // data_version advances once for every commit from another connection,
+    // while the checkpoint above is an operation on the monitor itself. The
+    // replacement blocker's heartbeat is written on that monitor, so it does
+    // not change the monitor's own value. Sampling both sides of rearm catches
+    // an app commit anywhere in the
+    // release/reacquire window, including the old sample-to-heartbeat gap that
+    // could otherwise be checkpointed away before the new blocker pinned it.
+    let data_version_before_rearm = checkpoint_data_version(state);
+    if cfg!(debug_assertions) {
+        if let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE") {
+            let selected_db = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_DB");
+            if selected_db
+                .as_ref()
+                .is_none_or(|selected| std::path::Path::new(selected) == state.db_path)
+            {
+                let path = std::path::PathBuf::from(path);
+                std::fs::write(&path, b"entered")?;
+                while path.exists() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    }
     let rearm_result = rearm_checkpoint_blocker(state);
     let heartbeat_live = match &rearm_result {
         Ok(()) => checkpoint_blocker_heartbeat_is_live(state),
@@ -788,15 +844,13 @@ async fn checkpoint_with_state_blocker_attempt(
     if rearm_result.is_ok() {
         durability_failpoint("blocker_reacquired");
     }
+    let data_version_after_rearm = checkpoint_data_version(state);
     let checkpoint_result = checkpoint_result.and_then(|completed| {
-        let data_version_after = data_version_after?;
-        monitor_refresh_result.with_context(|| {
-            format!(
-                "{}: failed to refresh checkpoint data_version monitor",
-                state.name
-            )
-        })?;
-        Ok((completed, data_version_after != data_version_before))
+        let before_rearm = data_version_before_rearm?;
+        let after_rearm = data_version_after_rearm?;
+        let dirty_before_rearm = before_rearm != data_version_before;
+        let dirty_during_rearm = after_rearm != before_rearm;
+        Ok((completed, dirty_before_rearm || dirty_during_rearm))
     });
     match (checkpoint_result, rearm_result) {
         (Ok((completed, data_version_dirty)), Ok(())) => Ok(CheckpointAttempt {
@@ -1815,36 +1869,8 @@ pub async fn watch_with_shadow(
                 ));
                 std::fs::create_dir_all(&spool_base)?;
                 let storage = S3Storage::new((*client).clone(), bucket_name.clone());
-                let restored_txid = walrust_core::legacy_restore::restore_legacy_ltx(
-                    &storage,
-                    &prefix,
-                    &name,
-                    &verify_path,
-                    Some(legacy_txid),
-                )
-                .await
-                .with_context(|| format!("{}: verify legacy migration head", name))?;
-                if restored_txid != legacy_txid {
-                    bail!(
-                        "{}: legacy migration verification restored TXID {}, expected {}",
-                        name,
-                        restored_txid,
-                        legacy_txid
-                    );
-                }
-                let verify_connection = Connection::open(&verify_path)?;
-                let integrity: String =
-                    verify_connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-                if integrity != "ok" {
-                    bail!(
-                        "{}: legacy migration head failed SQLite integrity_check: {}",
-                        name,
-                        integrity
-                    );
-                }
-                drop(verify_connection);
-                std::fs::remove_file(&verify_path)?;
-                std::fs::File::open(&spool_base)?.sync_all()?;
+                verify_legacy_migration_head(&storage, &prefix, &name, &verify_path, legacy_txid)
+                    .await?;
             }
             let identity = SpoolIdentity::new(
                 db_path,
@@ -2923,6 +2949,51 @@ mod tests {
         }
     }
 
+    struct FailingMigrationStorage;
+
+    #[async_trait]
+    impl StorageBackend for FailingMigrationStorage {
+        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+            panic!("legacy migration verification should fail during discovery")
+        }
+        async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            panic!("legacy migration verification performed PUT")
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            panic!("legacy migration verification performed DELETE")
+        }
+        async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+            Err(anyhow!("injected migration discovery failure"))
+        }
+        async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<CasResult> {
+            panic!("legacy migration verification performed CAS")
+        }
+        async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
+            panic!("legacy migration verification performed CAS")
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_legacy_migration_verification_removes_scratch() {
+        let temp = TempDir::new().unwrap();
+        let scratch = temp.path().join(".legacy-migration-verify-test.db");
+        std::fs::write(&scratch, b"partial restore").unwrap();
+
+        let error =
+            verify_legacy_migration_head(&FailingMigrationStorage, "prefix/", "db", &scratch, 7)
+                .await
+                .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("injected migration discovery failure"),
+            "unexpected verification error: {error:#}"
+        );
+        assert!(
+            !scratch.exists(),
+            "failed migration verification left a live scratch database"
+        );
+    }
+
     fn test_native_spool_state(
         db_path: &std::path::Path,
         root: &std::path::Path,
@@ -3974,20 +4045,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn monitor_refresh_failure_still_rearms_checkpoint_blocker() {
-        struct RemoveEnv(&'static str);
-        impl Drop for RemoveEnv {
-            fn drop(&mut self) {
-                unsafe { std::env::remove_var(self.0) };
-            }
-        }
-
+    async fn checkpoint_keeps_pre_blocker_monitor_open_through_rearm() {
         let (_temp, db_path, _conn) = create_real_wal_db();
         let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
             .await
             .unwrap();
         let mut state = ShadowDbState {
-            name: "native-monitor-refresh-failure".to_string(),
+            name: "native-monitor-stable".to_string(),
             db_path: db_path.clone(),
             wal_path: db_path.with_extension("db-wal"),
             current_txid: 0,
@@ -4002,32 +4066,129 @@ mod tests {
             wal_copy_offset: 0,
         };
         let data_version_before = checkpoint_data_version(&state).unwrap();
-        const INJECT: &str = "WALRUST_TEST_CHECKPOINT_MONITOR_REFRESH_FAILURE_DB";
-        unsafe { std::env::set_var(INJECT, &db_path) };
-        let _remove = RemoveEnv(INJECT);
+        let monitor_handle = unsafe {
+            state
+                .data_version_monitor
+                .as_ref()
+                .expect("monitor exists")
+                .handle()
+        };
 
-        let error = checkpoint_with_state_blocker_attempt(
+        let attempt = checkpoint_with_state_blocker_attempt(
             &mut state,
             ShadowCheckpointMode::Passive,
             data_version_before,
         )
         .await
-        .unwrap_err();
+        .unwrap();
+        assert!(attempt.completed);
         assert!(
-            format!("{error:#}").contains("failed to refresh checkpoint data_version monitor"),
-            "unexpected checkpoint error: {error:#}"
+            !attempt.dirty,
+            "a heartbeat written on the monitor must not change its own data_version"
+        );
+        assert_eq!(
+            unsafe {
+                state
+                    .data_version_monitor
+                    .as_ref()
+                    .expect("monitor remains open")
+                    .handle()
+            },
+            monitor_handle,
+            "closing a same-inode SQLite monitor after blocker acquisition can release process-scoped POSIX locks"
         );
         assert!(
             state
                 .checkpoint_blocker
                 .as_ref()
                 .is_some_and(|blocker| !blocker.is_autocommit()),
-            "monitor refresh failure returned to the watch loop without a live blocker"
+            "checkpoint returned to the watch loop without a live blocker"
         );
         assert!(
             checkpoint_blocker_heartbeat_is_live(&state).unwrap(),
             "replacement blocker heartbeat must remain pinned"
         );
+    }
+
+    #[tokio::test]
+    async fn app_commit_after_final_sample_marks_checkpoint_window_dirty() {
+        struct RemoveEnv(&'static str);
+        impl Drop for RemoveEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(self.0) };
+            }
+        }
+
+        let (temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let monitor = Connection::open(&db_path).unwrap();
+        let blocker = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+        let mut state = ShadowDbState {
+            name: "native-dirty-rearm-gap".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(blocker),
+            data_version_monitor: Some(monitor),
+            source_db_file: test_source_db_file(&db_path),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let data_version_before = checkpoint_data_version(&state).unwrap();
+        let pause = temp.path().join("checkpoint-rearm-gap.pause");
+        const PAUSE_ENV: &str = "WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE";
+        const PAUSE_DB_ENV: &str = "WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_DB";
+        unsafe { std::env::set_var(PAUSE_ENV, &pause) };
+        unsafe { std::env::set_var(PAUSE_DB_ENV, &db_path) };
+        let _remove_env = RemoveEnv(PAUSE_ENV);
+        let _remove_db_env = RemoveEnv(PAUSE_DB_ENV);
+
+        let writer_db = db_path.clone();
+        let writer_pause = pause.clone();
+        let writer = std::thread::spawn(move || {
+            let result = (|| -> Result<()> {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while !writer_pause.exists() {
+                    anyhow::ensure!(
+                        std::time::Instant::now() < deadline,
+                        "checkpoint never reached the post-sample rearm gap"
+                    );
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let app = Connection::open(writer_db)?;
+                app.execute(
+                    "INSERT INTO items(value) VALUES ('commit-in-rearm-gap')",
+                    [],
+                )?;
+                let busy: i64 =
+                    app.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
+                anyhow::ensure!(busy == 0, "test commit must cross the unblocked gap");
+                Ok(())
+            })();
+            let _ = std::fs::remove_file(writer_pause);
+            result.unwrap();
+        });
+
+        let attempt = checkpoint_with_state_blocker_attempt(
+            &mut state,
+            ShadowCheckpointMode::Passive,
+            data_version_before,
+        )
+        .await
+        .unwrap();
+        writer.join().unwrap();
+        assert!(attempt.completed);
+        assert!(
+            attempt.dirty,
+            "an app commit checkpointed after the final pre-rearm sample requires a full native re-anchor"
+        );
+        assert!(checkpoint_blocker_heartbeat_is_live(&state).unwrap());
     }
 
     #[tokio::test]

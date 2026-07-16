@@ -621,6 +621,19 @@ production call site made unchanged live DF2 fail immediately with
 restoring descriptor reuse returned DF2, DF1, app-TRUNCATE, paused-uploader,
 remote-release, partial-PASSIVE, and legacy-migration live gates to green.
 
+The final fresh review closed the remaining controlled-handoff gap. The old
+path sampled `data_version`, closed and replaced that monitor, then let the new
+blocker connection commit its own heartbeat. An application commit plus
+TRUNCATE in that interval could disappear while the replacement heartbeat made
+the later state look clean. The retained pre-blocker monitor now commits the
+heartbeat itself, so its own `data_version` remains unchanged; a pin-only
+replacement blocker then acquires the read mark, and any application commit
+across the full handoff forces the journaled snapshot re-anchor. A deterministic
+test commits and TRUNCATEs after the final sample and fails when the post-rearm
+comparison is disabled. The same pass made local PIT restore fall through to
+remote history below a cleaned local snapshot base and removed failed
+legacy-migration verification scratch files durably.
+
 ---
 
 ## Compaction (shipped — default off)

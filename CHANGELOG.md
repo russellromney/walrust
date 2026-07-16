@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Checkpoint rearm gap and local PIT fallback:** the controlled checkpoint
+  heartbeat is now committed by the retained pre-blocker `data_version`
+  monitor, then pinned by a write-free replacement blocker. The monitor's own
+  heartbeat cannot hide an application commit, so a commit plus TRUNCATE in
+  the former final-sample-to-rearm gap durably marks the window dirty and
+  forces a native snapshot re-anchor. The monitor is no longer closed after
+  blocker acquisition, preserving classic POSIX process locks. Local restore
+  now falls through to remote native history for a PIT below a cleaned local
+  snapshot base, and failed legacy-migration verification removes and fsyncs
+  its live scratch path.
 - **Local-first native HADBP shadow watch:** default CLI watch now stages every
   initial, periodic, threshold, idle, downtime, and dirty-window snapshot or
   delta as fsynced native HADBP plus a durable local journal before opening a
@@ -126,6 +136,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- Added a deterministic post-sample checkpoint handoff test that commits and
+  TRUNCATEs through the unblocked gap; disabling the after-rearm
+  `data_version` comparison makes it fail. A separate test pins the retained
+  monitor handle across rearm, and local cleanup coverage now proves an older
+  PIT returns “not local” so the CLI can continue to remote restore.
 - Added live-S3 call-site proofs for local checkpoint independence from paused
   uploads, opt-in remote release, exact staged bytes, all snapshot triggers,
   every shadow/snapshot/journal/checkpoint/PUT/publish/cleanup/shutdown SIGKILL

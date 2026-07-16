@@ -3109,6 +3109,14 @@ mod tests {
         let reopened = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
         assert!(reopened.get(2).is_some());
         assert_eq!(reopened.admitted_frames_since_checkpoint(), 5);
+        let expired_locally = dir.path().join("local-pit-before-base.sqlite");
+        assert_eq!(
+            crate::native_restore::restore_local_spool(&reopened, &expired_locally, Some(1))
+                .unwrap(),
+            None,
+            "a PIT below the retained local base must fall through to remote restore"
+        );
+        assert!(!expired_locally.exists());
         let restored = dir.path().join("local-restore.sqlite");
         assert_eq!(
             crate::native_restore::restore_local_spool(&reopened, &restored, None).unwrap(),
