@@ -1570,6 +1570,21 @@ pub async fn watch_with_shadow(
     cache_config: CacheConfig,
     spool_config: SpoolConfig,
 ) -> Result<()> {
+    // Install process signal handlers before any startup work. Remote
+    // discovery and initial native snapshot admission can both take long
+    // enough for an operator to request shutdown; registering only after
+    // startup left a window where SIGTERM took its default action and skipped
+    // the durable local shutdown admission path entirely. Tokio's Unix signal
+    // stream queues a signal until the main select loop is ready to consume it.
+    #[cfg(unix)]
+    let (mut sigterm, mut sigint) = {
+        use signal::unix::{signal, SignalKind};
+        (
+            signal(SignalKind::terminate()).context("failed to install SIGTERM handler")?,
+            signal(SignalKind::interrupt()).context("failed to install SIGINT handler")?,
+        )
+    };
+
     let (bucket_name, prefix) = parse_bucket(bucket);
 
     // Pin every source database before client construction or remote
@@ -2215,11 +2230,6 @@ pub async fn watch_with_shadow(
     let shutdown_signal = async {
         #[cfg(unix)]
         {
-            use signal::unix::{signal, SignalKind};
-            let mut sigterm =
-                signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
-            let mut sigint =
-                signal(SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
             tokio::select! {
                 _ = sigterm.recv() => "SIGTERM",
                 _ = sigint.recv() => "SIGINT",

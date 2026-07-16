@@ -22,6 +22,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Startup SIGTERM durability window:** shadow watch now installs its Unix
+  shutdown handlers before remote discovery or initial native snapshot work.
+  A SIGTERM arriving after durable startup admission but before the main loop
+  can no longer take the process default and bypass final local spool
+  admission; it is queued and handled by the bounded graceful-shutdown path.
+  Replacement CI exposed the race in the existing live shutdown-SIGKILL E2E;
+  the unchanged test passes against live Tigris after the production fix.
 - **Checkpoint rearm gap and local PIT fallback:** the controlled checkpoint
   heartbeat is now committed by the retained pre-blocker `data_version`
   monitor, then pinned by a write-free replacement blocker. The monitor's own

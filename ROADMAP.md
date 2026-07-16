@@ -634,6 +634,16 @@ comparison is disabled. The same pass made local PIT restore fall through to
 remote history below a cleaned local snapshot base and removed failed
 legacy-migration verification scratch files durably.
 
+Replacement CI then exposed one final startup/shutdown ordering gap: the
+watcher installed its SIGTERM stream only after initial native snapshot work.
+A signal arriving after that snapshot's durable admission but before the main
+select loop therefore took the OS default and skipped shutdown admission. The
+handler is now registered at watcher entry, before remote discovery and all
+snapshot work, so such a signal is queued for the normal bounded shutdown path.
+The pre-fix full-CI run failed the existing live
+`e2e_cli_sigkill_during_graceful_shutdown_recovers_pending_native_work` gate at
+that exact boundary; the same named live-Tigris test is green after the fix.
+
 ---
 
 ## Compaction (shipped — default off)
