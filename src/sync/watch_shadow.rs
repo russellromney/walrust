@@ -1,53 +1,40 @@
-use anyhow::{anyhow, bail, Context, Result};
-use futures::future::join_all;
-use std::collections::{HashMap, HashSet};
-use std::future::Future;
-use std::path::PathBuf;
-use std::pin::Pin;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-use tokio::signal;
-use tokio::sync::mpsc;
-
-use crate::cache::LocalCache;
-use crate::config::{CacheConfig, ResolvedDbConfig, SpoolConfig, SyncConfig, WebhookConfig};
+use crate::config::{ResolvedDbConfig, SpoolConfig, SyncConfig, WebhookConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::errors::WalrustError;
 use crate::ltx;
 use crate::retention::RetentionPolicy;
-use crate::retry::{RetryConfig, RetryPolicy};
+use crate::retry::RetryConfig;
 use crate::s3::{self, create_client, parse_bucket};
 use crate::shadow::ShadowWal;
-use crate::uploader::{UploadMessage, UploaderStats};
 use crate::webhook::{WebhookPayload, WebhookSender};
+use anyhow::{anyhow, bail, Context, Result};
 use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
 use rusqlite::Connection;
-use walrust_core::legacy_shadow_watch::{
-    apply_shadow_sync_result_to_state, apply_shadow_sync_results_strict,
-    checkpoint_blocker_heartbeat_is_live, checkpoint_data_version, load_shadow_progress,
-    rearm_checkpoint_blocker, save_shadow_watch_progress as save_shadow_progress,
-    shadow_sync_input, wait_for_cache_checkpoint_durability, ShadowProgress,
-};
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::signal;
 use walrust_core::native_publish::{object_key as native_object_key, NativeUploader, UploadWake};
 use walrust_core::native_shadow::{
-    encode_shadow_to_hadbp, write_snapshot_from_shadow_file, NativeShadowInput, NativeSnapshotInput,
+    committed_shadow_prefix_offset, encode_shadow_to_hadbp, snapshot_source_proof,
+    write_snapshot_from_shadow_file, NativeShadowInput, NativeSnapshotInput,
 };
 use walrust_core::native_spool::{
     durability_failpoint, filesystem_available_bytes, CapacityPolicy, CapacityState, NativeSpool,
-    ObjectKind, RecoveryHead, RemoteUploadState, SourceCursor, SpoolIdentity, StageObject,
+    ObjectKind, RecoveryHead, SourceCursor, SpoolIdentity, StageObject,
+};
+use walrust_core::shadow_watch::{
+    apply_shadow_sync_result_to_state, checkpoint_blocker_heartbeat_is_live,
+    checkpoint_data_version, load_shadow_progress, rearm_checkpoint_blocker,
+    rearm_checkpoint_blocker_after_checkpoint, save_shadow_watch_progress as save_shadow_progress,
+    ShadowProgress, ShadowSyncOutput,
 };
 
-use super::manifest::discover_state_from_s3;
 use super::prune::prune_with_client;
-use super::shadow::{sync_shadow_concurrent_with_retry, sync_shadow_to_cache_with_retry};
-#[cfg(test)]
-use super::types::Manifest;
-use super::types::{ShadowDbState, ShadowSyncInput, TriggerState};
+use super::types::{ShadowDbState, TriggerState};
 use super::verify::validate_backup_integrity;
-
-type ShadowSyncFuture =
-    Pin<Box<dyn Future<Output = Result<super::types::ShadowSyncOutput>> + Send>>;
 
 const CHECKPOINT_UPLOAD_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 const WAL_SIZE_EXCEEDED_EVENT: &str = "wal_size_exceeded";
@@ -140,24 +127,25 @@ fn spool_lock(spool: &Arc<Mutex<NativeSpool>>) -> Result<std::sync::MutexGuard<'
         .map_err(|_| anyhow!("native spool lock poisoned"))
 }
 
-fn watcher_retention_has_published_native_base(spool_state: &NativeSpoolState) -> Result<bool> {
-    let spool = spool_lock(&spool_state.0)?;
-    let identity = spool.identity();
-    if identity.legacy_boundary_txid.is_none() {
-        return Ok(true);
+fn classify_descriptor_absent_native_keys(database: &str, keys: &[String]) -> Result<()> {
+    if keys.is_empty() {
+        return Ok(());
     }
-    let Some(remote_seq) = spool.remote_published_seq() else {
-        return Ok(false);
-    };
-    if remote_seq < identity.first_native_seq {
-        return Ok(false);
-    }
-    let has_retained_base = spool.objects().any(|object| {
-        object.seq <= remote_seq
-            && object.kind == ObjectKind::Snapshot
-            && object.remote_upload_state == RemoteUploadState::Published
-    });
-    Ok(has_retained_base)
+    let sample = keys.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    bail!(
+        "{database}: native-v1 descriptor is absent but its remote namespace is not empty; refusing to create a new lineage over orphan/foreign keys: {sample}"
+    )
+}
+
+async fn require_empty_native_remote_namespace(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+    database: &str,
+) -> Result<()> {
+    let native_prefix = format!("{}{}/native/v1/", prefix, database);
+    let keys = s3::list_objects(client, bucket, &native_prefix).await?;
+    classify_descriptor_absent_native_keys(database, &keys)
 }
 
 async fn prune_watcher_database(
@@ -165,16 +153,9 @@ async fn prune_watcher_database(
     bucket: &str,
     prefix: &str,
     state: &ShadowDbState,
-    spool_state: &NativeSpoolState,
+    _spool_state: &NativeSpoolState,
     policy: &RetentionPolicy,
 ) -> Result<()> {
-    if !watcher_retention_has_published_native_base(spool_state)? {
-        tracing::warn!(
-            database = %state.name,
-            "native migration snapshot is not yet contiguously published; preserving legacy recovery history"
-        );
-        return Ok(());
-    }
     prune_with_client(client, bucket, prefix, &state.name, policy, true).await
 }
 
@@ -182,6 +163,7 @@ fn shadow_storage_bytes(state: &ShadowDbState) -> u64 {
     walkdir::WalkDir::new(state.shadow.shadow_dir())
         .into_iter()
         .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_type().is_file())
         .filter_map(|entry| entry.metadata().ok())
         .map(|metadata| metadata.len())
         .sum()
@@ -203,66 +185,6 @@ fn source_footprint_on_spool_filesystem(state: &ShadowDbState, spool: &NativeSpo
         .map(|metadata| metadata.len())
         .unwrap_or(0)
         .saturating_add(shadow_storage_bytes(state)))
-}
-
-async fn verify_legacy_migration_head(
-    storage: &dyn StorageBackend,
-    prefix: &str,
-    name: &str,
-    verify_path: &std::path::Path,
-    legacy_txid: u64,
-) -> Result<()> {
-    let verification = async {
-        let restored_txid = walrust_core::legacy_restore::restore_legacy_ltx(
-            storage,
-            prefix,
-            name,
-            verify_path,
-            Some(legacy_txid),
-        )
-        .await
-        .with_context(|| format!("{}: verify legacy migration head", name))?;
-        if restored_txid != legacy_txid {
-            bail!(
-                "{}: legacy migration verification restored TXID {}, expected {}",
-                name,
-                restored_txid,
-                legacy_txid
-            );
-        }
-        let verify_connection = Connection::open(verify_path)?;
-        let integrity: String =
-            verify_connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
-        if integrity != "ok" {
-            bail!(
-                "{}: legacy migration head failed SQLite integrity_check: {}",
-                name,
-                integrity
-            );
-        }
-        Ok::<(), anyhow::Error>(())
-    }
-    .await;
-
-    let cleanup: Result<()> = match std::fs::remove_file(verify_path) {
-        Ok(()) => match verify_path.parent() {
-            Some(parent) => std::fs::File::open(parent)
-                .and_then(|file| file.sync_all())
-                .map_err(Into::into),
-            None => Err(anyhow!("legacy migration scratch path has no parent")),
-        },
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
-    };
-    match (verification, cleanup) {
-        (Err(verification), Err(cleanup)) => Err(anyhow!(
-            "{verification:#}; additionally failed to remove legacy migration scratch {}: {cleanup}",
-            verify_path.display()
-        )),
-        (Err(verification), Ok(())) => Err(verification),
-        (Ok(()), Err(cleanup)) => Err(cleanup.into()),
-        (Ok(()), Ok(())) => Ok(()),
-    }
 }
 
 async fn reconcile_shadow_progress_from_spool(
@@ -337,7 +259,7 @@ async fn reconcile_shadow_progress_from_spool(
 async fn stage_native_shadow(
     state: &ShadowDbState,
     spool_state: &NativeSpoolState,
-) -> Result<super::types::ShadowSyncOutput> {
+) -> Result<ShadowSyncOutput> {
     let (seq, previous_chain_checksum) = {
         let spool = spool_lock(&spool_state.0)?;
         let seq = spool
@@ -361,7 +283,7 @@ async fn stage_native_shadow(
     };
     let encoded = tokio::task::spawn_blocking(move || encode_shadow_to_hadbp(&input)).await??;
     let Some(encoded) = encoded else {
-        return Ok(super::types::ShadowSyncOutput {
+        return Ok(ShadowSyncOutput {
             db_path: state.db_path.clone(),
             frame_count: 0,
             new_shadow_sync_offset: state.shadow_sync_offset,
@@ -383,15 +305,16 @@ async fn stage_native_shadow(
     let stage_started = std::time::Instant::now();
     {
         let mut spool = spool_lock(&spool_state.0)?;
-        let peak = (encoded.payload.len() as u64)
-            .saturating_mul(2)
-            .saturating_add(source_footprint_on_spool_filesystem(state, &spool)?);
-        match spool.capacity_state(peak)? {
+        let external_used = source_footprint_on_spool_filesystem(state, &spool)?;
+        let additional_peak =
+            (encoded.payload.len() as u64).saturating_add(spool.next_journal_rewrite_peak_bytes()?);
+        match spool.capacity_state_with_external(external_used, additional_peak)? {
             CapacityState::High => tracing::error!(
                 database = %state.name,
                 event = "local_spool_high",
                 spool_bytes = spool.used_bytes()?,
-                additional_peak_bytes = peak,
+                additional_peak_bytes = additional_peak,
+                external_used_bytes = external_used,
                 filesystem_free_bytes = spool.free_bytes()?,
                 "local native spool crossed its warning watermark"
             ),
@@ -423,7 +346,7 @@ async fn stage_native_shadow(
         "native HADBP delta admitted to durable local spool"
     );
     spool_state.1.notify();
-    Ok(super::types::ShadowSyncOutput {
+    Ok(ShadowSyncOutput {
         db_path: state.db_path.clone(),
         frame_count: encoded.frame_count,
         new_shadow_sync_offset: encoded.new_shadow_sync_offset,
@@ -541,12 +464,26 @@ async fn stage_native_snapshot(
         state.shadow_sync_offset = 0;
     }
     let snapshot_generation = state.shadow.generation();
-    let shadow_end_offset = state.shadow.segment_offset();
+    let durable_shadow_end_offset = state.shadow.segment_offset();
     anyhow::ensure!(
-        shadow_end_offset.is_multiple_of(frame_size),
+        durable_shadow_end_offset.is_multiple_of(frame_size),
         "{}: snapshot source cursor is not frame-aligned",
         state.name
     );
+    let shadow_end_offset = committed_shadow_prefix_offset(
+        state.shadow.shadow_dir(),
+        snapshot_generation,
+        durable_shadow_end_offset,
+        page_size,
+    )?;
+    if shadow_end_offset < durable_shadow_end_offset {
+        tracing::debug!(
+            database = %state.name,
+            committed_shadow_end_offset = shadow_end_offset,
+            durable_shadow_end_offset,
+            "native snapshot excluded an in-flight transaction from its frozen boundary"
+        );
+    }
     let proposed_cursor = SourceCursor {
         shadow_generation: snapshot_generation,
         shadow_frame_index: shadow_end_offset / frame_size,
@@ -567,21 +504,20 @@ async fn stage_native_snapshot(
     {
         let spool = spool_lock(&spool_state.0)?;
         let journal_peak = spool.next_journal_rewrite_peak_bytes()?;
-        let peak = payload_upper
-            .saturating_mul(2)
-            .saturating_add(journal_peak)
-            .saturating_add(source_footprint);
-        if spool.capacity_state(peak)? == CapacityState::Full {
+        let additional_peak = payload_upper.saturating_add(journal_peak);
+        if spool.capacity_state_with_external(source_footprint, additional_peak)?
+            == CapacityState::Full
+        {
             bail!(
                 "local_spool_full: {} lacks peak capacity/reserve for direct native HADBP snapshot payload + journal \
-                 (additional_peak={peak}, payload_upper={payload_upper}, journal_peak={journal_peak}, \
+                 (additional_peak={additional_peak}, payload_upper={payload_upper}, journal_peak={journal_peak}, \
                  source_footprint={source_footprint}, main_bytes={main_bytes}, shadow_frames={shadow_frames})",
                 state.name,
             );
         }
     }
-    let preparation = {
-        let mut spool = spool_lock(&spool_state.0)?;
+    let (proposed_seq, proposed_previous, proposed_key) = {
+        let spool = spool_lock(&spool_state.0)?;
         let seq = spool
             .admitted_seq()
             .map(|seq| seq + 1)
@@ -591,13 +527,50 @@ async fn stage_native_snapshot(
             .last()
             .map(|object| object.ending_chain_checksum)
             .unwrap_or(0);
-        let intended_remote_key = native_object_key(spool.identity(), ObjectKind::Snapshot, seq);
-        spool.prepare_snapshot(
+        (
             seq,
             previous,
-            intended_remote_key,
+            native_object_key(spool.identity(), ObjectKind::Snapshot, seq),
+        )
+    };
+    let source_db_file = state.source_db_file.as_ref().cloned().ok_or_else(|| {
+        anyhow!(
+            "{}: native snapshot source descriptor was not retained",
+            state.name
+        )
+    })?;
+    let proof_input = NativeSnapshotInput {
+        db_path: state.db_path.clone(),
+        seq: proposed_seq,
+        previous_chain_checksum: proposed_previous,
+        generation: proposed_cursor.shadow_generation,
+        shadow_end_offset: proposed_cursor
+            .shadow_frame_index
+            .saturating_mul(frame_size),
+        page_size,
+        shadow_dir: state.shadow.shadow_dir().to_path_buf(),
+        #[cfg(unix)]
+        expected_db_file_identity: db_identity_before,
+    };
+    let source_for_proof = Arc::clone(&source_db_file);
+    let source_proof = tokio::task::spawn_blocking(move || {
+        let mut source = source_for_proof
+            .lock()
+            .map_err(|_| anyhow!("native snapshot source descriptor lock poisoned"))?;
+        snapshot_source_proof(&proof_input, &mut source)
+    })
+    .await??;
+    let preparation = {
+        let mut spool = spool_lock(&spool_state.0)?;
+        spool.prepare_snapshot(
+            proposed_seq,
+            proposed_previous,
+            proposed_key,
             proposed_cursor,
             page_size,
+            source_proof.end_page_count,
+            source_proof.ending_chain_checksum,
+            source_proof.page_image_sha256,
         )
     };
     let preparation = preparation?;
@@ -625,12 +598,6 @@ async fn stage_native_snapshot(
         expected_db_file_identity: db_identity_before,
     };
     let payload_temp_for_encode = payload_temp.clone();
-    let source_db_file = state.source_db_file.as_ref().cloned().ok_or_else(|| {
-        anyhow!(
-            "{}: native snapshot source descriptor was not retained",
-            state.name
-        )
-    })?;
     let encoded_result = match tokio::task::spawn_blocking(move || -> Result<_> {
         let mut source = source_db_file
             .lock()
@@ -663,20 +630,34 @@ async fn stage_native_snapshot(
             return Err(error.into());
         }
     };
+    let decoded_snapshot = ltx::decode_sqlite_changeset(&encoded_payload)?;
+    let (page_digest, page_count) = ltx::snapshot_page_image_sha256(&decoded_snapshot)?;
+    let page_digest = page_digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    anyhow::ensure!(
+        encoded.end_page_count == preparation.expected_end_page_count
+            && encoded.ending_chain_checksum == preparation.expected_ending_chain_checksum
+            && page_count == preparation.expected_end_page_count
+            && page_digest == preparation.expected_page_image_sha256,
+        "native snapshot payload differs from its durable source-content intent at seq {}",
+        seq
+    );
     let stage_result = (|| -> Result<()> {
         let mut spool = spool_lock(&spool_state.0)?;
         // The fsynced payload temporary is already included in used_bytes and
         // admission renames that exact inode. Only journal/intent rewrite and
         // source-filesystem reserve remain as additional peak here.
-        let peak = spool
-            .next_journal_rewrite_peak_bytes()?
-            .saturating_add(source_footprint_on_spool_filesystem(state, &spool)?);
-        match spool.capacity_state(peak)? {
+        let external_used = source_footprint_on_spool_filesystem(state, &spool)?;
+        let additional_peak = spool.next_journal_rewrite_peak_bytes()?;
+        match spool.capacity_state_with_external(external_used, additional_peak)? {
             CapacityState::High => tracing::error!(
                 database = %state.name,
                 event = "local_spool_high",
                 spool_bytes = spool.used_bytes()?,
-                additional_peak_bytes = peak,
+                additional_peak_bytes = additional_peak,
+                external_used_bytes = external_used,
                 filesystem_free_bytes = spool.free_bytes()?,
                 "local native spool crossed its warning watermark while snapshotting"
             ),
@@ -804,16 +785,16 @@ async fn checkpoint_with_state_blocker_attempt(
         .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
     blocker.execute_batch("ROLLBACK;")?;
 
-    let monitor = state
-        .data_version_monitor
+    let controller = state
+        .checkpoint_controller
         .as_ref()
-        .ok_or_else(|| anyhow!("{}: CLI data_version monitor was not held", state.name))?;
+        .ok_or_else(|| anyhow!("{}: CLI checkpoint controller was not held", state.name))?;
 
     let mode_name = match mode {
         ShadowCheckpointMode::Passive => "PASSIVE",
         ShadowCheckpointMode::Truncate => "TRUNCATE",
     };
-    let checkpoint_result = monitor
+    let checkpoint_result = controller
         .query_row(
             &format!("PRAGMA wal_checkpoint({mode_name});"),
             [],
@@ -836,16 +817,6 @@ async fn checkpoint_with_state_blocker_attempt(
         });
     durability_failpoint("sqlite_checkpoint_returned");
 
-    // Keep the monitor opened before the blocker for its whole lifetime. Its
-    // data_version advances once for every commit from another connection,
-    // while the checkpoint above is an operation on the monitor itself. The
-    // blocker's refreshed heartbeat is written on that monitor, so it does
-    // not change the monitor's own value. Sampling both sides of rearm catches
-    // an app commit anywhere in the
-    // release/reacquire window, including the old sample-to-heartbeat gap that
-    // could otherwise be checkpointed away before the retained blocker
-    // repinned it.
-    let data_version_before_rearm = checkpoint_data_version(state);
     if cfg!(debug_assertions) {
         if let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE") {
             let selected_db = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_DB");
@@ -861,28 +832,21 @@ async fn checkpoint_with_state_blocker_attempt(
             }
         }
     }
-    let rearm_result = rearm_checkpoint_blocker(state);
+    let rearm_result = rearm_checkpoint_blocker_after_checkpoint(state, data_version_before);
     let heartbeat_live = match &rearm_result {
-        Ok(()) => checkpoint_blocker_heartbeat_is_live(state),
+        Ok(_) => checkpoint_blocker_heartbeat_is_live(state),
         Err(_) => Ok(false),
     };
     if rearm_result.is_ok() {
         durability_failpoint("blocker_reacquired");
     }
-    let data_version_after_rearm = checkpoint_data_version(state);
-    let checkpoint_result = checkpoint_result.and_then(|completed| {
-        let before_rearm = data_version_before_rearm?;
-        let after_rearm = data_version_after_rearm?;
-        let dirty_before_rearm = before_rearm != data_version_before;
-        let dirty_during_rearm = after_rearm != before_rearm;
-        Ok((completed, dirty_before_rearm || dirty_during_rearm))
-    });
+    let checkpoint_result = checkpoint_result.map(|completed| completed);
     match (checkpoint_result, rearm_result) {
-        (Ok((completed, data_version_dirty)), Ok(())) => Ok(CheckpointAttempt {
+        (Ok(completed), Ok(data_version_dirty)) => Ok(CheckpointAttempt {
             completed,
             dirty: data_version_dirty || !heartbeat_live?,
         }),
-        (Err(checkpoint_error), Ok(())) => Err(checkpoint_error),
+        (Err(checkpoint_error), Ok(_)) => Err(checkpoint_error),
         (Ok(_), Err(rearm_error)) => Err(rearm_error),
         (Err(checkpoint_error), Err(rearm_error)) => Err(anyhow!(
             "{}; additionally failed to rearm CLI checkpoint blocker: {}",
@@ -890,70 +854,6 @@ async fn checkpoint_with_state_blocker_attempt(
             rearm_error
         )),
     }
-}
-
-async fn checkpoint_with_state_blocker(
-    state: &mut ShadowDbState,
-    mode: ShadowCheckpointMode,
-    data_version_before: i64,
-) -> Result<bool> {
-    let attempt = checkpoint_with_state_blocker_attempt(state, mode, data_version_before).await?;
-    if !attempt.completed {
-        bail!("{}: shadow checkpoint incomplete", state.name);
-    }
-    Ok(attempt.dirty)
-}
-
-#[derive(Clone)]
-struct DirectShadowSyncTarget {
-    client: Arc<aws_sdk_s3::Client>,
-    bucket_name: String,
-    prefix: String,
-}
-
-async fn run_shadow_syncs(
-    db_states: &HashMap<PathBuf, ShadowDbState>,
-    cache_states: &HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
-    direct_target: Option<DirectShadowSyncTarget>,
-    retry_policy: &RetryPolicy,
-    webhook_sender: Arc<WebhookSender>,
-) -> Vec<Result<super::types::ShadowSyncOutput>> {
-    let sync_inputs: Vec<ShadowSyncInput> = db_states.values().map(shadow_sync_input).collect();
-
-    let sync_futures: Vec<ShadowSyncFuture> = sync_inputs
-        .into_iter()
-        .map(|input| {
-            let policy = retry_policy.clone();
-            let webhooks = Arc::clone(&webhook_sender);
-
-            if let Some((cache, upload_tx)) = cache_states.get(&input.db_path) {
-                let cache = Arc::clone(cache);
-                let upload_tx = upload_tx.clone();
-                Box::pin(sync_shadow_to_cache_with_retry(
-                    cache, upload_tx, input, policy, webhooks,
-                )) as ShadowSyncFuture
-            } else if let Some(target) = direct_target.clone() {
-                Box::pin(sync_shadow_concurrent_with_retry(
-                    Arc::clone(&target.client),
-                    target.bucket_name,
-                    target.prefix,
-                    input,
-                    policy,
-                    webhooks,
-                )) as ShadowSyncFuture
-            } else {
-                let name = input.name;
-                Box::pin(async move {
-                    Err(anyhow!(
-                        "{}: no cache uploader or direct upload target configured",
-                        name
-                    ))
-                }) as ShadowSyncFuture
-            }
-        })
-        .collect();
-
-    join_all(sync_futures).await
 }
 
 async fn copy_final_shadow_frames(db_states: &mut HashMap<PathBuf, ShadowDbState>) -> Result<()> {
@@ -982,7 +882,7 @@ async fn finish_shutdown_local_admission(
     native_spools: &HashMap<PathBuf, NativeSpoolState>,
 ) {
     loop {
-        let attempt = async {
+        let attempt: Result<()> = async {
             copy_final_shadow_frames(db_states).await?;
             let mut final_results = Vec::with_capacity(db_states.len());
             for (db_path, state) in db_states.iter() {
@@ -991,7 +891,13 @@ async fn finish_shutdown_local_admission(
                     None => Err(anyhow!("{}: native spool missing", state.name)),
                 });
             }
-            apply_shadow_sync_results_strict(db_states, final_results).await
+            for result in final_results {
+                let output = result?;
+                if let Some(state) = db_states.get_mut(&output.db_path) {
+                    apply_shadow_sync_result_to_state(state, &output).await?;
+                }
+            }
+            Ok(())
         }
         .await;
         match attempt {
@@ -1029,90 +935,6 @@ async fn finish_shutdown_local_admission(
             }
         }
     }
-}
-
-async fn checkpoint_shadow_after_durable_sync(
-    state: &mut ShadowDbState,
-    cache_state: Option<&(Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
-    direct_target: Option<DirectShadowSyncTarget>,
-    retry_policy: &RetryPolicy,
-    webhook_sender: Arc<WebhookSender>,
-    drain_timeout: Duration,
-    checkpoint_mode: ShadowCheckpointMode,
-) -> Result<bool> {
-    // `data_version` is connection-local and changes only when another
-    // connection commits. Read it before the final copy so any app commit that
-    // can race the drain/checkpoint boundary is detected after reactivation.
-    let data_version_before = checkpoint_data_version(state)?;
-    let (frames, new_offset) = state
-        .shadow
-        .copy_frames(state.wal_copy_offset)
-        .await
-        .with_context(|| format!("{}: shadow copy before checkpoint failed", state.name))?;
-    if !frames.is_empty() {
-        tracing::debug!(
-            "{}: checkpoint copied {} frames to shadow (offset {} -> {})",
-            state.name,
-            frames.len(),
-            state.wal_copy_offset,
-            new_offset
-        );
-        state.wal_copy_offset = new_offset;
-    }
-
-    let input = shadow_sync_input(state);
-    let output = if let Some((cache, upload_tx)) = cache_state {
-        sync_shadow_to_cache_with_retry(
-            Arc::clone(cache),
-            upload_tx.clone(),
-            input,
-            retry_policy.clone(),
-            Arc::clone(&webhook_sender),
-        )
-        .await?
-    } else if let Some(target) = direct_target {
-        sync_shadow_concurrent_with_retry(
-            Arc::clone(&target.client),
-            target.bucket_name,
-            target.prefix,
-            input,
-            retry_policy.clone(),
-            Arc::clone(&webhook_sender),
-        )
-        .await?
-    } else {
-        anyhow::bail!(
-            "{}: no cache uploader or direct upload target configured for checkpoint drain",
-            state.name
-        );
-    };
-    if let Some((cache, _)) = cache_state {
-        wait_for_cache_checkpoint_durability(
-            cache,
-            &state.name,
-            output.new_current_txid,
-            drain_timeout,
-        )
-        .await?;
-    }
-
-    apply_shadow_sync_result_to_state(state, &output).await?;
-
-    let checkpoint_window_dirty =
-        checkpoint_with_state_blocker(state, checkpoint_mode, data_version_before)
-            .await
-            .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
-
-    let cleanup_before_gen = state.shadow_sync_generation;
-    if cleanup_before_gen > 0 {
-        state
-            .shadow
-            .cleanup_segments(cleanup_before_gen)
-            .await
-            .with_context(|| format!("{}: shadow cleanup failed", state.name))?;
-    }
-
-    Ok(checkpoint_window_dirty)
 }
 
 async fn checkpoint_shadow_after_native_admission(
@@ -1368,69 +1190,6 @@ async fn enforce_native_wal_backpressure(
     Ok(true)
 }
 
-async fn shutdown_shadow_uploaders(
-    cache_states: &HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
-    db_states: &HashMap<PathBuf, ShadowDbState>,
-    uploader_handles: Vec<(PathBuf, tokio::task::JoinHandle<Result<UploaderStats>>)>,
-) -> Result<()> {
-    for (db_path, (_, upload_tx)) in cache_states.iter() {
-        let name = db_states
-            .get(db_path)
-            .map(|s| s.name.as_str())
-            .unwrap_or("unknown");
-        tracing::debug!("{}: Sending shutdown to uploader", name);
-        upload_tx
-            .send(UploadMessage::Shutdown)
-            .await
-            .map_err(|e| anyhow!("{}: failed to send shutdown to uploader: {}", name, e))?;
-    }
-
-    let drain_timeout = Duration::from_secs(10);
-    let mut first_error = None;
-
-    for (db_path, handle) in uploader_handles {
-        let name = db_states
-            .get(&db_path)
-            .map(|s| s.name.as_str())
-            .unwrap_or("unknown");
-        match tokio::time::timeout(drain_timeout, handle).await {
-            Ok(Ok(Ok(stats))) => {
-                tracing::debug!("{}: Uploader drained successfully: {:?}", name, stats);
-            }
-            Ok(Ok(Err(e))) => {
-                let e = e.context(format!("{}: uploader drain failed", name));
-                tracing::error!("{}", e);
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-            }
-            Ok(Err(e)) => {
-                let e = anyhow!("{}: uploader task panicked: {}", name, e);
-                tracing::error!("{}", e);
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-            }
-            Err(_) => {
-                let e = anyhow!(
-                    "{}: uploader drain timed out after {:?}",
-                    name,
-                    drain_timeout
-                );
-                tracing::error!("{}", e);
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-            }
-        }
-    }
-
-    match first_error {
-        Some(e) => Err(e),
-        None => Ok(()),
-    }
-}
-
 /// Perform the initial shadow copy on startup and detect databases whose live
 /// WAL salt changed while walrust was down.
 ///
@@ -1495,12 +1254,11 @@ pub async fn watch_with_shadow(
     bucket: &str,
     endpoint: Option<&str>,
     global_sync: SyncConfig,
-    compact_policy: Option<RetentionPolicy>,
+    prune_policy: Option<RetentionPolicy>,
     metrics_port: u16,
     no_metrics: bool,
     retry_config: RetryConfig,
     webhooks: Vec<WebhookConfig>,
-    cache_config: CacheConfig,
     spool_config: SpoolConfig,
 ) -> Result<()> {
     // Install process signal handlers before any startup work. Remote
@@ -1530,7 +1288,8 @@ pub async fn watch_with_shadow(
     let mut startup_blockers: HashMap<PathBuf, Connection> = HashMap::new();
     let mut startup_shadows: HashMap<PathBuf, ShadowWal> = HashMap::new();
     let mut startup_data_version_monitors: HashMap<PathBuf, Connection> = HashMap::new();
-    let mut startup_db_checksums: HashMap<PathBuf, Result<ltx::Checksum>> = HashMap::new();
+    let mut startup_checkpoint_controllers: HashMap<PathBuf, Connection> = HashMap::new();
+    let mut startup_db_checksums: HashMap<PathBuf, Result<u64>> = HashMap::new();
     for db_config in &databases {
         if !db_config.path.exists() {
             return Err(WalrustError::database(format!(
@@ -1566,6 +1325,14 @@ pub async fn watch_with_shadow(
         })?;
         data_version_monitor.busy_timeout(Duration::from_secs(5))?;
         ShadowWal::enable_persistent_wal(&data_version_monitor, &db_config.path)?;
+        let checkpoint_controller = Connection::open(&db_config.path).with_context(|| {
+            format!(
+                "{}: failed to open CLI checkpoint controller",
+                db_config.prefix
+            )
+        })?;
+        checkpoint_controller.busy_timeout(Duration::from_secs(5))?;
+        ShadowWal::enable_persistent_wal(&checkpoint_controller, &db_config.path)?;
         // This plain-file open targets the SQLite inode too. Complete it before
         // the final blocker operation so its close cannot release POSIX locks.
         startup_db_checksums.insert(
@@ -1580,6 +1347,7 @@ pub async fn watch_with_shadow(
         })?;
         startup_shadows.insert(db_config.path.clone(), shadow);
         startup_data_version_monitors.insert(db_config.path.clone(), data_version_monitor);
+        startup_checkpoint_controllers.insert(db_config.path.clone(), checkpoint_controller);
         startup_blockers.insert(db_config.path.clone(), blocker);
         startup_source_db_files
             .insert(db_config.path.clone(), Arc::new(Mutex::new(source_db_file)));
@@ -1623,11 +1391,6 @@ pub async fn watch_with_shadow(
         });
     }
 
-    // Initialize cache + uploader per database (if cache enabled)
-    let cache_states: HashMap<PathBuf, (Arc<LocalCache>, mpsc::Sender<UploadMessage>)> =
-        HashMap::new();
-    let uploader_handles: Vec<(PathBuf, tokio::task::JoinHandle<Result<UploaderStats>>)> =
-        Vec::new();
     let mut native_spools: HashMap<PathBuf, NativeSpoolState> = HashMap::new();
     let mut native_uploader_shutdown: HashMap<PathBuf, tokio::sync::watch::Sender<bool>> =
         HashMap::new();
@@ -1636,15 +1399,6 @@ pub async fn watch_with_shadow(
         PathBuf,
         Arc<Mutex<walrust_core::native_publish::RemoteLagState>>,
     > = HashMap::new();
-    if cache_config.enabled {
-        tracing::info!(
-            "Legacy LTX cache migration compatibility enabled (concurrency={}, retention={}, max_size={})",
-            cache_config.uploader_concurrency,
-            cache_config.retention,
-            cache_config.max_size,
-        );
-    }
-
     // Initialize shadow state for each database
     let mut db_states: HashMap<PathBuf, ShadowDbState> = HashMap::new();
     let mut trigger_states: HashMap<PathBuf, TriggerState> = HashMap::new();
@@ -1669,133 +1423,76 @@ pub async fn watch_with_shadow(
             name.clone(),
             "binding-only",
             1,
-            None,
-            false,
         )?;
         let spool_root = NativeSpool::resolve_path_for(&spool_base, &binding_identity)?;
         let existing_spool_identity = NativeSpool::read_identity(&spool_root)?;
 
-        // A complete matching local spool is sufficient for offline restart.
-        // Without it, startup must verify both the versioned native descriptor
-        // and legacy manifest remotely; ambiguous cloud failure is never fresh.
-        //
-        // H8 cousin (PR #36 review): a TRANSIENT manifest fetch failure — or a
-        // present-but-unparseable manifest — must NOT be silently read as "fresh
-        // database, txid 0". That default is safe ONLY for a genuine not-found; a
-        // transient (or a corrupt manifest) that defaults to fresh lets a replica
-        // adopt a fresh identity over existing remote state. Durable local shadow
-        // progress overrides this seed when present, and publishes are CAS-guarded
-        // (so the worst case is a loud CAS failure, not a silent fork) — but on a
-        // fresh host with no local progress a transient would still misclassify.
-        // Only a CONFIRMED not-found starts fresh; every other fetch/parse error
-        // propagates so startup fails loudly and is retried against a complete
-        // view. See `seed_state_from_manifest_fetch`. Not-found is classified
-        // from the TYPED SDK error (`s3::download_error_is_not_found`), never
-        // by matching message strings — free text like a DNS "host not found"
-        // must not read as a missing manifest and silently start fresh.
-        let (mut current_txid, manifest_checksum, spool_identity) = if let Some(identity) =
-            existing_spool_identity
-        {
-            if !identity.remote_base_verified
-                || identity.canonical_db_path != binding_identity.canonical_db_path
+        // Offline restart requires a complete matching local spool whose
+        // durable journal records a published snapshot base. A host without
+        // that proof must contact remote storage before it can continue or
+        // create a lineage. Ambiguous remote failure is never treated as a
+        // fresh stream.
+        let mut current_txid = 0;
+        let spool_identity = if let Some(identity) = existing_spool_identity {
+            if identity.canonical_db_path != binding_identity.canonical_db_path
                 || identity.bucket != bucket_name
                 || identity.prefix != prefix
                 || identity.database != name
             {
                 bail!("{}: local native spool identity/base mismatch", name);
             }
-            if !NativeSpool::validate_existing_complete_base(&spool_root, &identity)? {
+            if !NativeSpool::validate_existing_published_base(&spool_root, &identity)? {
                 let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
                 match s3::download_bytes(&client, &bucket_name, &descriptor_key).await {
-                    Ok(_) => bail!(
-                        "{}: local native spool has no complete snapshot base but the remote native stream already exists",
-                        name
-                    ),
+                    Ok(bytes) => {
+                        let descriptor: walrust_core::native_publish::StreamDescriptor =
+                            serde_json::from_slice(&bytes).with_context(|| {
+                                format!("{}: parse remote native stream descriptor", name)
+                            })?;
+                        let expected =
+                            walrust_core::native_publish::StreamDescriptor::from(&identity);
+                        anyhow::ensure!(
+                            descriptor == expected,
+                            "{}: remote native descriptor does not match the durable local lineage",
+                            name
+                        );
+                    }
                     Err(error) if s3::download_error_is_not_found(&error) => {
-                        let (legacy_txid, _, _) = discover_state_from_s3(
+                        require_empty_native_remote_namespace(
                             &client,
                             &bucket_name,
                             &prefix,
                             &name,
                         )
-                        .await
-                        .with_context(|| {
-                            format!(
-                                "{}: verify remote predecessor for incomplete local spool",
-                                name
-                            )
-                        })?;
-                        if identity.legacy_boundary_txid.unwrap_or(0) != legacy_txid {
-                            bail!(
-                                "{}: incomplete local spool predecessor differs from remote legacy head",
-                                name
-                            );
-                        }
+                        .await?;
                     }
                     Err(error) => {
                         return Err(error).with_context(|| {
                             format!(
-                                "{}: remote unavailable and local native spool has no complete snapshot base",
+                                "{}: remote unavailable and local native spool has no remotely published snapshot base",
                                 name
                             )
                         })
                     }
                 }
             }
-            (0, None, identity)
+            identity
         } else {
-            // One-time compatibility migration: drain any durable legacy
-            // LTX cache before pinning the legacy boundary. This preserves
-            // every locally pending 0.7 PITR object, then the native stream
-            // re-anchors with a full snapshot. The new spool never adopts
-            // or rewrites these bytes.
-            let configured_legacy_cache = cache_config.path.as_ref().map(PathBuf::from);
-            let legacy_cache_path = configured_legacy_cache
-                .filter(|path| path.join("manifest.json").exists())
-                .unwrap_or_else(|| LocalCache::cache_dir_for_db(db_path));
-            if let Some(legacy_cache) = LocalCache::open(&legacy_cache_path)? {
-                if !legacy_cache.pending_uploads().is_empty() {
-                    tracing::info!(
-                        database = %name,
-                        cache = %legacy_cache_path.display(),
-                        "draining verified legacy LTX cache before native HADBP migration boundary"
-                    );
-                    let storage: Arc<dyn StorageBackend> =
-                        Arc::new(S3Storage::new((*client).clone(), bucket_name.clone()));
-                    for txid in legacy_cache.pending_uploads() {
-                        let bytes = legacy_cache.read_ltx(txid)?;
-                        walrust_core::legacy_ltx::verify_ltx(std::io::Cursor::new(&bytes))?;
-                        let (generation, min_txid, max_txid) = legacy_cache.remote_key_parts(txid);
-                        let key = walrust_core::legacy_manifest::build_ltx_key(
-                            &prefix, &name, generation, min_txid, max_txid,
-                        );
-                        let cas = storage.put_if_absent(&key, &bytes).await?;
-                        if !cas.success {
-                            let existing = storage.get(&key).await?.ok_or_else(|| {
-                                anyhow!("legacy migration object vanished after CAS: {key}")
-                            })?;
-                            if existing != bytes {
-                                bail!(
-                                        "{}: divergent legacy LTX already exists at {}; refusing overwrite",
-                                        name,
-                                        key
-                                    );
-                            }
-                        }
-                        legacy_cache.mark_uploaded(txid)?;
-                    }
-                    if !legacy_cache.pending_uploads().is_empty() {
-                        bail!("{}: legacy cache did not drain contiguously; refusing native migration", name);
-                    }
-                }
-            }
             let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
             match s3::download_bytes(&client, &bucket_name, &descriptor_key).await {
                     Ok(_) => bail!(
                         "{}: remote native stream exists but no matching verified local spool/base is present",
                         name
                     ),
-                    Err(error) if s3::download_error_is_not_found(&error) => {}
+                    Err(error) if s3::download_error_is_not_found(&error) => {
+                        require_empty_native_remote_namespace(
+                            &client,
+                            &bucket_name,
+                            &prefix,
+                            &name,
+                        )
+                        .await?;
+                    }
                     Err(error) => {
                         return Err(error).with_context(|| {
                             format!(
@@ -1804,58 +1501,26 @@ pub async fn watch_with_shadow(
                             )
                         })
                     }
-                }
-            let (legacy_txid, _generation, checksum) =
-                discover_state_from_s3(&client, &bucket_name, &prefix, &name)
-                    .await
-                    .with_context(|| format!("{}: discover verified legacy history", name))?;
-            if legacy_txid > 0 {
-                let verify_path = spool_base.join(format!(
-                    ".legacy-migration-verify-{}-{}.db",
-                    std::process::id(),
-                    uuid::Uuid::new_v4()
-                ));
-                std::fs::create_dir_all(&spool_base)?;
-                let storage = S3Storage::new((*client).clone(), bucket_name.clone());
-                verify_legacy_migration_head(&storage, &prefix, &name, &verify_path, legacy_txid)
-                    .await?;
             }
-            let identity = SpoolIdentity::new(
+            SpoolIdentity::new(
                 db_path,
                 bucket_name.clone(),
                 prefix.clone(),
                 name.clone(),
                 uuid::Uuid::new_v4().to_string(),
-                legacy_txid.saturating_add(1).max(1),
-                (legacy_txid > 0).then_some(legacy_txid),
-                true,
-            )?;
-            (legacy_txid, checksum, identity)
+                1,
+            )?
         };
 
-        // Get initial checksum: from manifest if available, otherwise compute from db
-        let mut db_checksum = match manifest_checksum {
-            Some(cs) => {
-                tracing::debug!("{}: Using checksum from manifest: {:#x}", name, cs);
-                Some(cs)
+        let mut db_checksum = match startup_db_checksums
+            .remove(db_path)
+            .ok_or_else(|| anyhow!("{}: startup database checksum missing", name))?
+        {
+            Ok(checksum) => Some(checksum),
+            Err(error) => {
+                tracing::warn!("{}: Could not compute initial checksum: {}", name, error);
+                None
             }
-            None => match startup_db_checksums
-                .remove(db_path)
-                .ok_or_else(|| anyhow!("{}: startup database checksum missing", name))?
-            {
-                Ok(cs) => {
-                    tracing::debug!(
-                        "{}: Computed initial checksum: {:#x}",
-                        name,
-                        cs.into_inner()
-                    );
-                    Some(cs.into_inner())
-                }
-                Err(e) => {
-                    tracing::warn!("{}: Could not compute initial checksum: {}", name, e);
-                    None
-                }
-            },
         };
         let mut last_snapshot = None;
         let mut shadow_sync_generation = 0;
@@ -1868,6 +1533,9 @@ pub async fn watch_with_shadow(
         let data_version_monitor = startup_data_version_monitors
             .remove(db_path)
             .ok_or_else(|| anyhow!("{}: startup data_version monitor missing", name))?;
+        let checkpoint_controller = startup_checkpoint_controllers
+            .remove(db_path)
+            .ok_or_else(|| anyhow!("{}: startup checkpoint controller missing", name))?;
         let checkpoint_blocker = startup_blockers
             .remove(db_path)
             .ok_or_else(|| anyhow!("{}: startup checkpoint blocker missing", name))?;
@@ -1957,6 +1625,7 @@ pub async fn watch_with_shadow(
                 shadow,
                 checkpoint_blocker: Some(checkpoint_blocker),
                 data_version_monitor: Some(data_version_monitor),
+                checkpoint_controller: Some(checkpoint_controller),
                 source_db_file: Some(source_db_file),
                 shadow_sync_generation,
                 shadow_sync_offset,
@@ -2101,12 +1770,12 @@ pub async fn watch_with_shadow(
     wal_sync_timer.tick().await;
 
     let disabled_timer_duration = Duration::from_secs(86400 * 365);
-    let compact_interval_duration = if global_sync.compact_interval > 0 {
-        Duration::from_secs(global_sync.compact_interval)
+    let prune_interval_duration = if global_sync.prune_interval > 0 {
+        Duration::from_secs(global_sync.prune_interval)
     } else {
         disabled_timer_duration
     };
-    let mut compact_timer = tokio::time::interval(compact_interval_duration);
+    let mut compact_timer = tokio::time::interval(prune_interval_duration);
     compact_timer.tick().await;
 
     // Shadow mode: checkpoint is manual via shadow.checkpoint()
@@ -2142,15 +1811,8 @@ pub async fn watch_with_shadow(
     } else {
         Duration::from_secs(300)
     };
-    let mut cache_cleanup_timer = tokio::time::interval(cleanup_interval);
-    cache_cleanup_timer.tick().await; // Skip first immediate tick
-
-    // Parse cache retention for cleanup
-    let cache_retention = if cache_config.enabled {
-        crate::config::parse_duration_string(&cache_config.retention).ok()
-    } else {
-        None
-    };
+    let mut spool_cleanup_timer = tokio::time::interval(cleanup_interval);
+    spool_cleanup_timer.tick().await; // Skip first immediate tick
 
     tracing::info!(
         "walrust shadow mode running (snapshot: {}s, WAL sync: {}s, checkpoint: {}s)",
@@ -2549,8 +2211,8 @@ pub async fn watch_with_shadow(
                 }
 
                 // Run retention pruning after snapshots if enabled
-                if global_sync.compact_after_snapshot {
-                    if let Some(ref policy) = compact_policy {
+                if global_sync.prune_after_snapshot {
+                    if let Some(ref policy) = prune_policy {
                         for (db_path, state) in &db_states {
                             let Some(spool_state) = native_spools.get(db_path) else {
                                 tracing::error!("Failed to prune {}: native spool missing", state.name);
@@ -2566,8 +2228,8 @@ pub async fn watch_with_shadow(
             }
 
             // Pruning timer
-            _ = compact_timer.tick(), if global_sync.compact_interval > 0 => {
-                if let Some(ref policy) = compact_policy {
+            _ = compact_timer.tick(), if global_sync.prune_interval > 0 => {
+                if let Some(ref policy) = prune_policy {
                     for (db_path, state) in &db_states {
                         let Some(spool_state) = native_spools.get(db_path) else {
                             tracing::error!("Failed to prune {}: native spool missing", state.name);
@@ -2656,29 +2318,8 @@ pub async fn watch_with_shadow(
                 }
             }
 
-            // Cache cleanup timer
-            _ = cache_cleanup_timer.tick() => {
-                if let Some(ref retention) = cache_retention {
-                    for (db_path, (cache, _)) in cache_states.iter() {
-                        let name = db_states.get(db_path).map(|s| s.name.as_str()).unwrap_or("unknown");
-                        match cache.cleanup(*retention, cache_config.max_size) {
-                            Ok(stats) => {
-                                if stats.deleted_count > 0 {
-                                    tracing::info!(
-                                        "{}: Cache cleanup: deleted {} files ({:.2} MB), {:.2} MB remaining",
-                                        name,
-                                        stats.deleted_count,
-                                        stats.deleted_bytes as f64 / (1024.0 * 1024.0),
-                                        stats.remaining_bytes as f64 / (1024.0 * 1024.0)
-                                    );
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!("{}: Cache cleanup failed: {}", name, e);
-                            }
-                        }
-                    }
-                }
+            // Native spool cleanup timer
+            _ = spool_cleanup_timer.tick() => {
                 for (db_path, (spool, _)) in &native_spools {
                     let name = db_states
                         .get(db_path)
@@ -2745,7 +2386,6 @@ pub async fn watch_with_shadow(
     finish_shutdown_local_admission(&mut db_states, &native_spools).await;
     durability_failpoint("shutdown_local_admission_complete");
 
-    shutdown_shadow_uploaders(&cache_states, &db_states, uploader_handles).await?;
     let cloud_drain_deadline =
         tokio::time::Instant::now() + Duration::from_secs(spool_config.shutdown_drain_seconds);
     loop {
@@ -2803,6 +2443,7 @@ pub async fn watch_with_shadow(
             drop(blocker);
         }
         drop(state.data_version_monitor.take());
+        drop(state.checkpoint_controller.take());
         drop(state.source_db_file.take());
     }
 
@@ -2810,63 +2451,14 @@ pub async fn watch_with_shadow(
     Ok(())
 }
 
-/// How startup state is seeded from the remote `manifest.json`.
-#[derive(Debug, PartialEq, Eq)]
-#[cfg(test)]
-enum ManifestSeed {
-    /// No remote manifest exists: a brand-new database starts fresh at txid 0.
-    Fresh,
-    /// Seeded from an existing remote manifest.
-    Seeded { txid: u64, checksum: Option<u64> },
-}
-
-/// Decide how to seed startup state from a manifest FETCH result, enforcing the
-/// H8-cousin policy: a transient (or otherwise non-not-found) fetch failure, and
-/// a present-but-unparseable manifest, must NOT silently start fresh.
-///
-/// - `Ok(bytes)`: parse the manifest. A parse failure PROPAGATES (a corrupt or
-///   truncated manifest over existing remote state must be loud, never fresh).
-/// - `Err(e)` that `is_not_found` confirms: a genuine missing manifest → `Fresh`.
-/// - any other `Err(e)`: PROPAGATE. A transient/ambiguous failure never defaults
-///   to a fresh txid-0 database.
-///
-/// Pure and independent of S3 so both directions are unit-tested without a live
-/// backend.
-#[cfg(test)]
-fn seed_state_from_manifest_fetch(
-    fetch: Result<Vec<u8>>,
-    is_not_found: impl Fn(&anyhow::Error) -> bool,
-) -> Result<ManifestSeed> {
-    match fetch {
-        Ok(data) => {
-            let manifest: Manifest = serde_json::from_slice(&data).context(
-                "manifest.json present but unparseable; refusing to start fresh over existing \
-                 remote state",
-            )?;
-            Ok(ManifestSeed::Seeded {
-                txid: manifest.current_txid,
-                checksum: manifest.last_checksum,
-            })
-        }
-        Err(e) if is_not_found(&e) => Ok(ManifestSeed::Fresh),
-        Err(e) => Err(e.context(
-            "manifest fetch failed and is not a confirmed not-found; refusing to default to a \
-             fresh txid-0 database (a transient must be retried, not adopted as fresh)",
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::WebhookConfig;
-    use crate::shadow::format_segment_name;
     use async_trait::async_trait;
     use hadb_storage::CasResult;
     use rusqlite::Connection;
-    use std::io::{Read, Write};
+    use std::path::Path;
     use tempfile::TempDir;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     struct NoRemoteIo;
 
@@ -2892,409 +2484,9 @@ mod tests {
         }
     }
 
-    struct FailingMigrationStorage;
-
-    #[async_trait]
-    impl StorageBackend for FailingMigrationStorage {
-        async fn get(&self, _key: &str) -> Result<Option<Vec<u8>>> {
-            panic!("legacy migration verification should fail during discovery")
-        }
-        async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
-            panic!("legacy migration verification performed PUT")
-        }
-        async fn delete(&self, _key: &str) -> Result<()> {
-            panic!("legacy migration verification performed DELETE")
-        }
-        async fn list(&self, _prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
-            Err(anyhow!("injected migration discovery failure"))
-        }
-        async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<CasResult> {
-            panic!("legacy migration verification performed CAS")
-        }
-        async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
-            panic!("legacy migration verification performed CAS")
-        }
-    }
-
-    #[tokio::test]
-    async fn failed_legacy_migration_verification_removes_scratch() {
-        let temp = TempDir::new().unwrap();
-        let scratch = temp.path().join(".legacy-migration-verify-test.db");
-        std::fs::write(&scratch, b"partial restore").unwrap();
-
-        let error =
-            verify_legacy_migration_head(&FailingMigrationStorage, "prefix/", "db", &scratch, 7)
-                .await
-                .unwrap_err();
-
-        assert!(
-            format!("{error:#}").contains("injected migration discovery failure"),
-            "unexpected verification error: {error:#}"
-        );
-        assert!(
-            !scratch.exists(),
-            "failed migration verification left a live scratch database"
-        );
-    }
-
-    fn test_native_spool_state(
-        db_path: &std::path::Path,
-        root: &std::path::Path,
-    ) -> NativeSpoolState {
-        let identity = SpoolIdentity::new(
-            db_path,
-            "bucket",
-            "tests/",
-            "db",
-            "test-lineage",
-            1,
-            None,
-            true,
-        )
-        .unwrap();
-        let root = NativeSpool::path_for(root, &identity);
-        let spool = Arc::new(Mutex::new(
-            NativeSpool::create_or_open(
-                &root,
-                identity,
-                CapacityPolicy {
-                    warning_bytes: u64::MAX - 1,
-                    hard_bytes: u64::MAX,
-                    minimum_free_bytes: 0,
-                },
-            )
-            .unwrap(),
-        ));
-        let (uploader, wake, _lag) =
-            NativeUploader::new(Arc::new(NoRemoteIo), Arc::clone(&spool)).unwrap();
-        // Keep the receiver alive but deliberately paused: no remote operation
-        // can acknowledge the staged object.
-        drop(uploader);
-        (spool, wake)
-    }
-
-    fn test_source_db_file(path: &std::path::Path) -> Option<Arc<Mutex<std::fs::File>>> {
-        Some(Arc::new(Mutex::new(std::fs::File::open(path).unwrap())))
-    }
-
-    fn test_migrated_native_spool_state(
-        db_path: &std::path::Path,
-        root: &std::path::Path,
-        bucket: &str,
-        prefix: &str,
-        database: &str,
-        legacy_boundary_txid: u64,
-    ) -> NativeSpoolState {
-        let identity = SpoolIdentity::new(
-            db_path,
-            bucket,
-            prefix,
-            database,
-            "pending-migration-lineage",
-            legacy_boundary_txid + 1,
-            Some(legacy_boundary_txid),
-            true,
-        )
-        .unwrap();
-        let root = NativeSpool::path_for(root, &identity);
-        let spool = Arc::new(Mutex::new(
-            NativeSpool::create_or_open(
-                &root,
-                identity,
-                CapacityPolicy {
-                    warning_bytes: u64::MAX - 1,
-                    hard_bytes: u64::MAX,
-                    minimum_free_bytes: 0,
-                },
-            )
-            .unwrap(),
-        ));
-        let (uploader, wake, _lag) =
-            NativeUploader::new(Arc::new(NoRemoteIo), Arc::clone(&spool)).unwrap();
-        drop(uploader);
-        (spool, wake)
-    }
-
-    #[tokio::test]
-    async fn watcher_retention_preserves_legacy_base_before_descriptor_publication() {
-        if std::env::var("AWS_ENDPOINT_URL_S3").is_err()
-            && std::env::var("AWS_ENDPOINT_URL").is_err()
-            && std::env::var("AWS_ACCESS_KEY_ID").is_err()
-        {
-            eprintln!("SKIP watcher_retention_preserves_legacy_base_before_descriptor_publication: no S3 endpoint/credentials configured");
-            return;
-        }
-        let bucket_arg = std::env::var("WALRUST_TEST_BUCKET")
-            .unwrap_or_else(|_| "walrust-test-rr-2026/verify-test".to_string());
-        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
-            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
-            .ok();
-        let (bucket, prefix) = s3::parse_bucket(&bucket_arg);
-        let client = s3::create_client(endpoint.as_deref()).await.unwrap();
-        let name = format!(
-            "watch-pending-migration-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        let keep_old = crate::sync::manifest::build_ltx_key(&prefix, &name, 1, 1, 1);
-        let would_delete = crate::sync::manifest::build_ltx_key(&prefix, &name, 2, 1, 2);
-        let keep_latest = crate::sync::manifest::build_ltx_key(&prefix, &name, 3, 1, 3);
-        let keys = vec![keep_old.clone(), would_delete.clone(), keep_latest.clone()];
-        for key in &keys {
-            s3::upload_bytes(&client, &bucket, key, b"snapshot".to_vec())
-                .await
-                .unwrap();
-        }
-
-        let (_sqlite_temp, db_path, _writer) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let mut state = ShadowDbState {
-            name: name.clone(),
-            db_path: db_path.clone(),
-            wal_path: db_path.with_extension("db-wal"),
-            current_txid: 3,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
-        let spool_temp = TempDir::new().unwrap();
-        let spool_state = test_migrated_native_spool_state(
-            &db_path,
-            spool_temp.path(),
-            &bucket,
-            &prefix,
-            &name,
-            3,
-        );
-        assert_eq!(
-            stage_native_snapshot(&mut state, &spool_state)
-                .await
-                .unwrap(),
-            4
-        );
-        assert!(
-            spool_lock(&spool_state.0)
-                .unwrap()
-                .get(4)
-                .is_some_and(|object| object.remote_upload_state == RemoteUploadState::Pending),
-            "migration snapshot must be durably pending locally"
-        );
-        assert!(
-            !watcher_retention_has_published_native_base(&spool_state).unwrap(),
-            "pending first migration snapshot must keep watcher retention closed"
-        );
-        let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
-        assert!(
-            !s3::exists(&client, &bucket, &descriptor_key).await.unwrap(),
-            "test requires the pre-descriptor publication window"
-        );
-
-        let policy = RetentionPolicy::new(0, 0, 0, 0);
-        prune_watcher_database(&client, &bucket, &prefix, &state, &spool_state, &policy)
-            .await
-            .unwrap();
-        for key in &keys {
-            assert!(
-                s3::exists(&client, &bucket, key).await.unwrap(),
-                "watcher retention deleted legacy recovery object {key} while its native migration snapshot was only local"
-            );
-        }
-        let _ = s3::delete_objects(&client, &bucket, &keys).await;
-    }
-
-    #[tokio::test]
-    async fn watcher_retention_accepts_retained_published_snapshot_after_local_cleanup() {
-        let (_sqlite_temp, db_path, _writer) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let mut state = ShadowDbState {
-            name: "cleanup-migration".to_string(),
-            db_path: db_path.clone(),
-            wal_path: db_path.with_extension("db-wal"),
-            current_txid: 3,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
-        let spool_temp = TempDir::new().unwrap();
-        let spool_state = test_migrated_native_spool_state(
-            &db_path,
-            spool_temp.path(),
-            "bucket",
-            "tests/",
-            "cleanup-migration",
-            3,
-        );
-
-        assert_eq!(
-            stage_native_snapshot(&mut state, &spool_state)
-                .await
-                .unwrap(),
-            4
-        );
-        {
-            let mut spool = spool_lock(&spool_state.0).unwrap();
-            spool.mark_uploaded(4).unwrap();
-            spool.mark_published(4, b"published-four").unwrap();
-        }
-        assert!(watcher_retention_has_published_native_base(&spool_state).unwrap());
-
-        assert_eq!(
-            stage_native_snapshot(&mut state, &spool_state)
-                .await
-                .unwrap(),
-            5
-        );
-        {
-            let mut spool = spool_lock(&spool_state.0).unwrap();
-            spool.mark_uploaded(5).unwrap();
-            spool.mark_published(5, b"published-five").unwrap();
-            assert_eq!(spool.cleanup_published_before_latest_snapshot().unwrap(), 1);
-            assert!(spool.get(4).is_none(), "first snapshot should be cleaned");
-            assert!(spool.get(5).is_some(), "latest snapshot must remain");
-        }
-        assert!(
-            watcher_retention_has_published_native_base(&spool_state).unwrap(),
-            "a retained published snapshot and contiguous cursor keep watcher retention live after first-snapshot cleanup"
-        );
-    }
-
-    // ── H8 cousin: manifest-fetch seeding never silently starts fresh ────────
-
-    /// Build the anyhow error `s3::download_bytes` produces for a genuine
-    /// missing object: the typed SDK `NoSuchKey` service error.
-    fn typed_no_such_key() -> anyhow::Error {
-        use aws_sdk_s3::error::SdkError;
-        use aws_sdk_s3::operation::get_object::GetObjectError;
-        use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
-        use aws_smithy_runtime_api::http::StatusCode;
-        use aws_smithy_types::body::SdkBody;
-        let err = GetObjectError::NoSuchKey(aws_sdk_s3::types::error::NoSuchKey::builder().build());
-        let raw = HttpResponse::new(StatusCode::try_from(404u16).unwrap(), SdkBody::empty());
-        anyhow::Error::new(SdkError::service_error(err, raw))
-    }
-
-    /// A genuine (typed) not-found seeds a fresh txid-0 database (correct:
-    /// brand-new DB).
-    #[test]
-    fn manifest_not_found_starts_fresh() {
-        let seed = seed_state_from_manifest_fetch(
-            Err(typed_no_such_key()),
-            s3::download_error_is_not_found,
-        )
-        .expect("a confirmed not-found must seed fresh, not error");
-        assert_eq!(seed, ManifestSeed::Fresh);
-    }
-
-    /// A TRANSIENT fetch failure must NOT silently start fresh — it propagates.
-    /// This is the swallow-shape the harden closes: reverting it (defaulting to
-    /// `(0, None)` on any error) would return `Fresh` here.
-    #[test]
-    fn manifest_transient_fetch_does_not_start_fresh() {
-        let err = seed_state_from_manifest_fetch(
-            Err(anyhow!("Service unavailable (injected); dispatch failure")),
-            s3::download_error_is_not_found,
-        )
-        .expect_err("a transient fetch failure must propagate, never seed fresh");
-        assert!(
-            format!("{err:#}").contains("refusing to default to a fresh"),
-            "got: {err:#}"
-        );
-    }
-
-    /// A present-but-unparseable manifest must be loud, never a silent fresh
-    /// start over existing remote state.
-    #[test]
-    fn manifest_corrupt_parse_does_not_start_fresh() {
-        let err = seed_state_from_manifest_fetch(
-            Ok(b"{ this is not valid json".to_vec()),
-            s3::download_error_is_not_found,
-        )
-        .expect_err("a corrupt manifest must propagate, never seed fresh");
-        assert!(format!("{err:#}").contains("unparseable"), "got: {err:#}");
-    }
-
-    /// A valid remote manifest seeds the recorded txid + checksum.
-    #[test]
-    fn manifest_present_seeds_recorded_state() {
-        let manifest = Manifest {
-            name: "db".into(),
-            current_txid: 42,
-            page_size: 4096,
-            files: Vec::new(),
-            last_checksum: Some(0xDEAD_BEEF),
-        };
-        let bytes = serde_json::to_vec(&manifest).unwrap();
-        let seed =
-            seed_state_from_manifest_fetch(Ok(bytes), s3::download_error_is_not_found).unwrap();
-        assert_eq!(
-            seed,
-            ManifestSeed::Seeded {
-                txid: 42,
-                checksum: Some(0xDEAD_BEEF)
-            }
-        );
-    }
-
-    /// The not-found classifier is TYPED, not string-matched: only the SDK's
-    /// `NoSuchKey`/404 service error classifies as not-found. Free text that
-    /// merely *mentions* not-found signatures (a DNS "host not found", a proxy
-    /// body with "404", the SDK error message quoted in a wrapper) must NOT —
-    /// otherwise a transient would misread as a missing manifest and silently
-    /// start fresh, the exact bug this hardening closes.
-    #[test]
-    fn not_found_classifier_is_typed_not_string_matched() {
-        use aws_sdk_s3::error::SdkError;
-        use aws_sdk_s3::operation::get_object::GetObjectError;
-
-        // The real typed shape → not-found (also when wrapped with context).
-        assert!(s3::download_error_is_not_found(&typed_no_such_key()));
-        assert!(s3::download_error_is_not_found(
-            &typed_no_such_key().context("fetching manifest.json")
-        ));
-
-        // A typed TIMEOUT is not not-found even though it is an SDK error.
-        let timeout: SdkError<GetObjectError> = SdkError::timeout_error("timed out");
-        assert!(!s3::download_error_is_not_found(&anyhow::Error::new(
-            timeout
-        )));
-
-        // Free-text errors carrying not-found-looking words are NOT not-found.
-        for msg in [
-            "NoSuchKey: The specified key does not exist",
-            "Object not found: prefix/db/manifest.json",
-            "service error, HTTP status: 404",
-            "dns error: host not found",
-            "Service unavailable (injected)",
-            "connection reset by peer",
-        ] {
-            assert!(
-                !s3::download_error_is_not_found(&anyhow!("{msg}")),
-                "free-text {msg:?} must not classify as not-found"
-            );
-        }
-    }
-
     fn create_real_wal_db() -> (TempDir, PathBuf, Connection) {
         let temp = TempDir::new().unwrap();
-        let db_path = temp.path().join("shutdown-shadow.db");
+        let db_path = temp.path().join("watch-native.db");
         let conn = Connection::open(&db_path).unwrap();
         conn.execute_batch(
             "
@@ -3305,466 +2497,105 @@ mod tests {
             ",
         )
         .unwrap();
-
-        assert!(
-            db_path.with_extension("db-wal").exists(),
-            "test must exercise a live SQLite WAL"
-        );
-
+        assert!(db_path.with_extension("db-wal").exists());
         (temp, db_path, conn)
     }
 
-    async fn capture_one_webhook() -> (String, tokio::task::JoinHandle<String>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let handle = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut buffer = Vec::new();
-            let mut chunk = [0u8; 1024];
-
-            loop {
-                let count = stream.read(&mut chunk).await.unwrap();
-                assert!(count > 0, "webhook closed before sending its body");
-                buffer.extend_from_slice(&chunk[..count]);
-                let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
-                else {
-                    continue;
-                };
-                let headers = String::from_utf8_lossy(&buffer[..header_end]);
-                let content_length = headers
-                    .lines()
-                    .find_map(|line| {
-                        line.strip_prefix("Content-Length:")
-                            .or_else(|| line.strip_prefix("content-length:"))
-                            .and_then(|value| value.trim().parse::<usize>().ok())
-                    })
-                    .unwrap_or(0);
-                let body_start = header_end + 4;
-                if buffer.len() < body_start + content_length {
-                    continue;
-                }
-
-                let body =
-                    String::from_utf8(buffer[body_start..body_start + content_length].to_vec())
-                        .unwrap();
-                stream
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
-                    .await
-                    .unwrap();
-                return body;
-            }
-        });
-
-        (url, handle)
+    fn test_source_db_file(path: &Path) -> Option<Arc<Mutex<std::fs::File>>> {
+        Some(Arc::new(Mutex::new(std::fs::File::open(path).unwrap())))
     }
 
-    fn write_shadow_segment(
-        shadow_dir: &std::path::Path,
-        generation: u64,
-        page_size: usize,
-        page_data: &[u8],
-    ) {
-        std::fs::create_dir_all(shadow_dir).unwrap();
-        let path = shadow_dir.join(format_segment_name(generation, 0));
-        let mut file = std::fs::File::create(path).unwrap();
-        let mut header = [0u8; 24];
-        header[0..4].copy_from_slice(&1u32.to_be_bytes());
-        header[4..8].copy_from_slice(&1u32.to_be_bytes());
-        file.write_all(&header).unwrap();
-        file.write_all(&page_data[..page_size]).unwrap();
-    }
-
-    #[tokio::test]
-    async fn markerless_shadow_recovery_rewinds_live_wal_cursor_before_reanchor() {
-        let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow_dir = ShadowWal::shadow_dir_for(&db_path);
-        let mut page = vec![0u8; 4096];
-        std::fs::File::open(&db_path)
-            .unwrap()
-            .read_exact(&mut page)
-            .unwrap();
-        write_shadow_segment(&shadow_dir, 7, 4096, &page);
-
-        let mut shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        assert!(shadow.discarded_unproven_tail());
-        let stale_progress = ShadowProgress {
-            version: 2,
-            current_txid: 9,
-            last_snapshot: None,
-            db_checksum: Some(11),
-            shadow_sync_generation: 7,
-            shadow_sync_offset: (24 + 4096) as u64,
-            wal_copy_offset: u64::MAX / 2,
-            wal_salt: Some((1, 2)),
-            wal_checksum_chain: Some((3, 4)),
-        };
-        assert_eq!(
-            restore_wal_copy_progress(&mut shadow, &stale_progress),
-            0,
-            "discarded shadow bytes must force checked WAL recopy from zero"
-        );
-        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
-        assert!(
-            !frames.is_empty(),
-            "pinned live WAL frames must be recopied"
-        );
-        assert!(offset > 0);
-    }
-
-    #[tokio::test]
-    async fn test_shadow_shutdown_syncs_final_real_wal_frames_to_cache() {
-        let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let wal_path = db_path.with_extension("db-wal");
-
-        let mut db_states = HashMap::new();
-        db_states.insert(
-            db_path.clone(),
-            ShadowDbState {
-                name: "shutdown_shadow".to_string(),
-                db_path: db_path.clone(),
-                wal_path,
-                current_txid: 0,
-                last_snapshot: None,
-                db_checksum: None,
-                shadow,
-                checkpoint_blocker: None,
-                data_version_monitor: None,
-                source_db_file: None,
-                shadow_sync_generation: 0,
-                shadow_sync_offset: 0,
-                wal_copy_offset: 0,
-            },
-        );
-
-        copy_final_shadow_frames(&mut db_states).await.unwrap();
-        assert!(
-            db_states.get(&db_path).unwrap().wal_copy_offset > 0,
-            "final shutdown copy must consume real WAL frames"
-        );
-
-        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
-        let (upload_tx, mut upload_rx) = mpsc::channel(10);
-        let mut cache_states = HashMap::new();
-        cache_states.insert(db_path.clone(), (Arc::clone(&cache), upload_tx));
-
-        let results = run_shadow_syncs(
-            &db_states,
-            &cache_states,
-            None,
-            &RetryPolicy::new(RetryConfig::default()),
-            Arc::new(WebhookSender::new(vec![])),
-        )
-        .await;
-        apply_shadow_sync_results_strict(&mut db_states, results)
-            .await
-            .unwrap();
-
-        let pending = cache.pending_uploads();
-        assert_eq!(
-            pending.len(),
-            1,
-            "final shutdown sync must queue an LTX upload"
-        );
-
-        let ltx = cache.read_ltx(pending[0]).unwrap();
-        crate::ltx::verify_ltx(std::io::Cursor::new(ltx)).unwrap();
-
-        let msg = upload_rx.try_recv().unwrap();
-        assert!(
-            matches!(msg, UploadMessage::Upload(txid) if txid == pending[0]),
-            "cache sync must notify uploader for queued LTX"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_shadow_sync_persists_restart_progress_after_durable_cache_write() {
-        let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let progress_path = shadow.shadow_dir().join("progress.json");
-        let wal_path = db_path.with_extension("db-wal");
-
-        let mut db_states = HashMap::new();
-        db_states.insert(
-            db_path.clone(),
-            ShadowDbState {
-                name: "restart_progress".to_string(),
-                db_path: db_path.clone(),
-                wal_path,
-                current_txid: 0,
-                last_snapshot: None,
-                db_checksum: None,
-                shadow,
-                checkpoint_blocker: None,
-                data_version_monitor: None,
-                source_db_file: None,
-                shadow_sync_generation: 0,
-                shadow_sync_offset: 0,
-                wal_copy_offset: 0,
-            },
-        );
-
-        copy_final_shadow_frames(&mut db_states).await.unwrap();
-
-        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
-        let (upload_tx, _upload_rx) = mpsc::channel(10);
-        let mut cache_states = HashMap::new();
-        cache_states.insert(db_path.clone(), (Arc::clone(&cache), upload_tx));
-
-        let results = run_shadow_syncs(
-            &db_states,
-            &cache_states,
-            None,
-            &RetryPolicy::new(RetryConfig::default()),
-            Arc::new(WebhookSender::new(vec![])),
-        )
-        .await;
-        apply_shadow_sync_results_strict(&mut db_states, results)
-            .await
-            .unwrap();
-
-        assert!(
-            progress_path.exists(),
-            "shadow sync must persist a restart progress record after durable cache write"
-        );
-        let state = db_states.get(&db_path).unwrap();
-        let reloaded = load_shadow_progress(&state.shadow, &state.name)
-            .unwrap()
-            .expect("progress record must reload");
-        assert_eq!(reloaded.current_txid, state.current_txid);
-        assert_eq!(
-            reloaded.shadow_sync_generation,
-            state.shadow_sync_generation
-        );
-        assert_eq!(reloaded.shadow_sync_offset, state.shadow_sync_offset);
-    }
-
-    #[tokio::test]
-    async fn test_shadow_sync_cursor_resets_offset_when_advancing_generation() {
-        let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow_dir = ShadowWal::shadow_dir_for(&db_path);
-        let page_size = 4096usize;
-        let mut page = vec![0u8; page_size];
-        std::fs::File::open(&db_path)
-            .unwrap()
-            .read_exact(&mut page)
-            .unwrap();
-
-        write_shadow_segment(&shadow_dir, 0, page_size, &page);
-        write_shadow_segment(&shadow_dir, 1, page_size, &page);
-        let frame_len = (24 + page_size) as u64;
-        std::fs::write(
-            shadow_dir.join("durable-tail-v1.json"),
-            serde_json::to_vec_pretty(&serde_json::json!({
-                "version": 1,
-                "segments": {
-                    format_segment_name(0, 0): frame_len,
-                    format_segment_name(1, 0): frame_len,
-                }
-            }))
+    fn test_native_spool_state(db_path: &Path, base: &Path) -> NativeSpoolState {
+        let identity =
+            SpoolIdentity::new(db_path, "bucket", "tests/", "db", "test-lineage", 1).unwrap();
+        let root = NativeSpool::path_for(base, &identity);
+        let spool = Arc::new(Mutex::new(
+            NativeSpool::create_or_open(
+                &root,
+                identity,
+                CapacityPolicy {
+                    warning_bytes: u64::MAX - 1,
+                    hard_bytes: u64::MAX,
+                    minimum_free_bytes: 0,
+                },
+            )
             .unwrap(),
-        )
-        .unwrap();
-
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        assert_eq!(
-            shadow.generation(),
-            1,
-            "test setup must start with a newer live shadow generation"
-        );
-        let frame_size = 24 + page_size as u64;
-        let wal_path = db_path.with_extension("db-wal");
-        let mut db_states = HashMap::new();
-        db_states.insert(
-            db_path.clone(),
-            ShadowDbState {
-                name: "generation_cursor".to_string(),
-                db_path: db_path.clone(),
-                wal_path,
-                current_txid: 0,
-                last_snapshot: None,
-                db_checksum: None,
-                shadow,
-                checkpoint_blocker: None,
-                data_version_monitor: None,
-                source_db_file: None,
-                shadow_sync_generation: 0,
-                shadow_sync_offset: frame_size,
-                wal_copy_offset: 0,
-            },
-        );
-
-        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
-        let (upload_tx, _upload_rx) = mpsc::channel(10);
-        let mut cache_states = HashMap::new();
-        cache_states.insert(db_path.clone(), (Arc::clone(&cache), upload_tx));
-
-        let drained_old_generation = run_shadow_syncs(
-            &db_states,
-            &cache_states,
-            None,
-            &RetryPolicy::new(RetryConfig::default()),
-            Arc::new(WebhookSender::new(vec![])),
-        )
-        .await;
-        apply_shadow_sync_results_strict(&mut db_states, drained_old_generation)
-            .await
-            .unwrap();
-        let state = db_states.get(&db_path).unwrap();
-        assert_eq!(state.shadow_sync_generation, 1);
-        assert_eq!(
-            state.shadow_sync_offset, 0,
-            "offset must reset when advancing to the new shadow generation"
-        );
-        assert!(
-            cache.pending_uploads().is_empty(),
-            "draining the old generation at EOF should not upload anything"
-        );
-
-        let synced_new_generation = run_shadow_syncs(
-            &db_states,
-            &cache_states,
-            None,
-            &RetryPolicy::new(RetryConfig::default()),
-            Arc::new(WebhookSender::new(vec![])),
-        )
-        .await;
-        apply_shadow_sync_results_strict(&mut db_states, synced_new_generation)
-            .await
-            .unwrap();
-        assert_eq!(
-            cache.pending_uploads().len(),
-            1,
-            "new generation frames must be read from offset 0, not skipped by the prior generation offset"
-        );
+        ));
+        let (uploader, wake, _lag) =
+            NativeUploader::new(Arc::new(NoRemoteIo), Arc::clone(&spool)).unwrap();
+        drop(uploader);
+        (spool, wake)
     }
 
-    #[tokio::test]
-    async fn test_shadow_checkpoint_detects_app_commit_after_durable_copy() {
-        let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+    async fn test_state(db_path: &Path) -> ShadowDbState {
+        let shadow = ShadowWal::new_without_checkpoint_blocker(db_path)
             .await
             .unwrap();
-        let wal_path = db_path.with_extension("db-wal");
-        let mut state = ShadowDbState {
-            name: "checkpoint_shadow".to_string(),
-            db_path: db_path.clone(),
-            wal_path,
-            current_txid: 0,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
-
-        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
-        let (upload_tx, mut upload_rx) = mpsc::channel(10);
-        let ack_cache = Arc::clone(&cache);
-        let late_write_db = db_path.clone();
-        let ack_handle = tokio::spawn(async move {
-            match upload_rx.recv().await {
-                Some(UploadMessage::Upload(txid)) => {
-                    let app = Connection::open(late_write_db).unwrap();
-                    app.execute(
-                        "INSERT INTO items (value) VALUES ('commit-after-durable-copy')",
-                        [],
-                    )
-                    .unwrap();
-                    drop(app);
-                    ack_cache.mark_uploaded(txid).unwrap();
-                }
-                other => panic!("expected upload notification, got {other:?}"),
-            }
-        });
-        let cache_state = (Arc::clone(&cache), upload_tx);
-
-        let checkpoint_window_dirty = checkpoint_shadow_after_durable_sync(
-            &mut state,
-            Some(&cache_state),
-            None,
-            &RetryPolicy::new(RetryConfig::default()),
-            Arc::new(WebhookSender::new(vec![])),
-            Duration::from_secs(2),
-            ShadowCheckpointMode::Passive,
-        )
-        .await
-        .unwrap();
-        ack_handle.await.unwrap();
-        assert!(
-            checkpoint_window_dirty,
-            "an app commit after the durable shadow copy must force a snapshot re-anchor"
-        );
-
-        assert!(
-            state.wal_copy_offset > 0,
-            "checkpoint path must copy real active WAL frames before checkpointing"
-        );
-        assert!(
-            state.shadow_sync_offset > 0,
-            "checkpoint path must sync copied shadow frames before checkpointing"
-        );
-        assert!(
-            cache.pending_uploads().is_empty(),
-            "checkpoint must wait until cache uploads are confirmed durable"
-        );
-        assert!(
-            cache.last_uploaded_txid() >= state.current_txid,
-            "confirmed uploaded LTX must cover the checkpointed shadow state"
-        );
-    }
-
-    #[tokio::test]
-    async fn default_local_release_checkpoints_after_native_admission_without_remote_ack() {
-        let (temp, db_path, conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let mut state = ShadowDbState {
-            name: "native-local-release".to_string(),
-            db_path: db_path.clone(),
+        let data_version_monitor = Connection::open(db_path).unwrap();
+        let checkpoint_controller = Connection::open(db_path).unwrap();
+        let checkpoint_blocker = ShadowWal::open_checkpoint_blocker(db_path).unwrap();
+        ShadowDbState {
+            name: "native-watch-test".to_string(),
+            db_path: db_path.to_path_buf(),
             wal_path: db_path.with_extension("db-wal"),
             current_txid: 0,
             last_snapshot: None,
             db_checksum: None,
             shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
+            checkpoint_blocker: Some(checkpoint_blocker),
+            data_version_monitor: Some(data_version_monitor),
+            checkpoint_controller: Some(checkpoint_controller),
+            source_db_file: test_source_db_file(db_path),
             shadow_sync_generation: 0,
             shadow_sync_offset: 0,
             wal_copy_offset: 0,
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn application_commit_after_checkpoint_is_observed_before_heartbeat_write() {
+        let (_temp, db_path, app) = create_real_wal_db();
+        let mut state = test_state(&db_path).await;
+        rearm_checkpoint_blocker(&mut state).unwrap();
+        let baseline = checkpoint_data_version(&state).unwrap();
+
+        state
+            .checkpoint_blocker
+            .as_ref()
+            .unwrap()
+            .execute_batch("ROLLBACK;")
+            .unwrap();
+        let _: (i64, i64, i64) = state
+            .checkpoint_controller
+            .as_ref()
+            .unwrap()
+            .query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        app.execute("INSERT INTO items(value) VALUES ('dirty-window')", [])
+            .unwrap();
+
+        let dirty = rearm_checkpoint_blocker_after_checkpoint(&mut state, baseline).unwrap();
+        assert!(dirty, "application commit must force a snapshot re-anchor");
+        assert!(checkpoint_blocker_heartbeat_is_live(&state).unwrap());
+    }
+
+    #[tokio::test]
+    async fn default_local_release_checkpoints_without_any_remote_io() {
+        let (temp, db_path, conn) = create_real_wal_db();
+        let mut state = test_state(&db_path).await;
         rearm_checkpoint_blocker(&mut state).unwrap();
         let spool_state = test_native_spool_state(&db_path, temp.path());
         stage_native_snapshot(&mut state, &spool_state)
             .await
             .unwrap();
-        assert!(
-            !spool_lock(&spool_state.0)
-                .unwrap()
-                .snapshot_in_progress()
-                .unwrap(),
-            "snapshot call site must durably admit then retire its frozen-source intent"
-        );
-
         conn.execute(
             "INSERT INTO items(value) VALUES ('local-no-remote-ack')",
             [],
         )
         .unwrap();
+
         let attempt = checkpoint_shadow_after_native_admission(
             &mut state,
             &spool_state,
@@ -3774,183 +2605,53 @@ mod tests {
         )
         .await
         .unwrap();
+
         assert!(attempt.completed);
-        assert!(!attempt.dirty);
         let spool = spool_lock(&spool_state.0).unwrap();
         assert_eq!(spool.admitted_seq(), Some(2));
         assert_eq!(spool.remote_published_seq(), None);
-        let object = spool.get(2).unwrap();
         assert_eq!(
-            object.remote_upload_state,
+            spool.get(2).unwrap().remote_upload_state,
             walrust_core::native_spool::RemoteUploadState::Pending
         );
         assert!(spool.read_payload(2).unwrap().starts_with(b"HADBP"));
-        let durable_root = spool.root().to_path_buf();
-        let durable_identity = spool.identity().clone();
-        drop(spool);
-        drop(spool_state);
-        let reopened = NativeSpool::create_or_open(
-            &durable_root,
-            durable_identity,
-            CapacityPolicy {
-                warning_bytes: u64::MAX - 1,
-                hard_bytes: u64::MAX,
-                minimum_free_bytes: 0,
-            },
-        )
-        .expect("checkpoint admission must survive a process restart from its journal");
-        assert_eq!(reopened.admitted_seq(), Some(2));
-        assert!(reopened.read_payload(2).unwrap().starts_with(b"HADBP"));
-        assert!(
-            state
-                .checkpoint_blocker
-                .as_ref()
-                .is_some_and(|blocker| !blocker.is_autocommit()),
-            "blocker must be reacquired after local-only checkpoint"
-        );
-        assert!(
-            live_wal_page_count(&state.wal_path).await.unwrap() <= 4,
-            "controlled TRUNCATE plus blocker heartbeat should leave a bounded live WAL"
-        );
+        assert!(checkpoint_blocker_heartbeat_is_live(&state).unwrap());
+        assert!(live_wal_page_count(&state.wal_path).await.unwrap() <= 4);
     }
 
     #[tokio::test]
-    async fn direct_snapshot_is_exact_while_passive_checkpoint_contends() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
+    async fn remote_release_requires_contiguous_publication_before_checkpoint() {
         let (temp, db_path, conn) = create_real_wal_db();
-        for id in 10..1010i64 {
-            conn.execute(
-                "INSERT INTO items(id, value) VALUES (?1, ?2)",
-                rusqlite::params![id, format!("passive-{id}")],
-            )
-            .unwrap();
-        }
-        let expected_count: i64 = conn
-            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
-            .unwrap();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let mut state = ShadowDbState {
-            name: "native-passive-snapshot".to_string(),
-            db_path: db_path.clone(),
-            wal_path: db_path.with_extension("db-wal"),
-            current_txid: 0,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
-        let spool_state = test_native_spool_state(&db_path, temp.path());
-        let running = Arc::new(AtomicBool::new(true));
-        let checkpoint_running = Arc::clone(&running);
-        let checkpoint_db = db_path.clone();
-        let checkpointer = std::thread::spawn(move || {
-            let checkpoint = Connection::open(checkpoint_db).unwrap();
-            while checkpoint_running.load(Ordering::Relaxed) {
-                let _: (i64, i64, i64) = checkpoint
-                    .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
-                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                    })
-                    .unwrap();
-                std::thread::yield_now();
-            }
-        });
-        let stage_result = stage_native_snapshot(&mut state, &spool_state).await;
-        running.store(false, Ordering::Relaxed);
-        checkpointer.join().unwrap();
-        stage_result.unwrap();
-        let payload = spool_lock(&spool_state.0).unwrap().read_payload(1).unwrap();
-        let restored_path = temp.path().join("passive-restored.db");
-        walrust_core::ltx::decode_to_db(&payload, &restored_path).unwrap();
-        let restored = Connection::open(restored_path).unwrap();
-        let restored_count: i64 = restored
-            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(restored_count, expected_count);
-        assert_eq!(
-            restored
-                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
-                .unwrap(),
-            "ok"
-        );
-    }
-
-    #[tokio::test]
-    async fn remote_release_waits_before_opening_checkpoint_window() {
-        let (temp, db_path, conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let mut state = ShadowDbState {
-            name: "native-remote-release".to_string(),
-            db_path: db_path.clone(),
-            wal_path: db_path.with_extension("db-wal"),
-            current_txid: 0,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
+        let mut state = test_state(&db_path).await;
         let spool_state = test_native_spool_state(&db_path, temp.path());
         stage_native_snapshot(&mut state, &spool_state)
             .await
             .unwrap();
         conn.execute("INSERT INTO items(value) VALUES ('remote-policy')", [])
             .unwrap();
+
         let error = checkpoint_shadow_after_native_admission(
             &mut state,
             &spool_state,
             crate::config::CheckpointRelease::Remote,
-            Duration::from_millis(50),
+            Duration::from_millis(25),
             ShadowCheckpointMode::Truncate,
         )
         .await
         .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("timed out waiting for contiguous remote publish"));
-        assert!(
-            state
-                .checkpoint_blocker
-                .as_ref()
-                .is_some_and(|blocker| !blocker.is_autocommit()),
-            "remote policy timeout must not release the blocker"
+
+        assert!(format!("{error:#}").contains("contiguous remote publish"));
+        assert_eq!(
+            spool_lock(&spool_state.0).unwrap().checkpoint_window(),
+            &walrust_core::native_spool::CheckpointWindow::Closed
         );
+        assert!(checkpoint_blocker_heartbeat_is_live(&state).unwrap());
     }
 
     #[tokio::test]
-    async fn partial_passive_checkpoint_rearms_blocker_and_retries_without_advancing() {
+    async fn partial_passive_checkpoint_is_nonfatal_and_rearms_blocker() {
         let (temp, db_path, conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let mut state = ShadowDbState {
-            name: "native-partial-passive".to_string(),
-            db_path: db_path.clone(),
-            wal_path: db_path.with_extension("db-wal"),
-            current_txid: 0,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
+        let mut state = test_state(&db_path).await;
         let spool_state = test_native_spool_state(&db_path, temp.path());
         stage_native_snapshot(&mut state, &spool_state)
             .await
@@ -3962,283 +2663,67 @@ mod tests {
             .unwrap();
         conn.execute("INSERT INTO items(value) VALUES ('reader-pinned')", [])
             .unwrap();
+
         let attempt = checkpoint_shadow_after_native_admission(
             &mut state,
             &spool_state,
             crate::config::CheckpointRelease::Local,
-            Duration::from_millis(50),
+            Duration::from_millis(25),
             ShadowCheckpointMode::Passive,
         )
         .await
         .unwrap();
-        assert!(!attempt.completed, "reader pin must make PASSIVE partial");
-        assert!(
-            state
-                .checkpoint_blocker
-                .as_ref()
-                .is_some_and(|blocker| !blocker.is_autocommit()),
-            "partial PASSIVE must immediately rearm the blocker"
-        );
-        assert_eq!(
-            spool_lock(&spool_state.0).unwrap().admitted_seq(),
-            Some(2),
-            "local admission remains durable for the later checkpoint retry"
-        );
+
+        assert!(!attempt.completed);
+        assert_eq!(spool_lock(&spool_state.0).unwrap().admitted_seq(), Some(2));
+        assert!(checkpoint_blocker_heartbeat_is_live(&state).unwrap());
         reader.execute_batch("ROLLBACK").unwrap();
     }
 
     #[tokio::test]
-    async fn checkpoint_keeps_pre_blocker_monitor_open_through_rearm() {
-        let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
+    async fn partial_truncate_checkpoint_is_bounded_nonfatal_and_rearms_blocker() {
+        let (temp, db_path, conn) = create_real_wal_db();
+        let mut state = test_state(&db_path).await;
+        state
+            .checkpoint_controller
+            .as_ref()
+            .unwrap()
+            .busy_timeout(Duration::from_millis(50))
             .unwrap();
-        let mut state = ShadowDbState {
-            name: "native-monitor-stable".to_string(),
-            db_path: db_path.clone(),
-            wal_path: db_path.with_extension("db-wal"),
-            current_txid: 0,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
-        let data_version_before = checkpoint_data_version(&state).unwrap();
-        let monitor_handle = unsafe {
-            state
-                .data_version_monitor
-                .as_ref()
-                .expect("monitor exists")
-                .handle()
-        };
-
-        let attempt = checkpoint_with_state_blocker_attempt(
-            &mut state,
-            ShadowCheckpointMode::Passive,
-            data_version_before,
-        )
-        .await
-        .unwrap();
-        assert!(attempt.completed);
-        assert!(
-            !attempt.dirty,
-            "a heartbeat written on the monitor must not change its own data_version"
-        );
-        assert_eq!(
-            unsafe {
-                state
-                    .data_version_monitor
-                    .as_ref()
-                    .expect("monitor remains open")
-                    .handle()
-            },
-            monitor_handle,
-            "closing a same-inode SQLite monitor after blocker acquisition can release process-scoped POSIX locks"
-        );
-        assert!(
-            state
-                .checkpoint_blocker
-                .as_ref()
-                .is_some_and(|blocker| !blocker.is_autocommit()),
-            "checkpoint returned to the watch loop without a live blocker"
-        );
-        assert!(
-            checkpoint_blocker_heartbeat_is_live(&state).unwrap(),
-            "reused blocker heartbeat must remain pinned"
-        );
-    }
-
-    #[tokio::test]
-    async fn app_commit_after_final_sample_marks_checkpoint_window_dirty() {
-        struct RemoveEnv(&'static str);
-        impl Drop for RemoveEnv {
-            fn drop(&mut self) {
-                unsafe { std::env::remove_var(self.0) };
-            }
-        }
-
-        let (temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let monitor = Connection::open(&db_path).unwrap();
-        let blocker = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
-        let mut state = ShadowDbState {
-            name: "native-dirty-rearm-gap".to_string(),
-            db_path: db_path.clone(),
-            wal_path: db_path.with_extension("db-wal"),
-            current_txid: 0,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(blocker),
-            data_version_monitor: Some(monitor),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
-        let data_version_before = checkpoint_data_version(&state).unwrap();
-        let pause = temp.path().join("checkpoint-rearm-gap.pause");
-        const PAUSE_ENV: &str = "WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE";
-        const PAUSE_DB_ENV: &str = "WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_DB";
-        unsafe { std::env::set_var(PAUSE_ENV, &pause) };
-        unsafe { std::env::set_var(PAUSE_DB_ENV, &db_path) };
-        let _remove_env = RemoveEnv(PAUSE_ENV);
-        let _remove_db_env = RemoveEnv(PAUSE_DB_ENV);
-
-        let writer_db = db_path.clone();
-        let writer_pause = pause.clone();
-        let writer = std::thread::spawn(move || {
-            let result = (|| -> Result<()> {
-                let deadline = std::time::Instant::now() + Duration::from_secs(5);
-                while !writer_pause.exists() {
-                    anyhow::ensure!(
-                        std::time::Instant::now() < deadline,
-                        "checkpoint never reached the post-sample rearm gap"
-                    );
-                    std::thread::sleep(Duration::from_millis(5));
-                }
-                let app = Connection::open(writer_db)?;
-                app.execute(
-                    "INSERT INTO items(value) VALUES ('commit-in-rearm-gap')",
-                    [],
-                )?;
-                let busy: i64 =
-                    app.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| row.get(0))?;
-                anyhow::ensure!(busy == 0, "test commit must cross the unblocked gap");
-                Ok(())
-            })();
-            let _ = std::fs::remove_file(writer_pause);
-            result.unwrap();
-        });
-
-        let attempt = checkpoint_with_state_blocker_attempt(
-            &mut state,
-            ShadowCheckpointMode::Passive,
-            data_version_before,
-        )
-        .await
-        .unwrap();
-        writer.join().unwrap();
-        assert!(attempt.completed);
-        assert!(
-            attempt.dirty,
-            "an app commit checkpointed after the final pre-rearm sample requires a full native re-anchor"
-        );
-        assert!(checkpoint_blocker_heartbeat_is_live(&state).unwrap());
-    }
-
-    #[tokio::test]
-    async fn app_commit_during_quiet_interval_is_admitted_before_checkpoint_release() {
-        struct RemoveEnv(&'static str);
-        impl Drop for RemoveEnv {
-            fn drop(&mut self) {
-                unsafe { std::env::remove_var(self.0) };
-            }
-        }
-
-        let (temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let mut state = ShadowDbState {
-            name: "native-preflight-quiet-commit".to_string(),
-            db_path: db_path.clone(),
-            wal_path: db_path.with_extension("db-wal"),
-            current_txid: 0,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
         let spool_state = test_native_spool_state(&db_path, temp.path());
         stage_native_snapshot(&mut state, &spool_state)
             .await
             .unwrap();
-        let initial_seq = spool_lock(&spool_state.0).unwrap().admitted_seq().unwrap();
 
-        let pause = temp.path().join("checkpoint-quiet.pause");
-        const PAUSE_ENV: &str = "WALRUST_TEST_NATIVE_CHECKPOINT_QUIET_PAUSE_FILE";
-        const PAUSE_DB_ENV: &str = "WALRUST_TEST_NATIVE_CHECKPOINT_QUIET_PAUSE_DB";
-        unsafe { std::env::set_var(PAUSE_ENV, &pause) };
-        unsafe { std::env::set_var(PAUSE_DB_ENV, &db_path) };
-        let _remove_pause_env = RemoveEnv(PAUSE_ENV);
-        let _remove_db_env = RemoveEnv(PAUSE_DB_ENV);
-
-        let writer_db = db_path.clone();
-        let writer_pause = pause.clone();
-        let writer = std::thread::spawn(move || {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while !writer_pause.exists() {
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "checkpoint never entered its quiet interval"
-                );
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let app = Connection::open(writer_db).unwrap();
-            app.execute(
-                "INSERT INTO items(value) VALUES ('commit-in-quiet-interval')",
-                [],
-            )
+        let reader = Connection::open(&db_path).unwrap();
+        reader
+            .execute_batch("BEGIN; SELECT count(*) FROM items;")
             .unwrap();
-            std::fs::remove_file(writer_pause).unwrap();
-        });
+        conn.execute("INSERT INTO items(value) VALUES ('truncate-pinned')", [])
+            .unwrap();
 
+        let started = std::time::Instant::now();
         let attempt = checkpoint_shadow_after_native_admission(
             &mut state,
             &spool_state,
             crate::config::CheckpointRelease::Local,
-            Duration::from_secs(2),
-            ShadowCheckpointMode::Passive,
+            Duration::from_millis(25),
+            ShadowCheckpointMode::Truncate,
         )
         .await
         .unwrap();
-        writer.join().unwrap();
-        assert!(attempt.completed);
-        assert!(
-            !attempt.dirty,
-            "a commit drained while the blocker remains held must not become a dirty-window re-anchor"
-        );
-        let spool = spool_lock(&spool_state.0).unwrap();
-        let admitted_seq = spool.admitted_seq().unwrap();
-        assert!(admitted_seq > initial_seq);
-        assert_eq!(spool.get(admitted_seq).unwrap().kind, ObjectKind::Delta);
+
+        assert!(!attempt.completed);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(spool_lock(&spool_state.0).unwrap().admitted_seq(), Some(2));
         assert!(checkpoint_blocker_heartbeat_is_live(&state).unwrap());
+        reader.execute_batch("ROLLBACK").unwrap();
     }
 
     #[tokio::test]
-    async fn spool_full_refuses_checkpoint_and_keeps_blocker() {
+    async fn spool_full_refuses_checkpoint_and_retains_blocker() {
         let (temp, db_path, conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let mut state = ShadowDbState {
-            name: "native-spool-full".to_string(),
-            db_path: db_path.clone(),
-            wal_path: db_path.with_extension("db-wal"),
-            current_txid: 0,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
+        let mut state = test_state(&db_path).await;
         let initial = test_native_spool_state(&db_path, temp.path());
         stage_native_snapshot(&mut state, &initial).await.unwrap();
         let (root, identity, hard_bytes) = {
@@ -4266,283 +2751,86 @@ mod tests {
             NativeUploader::new(Arc::new(NoRemoteIo), Arc::clone(&spool)).unwrap();
         drop(uploader);
         let spool_state = (spool, wake);
+        conn.execute("INSERT INTO items(value) VALUES ('must-stay-local')", [])
+            .unwrap();
 
-        conn.execute(
-            "INSERT INTO items(value) VALUES ('must-not-checkpoint')",
-            [],
-        )
-        .unwrap();
         let error = checkpoint_shadow_after_native_admission(
             &mut state,
             &spool_state,
             crate::config::CheckpointRelease::Local,
-            Duration::from_millis(50),
+            Duration::from_millis(25),
             ShadowCheckpointMode::Truncate,
         )
         .await
         .unwrap_err();
+
         assert!(format!("{error:#}").contains("local_spool_full"));
-        assert!(
-            state
-                .checkpoint_blocker
-                .as_ref()
-                .is_some_and(|blocker| !blocker.is_autocommit()),
-            "capacity exhaustion must retain the checkpoint blocker"
-        );
         assert_eq!(spool_lock(&spool_state.0).unwrap().admitted_seq(), Some(1));
+        assert!(checkpoint_blocker_heartbeat_is_live(&state).unwrap());
     }
 
     #[tokio::test]
-    async fn test_wal_backpressure_alarms_drains_truncates_and_reacquires_blocker() {
+    async fn direct_native_snapshot_restores_exactly_during_passive_contention() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
         let (temp, db_path, conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        for id in 0..40i64 {
+        for id in 10..1010i64 {
             conn.execute(
-                "INSERT INTO items (value) VALUES (?1)",
-                [format!("backpressure-{id}-{}", "x".repeat(500))],
+                "INSERT INTO items(id, value) VALUES (?1, ?2)",
+                rusqlite::params![id, format!("passive-{id}")],
             )
             .unwrap();
         }
-
-        let wal_path = db_path.with_extension("db-wal");
-        let mut state = ShadowDbState {
-            name: "backpressure-shadow".to_string(),
-            db_path: db_path.clone(),
-            wal_path: wal_path.clone(),
-            current_txid: 0,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
-        let before_pages = live_wal_page_count(&wal_path).await.unwrap();
-        assert!(
-            before_pages > 2,
-            "test must create a meaningfully large WAL"
-        );
-
+        let expected: i64 = conn
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        let mut state = test_state(&db_path).await;
         let spool_state = test_native_spool_state(&db_path, temp.path());
-        stage_native_snapshot(&mut state, &spool_state)
-            .await
-            .unwrap();
-        let (webhook_url, webhook_body) = capture_one_webhook().await;
-        let webhook_sender = Arc::new(WebhookSender::new(vec![WebhookConfig {
-            url: webhook_url,
-            events: vec![WAL_SIZE_EXCEEDED_EVENT.to_string()],
-            secret: None,
-        }]));
+        let running = Arc::new(AtomicBool::new(true));
+        let checkpoint_running = Arc::clone(&running);
+        let checkpoint_db = db_path.clone();
+        let checkpointer = std::thread::spawn(move || {
+            let checkpoint = Connection::open(checkpoint_db).unwrap();
+            while checkpoint_running.load(Ordering::Relaxed) {
+                let _: (i64, i64, i64) = checkpoint
+                    .query_row("PRAGMA wal_checkpoint(PASSIVE)", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+                std::thread::yield_now();
+            }
+        });
 
-        assert!(
-            enforce_native_wal_backpressure(
-                &mut state,
-                before_pages,
-                &spool_state,
-                crate::config::CheckpointRelease::Local,
-                Arc::clone(&webhook_sender),
-                Duration::from_secs(2),
-            )
-            .await
-            .unwrap(),
-            "crossing the threshold must run the native backpressure path"
-        );
+        let staged = stage_native_snapshot(&mut state, &spool_state).await;
+        running.store(false, Ordering::Relaxed);
+        checkpointer.join().unwrap();
+        staged.unwrap();
 
-        let payload: serde_json::Value = serde_json::from_str(
-            &tokio::time::timeout(Duration::from_secs(2), webhook_body)
-                .await
-                .unwrap()
+        let payload = spool_lock(&spool_state.0).unwrap().read_payload(1).unwrap();
+        let restored_path = temp.path().join("restored.db");
+        walrust_core::ltx::decode_to_db(&payload, &restored_path).unwrap();
+        let restored = Connection::open(restored_path).unwrap();
+        assert_eq!(
+            restored
+                .query_row("SELECT count(*) FROM items", [], |row| row.get::<_, i64>(0))
                 .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(payload["event"], WAL_SIZE_EXCEEDED_EVENT);
-        assert_eq!(payload["database"], state.name);
-        assert_eq!(payload["context"]["wal_pages"], before_pages);
-        assert_eq!(payload["context"]["threshold_pages"], before_pages);
-
-        let after_pages = live_wal_page_count(&wal_path).await.unwrap();
-        assert!(
-            after_pages < before_pages,
-            "controlled TRUNCATE must shrink the WAL (before={before_pages}, after={after_pages})"
-        );
-        conn.execute_batch("PRAGMA busy_timeout=0;").unwrap();
-        let busy: i64 = conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
-            .unwrap();
-        assert_eq!(
-            busy, 1,
-            "native backpressure checkpoint must reacquire the blocker before returning"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_shadow_checkpoint_refuses_pending_cache_upload() {
-        let (_temp, db_path, _conn) = create_real_wal_db();
-        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
-            .await
-            .unwrap();
-        let wal_path = db_path.with_extension("db-wal");
-        let mut state = ShadowDbState {
-            name: "checkpoint_shadow_pending".to_string(),
-            db_path: db_path.clone(),
-            wal_path,
-            current_txid: 0,
-            last_snapshot: None,
-            db_checksum: None,
-            shadow,
-            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
-            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
-            source_db_file: test_source_db_file(&db_path),
-            shadow_sync_generation: 0,
-            shadow_sync_offset: 0,
-            wal_copy_offset: 0,
-        };
-
-        let cache = Arc::new(LocalCache::new(&db_path).unwrap());
-        let (upload_tx, _upload_rx) = mpsc::channel(10);
-        let cache_state = (Arc::clone(&cache), upload_tx);
-
-        let err = checkpoint_shadow_after_durable_sync(
-            &mut state,
-            Some(&cache_state),
-            None,
-            &RetryPolicy::new(RetryConfig::default()),
-            Arc::new(WebhookSender::new(vec![])),
-            Duration::from_millis(100),
-            ShadowCheckpointMode::Passive,
-        )
-        .await
-        .expect_err("checkpoint must fail closed while cache uploads are pending")
-        .to_string();
-
-        assert!(
-            err.contains("durable upload confirmation timed out"),
-            "expected durability timeout, got {err}"
-        );
-        assert!(
-            !cache.pending_uploads().is_empty(),
-            "test must leave an unconfirmed cache upload pending"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_initial_shadow_copy_detects_downtime_checkpoint() {
-        // D3: if the live WAL salt changed while walrust was down, the initial
-        // copy must flag the database for an eager snapshot.
-        let (_temp, db_path, conn) = create_real_wal_db();
-
-        // First "process": copy WAL frames and remember the salt/offset.
-        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
-        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
-        assert!(!frames.is_empty(), "pre-restart copy must read frames");
-        let saved_salt = shadow.wal_read_salt();
-        let saved_chain = shadow.wal_read_chain();
-        drop(shadow);
-
-        // External checkpoint while walrust is down resets the WAL and changes salt.
-        let _: (i64, i64, i64) = conn
-            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-            })
-            .unwrap();
-        conn.execute("INSERT INTO items (value) VALUES ('post-ckpt')", [])
-            .unwrap();
-
-        // Second "process": restart with the persisted cursor.
-        let restarted = ShadowWal::new(&db_path).await.unwrap();
-        let mut shadow = restarted;
-        shadow.restore_read_cursor(saved_salt, saved_chain);
-
-        let mut db_states = HashMap::new();
-        db_states.insert(
-            db_path.clone(),
-            ShadowDbState {
-                name: "downtime-ckpt".to_string(),
-                db_path: db_path.clone(),
-                wal_path: db_path.with_extension("db-wal"),
-                current_txid: 0,
-                last_snapshot: None,
-                db_checksum: None,
-                shadow,
-                checkpoint_blocker: None,
-                data_version_monitor: None,
-                source_db_file: None,
-                shadow_sync_generation: 0,
-                shadow_sync_offset: 0,
-                wal_copy_offset: offset,
-            },
-        );
-
-        let eager = initial_shadow_copy(&mut db_states).await.unwrap();
-        assert!(
-            eager.contains(&db_path),
-            "initial copy must flag a downtime-checkpointed DB for eager snapshot"
-        );
-        assert!(
-            db_states[&db_path].shadow.generation() > 0,
-            "shadow generation must advance after salt mismatch"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_initial_shadow_copy_no_eager_snapshot_without_downtime_checkpoint() {
-        // D3 (negative): if the live WAL salt did NOT change while walrust was
-        // down (no external checkpoint), the initial copy must NOT flag the
-        // database for an eager snapshot. Eager snapshots fire ONLY on mismatch.
-        let (_temp, db_path, conn) = create_real_wal_db();
-
-        // First "process": copy WAL frames and remember the salt/offset.
-        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
-        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
-        assert!(!frames.is_empty(), "pre-restart copy must read frames");
-        let saved_salt = shadow.wal_read_salt();
-        let saved_chain = shadow.wal_read_chain();
-        drop(shadow);
-
-        // Normal writes while walrust is "down" — appended to the SAME WAL, no
-        // checkpoint, so the salt is unchanged.
-        conn.execute("INSERT INTO items (value) VALUES ('delta')", [])
-            .unwrap();
-
-        // Second "process": restart with the persisted cursor.
-        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
-        shadow.restore_read_cursor(saved_salt, saved_chain);
-        let generation_before = shadow.generation();
-
-        let mut db_states = HashMap::new();
-        db_states.insert(
-            db_path.clone(),
-            ShadowDbState {
-                name: "no-downtime-ckpt".to_string(),
-                db_path: db_path.clone(),
-                wal_path: db_path.with_extension("db-wal"),
-                current_txid: 0,
-                last_snapshot: None,
-                db_checksum: None,
-                shadow,
-                checkpoint_blocker: None,
-                data_version_monitor: None,
-                source_db_file: None,
-                shadow_sync_generation: 0,
-                shadow_sync_offset: 0,
-                wal_copy_offset: offset,
-            },
-        );
-
-        let eager = initial_shadow_copy(&mut db_states).await.unwrap();
-        assert!(
-            !eager.contains(&db_path),
-            "no salt mismatch means no eager snapshot must be scheduled"
+            expected
         );
         assert_eq!(
-            db_states[&db_path].shadow.generation(),
-            generation_before,
-            "shadow generation must not advance without a downtime checkpoint"
+            restored
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
         );
+    }
+
+    #[test]
+    fn descriptor_absence_rejects_orphan_native_namespace_keys() {
+        classify_descriptor_absent_native_keys(
+            "db",
+            &["p/db/native/v1/lineages/orphan/0001/0000000000000001.hadbp".into()],
+        )
+        .expect_err("orphan native key must prevent fresh-lineage classification");
+        classify_descriptor_absent_native_keys("db", &[]).unwrap();
     }
 }

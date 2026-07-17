@@ -12,7 +12,7 @@ walrust replicate s3://my-bucket/mydb --local replica.db --interval 5s
 ```
 
 This:
-1. Checks S3 for the latest LTX files
+1. Checks S3 for the latest contiguous native HADBP publication
 2. Downloads and applies any new changes
 3. Waits 5 seconds
 4. Repeats forever
@@ -26,7 +26,7 @@ This:
 └──────────┘          └─────┘          └─────────┘
 ```
 
-The replica never talks to the primary. It just watches S3 for new LTX files. This means:
+The replica never talks to the primary. It watches S3 for published native HADBP changes. This means:
 - Primary and replica can be in different regions
 - Primary going down doesn't affect the replica
 - You can have replicas anywhere with S3 access
@@ -38,8 +38,8 @@ If the local database doesn't exist, walrust bootstraps it from the latest snaps
 ```
 $ walrust replicate s3://my-bucket/mydb --local replica.db --interval 5s
 Bootstrapping from snapshot...
-Downloaded 00000001-00000001.ltx (2.3 MB)
-Applied 1024 pages, TXID 1
+Downloaded native snapshot sequence 1 (2.3 MB)
+Applied 1024 pages, sequence 1
 Polling for updates...
 ```
 
@@ -70,7 +70,9 @@ Choose based on your freshness needs and S3 budget.
 
 ## Gap Detection
 
-If the replica falls too far behind (missing LTX files), walrust detects the gap and re-bootstraps from the latest snapshot automatically. You don't need to babysit it.
+If retention has removed the replica's next required sequence, walrust detects
+the gap and re-bootstraps from the latest published snapshot. A raw uploaded
+object beyond a publication gap is never applied.
 
 ## Use Cases
 

@@ -15,7 +15,7 @@ use hadb_storage::{CasResult, StorageBackend};
 
 use walrust_core::compaction::{
     layout::CompactionLayout, run_level_compaction, CompactionError, CompactionOutcome, LayoutFile,
-    Level, RangeLayout, SeqLayout, SeqRange,
+    Level, SeqLayout, SeqRange,
 };
 
 // ── Minimal in-memory backend (correct range_get via default slice) ─────────
@@ -108,15 +108,6 @@ async fn put_l0_seq(store: &MemStore, prefix: &str, db: &str, cs: &PhysicalChang
     store.put(&key, &physical::encode(cs)).await.unwrap();
 }
 
-/// Put an L0 range-layout object (`{prefix}{db}/0000/{min:016x}-{max:016x}.ltx`).
-async fn put_l0_range(store: &MemStore, prefix: &str, db: &str, cs: &PhysicalChangeset) {
-    let s = cs.header.seq;
-    let key = format!("{prefix}{db}/0000/{:016x}-{:016x}.ltx", s, s);
-    store.put(&key, &physical::encode(cs)).await.unwrap();
-}
-
-/// A contiguous chain of `n` L0 changesets starting at seq `start`, each
-/// touching page `(seq % width)` plus overlapping page 0. Returns the chain.
 fn make_chain(start: u64, n: u64, prev0: u64) -> Vec<PhysicalChangeset> {
     let mut out = Vec::new();
     let mut prev = prev0;
@@ -240,24 +231,6 @@ async fn engine_e2e_seq_layout() {
         put_l0_seq(&store, "p/", "db", c).await;
     }
     let layout = SeqLayout::new(store.clone(), "p/", "db");
-    run_e2e_for(
-        store.clone(),
-        layout,
-        "p/db/0000/",
-        "p/db/levels/L1/",
-        &chain,
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn engine_e2e_range_layout() {
-    let store = MemStore::new();
-    let chain = make_chain(1, 6, 0);
-    for c in &chain {
-        put_l0_range(&store, "p/", "db", c).await;
-    }
-    let layout = RangeLayout::new(store.clone(), "p/", "db");
     run_e2e_for(
         store.clone(),
         layout,
@@ -501,76 +474,6 @@ async fn cascade_l0_to_l1_to_l2() {
     let via_sources = apply_all(&chain, 0);
     let via_l2 = apply_one(&merged, 0);
     assert_eq!(via_sources, via_l2, "cross-level merge preserves DB bytes");
-}
-
-// ── Collision proof: compaction levels vs legacy snapshot generations ────────
-
-/// The headline of this review. In the litestream-heritage layout, snapshots
-/// increment the generation folder by one per snapshot (`snapshot_gen =
-/// current_gen + 1`), so the 16th snapshot lands in `0010/` — the folder an
-/// earlier design reserved for compaction L1. This test pins the redesign:
-/// compaction levels live under a dedicated `levels/L{n}/` sub-path that legacy
-/// discovery cannot see, and compaction listing cannot see legacy snapshots.
-#[tokio::test]
-async fn compaction_levels_do_not_collide_with_legacy_snapshot_generations() {
-    use walrust_core::compaction::layout::CompactionLayout;
-    use walrust_core::legacy_manifest::{
-        build_ltx_key, discover_all_legacy_ltx, discover_legacy_state,
-    };
-
-    let store = MemStore::new();
-
-    // A real legacy LTX snapshot in generation 0x0010 — the 16th snapshot of a
-    // long-lived database. This is the folder the OLD compaction scheme
-    // reserved for L1.
-    let snap16 = build_ltx_key("", "db", 0x10, 1, 100);
-    store.put(&snap16, b"a-real-ltx-snapshot").await.unwrap();
-
-    // Seed L0 range-layout sources and run an L0→L1 compaction.
-    let chain = make_chain(1, 6, 0);
-    for c in &chain {
-        put_l0_range(&store, "", "db", c).await;
-    }
-    let layout = RangeLayout::new(store.clone(), "", "db");
-
-    // Compaction's L1 listing must NOT pick up the legacy snapshot in gen 0x0010.
-    assert!(
-        layout.list_level(1).await.unwrap().is_empty(),
-        "compaction L1 listing must not ingest the legacy snapshot at gen 0x0010"
-    );
-
-    let outcome = run_level_compaction(&layout, 0, chain.len(), Duration::from_secs(0), NOW)
-        .await
-        .unwrap();
-    assert_eq!(outcome.merged_count(), chain.len());
-
-    // The merged L1 object lives under levels/, and gen 0x0010 still holds ONLY
-    // the legacy snapshot (compaction wrote nothing there).
-    assert_eq!(
-        store.list("db/levels/L1/", None).await.unwrap().len(),
-        1,
-        "L1 merged object must live under db/levels/L1/"
-    );
-    assert_eq!(
-        store.list("db/0010/", None).await.unwrap(),
-        vec![snap16.clone()],
-        "db/0010/ must contain only the legacy snapshot, never compaction output"
-    );
-
-    // Legacy discovery is blind to compaction levels: the `levels/` dir does not
-    // register as a generation, and no compaction object is surfaced as a legacy
-    // LTX/snapshot.
-    let (_txid, max_gen) = discover_legacy_state(&*store, "", "db").await.unwrap();
-    assert_eq!(
-        max_gen, 0x10,
-        "the levels/ sub-path must not register as a generation"
-    );
-    let all = discover_all_legacy_ltx(&*store, "", "db").await.unwrap();
-    assert!(
-        all.iter().all(|f| !f.key.contains("levels/")),
-        "legacy discovery must never surface a compaction level object: {:?}",
-        all.iter().map(|f| f.key.clone()).collect::<Vec<_>>()
-    );
 }
 
 // ── Convergence is exact-range only: a partial overlap is a loud error ───────

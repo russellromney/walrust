@@ -1,8 +1,6 @@
 //! Durable local-first spool for native HADBP CLI shadow-watch streams.
 //!
-//! This is deliberately independent of `legacy_cache::LocalCache`: that cache
-//! stores Litestream-heritage LTX bytes and keys objects by legacy TXID.  A
-//! native spool entry is an immutable HADBP payload plus a journal record that
+//! A native spool entry is an immutable HADBP payload plus a journal record that
 //! binds its source cursor, lineage, destination, checksums, and remote key.
 
 use crate::ltx;
@@ -81,15 +79,13 @@ impl SourceCursor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpoolIdentity {
     pub version: u32,
+    pub hadbp_format_version: u8,
     pub canonical_db_path: String,
     pub bucket: String,
     pub prefix: String,
     pub database: String,
     pub lineage_id: String,
     pub first_native_seq: u64,
-    pub legacy_boundary_txid: Option<u64>,
-    /// True only after startup successfully verified the remote base/absence.
-    pub remote_base_verified: bool,
 }
 
 impl SpoolIdentity {
@@ -100,27 +96,25 @@ impl SpoolIdentity {
         database: impl Into<String>,
         lineage_id: impl Into<String>,
         first_native_seq: u64,
-        legacy_boundary_txid: Option<u64>,
-        remote_base_verified: bool,
     ) -> Result<Self> {
         let canonical = fs::canonicalize(db_path)
             .with_context(|| format!("canonicalize spool database path {}", db_path.display()))?;
         Ok(Self {
             version: SPOOL_VERSION,
+            hadbp_format_version: ltx::HADBP_FORMAT_VERSION,
             canonical_db_path: canonical.to_string_lossy().into_owned(),
             bucket: bucket.into(),
             prefix: prefix.into(),
             database: database.into(),
             lineage_id: lineage_id.into(),
             first_native_seq,
-            legacy_boundary_txid,
-            remote_base_verified,
         })
     }
 
     pub fn stream_digest(&self) -> String {
         let mut h = Sha256::new();
         h.update(self.version.to_be_bytes());
+        h.update([self.hadbp_format_version]);
         for value in [
             self.bucket.as_str(),
             self.prefix.as_str(),
@@ -131,17 +125,6 @@ impl SpoolIdentity {
             h.update(value.as_bytes());
         }
         h.update(self.first_native_seq.to_be_bytes());
-        h.update(self.legacy_boundary_txid.unwrap_or(0).to_be_bytes());
-        hex_digest(h.finalize().as_slice())
-    }
-
-    fn legacy_local_path_digest(&self) -> String {
-        let mut h = Sha256::new();
-        h.update(b"walrust-native-spool-path-v1");
-        h.update(self.canonical_db_path.as_bytes());
-        h.update(self.bucket.as_bytes());
-        h.update(self.prefix.as_bytes());
-        h.update(self.database.as_bytes());
         hex_digest(h.finalize().as_slice())
     }
 
@@ -272,17 +255,6 @@ pub enum CheckpointWindow {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct JournalV1 {
-    version: u32,
-    identity: SpoolIdentity,
-    objects: BTreeMap<u64, SpoolObject>,
-    local_base_seq: u64,
-    admitted_seq: Option<u64>,
-    checkpointed_seq: Option<u64>,
-    remote_published_seq: Option<u64>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryHead {
     pub seq: u64,
@@ -300,11 +272,6 @@ struct InstallIntent {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SnapshotIntentState {
     Creating,
-    /// Compatibility-only state written by pre-direct-snapshot PR #43 builds.
-    Stable {
-        payload_length: u64,
-        sha256: String,
-    },
     Admitted,
 }
 
@@ -317,12 +284,9 @@ pub struct SnapshotIntent {
     pub intended_remote_key: String,
     pub source_cursor: SourceCursor,
     pub page_size: u32,
-    #[serde(
-        default,
-        skip_serializing_if = "Option::is_none",
-        alias = "stable_file_name"
-    )]
-    pub legacy_stable_file_name: Option<String>,
+    pub expected_end_page_count: u64,
+    pub expected_ending_chain_checksum: u64,
+    pub expected_page_image_sha256: String,
     pub state: SnapshotIntentState,
 }
 
@@ -333,13 +297,15 @@ pub struct SnapshotPreparation {
     pub intended_remote_key: String,
     pub source_cursor: SourceCursor,
     pub page_size: u32,
+    pub expected_end_page_count: u64,
+    pub expected_ending_chain_checksum: u64,
+    pub expected_page_image_sha256: String,
 }
 
 pub struct NativeSpool {
     root: PathBuf,
     objects_dir: PathBuf,
     intents_dir: PathBuf,
-    snapshots_dir: PathBuf,
     journal_path: PathBuf,
     snapshot_intent_path: PathBuf,
     journal: Journal,
@@ -360,36 +326,8 @@ impl NativeSpool {
         base.join("native-v1").join(identity.local_path_digest())
     }
 
-    /// Resolve the collision-safe v2 path, falling back to the original v1
-    /// path only when it already exists. This keeps PR-created local spools
-    /// restartable while all new streams use the unambiguous encoding.
     pub fn resolve_path_for(base: &Path, identity: &SpoolIdentity) -> Result<PathBuf> {
-        let current = Self::path_for(base, identity);
-        let legacy = base
-            .join("native-v1")
-            .join(identity.legacy_local_path_digest());
-        let legacy_matches = if legacy.exists() {
-            Self::read_identity(&legacy)?.is_some_and(|stored| {
-                stored.canonical_db_path == identity.canonical_db_path
-                    && stored.bucket == identity.bucket
-                    && stored.prefix == identity.prefix
-                    && stored.database == identity.database
-            })
-        } else {
-            false
-        };
-        if current.exists() && legacy_matches {
-            bail!(
-                "both v1 and v2 native spool paths exist for the same stream: {} and {}",
-                legacy.display(),
-                current.display()
-            );
-        }
-        Ok(if current.exists() || !legacy_matches {
-            current
-        } else {
-            legacy
-        })
+        Ok(Self::path_for(base, identity))
     }
 
     pub fn read_identity(root: &Path) -> Result<Option<SpoolIdentity>> {
@@ -408,6 +346,7 @@ impl NativeSpool {
             serde_json::from_slice(&bytes).with_context(|| format!("parse {}", path.display()))?;
         if !matches!(journal.version, SPOOL_VERSION | JOURNAL_VERSION)
             || journal.identity.version != SPOOL_VERSION
+            || journal.identity.hadbp_format_version != ltx::HADBP_FORMAT_VERSION
         {
             bail!(
                 "unsupported native spool journal/identity version at {}",
@@ -427,7 +366,7 @@ impl NativeSpool {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        let (journal, _) = load_journal(&bytes, &path)?;
+        let journal = load_journal(&bytes, &path)?;
         if &journal.identity != expected_identity {
             bail!("native spool identity mismatch while validating local base");
         }
@@ -474,15 +413,53 @@ impl NativeSpool {
         Ok(true)
     }
 
+    /// Return true only when the durable local journal proves that a complete
+    /// snapshot base was contiguously published remotely. This is the offline
+    /// ownership gate: a merely admitted local snapshot is locally restorable,
+    /// but it is not authority to continue a remote lineage during an outage.
+    pub fn validate_existing_published_base(
+        root: &Path,
+        expected_identity: &SpoolIdentity,
+    ) -> Result<bool> {
+        let path = root.join("journal.json");
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        let journal = load_journal(&bytes, &path)?;
+        if &journal.identity != expected_identity {
+            bail!("native spool identity mismatch while validating published base");
+        }
+        let Some(published_seq) = journal.remote_published_seq else {
+            return Ok(false);
+        };
+        let Some(base) = journal.objects.values().rev().find(|object| {
+            object.seq <= published_seq
+                && object.kind == ObjectKind::Snapshot
+                && object.local_creation_state == LocalCreationState::Installed
+                && object.remote_upload_state == RemoteUploadState::Published
+        }) else {
+            return Ok(false);
+        };
+        let payload = fs::read(root.join("objects").join(base.payload_file_name()))
+            .with_context(|| format!("read published native snapshot base seq {}", base.seq))?;
+        validate_payload(base, &payload, &std::env::temp_dir())?;
+        Ok(true)
+    }
+
     pub fn create_or_open(
         root: &Path,
         identity: SpoolIdentity,
         capacity: CapacityPolicy,
     ) -> Result<Self> {
-        if identity.version != SPOOL_VERSION {
+        if identity.version != SPOOL_VERSION
+            || identity.hadbp_format_version != ltx::HADBP_FORMAT_VERSION
+        {
             bail!(
-                "unsupported native spool identity version {}",
-                identity.version
+                "unsupported native spool identity/format version {}/{}",
+                identity.version,
+                identity.hadbp_format_version
             );
         }
         if capacity.warning_bytes > capacity.hard_bytes {
@@ -494,23 +471,21 @@ impl NativeSpool {
         let owner_lock = acquire_owner_lock(root)?;
         let objects_dir = root.join("objects");
         let intents_dir = root.join("intents");
-        let snapshots_dir = root.join("snapshots");
         fs::create_dir_all(&objects_dir)?;
         fs::create_dir_all(&intents_dir)?;
-        fs::create_dir_all(&snapshots_dir)?;
         sync_dir(root)?;
 
         let journal_path = root.join("journal.json");
-        let (journal, migrated) = match fs::read(&journal_path) {
+        let journal = match fs::read(&journal_path) {
             Ok(bytes) => {
-                let (journal, migrated) = load_journal(&bytes, &journal_path)?;
+                let journal = load_journal(&bytes, &journal_path)?;
                 if journal.identity != identity {
                     bail!(
                         "native spool identity mismatch at {}; refusing cross-stream reuse",
                         root.display()
                     );
                 }
-                (journal, migrated)
+                journal
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let local_base_seq = identity.first_native_seq;
@@ -526,7 +501,7 @@ impl NativeSpool {
                     checkpoint_window: CheckpointWindow::Closed,
                 };
                 persist_json(root, &journal_path, &journal)?;
-                (journal, false)
+                journal
             }
             Err(e) => return Err(e).context("read native spool journal"),
         };
@@ -535,7 +510,6 @@ impl NativeSpool {
             root: root.to_path_buf(),
             objects_dir,
             intents_dir,
-            snapshots_dir,
             journal_path,
             snapshot_intent_path: root.join("snapshot-intent.json"),
             journal,
@@ -544,14 +518,10 @@ impl NativeSpool {
             last_capacity_state: Cell::new(CapacityState::Healthy),
             _owner_lock: owner_lock,
         };
-        if migrated {
-            spool.persist_journal()?;
-        }
         spool.complete_interrupted_cleanup()?;
         spool.verify_journal_payloads()?;
         spool.reconcile_orphans()?;
         spool.reconcile_snapshot_intent()?;
-        spool.cleanup_unbound_snapshot_temporaries()?;
         Ok(spool)
     }
 
@@ -649,7 +619,22 @@ impl NativeSpool {
         intended_remote_key: String,
         source_cursor: SourceCursor,
         page_size: u32,
+        expected_end_page_count: u64,
+        expected_ending_chain_checksum: u64,
+        expected_page_image_sha256: String,
     ) -> Result<SnapshotPreparation> {
+        if expected_end_page_count == 0
+            || expected_page_image_sha256.len() != 64
+            || !expected_page_image_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("native snapshot source proof is malformed");
+        }
+        let expected_prefix = decoded_snapshot_digest_prefix(&expected_page_image_sha256)?;
+        if u64::from_be_bytes(expected_prefix) != expected_ending_chain_checksum {
+            bail!("native snapshot source checksum differs from its SHA-256 proof");
+        }
         let proposed = SnapshotIntent {
             version: SPOOL_VERSION,
             stream_digest: self.journal.identity.stream_digest(),
@@ -658,7 +643,9 @@ impl NativeSpool {
             intended_remote_key,
             source_cursor,
             page_size,
-            legacy_stable_file_name: None,
+            expected_end_page_count,
+            expected_ending_chain_checksum,
+            expected_page_image_sha256,
             state: SnapshotIntentState::Creating,
         };
         let intent = match self.read_snapshot_intent()? {
@@ -692,6 +679,9 @@ impl NativeSpool {
             intended_remote_key: intent.intended_remote_key,
             source_cursor: intent.source_cursor,
             page_size: intent.page_size,
+            expected_end_page_count: intent.expected_end_page_count,
+            expected_ending_chain_checksum: intent.expected_ending_chain_checksum,
+            expected_page_image_sha256: intent.expected_page_image_sha256,
         })
     }
 
@@ -714,14 +704,15 @@ impl NativeSpool {
             || object.source_cursor != intent.source_cursor
             || object.previous_chain_checksum != intent.previous_chain_checksum
             || object.intended_remote_key != intent.intended_remote_key
+            || object.end_page_count != intent.expected_end_page_count
+            || object.ending_chain_checksum != intent.expected_ending_chain_checksum
         {
             bail!("admitted native snapshot seq {seq} differs from its durable intent");
         }
+        let payload = fs::read(self.payload_path(object))?;
+        validate_snapshot_source_intent(object, &payload, &intent)?;
         intent.state = SnapshotIntentState::Admitted;
         persist_json(&self.root, &self.snapshot_intent_path, &intent)?;
-        if let Some(path) = self.legacy_snapshot_stable_path(&intent)? {
-            remove_and_sync(&path, &self.snapshots_dir)?;
-        }
         remove_and_sync(&self.snapshot_intent_path, &self.root)
     }
 
@@ -915,7 +906,9 @@ impl NativeSpool {
         let additional_peak = (if prepared_temp_exists {
             0
         } else {
-            (stage.payload.len() as u64).saturating_mul(2)
+            // install_payload writes one temporary and atomically renames that
+            // inode; temporary and final payload bytes never coexist.
+            stage.payload.len() as u64
         })
         .saturating_add(intent_bytes)
         .saturating_add(journal_bytes);
@@ -1197,13 +1190,28 @@ impl NativeSpool {
     }
 
     pub fn capacity_state(&self, additional_peak_bytes: u64) -> Result<CapacityState> {
+        self.capacity_state_with_external(0, additional_peak_bytes)
+    }
+
+    /// Include live WAL/shadow bytes outside the spool root in the hard quota,
+    /// but do not subtract those already-existing bytes from filesystem free
+    /// space a second time.
+    pub fn capacity_state_with_external(
+        &self,
+        external_used_bytes: u64,
+        additional_peak_bytes: u64,
+    ) -> Result<CapacityState> {
         let used = self.used_bytes()?;
         let free = self.free_bytes()?;
-        let state = if used.saturating_add(additional_peak_bytes) > self.capacity.hard_bytes
+        let accounted_used = used.saturating_add(external_used_bytes);
+        let state = if accounted_used.saturating_add(additional_peak_bytes)
+            > self.capacity.hard_bytes
             || free.saturating_sub(additional_peak_bytes) < self.capacity.minimum_free_bytes
         {
             CapacityState::Full
-        } else if used.saturating_add(additional_peak_bytes) >= self.capacity.warning_bytes {
+        } else if accounted_used.saturating_add(additional_peak_bytes)
+            >= self.capacity.warning_bytes
+        {
             CapacityState::High
         } else {
             CapacityState::Healthy
@@ -1680,17 +1688,18 @@ impl NativeSpool {
                 || object.source_cursor != intent.source_cursor
                 || object.previous_chain_checksum != intent.previous_chain_checksum
                 || object.intended_remote_key != intent.intended_remote_key
+                || object.end_page_count != intent.expected_end_page_count
+                || object.ending_chain_checksum != intent.expected_ending_chain_checksum
             {
                 bail!(
                     "admitted native seq {} diverges from interrupted snapshot intent",
                     intent.seq
                 );
             }
+            let payload = fs::read(self.payload_path(object))?;
+            validate_snapshot_source_intent(object, &payload, &intent)?;
             intent.state = SnapshotIntentState::Admitted;
             persist_json(&self.root, &self.snapshot_intent_path, &intent)?;
-            if let Some(path) = self.legacy_snapshot_stable_path(&intent)? {
-                remove_and_sync(&path, &self.snapshots_dir)?;
-            }
             return remove_and_sync(&self.snapshot_intent_path, &self.root);
         }
         match &intent.state {
@@ -1731,8 +1740,19 @@ impl NativeSpool {
                         intent.seq
                     );
                 }
-                let (ending_chain_checksum, end_page_count) =
-                    ltx::snapshot_checksum_and_page_count(&decoded)?;
+                let (page_digest, end_page_count) = ltx::snapshot_page_image_sha256(&decoded)?;
+                let ending_chain_checksum =
+                    u64::from_be_bytes(page_digest[0..8].try_into().expect("sha256 is 32 bytes"));
+                let page_digest = hex_digest(&page_digest);
+                if end_page_count != intent.expected_end_page_count
+                    || ending_chain_checksum != intent.expected_ending_chain_checksum
+                    || page_digest != intent.expected_page_image_sha256
+                {
+                    bail!(
+                        "valid native snapshot temporary diverges from durable source content at seq {}; retaining it",
+                        intent.seq
+                    );
+                }
                 self.stage(StageObject {
                     seq: intent.seq,
                     kind: ObjectKind::Snapshot,
@@ -1745,40 +1765,6 @@ impl NativeSpool {
                 })?;
                 self.finish_snapshot(intent.seq)
             }
-            SnapshotIntentState::Stable {
-                payload_length,
-                sha256,
-            } => {
-                let path = self.legacy_snapshot_stable_path(&intent)?.ok_or_else(|| {
-                    anyhow!("legacy stable snapshot intent is missing its filename")
-                })?;
-                let bytes = fs::read(&path)
-                    .with_context(|| format!("read legacy stable snapshot {}", path.display()))?;
-                if bytes.len() as u64 != *payload_length || sha256_hex(&bytes) != *sha256 {
-                    bail!(
-                        "legacy stable snapshot intent failed length/digest validation at seq {}",
-                        intent.seq
-                    );
-                }
-                let encoded = ltx::encode_snapshot_with_checksum(
-                    &path,
-                    intent.page_size,
-                    intent.seq,
-                    intent.previous_chain_checksum,
-                )?;
-                let pages = bytes.len() as u64 / intent.page_size as u64;
-                self.stage(StageObject {
-                    seq: intent.seq,
-                    kind: ObjectKind::Snapshot,
-                    previous_chain_checksum: intent.previous_chain_checksum,
-                    ending_chain_checksum: encoded.checksum,
-                    end_page_count: pages,
-                    intended_remote_key: intent.intended_remote_key.clone(),
-                    source_cursor: intent.source_cursor.clone(),
-                    payload: &encoded.bytes,
-                })?;
-                self.finish_snapshot(intent.seq)
-            }
             SnapshotIntentState::Admitted => {
                 bail!(
                     "native snapshot intent says seq {} was admitted but the journal object is missing",
@@ -1786,62 +1772,6 @@ impl NativeSpool {
                 );
             }
         }
-    }
-
-    fn legacy_snapshot_stable_path(&self, intent: &SnapshotIntent) -> Result<Option<PathBuf>> {
-        let Some(file_name) = &intent.legacy_stable_file_name else {
-            return Ok(None);
-        };
-        let name = Path::new(file_name);
-        if name.components().count() != 1
-            || name.file_name().and_then(|value| value.to_str()) != Some(file_name.as_str())
-        {
-            bail!("legacy native snapshot intent contains an unsafe stable filename");
-        }
-        Ok(Some(self.snapshots_dir.join(name)))
-    }
-
-    fn cleanup_unbound_snapshot_temporaries(&self) -> Result<()> {
-        for entry in fs::read_dir(&self.snapshots_dir)? {
-            let path = entry?.path();
-            if !path.is_file() {
-                continue;
-            }
-            tracing::error!(
-                path = %path.display(),
-                "removing obsolete native SQLite stable-copy artifact; snapshots encode directly to HADBP"
-            );
-            remove_and_sync(&path, &self.snapshots_dir)?;
-        }
-        // Recover pre-intent PR #43 snapshot files before capacity accounting.
-        for entry in fs::read_dir(&self.root)? {
-            let path = entry?.path();
-            let Some(name) = path.file_name().and_then(|value| value.to_str()) else {
-                continue;
-            };
-            if name.starts_with(".snapshot-") && name.ends_with(".db.tmp") && path.is_file() {
-                tracing::error!(
-                    path = %path.display(),
-                    "removing legacy unbound snapshot temporary before spool capacity accounting"
-                );
-                remove_and_sync(&path, &self.root)?;
-            }
-        }
-        for entry in fs::read_dir(&self.objects_dir)? {
-            let path = entry?.path();
-            if path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .is_some_and(|name| name.starts_with("0001-") && name.ends_with(".hadbp.tmp"))
-            {
-                tracing::error!(
-                    path = %path.display(),
-                    "removing unadmitted native snapshot payload temporary after restart"
-                );
-                remove_and_sync(&path, &self.objects_dir)?;
-            }
-        }
-        Ok(())
     }
 
     fn intent_path(&self, seq: u64) -> PathBuf {
@@ -1861,6 +1791,41 @@ fn same_snapshot_identity(a: &SnapshotIntent, b: &SnapshotIntent) -> bool {
         && a.intended_remote_key == b.intended_remote_key
         && a.source_cursor == b.source_cursor
         && a.page_size == b.page_size
+        && a.expected_end_page_count == b.expected_end_page_count
+        && a.expected_ending_chain_checksum == b.expected_ending_chain_checksum
+        && a.expected_page_image_sha256 == b.expected_page_image_sha256
+}
+
+fn decoded_snapshot_digest_prefix(hex: &str) -> Result<[u8; 8]> {
+    if hex.len() != 64 {
+        bail!("native snapshot source digest is not SHA-256");
+    }
+    let mut prefix = [0u8; 8];
+    for (index, byte) in prefix.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16)
+            .context("decode native snapshot source digest")?;
+    }
+    Ok(prefix)
+}
+
+fn validate_snapshot_source_intent(
+    object: &SpoolObject,
+    payload: &[u8],
+    intent: &SnapshotIntent,
+) -> Result<()> {
+    let decoded = ltx::decode_sqlite_changeset(payload)?;
+    let (digest, page_count) = ltx::snapshot_page_image_sha256(&decoded)?;
+    if object.end_page_count != intent.expected_end_page_count
+        || object.ending_chain_checksum != intent.expected_ending_chain_checksum
+        || page_count != intent.expected_end_page_count
+        || hex_digest(&digest) != intent.expected_page_image_sha256
+    {
+        bail!(
+            "native snapshot seq {} diverges from its durable source-content intent",
+            intent.seq
+        );
+    }
+    Ok(())
 }
 
 fn validate_source_cursor_successor(previous: &SourceCursor, next: &SourceCursor) -> Result<()> {
@@ -1879,7 +1844,7 @@ fn validate_source_cursor_successor(previous: &SourceCursor, next: &SourceCursor
     Ok(())
 }
 
-fn load_journal(bytes: &[u8], path: &Path) -> Result<(Journal, bool)> {
+fn load_journal(bytes: &[u8], path: &Path) -> Result<Journal> {
     #[derive(Deserialize)]
     struct VersionEnvelope {
         version: u32,
@@ -1887,47 +1852,10 @@ fn load_journal(bytes: &[u8], path: &Path) -> Result<(Journal, bool)> {
     let version = serde_json::from_slice::<VersionEnvelope>(bytes)
         .with_context(|| format!("parse native spool journal version at {}", path.display()))?
         .version;
-    match version {
-        JOURNAL_VERSION => {
-            let journal: Journal = serde_json::from_slice(bytes)
-                .with_context(|| format!("parse {}", path.display()))?;
-            Ok((journal, false))
-        }
-        SPOOL_VERSION => {
-            let old: JournalV1 = serde_json::from_slice(bytes)
-                .with_context(|| format!("parse legacy local journal {}", path.display()))?;
-            let checkpointed_source_cursor = old
-                .checkpointed_seq
-                .and_then(|seq| old.objects.get(&seq))
-                .map(|object| object.source_cursor.clone());
-            let checkpoint_window = match old.objects.last_key_value() {
-                Some((seq, object)) => CheckpointWindow::Opening {
-                    seq: *seq,
-                    source_cursor: object.source_cursor.clone(),
-                },
-                None => CheckpointWindow::Closed,
-            };
-            tracing::error!(
-                path = %path.display(),
-                "migrating v1 native spool journal conservatively; a non-empty spool requires a snapshot re-anchor"
-            );
-            Ok((
-                Journal {
-                    version: JOURNAL_VERSION,
-                    identity: old.identity,
-                    objects: old.objects,
-                    local_base_seq: old.local_base_seq,
-                    admitted_seq: old.admitted_seq,
-                    checkpointed_seq: old.checkpointed_seq,
-                    checkpointed_source_cursor,
-                    remote_published_seq: old.remote_published_seq,
-                    checkpoint_window,
-                },
-                true,
-            ))
-        }
-        other => bail!("unsupported native spool journal version {other}"),
+    if version != JOURNAL_VERSION {
+        bail!("unsupported native spool journal version {version}");
     }
+    serde_json::from_slice(bytes).with_context(|| format!("parse {}", path.display()))
 }
 
 fn validate_object_identity(identity: &SpoolIdentity, object: &SpoolObject) -> Result<()> {
@@ -2160,7 +2088,7 @@ mod tests {
     use tempfile::tempdir;
 
     fn identity(db: &Path) -> SpoolIdentity {
-        SpoolIdentity::new(db, "bucket", "prefix/", "db", "lineage-a", 1, None, true).unwrap()
+        SpoolIdentity::new(db, "bucket", "prefix/", "db", "lineage-a", 1).unwrap()
     }
 
     fn snapshot(db: &Path, seq: u64, prev: u64) -> (Vec<u8>, u64, u64) {
@@ -2173,6 +2101,16 @@ mod tests {
         let encoded = ltx::encode_snapshot_with_checksum(db, page_size, seq, prev).unwrap();
         let pages = fs::metadata(db).unwrap().len() / page_size as u64;
         (encoded.bytes, encoded.checksum, pages)
+    }
+
+    fn snapshot_proof(bytes: &[u8]) -> (u64, u64, String) {
+        let decoded = ltx::decode_sqlite_changeset(bytes).unwrap();
+        let (digest, pages) = ltx::snapshot_page_image_sha256(&decoded).unwrap();
+        (
+            u64::from_be_bytes(digest[0..8].try_into().unwrap()),
+            pages,
+            hex_digest(&digest),
+        )
     }
 
     fn generous() -> CapacityPolicy {
@@ -2208,6 +2146,16 @@ mod tests {
         let reopened = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
         assert_eq!(reopened.read_payload(1).unwrap(), bytes);
         assert!(NativeSpool::validate_existing_complete_base(&root, &identity(&db)).unwrap());
+        assert!(
+            !NativeSpool::validate_existing_published_base(&root, &identity(&db)).unwrap(),
+            "a locally admitted snapshot is not remote ownership proof"
+        );
+        drop(reopened);
+        let mut reopened = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
+        reopened.mark_uploaded(1).unwrap();
+        reopened.mark_published(1, b"publish-record-1").unwrap();
+        drop(reopened);
+        assert!(NativeSpool::validate_existing_published_base(&root, &identity(&db)).unwrap());
     }
 
     #[test]
@@ -2218,8 +2166,18 @@ mod tests {
         let root = NativeSpool::path_for(dir.path(), &identity(&db));
         let mut spool = NativeSpool::create_or_open(&root, identity(&db), generous()).unwrap();
         let cursor = SourceCursor::snapshot();
+        let (expected_checksum, expected_pages, expected_digest) = snapshot_proof(&bytes);
         spool
-            .prepare_snapshot(1, 0, "one.hadbp".into(), cursor.clone(), 4096)
+            .prepare_snapshot(
+                1,
+                0,
+                "one.hadbp".into(),
+                cursor.clone(),
+                4096,
+                expected_pages,
+                expected_checksum,
+                expected_digest,
+            )
             .unwrap();
         let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
         let mut file = OpenOptions::new()
@@ -2352,45 +2310,6 @@ mod tests {
     }
 
     #[test]
-    fn v1_nonempty_journal_migration_fails_closed_to_reanchor() {
-        let dir = tempdir().unwrap();
-        let db = dir.path().join("db.sqlite");
-        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
-        let id = identity(&db);
-        let root = NativeSpool::path_for(dir.path(), &id);
-        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
-        spool
-            .stage(StageObject {
-                seq: 1,
-                kind: ObjectKind::Snapshot,
-                previous_chain_checksum: 0,
-                ending_chain_checksum: checksum,
-                end_page_count: pages,
-                intended_remote_key: "snapshot-1.hadbp".into(),
-                source_cursor: SourceCursor::snapshot(),
-                payload: &bytes,
-            })
-            .unwrap();
-        let legacy = JournalV1 {
-            version: SPOOL_VERSION,
-            identity: spool.journal.identity.clone(),
-            objects: spool.journal.objects.clone(),
-            local_base_seq: spool.journal.local_base_seq,
-            admitted_seq: spool.journal.admitted_seq,
-            checkpointed_seq: spool.journal.checkpointed_seq,
-            remote_published_seq: spool.journal.remote_published_seq,
-        };
-        persist_json(&root, &spool.journal_path, &legacy).unwrap();
-        drop(spool);
-
-        let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
-        assert!(reopened.requires_checkpoint_reanchor());
-        let durable: Journal =
-            serde_json::from_slice(&fs::read(root.join("journal.json")).unwrap()).unwrap();
-        assert_eq!(durable.version, JOURNAL_VERSION);
-    }
-
-    #[test]
     fn admitted_snapshot_intent_reconciles_after_restart() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
@@ -2405,8 +2324,18 @@ mod tests {
             wal_checksum_chain: Some((3, 4)),
         };
         let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        let (expected_checksum, expected_pages, expected_digest) = snapshot_proof(&bytes);
         let preparing = spool
-            .prepare_snapshot(1, 0, "snapshot-1.hadbp".into(), cursor.clone(), 4096)
+            .prepare_snapshot(
+                1,
+                0,
+                "snapshot-1.hadbp".into(),
+                cursor.clone(),
+                4096,
+                expected_pages,
+                expected_checksum,
+                expected_digest,
+            )
             .unwrap();
         spool
             .stage(StageObject {
@@ -2428,46 +2357,6 @@ mod tests {
     }
 
     #[test]
-    fn pre_direct_snapshot_stable_intent_migrates_once_to_hadbp() {
-        let dir = tempdir().unwrap();
-        let db = dir.path().join("db.sqlite");
-        let (_bytes, expected_checksum, pages) = snapshot(&db, 1, 0);
-        let id = identity(&db);
-        let root = NativeSpool::path_for(dir.path(), &id);
-        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
-        spool
-            .prepare_snapshot(
-                1,
-                0,
-                "snapshot-1.hadbp".into(),
-                SourceCursor::snapshot(),
-                4096,
-            )
-            .unwrap();
-        let stable_name = "0000000000000001.db";
-        let stable = spool.snapshots_dir.join(stable_name);
-        fs::copy(&db, &stable).unwrap();
-        File::open(&stable).unwrap().sync_all().unwrap();
-        let stable_bytes = fs::read(&stable).unwrap();
-        let mut intent = spool.read_snapshot_intent().unwrap().unwrap();
-        intent.legacy_stable_file_name = Some(stable_name.into());
-        intent.state = SnapshotIntentState::Stable {
-            payload_length: stable_bytes.len() as u64,
-            sha256: sha256_hex(&stable_bytes),
-        };
-        persist_json(&spool.root, &spool.snapshot_intent_path, &intent).unwrap();
-        drop(spool);
-
-        let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
-        let object = reopened.get(1).unwrap();
-        assert_eq!(object.ending_chain_checksum, expected_checksum);
-        assert_eq!(object.end_page_count, pages);
-        assert!(reopened.read_payload(1).unwrap().starts_with(b"HADBP"));
-        assert!(!stable.exists());
-        assert!(!reopened.snapshot_intent_path.exists());
-    }
-
-    #[test]
     fn valid_unadmitted_snapshot_payload_is_adopted_on_restart() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
@@ -2475,6 +2364,7 @@ mod tests {
         let id = identity(&db);
         let root = NativeSpool::path_for(dir.path(), &id);
         let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        let (expected_checksum, expected_pages, expected_digest) = snapshot_proof(&bytes);
         spool
             .prepare_snapshot(
                 1,
@@ -2482,6 +2372,9 @@ mod tests {
                 "snapshot-1.hadbp".into(),
                 SourceCursor::snapshot(),
                 4096,
+                expected_pages,
+                expected_checksum,
+                expected_digest,
             )
             .unwrap();
         let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
@@ -2513,6 +2406,9 @@ mod tests {
                 "snapshot-1.hadbp".into(),
                 SourceCursor::snapshot(),
                 4096,
+                1,
+                0,
+                "00".repeat(32),
             )
             .unwrap();
         let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
@@ -2536,8 +2432,18 @@ mod tests {
         let root = NativeSpool::path_for(dir.path(), &id);
         let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
         let source_cursor = SourceCursor::snapshot();
+        let (expected_checksum, expected_pages, expected_digest) = snapshot_proof(&bytes);
         spool
-            .prepare_snapshot(1, 0, "snapshot-1.hadbp".into(), source_cursor.clone(), 4096)
+            .prepare_snapshot(
+                1,
+                0,
+                "snapshot-1.hadbp".into(),
+                source_cursor.clone(),
+                4096,
+                expected_pages,
+                expected_checksum,
+                expected_digest,
+            )
             .unwrap();
         let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
         fs::write(&tmp, &bytes).unwrap();
@@ -2597,6 +2503,7 @@ mod tests {
         let id = identity(&db);
         let root = NativeSpool::path_for(dir.path(), &id);
         let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        let (expected_checksum, expected_pages, expected_digest) = snapshot_proof(&wrong_seq_bytes);
         spool
             .prepare_snapshot(
                 1,
@@ -2604,6 +2511,9 @@ mod tests {
                 "snapshot-1.hadbp".into(),
                 SourceCursor::snapshot(),
                 4096,
+                expected_pages,
+                expected_checksum,
+                expected_digest,
             )
             .unwrap();
         let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
@@ -2619,6 +2529,52 @@ mod tests {
             .to_string()
             .contains("diverges from durable source intent"));
         assert!(tmp.exists(), "divergent evidence must be retained");
+    }
+
+    #[test]
+    fn valid_same_header_snapshot_with_different_pages_is_retained_and_rejected() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (intended_bytes, _, _) = snapshot(&db, 1, 0);
+        let (expected_checksum, expected_pages, expected_digest) = snapshot_proof(&intended_bytes);
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute("INSERT INTO t(v) VALUES ('different')", [])
+            .unwrap();
+        let page_size = conn
+            .query_row("PRAGMA page_size", [], |row| row.get::<_, u32>(0))
+            .unwrap();
+        drop(conn);
+        let divergent = ltx::encode_snapshot_with_checksum(&db, page_size, 1, 0)
+            .unwrap()
+            .bytes;
+        assert_ne!(snapshot_proof(&divergent).2, expected_digest);
+
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .prepare_snapshot(
+                1,
+                0,
+                "snapshot-1.hadbp".into(),
+                SourceCursor::snapshot(),
+                page_size,
+                expected_pages,
+                expected_checksum,
+                expected_digest,
+            )
+            .unwrap();
+        let tmp = spool.payload_temporary_path(ObjectKind::Snapshot, 1);
+        fs::write(&tmp, divergent).unwrap();
+        File::open(&tmp).unwrap().sync_all().unwrap();
+        sync_dir(&spool.objects_dir).unwrap();
+        drop(spool);
+
+        let error = NativeSpool::create_or_open(&root, id, generous())
+            .err()
+            .expect("content-divergent valid temp must fail startup");
+        assert!(format!("{error:#}").contains("durable source content"));
+        assert!(tmp.exists(), "divergent recovery evidence must be retained");
     }
 
     #[test]
@@ -2656,8 +2612,7 @@ mod tests {
         File::create(&db1).unwrap();
         File::create(&db2).unwrap();
         let a = identity(&db1);
-        let b = SpoolIdentity::new(&db2, "bucket", "prefix/", "db", "lineage-a", 1, None, true)
-            .unwrap();
+        let b = SpoolIdentity::new(&db2, "bucket", "prefix/", "db", "lineage-a", 1).unwrap();
         assert_ne!(
             NativeSpool::path_for(dir.path(), &a),
             NativeSpool::path_for(dir.path(), &b)
@@ -2668,42 +2623,23 @@ mod tests {
     }
 
     #[test]
-    fn local_path_digest_length_prefixes_identity_components_and_finds_v1() {
+    fn local_path_digest_length_prefixes_identity_components() {
         let dir = tempdir().unwrap();
         let db_a = dir.path().join("a");
         let db_ab = dir.path().join("ab");
         File::create(&db_a).unwrap();
         File::create(&db_ab).unwrap();
-        let first =
-            SpoolIdentity::new(&db_a, "b", "prefix/", "db", "lineage-a", 1, None, true).unwrap();
-        let second =
-            SpoolIdentity::new(&db_ab, "", "prefix/", "db", "lineage-b", 1, None, true).unwrap();
-        assert_eq!(
-            first.legacy_local_path_digest(),
-            second.legacy_local_path_digest(),
-            "the old concatenation must reproduce the adversarial tuple collision"
-        );
+        let first = SpoolIdentity::new(&db_a, "b", "prefix/", "db", "lineage-a", 1).unwrap();
+        let second = SpoolIdentity::new(&db_ab, "", "prefix/", "db", "lineage-b", 1).unwrap();
         assert_ne!(
             NativeSpool::path_for(dir.path(), &first),
             NativeSpool::path_for(dir.path(), &second),
             "v2 length-prefixing must separate the tuples"
         );
 
-        let legacy = dir
-            .path()
-            .join("native-v1")
-            .join(first.legacy_local_path_digest());
-        let spool = NativeSpool::create_or_open(&legacy, first.clone(), generous()).unwrap();
-        drop(spool);
         assert_eq!(
             NativeSpool::resolve_path_for(dir.path(), &first).unwrap(),
-            legacy,
-            "existing v1 spools must remain discoverable"
-        );
-        assert_eq!(
-            NativeSpool::resolve_path_for(dir.path(), &second).unwrap(),
-            NativeSpool::path_for(dir.path(), &second),
-            "a colliding v1 tuple owned by another identity must not strand a new v2 stream"
+            NativeSpool::path_for(dir.path(), &first)
         );
     }
 
@@ -2767,8 +2703,8 @@ mod tests {
         let initial = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
         let used = initial.used_bytes().unwrap();
         drop(initial);
-        let old_payload_only_peak = (bytes.len() as u64).saturating_mul(2);
-        let hard = used.saturating_add(old_payload_only_peak).saturating_add(1);
+        let single_payload_peak = bytes.len() as u64;
+        let hard = used.saturating_add(single_payload_peak).saturating_add(1);
         let mut spool = NativeSpool::create_or_open(
             &root,
             id,

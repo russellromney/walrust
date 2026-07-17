@@ -3,6 +3,7 @@
 //! Root sync code keeps its module path while Phase 4 convergence moves shadow
 //! WAL behavior to `walrust-core`.
 
+#[allow(unused_imports)]
 pub use walrust_core::shadow::{ShadowSegment, ShadowWal};
 
 #[cfg(test)]

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 // Re-export shared config types from hadb-io
-pub use hadb_io::config::{parse_duration_string, CacheConfig, S3Config, WebhookConfig};
+pub use hadb_io::config::{S3Config, WebhookConfig};
 
 /// Root configuration structure
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -25,10 +25,6 @@ pub struct Config {
     /// Global retention policy
     #[serde(default)]
     pub retention: RetentionConfig,
-
-    /// Cache configuration for disk-based upload queue
-    #[serde(default)]
-    pub cache: CacheConfig,
 
     /// Mandatory native-HADBP local spool used by default shadow watch.
     #[serde(default)]
@@ -86,22 +82,12 @@ pub struct SyncConfig {
     pub on_startup: bool,
 
     /// Run retention pruning after each snapshot.
-    ///
-    /// Preferred TOML key: `prune_after_snapshot`. The legacy
-    /// `compact_after_snapshot` spelling is still accepted (retention expiry is
-    /// pruning, not compaction).
-    #[serde(
-        default,
-        rename = "prune_after_snapshot",
-        alias = "compact_after_snapshot"
-    )]
-    pub compact_after_snapshot: bool,
+    #[serde(default)]
+    pub prune_after_snapshot: bool,
 
     /// Retention pruning interval in seconds (0 = disabled).
-    ///
-    /// Preferred TOML key: `prune_interval`; legacy `compact_interval` accepted.
-    #[serde(default, rename = "prune_interval", alias = "compact_interval")]
-    pub compact_interval: u64,
+    #[serde(default)]
+    pub prune_interval: u64,
 
     /// Checkpoint interval in seconds (default: 60)
     /// Runs PRAGMA wal_checkpoint(PASSIVE) on interval
@@ -119,7 +105,7 @@ pub struct SyncConfig {
     pub wal_truncate_threshold_pages: u64,
 
     /// Automated validation interval in seconds (default: 0 = disabled)
-    /// Periodically verifies backup integrity by checking LTX checksums and TXID continuity.
+    /// Periodically verifies native HADBP checksums and published-chain continuity.
     /// Recommended: 86400 (daily) for production. Warning: downloads metadata from S3.
     #[serde(default)]
     pub validation_interval: u64,
@@ -192,8 +178,8 @@ impl Default for SyncConfig {
             max_interval: 0,
             on_idle: 0,
             on_startup: true,
-            compact_after_snapshot: false,
-            compact_interval: 0,
+            prune_after_snapshot: false,
+            prune_interval: 0,
             checkpoint_interval: 60,
             min_checkpoint_page_count: 1000,
             wal_truncate_threshold_pages: 121359,
@@ -624,8 +610,8 @@ mod tests {
             max_interval = 300
             on_idle = 60
             on_startup = false
-            compact_after_snapshot = true
-            compact_interval = 7200
+            prune_after_snapshot = true
+            prune_interval = 7200
 
             [retention]
             hourly = 12
@@ -664,8 +650,8 @@ mod tests {
         assert_eq!(config.sync.max_interval, 300);
         assert_eq!(config.sync.on_idle, 60);
         assert!(!config.sync.on_startup);
-        assert!(config.sync.compact_after_snapshot);
-        assert_eq!(config.sync.compact_interval, 7200);
+        assert!(config.sync.prune_after_snapshot);
+        assert_eq!(config.sync.prune_interval, 7200);
 
         // Check retention config
         assert_eq!(config.retention.hourly, 12);
@@ -695,8 +681,8 @@ mod tests {
         assert_eq!(config.sync.max_interval, 0);
         assert_eq!(config.sync.on_idle, 0);
         assert!(config.sync.on_startup);
-        assert!(!config.sync.compact_after_snapshot);
-        assert_eq!(config.sync.compact_interval, 0);
+        assert!(!config.sync.prune_after_snapshot);
+        assert_eq!(config.sync.prune_interval, 0);
         assert_eq!(config.sync.validation_interval, 0);
 
         // Check retention defaults
@@ -707,8 +693,7 @@ mod tests {
     }
 
     #[test]
-    fn test_prune_keys_preferred_and_compact_alias_accepted() {
-        // Preferred `prune_*` spelling parses.
+    fn test_prune_keys_parse() {
         let prune_toml = r#"
             [sync]
             prune_after_snapshot = true
@@ -718,21 +703,8 @@ mod tests {
             path = "/data/test.db"
         "#;
         let config: Config = toml::from_str(prune_toml).unwrap();
-        assert!(config.sync.compact_after_snapshot);
-        assert_eq!(config.sync.compact_interval, 4242);
-
-        // Legacy `compact_*` spelling still accepted via serde alias.
-        let compact_toml = r#"
-            [sync]
-            compact_after_snapshot = true
-            compact_interval = 99
-
-            [[databases]]
-            path = "/data/test.db"
-        "#;
-        let config: Config = toml::from_str(compact_toml).unwrap();
-        assert!(config.sync.compact_after_snapshot);
-        assert_eq!(config.sync.compact_interval, 99);
+        assert!(config.sync.prune_after_snapshot);
+        assert_eq!(config.sync.prune_interval, 4242);
     }
 
     #[test]
@@ -958,49 +930,6 @@ mod tests {
         let config: Config = toml::from_str(toml).unwrap();
         let merged = config.merge_sync_config(&config.databases[0]);
         assert_eq!(merged.validation_interval, 3600);
-    }
-
-    // ============================================
-    // Cache Config Tests
-    // ============================================
-
-    #[test]
-    fn test_cache_config_defaults() {
-        let toml = r#"
-            [[databases]]
-            path = "/data/test.db"
-        "#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(!config.cache.enabled);
-        assert_eq!(config.cache.retention, "24h");
-        assert_eq!(config.cache.max_size, 5 * 1024 * 1024 * 1024); // 5GB
-        assert!(config.cache.path.is_none());
-    }
-
-    #[test]
-    fn test_cache_config_enabled() {
-        let toml = r#"
-            [cache]
-            enabled = true
-            retention = "7d"
-            max_size = 5368709120
-            path = "/var/cache/walrust"
-
-            [[databases]]
-            path = "/data/test.db"
-        "#;
-        let config: Config = toml::from_str(toml).unwrap();
-        assert!(config.cache.enabled);
-        assert_eq!(config.cache.retention, "7d");
-        assert_eq!(config.cache.max_size, 5 * 1024 * 1024 * 1024); // 5GB
-        assert_eq!(config.cache.path, Some("/var/cache/walrust".to_string()));
-    }
-
-    #[test]
-    fn test_parse_duration_reexport_works() {
-        // Verify re-exported parse_duration_string is usable
-        let duration = parse_duration_string("24h").unwrap();
-        assert_eq!(duration.num_hours(), 24);
     }
 
     #[test]

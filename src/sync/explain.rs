@@ -69,16 +69,16 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
 
             // Pruning Settings
             println!("Pruning:");
-            if cfg.sync.compact_after_snapshot {
+            if cfg.sync.prune_after_snapshot {
                 println!("  After snapshot: enabled");
             } else {
                 println!("  After snapshot: disabled");
             }
-            if cfg.sync.compact_interval > 0 {
+            if cfg.sync.prune_interval > 0 {
                 println!(
                     "  Interval:       {} seconds ({} minutes)",
-                    cfg.sync.compact_interval,
-                    cfg.sync.compact_interval / 60
+                    cfg.sync.prune_interval,
+                    cfg.sync.prune_interval / 60
                 );
             } else {
                 println!("  Interval:       disabled");
@@ -211,7 +211,7 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
                 "  Max snapshots retained per database: ~{}",
                 total_snapshots
             );
-            if cfg.sync.compact_after_snapshot || cfg.sync.compact_interval > 0 {
+            if cfg.sync.prune_after_snapshot || cfg.sync.prune_interval > 0 {
                 println!("  Automatic pruning: enabled");
             } else {
                 println!("  Automatic pruning: disabled (run 'walrust prune' manually)");
@@ -249,7 +249,9 @@ pub fn explain(config: &Option<Config>) -> Result<()> {
                         "  - Real database sizes (current estimate: {}GB per DB)",
                         avg_db_size_gb
                     );
-                    println!("  - Compression ratio (LTX typically compresses well)");
+                    println!(
+                        "  - Compression ratio (native HADBP page images typically compress well)"
+                    );
                     println!("  - Incremental file sizes between snapshots");
                 }
                 _ => {}

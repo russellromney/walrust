@@ -27,6 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// SQLite page ID size (u32).
 pub const SQLITE_PAGE_ID_SIZE: PageIdSize = PageIdSize::U32;
+/// Wire-format identity persisted by native CLI spool and remote descriptors.
+/// Keep this distinct from spool/journal/layout versions.
+pub const HADBP_FORMAT_VERSION: u8 = physical::HADBP_VERSION;
 pub const FLAG_END_PAGE_COUNT_MARKER: u8 = 0x01;
 const HADBP_HEADER_SIZE: usize = 40;
 const HADBP_TRAILER_SIZE: usize = 8;
@@ -748,6 +751,17 @@ pub fn compute_db_checksum_raw(data: &[u8]) -> u64 {
 /// Verify that a decoded changeset is a complete SQLite snapshot and compute
 /// its materialized database checksum without writing a second `.db` file.
 pub fn snapshot_checksum_and_page_count(changeset: &PhysicalChangeset) -> Result<(u64, u64)> {
+    let (digest, page_count) = snapshot_page_image_sha256(changeset)?;
+    Ok((
+        u64::from_be_bytes(digest[0..8].try_into().expect("sha256 is 32 bytes")),
+        page_count,
+    ))
+}
+
+/// Return the full content identity of a complete snapshot page image.
+/// The spool persists this in the pre-encode source intent so restart recovery
+/// cannot adopt different-but-well-formed HADBP bytes at the same sequence.
+pub fn snapshot_page_image_sha256(changeset: &PhysicalChangeset) -> Result<([u8; 32], u64)> {
     use sha2::{Digest, Sha256};
 
     if changeset_end_page_count(changeset)?.is_some() {
@@ -770,11 +784,8 @@ pub fn snapshot_checksum_and_page_count(changeset: &PhysicalChangeset) -> Result
         }
         hasher.update(&entry.data);
     }
-    let digest = hasher.finalize();
-    Ok((
-        u64::from_be_bytes(digest[0..8].try_into().expect("sha256 is 32 bytes")),
-        pages.len() as u64,
-    ))
+    let digest: [u8; 32] = hasher.finalize().into();
+    Ok((digest, pages.len() as u64))
 }
 
 #[cfg(test)]
@@ -1028,7 +1039,7 @@ mod tests {
 
         let encoded = encode_snapshot(&db_path, page_size, 1000, 0).unwrap();
 
-        let result = decode_to_db(&encoded, &restored_path).unwrap();
+        decode_to_db(&encoded, &restored_path).unwrap();
         let restored_data = std::fs::read(&restored_path).unwrap();
         assert_eq!(db_data, restored_data);
     }
@@ -1331,6 +1342,7 @@ mod tests {
         let snap_encoded = encode_snapshot(&db_path, page_size, 1, 0).unwrap();
         let snap_result =
             decode_to_db(&snap_encoded, &dir.path().join("snap_restored.db")).unwrap();
+        assert_eq!(snap_result.header.seq, 1);
 
         // First incremental: update page 1 (seq 2)
         let pre_checksum1 = compute_checksum_from_file(&db_path).unwrap();
@@ -1339,6 +1351,7 @@ mod tests {
 
         let (inc1_encoded, post1) =
             encode_wal_changes(&pages1, page_size, 2, pre_checksum1).unwrap();
+        assert_eq!(post1, expected_post1);
 
         let result1 = apply_changeset_to_db(&inc1_encoded, &db_path, pre_checksum1).unwrap();
         assert_eq!(result1.checksum, expected_post1);

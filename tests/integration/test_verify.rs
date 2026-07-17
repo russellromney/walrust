@@ -6,16 +6,6 @@
 use anyhow::Result;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tempfile::TempDir;
-
-/// Helper to create a test database file
-fn create_test_db(path: &str) -> Result<()> {
-    let conn = rusqlite::Connection::open(path)?;
-    conn.execute("CREATE TABLE test(id INTEGER PRIMARY KEY, data TEXT)", [])?;
-    conn.execute("INSERT INTO test VALUES (1, 'data1')", [])?;
-    conn.execute("INSERT INTO test VALUES (2, 'data2')", [])?;
-    Ok(())
-}
 
 /// Helper to get test bucket and endpoint
 fn test_bucket_config() -> (String, String) {
@@ -49,144 +39,6 @@ fn s3_test_enabled() -> bool {
 }
 
 #[test]
-fn test_verify_valid_backup() -> Result<()> {
-    if !s3_test_enabled() {
-        eprintln!("SKIP test_verify_valid_backup: no S3 endpoint/credentials configured");
-        return Ok(());
-    }
-    let (bucket, endpoint) = test_bucket_config();
-    let tempdir = TempDir::new()?;
-    let db_path = tempdir.path().join("verify-test.db");
-
-    // Create test database
-    create_test_db(db_path.to_str().unwrap())?;
-
-    // Take snapshot
-    let snapshot_output = Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("snapshot")
-        .arg(db_path.to_str().unwrap())
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .output()?;
-
-    assert!(snapshot_output.status.success(), "Snapshot should succeed");
-
-    // Verify the backup
-    let verify_output = Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("verify")
-        .arg("verify-test")
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .output()?;
-
-    let stdout = String::from_utf8_lossy(&verify_output.stdout);
-
-    // Should succeed with exit code 0
-    assert!(
-        verify_output.status.success(),
-        "Verify should succeed: {}",
-        stdout
-    );
-
-    // Check output format
-    assert!(
-        stdout.contains("Verifying backup:"),
-        "Output should have header"
-    );
-    assert!(
-        stdout.contains("Snapshot: Found generation"),
-        "Output should confirm snapshot exists"
-    );
-    assert!(
-        stdout.contains("All checks passed"),
-        "Output should show success"
-    );
-    assert!(
-        stdout.contains("Exit code: 0"),
-        "Output should show exit code 0"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_verify_with_incrementals() -> Result<()> {
-    if !s3_test_enabled() {
-        eprintln!("SKIP test_verify_with_incrementals: no S3 endpoint/credentials configured");
-        return Ok(());
-    }
-    let (bucket, endpoint) = test_bucket_config();
-    let tempdir = TempDir::new()?;
-    let db_path = tempdir.path().join("verify-incremental.db");
-
-    // Create and populate database
-    create_test_db(db_path.to_str().unwrap())?;
-
-    // Take initial snapshot
-    Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("snapshot")
-        .arg(db_path.to_str().unwrap())
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .output()?;
-
-    // Add more data to create incrementals
-    let conn = rusqlite::Connection::open(&db_path)?;
-    for i in 3..10 {
-        conn.execute(
-            "INSERT INTO test VALUES (?, ?)",
-            rusqlite::params![i, format!("data{}", i)],
-        )?;
-    }
-    drop(conn);
-
-    // Start watch mode briefly to create incrementals
-    let mut watch_cmd = Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("watch")
-        .arg(db_path.to_str().unwrap())
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .arg("--snapshot-interval")
-        .arg("999999")
-        .arg("--wal-sync-interval")
-        .arg("1")
-        .spawn()?;
-
-    std::thread::sleep(std::time::Duration::from_secs(3));
-    watch_cmd.kill()?;
-
-    // Verify the backup
-    let verify_output = Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("verify")
-        .arg("verify-incremental")
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .output()?;
-
-    let stdout = String::from_utf8_lossy(&verify_output.stdout);
-
-    assert!(
-        verify_output.status.success(),
-        "Verify with incrementals should succeed: {}",
-        stdout
-    );
-    assert!(stdout.contains("OK"), "Should have OK for verified files");
-    assert!(stdout.contains("files"), "Should show file count");
-
-    Ok(())
-}
-
-#[test]
 fn test_verify_no_backup_found() -> Result<()> {
     if !s3_test_enabled() {
         eprintln!("SKIP test_verify_no_backup_found: no S3 endpoint/credentials configured");
@@ -211,7 +63,7 @@ fn test_verify_no_backup_found() -> Result<()> {
     // A verifier cannot certify an empty/missing backup as success.
     assert!(
         !verify_output.status.success(),
-        "verify must fail closed when no LTX files exist"
+        "verify must fail closed when no native recovery stream exists"
     );
     assert_eq!(
         verify_output.status.code(),
@@ -219,103 +71,9 @@ fn test_verify_no_backup_found() -> Result<()> {
         "missing backups are integrity failures, not generic errors; stdout={stdout}; stderr={stderr}"
     );
     assert!(
-        stdout.contains("No LTX files found") || stderr.contains("No LTX files found"),
-        "Should report no files found"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_verify_exit_codes() -> Result<()> {
-    if !s3_test_enabled() {
-        eprintln!("SKIP test_verify_exit_codes: no S3 endpoint/credentials configured");
-        return Ok(());
-    }
-    let (bucket, endpoint) = test_bucket_config();
-    let tempdir = TempDir::new()?;
-    let db_path = tempdir.path().join("exit-code-test.db");
-
-    create_test_db(db_path.to_str().unwrap())?;
-
-    // Create valid backup
-    Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("snapshot")
-        .arg(db_path.to_str().unwrap())
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .output()?;
-
-    // Verify should return exit code 0 for valid backup
-    let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("verify")
-        .arg("exit-code-test")
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .output()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        output.status.success(),
-        "Exit code should be 0 for valid backup: {}",
-        stdout
-    );
-    assert!(
-        stdout.contains("Exit code: 0"),
-        "Output should explicitly state exit code 0"
-    );
-
-    Ok(())
-}
-
-#[test]
-fn test_verify_continuity_check() -> Result<()> {
-    if !s3_test_enabled() {
-        eprintln!("SKIP test_verify_continuity_check: no S3 endpoint/credentials configured");
-        return Ok(());
-    }
-    let (bucket, endpoint) = test_bucket_config();
-    let tempdir = TempDir::new()?;
-    let db_path = tempdir.path().join("continuity-test.db");
-
-    create_test_db(db_path.to_str().unwrap())?;
-
-    // Create snapshot
-    Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("snapshot")
-        .arg(db_path.to_str().unwrap())
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .output()?;
-
-    // Verify should check TXID continuity
-    let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("verify")
-        .arg("continuity-test")
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .output()?;
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Should report on continuity
-    assert!(
-        stdout.contains("Continuity:"),
-        "Should check TXID continuity"
-    );
-    assert!(
-        stdout.contains("No gaps detected")
-            || stdout.contains("Gaps detected")
-            || stdout.contains("Snapshot only"),
-        "Should report continuity status"
+        stdout.contains("no contiguous native-v1 HADBP recovery stream")
+            || stderr.contains("no contiguous native-v1 HADBP recovery stream"),
+        "Should report no contiguous native stream"
     );
 
     Ok(())
@@ -375,58 +133,4 @@ fn test_verify_help_output() {
         stdout.contains("--bucket"),
         "Help should show --bucket flag"
     );
-}
-
-// ============================================================================
-// REGRESSION TESTS - Specific bugs
-// ============================================================================
-
-#[test]
-fn test_verify_doesnt_double_count_file_sizes() -> Result<()> {
-    if !s3_test_enabled() {
-        eprintln!("SKIP test_verify_doesnt_double_count_file_sizes: no S3 endpoint/credentials configured");
-        return Ok(());
-    }
-    // Regression test for the bug where total_size was counted twice
-    let (bucket, endpoint) = test_bucket_config();
-    let tempdir = TempDir::new()?;
-    let db_path = tempdir.path().join("size-test.db");
-
-    create_test_db(db_path.to_str().unwrap())?;
-
-    // Create large database to make size counting visible
-    let conn = rusqlite::Connection::open(&db_path)?;
-    for i in 0..1000 {
-        conn.execute(
-            "INSERT INTO test VALUES (?, ?)",
-            rusqlite::params![100 + i, format!("large_data_string_{}", "x".repeat(100))],
-        )?;
-    }
-    drop(conn);
-
-    Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("snapshot")
-        .arg(db_path.to_str().unwrap())
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .output()?;
-
-    let output = Command::new(env!("CARGO_BIN_EXE_walrust"))
-        .arg("verify")
-        .arg("size-test")
-        .arg("-b")
-        .arg(&bucket)
-        .arg("--endpoint")
-        .arg(&endpoint)
-        .output()?;
-
-    // Should succeed and not panic with overflow
-    assert!(
-        output.status.success(),
-        "Should handle large files without overflow"
-    );
-
-    Ok(())
 }

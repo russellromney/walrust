@@ -80,7 +80,10 @@ Most ORMs do this automatically. If yours doesn't, run this once on database cre
 
 **SQLite Encryption Extension (SEE), SQLCipher, etc. - don't use them with walrust.**
 
-Encrypted databases have encrypted pages. Walrust can back them up, but the pages are meaningless without the key. Worse, some encryption schemes modify the WAL format in ways that break LTX encoding entirely.
+Encrypted databases have encrypted pages. Walrust can back them up only when
+their WAL remains valid SQLite WAL and the same key/codec can read the restored
+pages. Some encryption schemes change the WAL format and are incompatible with
+native HADBP capture.
 
 If you need encryption:
 - Encrypt at the S3 layer (server-side encryption)
@@ -89,7 +92,9 @@ If you need encryption:
 
 ### Compression Extensions Are Not Supported
 
-SQLite extensions that compress pages are not compatible with walrust. The LTX format requires uncompressed page data. SQLite pages contain internal pointers and metadata that compress poorly, so the storage savings are minimal.
+SQLite extensions that replace SQLite's page or WAL format are not compatible
+with walrust. Native HADBP records SQLite pages and requires standard page/WAL
+semantics.
 
 ### File Permissions
 

@@ -1,7 +1,6 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-mod cache;
 mod config;
 mod dashboard;
 mod errors;
@@ -12,7 +11,6 @@ mod retry;
 mod s3;
 mod shadow;
 mod sync;
-mod uploader;
 mod wal;
 mod webhook;
 
@@ -84,13 +82,13 @@ enum Commands {
         #[arg(long)]
         on_startup: Option<bool>,
 
-        /// Run retention pruning after each snapshot (legacy flag name)
+        /// Run retention pruning after each snapshot
         #[arg(long)]
-        compact_after_snapshot: bool,
+        prune_after_snapshot: bool,
 
-        /// Retention pruning interval in seconds (0 = disabled, legacy flag name)
+        /// Retention pruning interval in seconds (0 = disabled)
         #[arg(long)]
-        compact_interval: Option<u64>,
+        prune_interval: Option<u64>,
 
         /// Checkpoint interval in seconds (default: 60)
         /// Runs PASSIVE checkpoint periodically to prevent unbounded WAL growth
@@ -107,7 +105,7 @@ enum Commands {
         wal_truncate_threshold: Option<u64>,
 
         /// Backup validation interval in seconds (0 = disabled)
-        /// Periodically verifies backup integrity by checking LTX checksums
+        /// Periodically verifies native HADBP checksums and published-chain continuity
         #[arg(long)]
         validation_interval: Option<u64>,
 
@@ -160,51 +158,13 @@ enum Commands {
         #[arg(long)]
         circuit_breaker_threshold: Option<u32>,
 
-        /// Enable independent per-DB tasks (experimental)
-        ///
-        /// Each database gets its own task that independently watches
-        /// for WAL changes and syncs to S3. This allows maximum concurrency
-        /// across all databases with CPU-bound encoding distributed across
-        /// the thread pool.
+        /// Override the mandatory native HADBP spool root.
         #[arg(long)]
-        independent_tasks: bool,
+        spool_dir: Option<PathBuf>,
 
-        // Cache configuration (disk-based upload queue)
-        /// Enable disk cache for decoupled uploads (experimental)
-        ///
-        /// When enabled, LTX files are written to disk cache before uploading
-        /// to S3. This provides crash recovery, decouples encoding from uploads,
-        /// and enables fast local restore.
+        /// Maximum native spool size in bytes.
         #[arg(long)]
-        enable_cache: bool,
-
-        /// Override native spool root (legacy alias: --cache-dir)
-        ///
-        /// Default: .{db_name}-walrust/ next to each database file
-        #[arg(long = "spool-dir", visible_alias = "cache-dir")]
-        cache_dir: Option<PathBuf>,
-
-        /// Cache retention duration (default: 24h)
-        ///
-        /// How long to keep uploaded files in cache. Supports: "1h", "24h", "7d"
-        #[arg(long, default_value = "24h")]
-        cache_retention: String,
-
-        /// Maximum cache size in bytes (default: 5GB)
-        ///
-        /// Cleanup deletes oldest uploaded files when cache exceeds this size.
-        #[arg(long)]
-        cache_max_size: Option<u64>,
-
-        /// Max concurrent S3 uploads per database (default: 4)
-        #[arg(long, default_value = "4")]
-        uploader_concurrency: usize,
-
-        /// Disable cache (direct S3 upload)
-        ///
-        /// Forces direct S3 upload even if cache is enabled in config file.
-        #[arg(long)]
-        no_cache: bool,
+        spool_max_size: Option<u64>,
     },
 
     /// Restore a database from S3
@@ -228,12 +188,9 @@ enum Commands {
         #[arg(long)]
         point_in_time: Option<String>,
 
-        /// Local native spool root or legacy cache directory for fast restore
-        ///
-        /// Native HADBP restore requires no S3 client when the local chain is complete.
-        /// Legacy LTX cache entries fall back to S3 for missing history.
-        #[arg(long = "spool-dir", visible_alias = "cache-dir")]
-        cache_dir: Option<PathBuf>,
+        /// Local native spool root for recovery without S3.
+        #[arg(long)]
+        spool_dir: Option<PathBuf>,
     },
 
     /// List databases in S3 bucket
@@ -247,58 +204,8 @@ enum Commands {
         endpoint: Option<String>,
     },
 
-    /// Take an immediate snapshot
-    Snapshot {
-        /// Database file
-        database: PathBuf,
-
-        /// S3 bucket
-        #[arg(short, long)]
-        bucket: String,
-
-        /// S3 endpoint URL
-        #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
-        endpoint: Option<String>,
-    },
-
     /// Prune old snapshots using retention policy (GFS rotation)
     Prune {
-        /// Database name (as registered in S3)
-        name: String,
-
-        /// S3 bucket
-        #[arg(short, long)]
-        bucket: String,
-
-        /// S3 endpoint URL
-        #[arg(long, env = "AWS_ENDPOINT_URL_S3")]
-        endpoint: Option<String>,
-
-        /// Number of hourly snapshots to keep (default: 24)
-        #[arg(long, default_value = "24")]
-        hourly: usize,
-
-        /// Number of daily snapshots to keep (default: 7)
-        #[arg(long, default_value = "7")]
-        daily: usize,
-
-        /// Number of weekly snapshots to keep (default: 12)
-        #[arg(long, default_value = "12")]
-        weekly: usize,
-
-        /// Number of monthly snapshots to keep (default: 12)
-        #[arg(long, default_value = "12")]
-        monthly: usize,
-
-        /// Actually delete files (default: dry-run only)
-        #[arg(long)]
-        force: bool,
-    },
-
-    /// Deprecated alias for `prune` (retention expiry is pruning, not
-    /// compaction). Kept working but hidden; prints a deprecation warning.
-    #[command(hide = true)]
-    Compact {
         /// Database name (as registered in S3)
         name: String,
 
@@ -355,10 +262,9 @@ enum Commands {
     /// retention tiers, and resolved database paths with any per-database overrides.
     Explain,
 
-    /// Verify integrity of backed-up LTX files in S3
+    /// Verify integrity of a published native HADBP stream in S3
     ///
-    /// Checks that each LTX file exists, has valid checksums, and maintains
-    /// TXID continuity.
+    /// Checks immutable object bytes, checksums, lineage, and sequence continuity.
     Verify {
         /// Database name (as registered in S3)
         name: String,
@@ -398,8 +304,8 @@ struct WatchArgs {
     max_interval: Option<u64>,
     on_idle: Option<u64>,
     on_startup: Option<bool>,
-    compact_after_snapshot: bool,
-    compact_interval: Option<u64>,
+    prune_after_snapshot: bool,
+    prune_interval: Option<u64>,
     checkpoint_interval: Option<u64>,
     min_checkpoint_pages: Option<u64>,
     wal_truncate_threshold: Option<u64>,
@@ -417,28 +323,20 @@ struct WatchArgs {
     max_delay_ms: Option<u64>,
     no_circuit_breaker: bool,
     circuit_breaker_threshold: Option<u32>,
-    // Cache configuration
-    enable_cache: bool,
-    cache_dir: Option<PathBuf>,
-    cache_retention: String,
-    cache_max_size: Option<u64>,
-    uploader_concurrency: usize,
-    no_cache: bool,
+    spool_dir: Option<PathBuf>,
+    spool_max_size: Option<u64>,
 }
 
 /// Fail loudly (E7) when the default shadow watch loop is asked to run with
-/// leveled compaction enabled. Leveled compaction only ticks in the
-/// independent-tasks loop (`maybe_compact_legacy` in `watch_independent.rs`); the
-/// shadow loop has no compaction tick, so accepting the config there would
-/// silently ignore the knob and let a bucket the operator believes is compacting
-/// grow unbounded. Refuse to start and point at the mode that honors it.
+/// leveled compaction enabled. Native-v1 compacts with full snapshots and
+/// retention floors; accepting the separate leveled-engine knob would silently
+/// ignore it.
 fn reject_shadow_compaction(dbs: &[ResolvedDbConfig]) -> Result<()> {
     if let Some(db) = dbs.iter().find(|d| d.compaction.enabled) {
         return Err(WalrustError::config(format!(
-            "[compaction] enabled = true is set (for database {}), but leveled compaction only \
-             runs in independent-tasks watch mode. The default shadow watch loop does not compact \
-             and would silently ignore the setting. Re-run `walrust watch` with \
-             --independent-tasks, or set [compaction] enabled = false.",
+            "[compaction] enabled = true is set (for database {}), but the leveled engine does \
+             not apply to native-v1 streams. Use snapshot/retention settings or set \
+             [compaction] enabled = false.",
             db.path.display()
         ))
         .into());
@@ -558,8 +456,8 @@ fn resolve_watch_config(
                 max_interval: cli.max_interval.unwrap_or(0),
                 on_idle: cli.on_idle.unwrap_or(0),
                 on_startup: cli.on_startup.unwrap_or(true),
-                compact_after_snapshot: cli.compact_after_snapshot,
-                compact_interval: cli.compact_interval.unwrap_or(0),
+                prune_after_snapshot: cli.prune_after_snapshot,
+                prune_interval: cli.prune_interval.unwrap_or(0),
                 checkpoint_interval: cli.checkpoint_interval.unwrap_or(60),
                 min_checkpoint_page_count: cli.min_checkpoint_pages.unwrap_or(1000),
                 wal_truncate_threshold_pages: cli.wal_truncate_threshold.unwrap_or(121359),
@@ -616,8 +514,8 @@ fn merge_cli_sync_overrides(base: &SyncConfig, cli: &WatchArgs) -> SyncConfig {
         max_interval: cli.max_interval.unwrap_or(base.max_interval),
         on_idle: cli.on_idle.unwrap_or(base.on_idle),
         on_startup: cli.on_startup.unwrap_or(base.on_startup),
-        compact_after_snapshot: cli.compact_after_snapshot || base.compact_after_snapshot,
-        compact_interval: cli.compact_interval.unwrap_or(base.compact_interval),
+        prune_after_snapshot: cli.prune_after_snapshot || base.prune_after_snapshot,
+        prune_interval: cli.prune_interval.unwrap_or(base.prune_interval),
         checkpoint_interval: cli.checkpoint_interval.unwrap_or(base.checkpoint_interval),
         min_checkpoint_page_count: cli
             .min_checkpoint_pages
@@ -652,59 +550,6 @@ fn merge_cli_retry_overrides(base: &retry::RetryConfig, cli: &WatchArgs) -> retr
             .unwrap_or(base.circuit_breaker_threshold),
         circuit_breaker_cooldown_ms: base.circuit_breaker_cooldown_ms,
     }
-}
-
-/// Resolve cache configuration from config file and CLI args.
-///
-/// `cache-retention` and `uploader-concurrency` have clap `default_value`s, so
-/// we use `value_source` to only override the toml when the user actually
-/// passed the flag.
-fn resolve_cache_config(
-    config: &Option<Config>,
-    cli: &WatchArgs,
-    matches: &clap::ArgMatches,
-) -> config::CacheConfig {
-    let base = config.as_ref().map(|c| c.cache.clone()).unwrap_or_default();
-
-    // CLI --enable-cache overrides config, --no-cache forces disable
-    let enabled = if cli.no_cache {
-        false
-    } else {
-        cli.enable_cache || base.enabled
-    };
-
-    let retention = if user_provided(matches, "cache_retention") {
-        cli.cache_retention.clone()
-    } else {
-        base.retention.clone()
-    };
-
-    let uploader_concurrency = if user_provided(matches, "uploader_concurrency") {
-        cli.uploader_concurrency
-    } else {
-        base.uploader_concurrency
-    };
-
-    config::CacheConfig {
-        enabled,
-        retention,
-        max_size: cli.cache_max_size.unwrap_or(base.max_size),
-        path: cli
-            .cache_dir
-            .as_ref()
-            .map(|p| p.display().to_string())
-            .or(base.path),
-        uploader_concurrency,
-    }
-}
-
-/// True if the named argument was supplied by the user on the command line
-/// (as opposed to coming from a clap `default_value`).
-fn user_provided(matches: &clap::ArgMatches, id: &str) -> bool {
-    matches
-        .value_source(id)
-        .map(|src| src == clap::parser::ValueSource::CommandLine)
-        .unwrap_or(false)
 }
 
 /// Parse duration string like "5s", "1m", "30s", "2h"
@@ -751,7 +596,7 @@ fn parse_duration(s: &str) -> Result<Duration> {
 /// - 2: Configuration error (invalid config file, missing CLI args)
 /// - 3: Database error (file not found, WAL corruption, SQLite issues)
 /// - 4: S3 error (network, authentication, bucket access)
-/// - 5: Integrity error (checksum mismatch, LTX verification failed)
+/// - 5: Integrity error (checksum, lineage, or native stream verification failed)
 /// - 6: Restore error (no snapshot found, PITR unavailable)
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -777,7 +622,6 @@ async fn run() -> Result<()> {
     let command = Cli::command();
     let matches = command.get_matches();
     let cli = Cli::from_arg_matches(&matches)?;
-    let watch_matches = matches.subcommand_matches("watch");
 
     // Load config file (optional)
     let config = Config::load(cli.config.as_deref())?;
@@ -793,8 +637,8 @@ async fn run() -> Result<()> {
             max_interval,
             on_idle,
             on_startup,
-            compact_after_snapshot,
-            compact_interval,
+            prune_after_snapshot,
+            prune_interval,
             checkpoint_interval,
             min_checkpoint_pages,
             wal_truncate_threshold,
@@ -811,13 +655,8 @@ async fn run() -> Result<()> {
             max_delay_ms,
             no_circuit_breaker,
             circuit_breaker_threshold,
-            independent_tasks,
-            enable_cache,
-            cache_dir,
-            cache_retention,
-            cache_max_size,
-            uploader_concurrency,
-            no_cache,
+            spool_dir,
+            spool_max_size,
         } => {
             let watch_args = WatchArgs {
                 databases,
@@ -829,8 +668,8 @@ async fn run() -> Result<()> {
                 max_interval,
                 on_idle,
                 on_startup,
-                compact_after_snapshot,
-                compact_interval,
+                prune_after_snapshot,
+                prune_interval,
                 checkpoint_interval,
                 min_checkpoint_pages,
                 wal_truncate_threshold,
@@ -847,12 +686,8 @@ async fn run() -> Result<()> {
                 max_delay_ms,
                 no_circuit_breaker,
                 circuit_breaker_threshold,
-                enable_cache,
-                cache_dir,
-                cache_retention,
-                cache_max_size,
-                uploader_concurrency,
-                no_cache,
+                spool_dir,
+                spool_max_size,
             };
 
             let (
@@ -865,88 +700,45 @@ async fn run() -> Result<()> {
                 webhooks,
             ) = resolve_watch_config(&config, &watch_args)?;
 
-            // Resolve cache configuration
-            let cache_config = resolve_cache_config(&config, &watch_args, watch_matches.unwrap());
             let mut spool_config = config
                 .as_ref()
                 .map(|config| config.spool.clone())
                 .unwrap_or_default();
-            // Compatibility: existing cache path/size flags now configure the
-            // mandatory native spool in default shadow mode. They retain their
-            // legacy meaning only in independent mode.
-            if let Some(path) = watch_args.cache_dir.clone() {
+            if let Some(path) = watch_args.spool_dir.clone() {
                 spool_config.path = Some(path);
             }
-            if let Some(max_size) = watch_args.cache_max_size {
+            if let Some(max_size) = watch_args.spool_max_size {
                 spool_config.max_size = max_size;
                 spool_config.warning_size = spool_config
                     .warning_size
                     .min(max_size.saturating_mul(4) / 5);
             }
-            if cache_config.enabled {
-                tracing::info!(
-                    "Disk cache enabled (experimental): retention={}, max_size={}MB",
-                    cache_config.retention,
-                    cache_config.max_size / (1024 * 1024)
-                );
-            }
-
-            let compact_policy =
-                if sync_config.compact_after_snapshot || sync_config.compact_interval > 0 {
-                    Some(retention::RetentionPolicy::new(
-                        retention_config.hourly,
-                        retention_config.daily,
-                        retention_config.weekly,
-                        retention_config.monthly,
-                    ))
-                } else {
-                    None
-                };
-
-            // Choose sync mode based on flags
-            if independent_tasks {
-                tracing::info!("Independent tasks mode enabled");
-                sync::watch_with_independent_tasks(
-                    resolved_dbs,
-                    &bucket,
-                    endpoint.as_deref(),
-                    sync_config,
-                    compact_policy,
-                    watch_args.metrics_port,
-                    watch_args.no_metrics,
-                    retry_config,
-                    webhooks,
-                    cache_config.clone(),
-                )
-                .await?;
+            let prune_policy = if sync_config.prune_after_snapshot || sync_config.prune_interval > 0
+            {
+                Some(retention::RetentionPolicy::new(
+                    retention_config.hourly,
+                    retention_config.daily,
+                    retention_config.weekly,
+                    retention_config.monthly,
+                ))
             } else {
-                // Fail loudly on a silently-ignored knob (E7): leveled
-                // compaction only ticks in the independent-tasks watch loop
-                // (`maybe_compact_legacy` in `watch_independent.rs`). The default
-                // shadow loop has no compaction tick, so starting it with
-                // `[compaction] enabled = true` would accept the config and never
-                // compact — a config no-op that silently defeats the user's
-                // intent (and, worse, lets a bucket the user believes is being
-                // compacted grow unbounded). Refuse to start instead, pointing at
-                // the mode that honors the knob. (C3b adversarial review.)
-                reject_shadow_compaction(&resolved_dbs)?;
+                None
+            };
 
-                // Default: shadow WAL mode (decouples uploads from SQLite WAL)
-                sync::watch_with_shadow(
-                    resolved_dbs,
-                    &bucket,
-                    endpoint.as_deref(),
-                    sync_config,
-                    compact_policy,
-                    watch_args.metrics_port,
-                    watch_args.no_metrics,
-                    retry_config,
-                    webhooks,
-                    cache_config,
-                    spool_config,
-                )
-                .await?;
-            }
+            reject_shadow_compaction(&resolved_dbs)?;
+            sync::watch_with_shadow(
+                resolved_dbs,
+                &bucket,
+                endpoint.as_deref(),
+                sync_config,
+                prune_policy,
+                watch_args.metrics_port,
+                watch_args.no_metrics,
+                retry_config,
+                webhooks,
+                spool_config,
+            )
+            .await?;
         }
         Commands::Restore {
             name,
@@ -954,7 +746,7 @@ async fn run() -> Result<()> {
             bucket,
             endpoint,
             point_in_time,
-            cache_dir,
+            spool_dir,
         } => {
             sync::restore(
                 &name,
@@ -962,20 +754,13 @@ async fn run() -> Result<()> {
                 &bucket,
                 endpoint.as_deref(),
                 point_in_time.as_deref(),
-                cache_dir.as_deref(),
+                spool_dir.as_deref(),
                 None,
             )
             .await?;
         }
         Commands::List { bucket, endpoint } => {
             sync::list(&bucket, endpoint.as_deref()).await?;
-        }
-        Commands::Snapshot {
-            database,
-            bucket,
-            endpoint,
-        } => {
-            sync::snapshot(&database, &bucket, endpoint.as_deref()).await?;
         }
         Commands::Prune {
             name,
@@ -987,23 +772,6 @@ async fn run() -> Result<()> {
             monthly,
             force,
         } => {
-            let policy = retention::RetentionPolicy::new(hourly, daily, weekly, monthly);
-            sync::prune(&name, &bucket, endpoint.as_deref(), &policy, force).await?;
-        }
-
-        Commands::Compact {
-            name,
-            bucket,
-            endpoint,
-            hourly,
-            daily,
-            weekly,
-            monthly,
-            force,
-        } => {
-            eprintln!(
-                "warning: `walrust compact` is deprecated and will be removed; use `walrust prune` instead"
-            );
             let policy = retention::RetentionPolicy::new(hourly, daily, weekly, monthly);
             sync::prune(&name, &bucket, endpoint.as_deref(), &policy, force).await?;
         }
@@ -1109,8 +877,8 @@ mod tests {
             max_interval: None,
             on_idle: None,
             on_startup: None,
-            compact_after_snapshot: false,
-            compact_interval: None,
+            prune_after_snapshot: false,
+            prune_interval: None,
             checkpoint_interval: None,
             min_checkpoint_pages: None,
             wal_truncate_threshold: None,
@@ -1127,12 +895,8 @@ mod tests {
             max_delay_ms: None,
             no_circuit_breaker: false,
             circuit_breaker_threshold: None,
-            enable_cache: false,
-            cache_dir: None,
-            cache_retention: "24h".to_string(),
-            cache_max_size: None,
-            uploader_concurrency: 4,
-            no_cache: false,
+            spool_dir: None,
+            spool_max_size: None,
         }
     }
 
@@ -1190,109 +954,6 @@ mod tests {
         assert_eq!(result.max_retries, 3);
         assert_eq!(result.base_delay_ms, 100); // Default
         assert_eq!(result.max_delay_ms, 30000); // Default
-    }
-
-    // ============================================
-    // Cache Config Resolution Tests
-    // ============================================
-
-    fn matches_from_args(args: &[&str]) -> clap::ArgMatches {
-        use clap::CommandFactory;
-        let mut full_args = vec!["walrust", "watch"];
-        full_args.extend(args);
-        let matches = Cli::command()
-            .try_get_matches_from(full_args)
-            .expect("test args should parse");
-        matches
-            .subcommand_matches("watch")
-            .expect("watch subcommand should be present")
-            .clone()
-    }
-
-    #[test]
-    fn test_resolve_cache_config_defaults() {
-        let cli = default_watch_args();
-        let matches = matches_from_args(&[]);
-        let config = resolve_cache_config(&None, &cli, &matches);
-
-        assert!(!config.enabled);
-        assert_eq!(config.retention, "24h");
-        assert_eq!(config.max_size, 5 * 1024 * 1024 * 1024);
-        assert!(config.path.is_none());
-        assert_eq!(config.uploader_concurrency, 4);
-    }
-
-    #[test]
-    fn test_resolve_cache_config_cli_enable() {
-        let mut cli = default_watch_args();
-        cli.enable_cache = true;
-
-        let matches = matches_from_args(&["--enable-cache"]);
-        let config = resolve_cache_config(&None, &cli, &matches);
-
-        assert!(config.enabled);
-    }
-
-    #[test]
-    fn test_resolve_cache_config_cli_no_cache_overrides() {
-        let mut cli = default_watch_args();
-        cli.enable_cache = true;
-        cli.no_cache = true;
-
-        let matches = matches_from_args(&["--enable-cache", "--no-cache"]);
-        let config = resolve_cache_config(&None, &cli, &matches);
-
-        assert!(!config.enabled); // --no-cache wins
-    }
-
-    #[test]
-    fn test_resolve_cache_config_cli_overrides() {
-        let mut cli = default_watch_args();
-        cli.enable_cache = true;
-        cli.cache_retention = "7d".to_string();
-        cli.cache_max_size = Some(5 * 1024 * 1024 * 1024);
-        cli.cache_dir = Some(PathBuf::from("/custom/cache"));
-        cli.uploader_concurrency = 8;
-
-        let matches = matches_from_args(&[
-            "--enable-cache",
-            "--cache-retention",
-            "7d",
-            "--cache-max-size",
-            "5368709120",
-            "--cache-dir",
-            "/custom/cache",
-            "--uploader-concurrency",
-            "8",
-        ]);
-        let config = resolve_cache_config(&None, &cli, &matches);
-
-        assert!(config.enabled);
-        assert_eq!(config.retention, "7d");
-        assert_eq!(config.max_size, 5 * 1024 * 1024 * 1024);
-        assert_eq!(config.path, Some("/custom/cache".to_string()));
-        assert_eq!(config.uploader_concurrency, 8);
-    }
-
-    #[test]
-    fn test_resolve_cache_config_from_config_file() {
-        let mut file_config = Config::default();
-        file_config.cache.enabled = true;
-        file_config.cache.retention = "48h".to_string();
-        file_config.cache.max_size = 20 * 1024 * 1024 * 1024;
-        file_config.cache.path = Some("/config/cache".to_string());
-        file_config.cache.uploader_concurrency = 16;
-
-        let cli = default_watch_args();
-        let matches = matches_from_args(&[]);
-        let config = resolve_cache_config(&Some(file_config), &cli, &matches);
-
-        assert!(config.enabled);
-        // D7.2: CLI defaults must not override walrust.toml.
-        assert_eq!(config.retention, "48h"); // From file
-        assert_eq!(config.max_size, 20 * 1024 * 1024 * 1024); // From file
-        assert_eq!(config.path, Some("/config/cache".to_string())); // From file
-        assert_eq!(config.uploader_concurrency, 16); // From file
     }
 
     #[test]
@@ -1354,14 +1015,10 @@ mod tests {
         let err = reject_shadow_compaction(&[db_with_compaction(true)])
             .expect_err("shadow loop must refuse enabled compaction");
         let msg = err.to_string();
-        assert!(
-            msg.contains("independent-tasks"),
-            "error must point at independent-tasks mode; got: {msg}"
-        );
+        assert!(msg.contains("native-v1 streams"), "unexpected error: {msg}");
     }
 
-    /// The refusal is scoped to the enabled knob: compaction off (the default) or
-    /// independent-tasks mode (which never calls this) start normally.
+    /// The refusal is scoped to the enabled knob: compaction off starts normally.
     #[test]
     fn shadow_watch_allows_compaction_off() {
         reject_shadow_compaction(&[db_with_compaction(false)])

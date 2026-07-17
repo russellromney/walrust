@@ -10,8 +10,8 @@ readme = "README.md"
 
 [features]
 default = []
-# Re-enables hadb-io's `s3` (AWS SDK + the `hadb_io::s3` helpers used by
-# legacy walrust-core consumers). The trait surface (StorageBackend) is
+# Re-enables hadb-io's `s3` (AWS SDK + the `hadb_io::s3` convenience helpers).
+# The trait surface (StorageBackend) is
 # already AWS-free; this feature only governs the convenience re-exports.
 s3 = ["hadb-io/s3"]
 
@@ -25,16 +25,13 @@ async-trait = "0.1"
 # Storage substrate (trait)
 hadb-storage = { version = "0.5.0" }
 
-# Legacy retry/checksum helpers; replaced in step i.
+# Shared retry, configuration, retention, and webhook helpers.
 # default-features off so consumers can build walrust-core with no AWS deps;
 # the outer walrust crate's `s3` feature re-enables hadb-io/s3.
 hadb-io = { version = "0.5.0", default-features = false }
 
 # HADBP changeset format
 hadb-changeset = { version = "0.5.0" }
-
-# Legacy Litestream-derived LTX format used by the root CLI migration path.
-litepages = "0.1.0"
 
 # SQLite for checkpointing (shadow WAL)
 rusqlite = { version = "0.35", features = ["bundled"] }

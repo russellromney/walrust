@@ -10,18 +10,17 @@ append_rows "$DRILL_DB" 5 base
 
 name=$(basename "$DRILL_DB" .db)
 history="$DRILL_WORKDIR/pitr-history.tsv"
+WALRUST_DRILL_SNAPSHOT_INTERVAL=${WALRUST_DRILL_SNAPSHOT_INTERVAL:-2}
+start_walrust "$DRILL_DB"
 
-run_snapshot "$DRILL_DB" >/dev/null
 wait_restore_count "$name" 5
 printf '%s\t%s\n' "$(latest_txid)" 5 >>"$history"
 
 append_rows "$DRILL_DB" 6 mid
-run_snapshot "$DRILL_DB" >/dev/null
 wait_restore_count "$name" 11
 printf '%s\t%s\n' "$(latest_txid)" 11 >>"$history"
 
 append_rows "$DRILL_DB" 7 late
-run_snapshot "$DRILL_DB" >/dev/null
 wait_restore_count "$name" 18
 printf '%s\t%s\n' "$(latest_txid)" 18 >>"$history"
 

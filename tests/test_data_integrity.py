@@ -69,7 +69,7 @@ def test_single_db_integrity(bucket: str, endpoint: str = None):
         cmd = [
             "./target/release/walrust", "watch",
             "--bucket", f"s3://{bucket}/integrity-test/",
-            "--independent-tasks", "--no-metrics",
+            "--no-metrics",
             str(original_db)
         ]
         if endpoint:
@@ -181,7 +181,7 @@ def test_multi_db_integrity(num_dbs: int, bucket: str, endpoint: str = None):
         cmd = [
             "./target/release/walrust", "watch",
             "--bucket", f"s3://{bucket}/multi-integrity-test/",
-            "--independent-tasks", "--no-metrics"
+            "--no-metrics"
         ] + [str(p) for p in db_paths]
 
         if endpoint:

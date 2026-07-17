@@ -11,11 +11,6 @@
 //! name, and the nextest serial-group filters reference its test names.
 
 mod cli_exit_codes;
-mod legacy_ltx_core_convergence;
-mod legacy_manifest_core_convergence;
-mod restore_chain;
 mod test_explain;
-mod test_litestream_ltx_decode;
 mod test_verify;
-mod test_walrust_to_litestream;
 mod test_webhooks;

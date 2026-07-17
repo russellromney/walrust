@@ -174,8 +174,8 @@ fn test_explain_with_webhooks_configured() -> Result<()> {
 #[test]
 fn test_explain_with_compaction_enabled() -> Result<()> {
     let mut config = minimal_config();
-    config.sync.compact_after_snapshot = true;
-    config.sync.compact_interval = 7200;
+    config.sync.prune_after_snapshot = true;
+    config.sync.prune_interval = 7200;
 
     let result = sync::explain(&Some(config));
     assert!(

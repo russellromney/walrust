@@ -1,471 +1,114 @@
 ---
 title: FAQ
-description: Frequently asked questions about walrust
+description: Native HADBP replication, durability, restore, and operations
 ---
 
-Common questions about using walrust.
+## What does walrust replicate?
 
-## General
+Walrust watches a SQLite WAL, fsyncs validated frames into a shadow copy,
+encodes native HADBP snapshots/deltas into a durable local spool, and publishes
+those exact bytes to S3-compatible storage.
 
-### What is walrust?
+## Is this Litestream-compatible?
 
-Walrust is a lightweight SQLite replication tool written in Rust. It continuously backs up SQLite databases to S3-compatible storage by watching WAL (Write-Ahead Log) files and uploading changes as LTX files.
+No. Walrust does not read or write Litestream LTX. Use a separate bucket/prefix
+and start walrust with a fresh native snapshot.
 
-### How is walrust different from Litestream?
+## Does an S3 outage stop application checkpoints?
 
-Both tools use WAL-based replication with the LTX file format. Key differences:
+Not with the default `checkpoint_release = "local"`. A controlled checkpoint
+may proceed after the matching local HADBP payload and journal/cursor record are
+fsynced. Cloud failures increase `remote_lag`; they do not enter the checkpoint
+path while the spool remains healthy.
 
-| Aspect | walrust | Litestream |
-|--------|---------|------------|
-| Memory (1 DB) | 19 MB | 36 MB |
-| Memory (100 DBs) | 20 MB | 160 MB |
-| Language | Rust | Go |
-| Config format | TOML | YAML |
+`checkpoint_release = "remote"` additionally waits for contiguous publication.
+It still stages locally first and does not make every SQLite commit synchronous
+to S3.
 
-See [Migration from Litestream](/guide/migration-from-litestream/) for detailed comparison.
+## What happens when the spool fills?
 
-### Is walrust production-ready?
+Walrust emits `local_spool_high` before the hard limit. At
+`local_spool_full`, it retains pending objects and the SQLite checkpoint blocker
+and stops checkpointing. It never evicts an unuploaded object or the only local
+snapshot base. Increase capacity/free space or restore cloud publication.
 
-No. Walrust is alpha software — a hobby project that hasn't been used intensively in production. It works, but APIs and behavior may change. Test restores regularly if you use it.
+## Can walrust start for the first time while S3 is down?
 
-### What databases does walrust support?
+No. First startup must verify remote absence or an existing matching native
+descriptor. Offline continuation is allowed only from a matching local spool
+with a locally recorded published snapshot base.
 
-Walrust works with any SQLite database in WAL mode. This includes:
+## Is offline multi-host failover safe?
 
-- Raw SQLite databases
-- [Turso](https://turso.tech) local databases
-- Python apps using sqlite3
-- Node.js apps using better-sqlite3
-- Any application using SQLite
+Walrust does not claim that. Publication uses immutable conditional writes,
+lineage identity, and a chained visibility cursor, so a reconnecting divergent
+writer is rejected as split brain. There is no renewable distributed lease that
+would authorize two hosts to write offline concurrently.
 
-### Can I use walrust with non-WAL databases?
-
-No. Walrust requires WAL mode to capture incremental changes. Enable it with:
-
-```sql
-PRAGMA journal_mode=WAL;
-```
-
-## Setup & Configuration
-
-### Do I need AWS S3?
-
-No. Walrust works with any S3-compatible storage:
-
-- AWS S3
-- Tigris (Fly.io's object storage)
-- Cloudflare R2
-- MinIO (self-hosted)
-- Backblaze B2
-- DigitalOcean Spaces
-
-See [S3 Providers](/config/s3-providers/) for setup guides.
-
-### How do I configure walrust?
-
-Three ways:
-
-1. **CLI arguments** (quick, one-off commands)
-2. **Environment variables** (for credentials)
-3. **Config file** (`walrust.toml` for complex setups)
-
-See [Configuration Reference](/config/configuration-reference/) for all options.
-
-### Can I watch multiple databases?
-
-Yes! Pass multiple paths:
+## How do I restore latest or PITR?
 
 ```bash
-walrust watch app.db users.db analytics.db --bucket my-backups
+walrust restore app --bucket s3://bucket/backups --output restored.db
+walrust restore app --bucket s3://bucket/backups --output restored.db --point-in-time 42
 ```
 
-Or use wildcards in a config file:
+PITR targets native sequence numbers, not timestamps. Restore uses only the
+contiguous published recovery point and verifies the complete selected chain.
 
-```toml
-[[databases]]
-path = "/data/*.db"
-```
+## Can I restore from the local spool without S3?
 
-Walrust uses one process for all databases with minimal memory overhead.
-
-### How often are snapshots taken?
-
-Default: every 3600 seconds (1 hour). Configure with:
-
-```toml
-[sync]
-snapshot_interval = 1800  # 30 minutes
-```
-
-You can also trigger snapshots based on:
-- WAL frame count (`max_changes`)
-- Idle time (`on_idle`)
-- Time since last change (`max_interval`)
-
-## Backups & Restore
-
-### How much data will I lose if my server crashes?
-
-Depends on `wal_sync_interval`:
-
-- Default (1 second): Up to 1 second of data
-- Aggressive (0.5 seconds): Up to 0.5 seconds of data
-
-WAL changes are batched and uploaded on this interval. Lower values = less data loss but more S3 API calls.
-
-### How do I restore a database?
+Yes, when it contains a complete matching chain and the watcher does not own it:
 
 ```bash
-walrust restore mydb --bucket my-backups -o restored.db
+walrust restore app --bucket s3://bucket/backups \
+  --output restored.db --spool-dir /var/lib/walrust/spool
 ```
 
-This downloads the latest snapshot and applies all incremental LTX files.
+Ambiguous/mismatched spools and active owners are rejected.
 
-### Can I restore to a specific point in time?
-
-Yes, using point-in-time recovery (PITR):
+## How do I verify a backup?
 
 ```bash
-walrust restore mydb \
-  --bucket my-backups \
-  -o restored.db \
-  --point-in-time 42
+walrust verify app --bucket s3://bucket/backups
 ```
 
-Walrust will restore through that TXID/sequence number. Timestamp-based PITR is not currently implemented.
+This verifies descriptor identity, publication continuity, immutable payload
+hashes, HADBP decoding and chain checksums, and final SQLite integrity.
 
-### How do I test my backups?
-
-Run periodic test restores:
+## How is retention applied?
 
 ```bash
-#!/bin/bash
-# test-restore.sh
-walrust restore mydb --bucket my-backups -o /tmp/test.db
-sqlite3 /tmp/test.db "PRAGMA integrity_check;"
-if [ $? -eq 0 ]; then
-  echo "Backup verified successfully"
-  rm /tmp/test.db
-else
-  echo "Backup verification FAILED"
-  exit 1
-fi
+walrust prune app --bucket s3://bucket/backups        # dry run
+walrust prune app --bucket s3://bucket/backups --force
 ```
 
-Schedule this with cron or CI.
+Forced pruning publishes a native retention floor before deleting old objects.
+Watch can run the same GFS policy after snapshots or on an interval.
 
-### How do I verify backup integrity?
+## Can an application issue `wal_checkpoint(TRUNCATE)`?
 
-Use the verify command:
+The watcher holds a real checkpoint blocker so an application checkpoint cannot
+discard frames walrust has not admitted. Walrust's own PASSIVE contention is
+nonfatal; emergency TRUNCATE is bounded and observable.
+
+## What SQLite settings are required?
+
+The database must use WAL mode. Run `walrust pragma` for recommended settings.
+Keep the database, WAL, and SHM together on a filesystem with normal SQLite
+locking semantics. Network filesystems with unreliable locking are unsafe.
+
+## How do read replicas work?
 
 ```bash
-walrust verify mydb --bucket my-backups
+walrust replicate s3://bucket/backups/app --local replica.db --interval 5s
 ```
 
-This checks:
-- File existence
-- SHA256 checksums
-- TXID continuity
-- LTX header validity
-
-You can also enable automated verification:
-
-```toml
-[sync]
-validation_interval = 86400  # Verify daily
-```
-
-## Storage & Retention
-
-### How much S3 storage will I use?
-
-It depends on:
-- Database size
-- Write rate
-- Retention policy
-
-**Example:** A 100 MB database with moderate writes and default retention (24 hourly + 7 daily + 12 weekly + 12 monthly snapshots) uses roughly:
-
-```
-~100 MB (latest snapshot)
-+ ~50 MB (hourly incrementals)
-+ ~300 MB (older snapshots)
-= ~450 MB total
-```
-
-### How do I reduce storage costs?
-
-1. **Aggressive retention:**
-
-```toml
-[retention]
-hourly = 6   # Keep only last 6 hours
-daily = 3    # Last 3 days
-weekly = 4   # Last 4 weeks
-monthly = 3  # Last 3 months
-```
-
-2. **Auto-compaction:**
-
-```toml
-[sync]
-compact_after_snapshot = true
-```
-
-3. **Manual compaction:**
-
-```bash
-walrust compact mydb --bucket my-backups --force
-```
-
-### What happens to old snapshots?
-
-Walrust uses Grandfather-Father-Son (GFS) rotation to keep storage bounded:
-
-| Tier | Default | Keeps |
-|------|---------|-------|
-| Hourly | 24 | Last 24 hours |
-| Daily | 7 | One per day for a week |
-| Weekly | 12 | One per week for 12 weeks |
-| Monthly | 12 | One per month beyond that |
-
-Run `walrust compact` to delete old snapshots according to this policy.
-
-### Is my data encrypted?
-
-**In transit:** Yes, HTTPS by default.
-
-**At rest:** Depends on your S3 provider:
-- AWS S3: Enable server-side encryption (SSE-S3 or SSE-KMS)
-- Tigris: Enabled by default
-- MinIO: Configure encryption in MinIO settings
-
-Walrust doesn't do client-side encryption (yet). Use your S3 provider's encryption features.
-
-## Performance
-
-### How much memory does walrust use?
-
-- **Single database:** ~19 MB
-- **10 databases:** ~20 MB
-- **100 databases:** ~19 MB
-
-Walrust shares one S3 client (with connection pooling) across all databases and uses polling instead of file watchers.
-
-### How much CPU does it use?
-
-- **Idle:** <1%
-- **Active syncing:** 2-5% on modern hardware
-- **High write rate (10K+ writes/sec):** 10-20%
-
-If CPU is high, increase `wal_sync_interval`.
-
-### Can walrust keep up with high write rates?
-
-Walrust reads the WAL file externally and doesn't block SQLite writes. Sync latency depends on `wal_sync_interval` and your S3 provider. If you're seeing issues, increase `wal_sync_interval` or enable the disk cache.
-
-See [Benchmark Results](/benchmarks/results/) for measured latencies.
-
-## Read Replicas
-
-### What are read replicas?
-
-Read replicas are local databases that poll S3 for changes and stay in sync with the primary database. Useful for:
-
-- Offloading read queries
-- Running analytics without affecting production
-- Disaster recovery (warm standby)
-
-### How do I create a read replica?
-
-```bash
-walrust replicate s3://my-bucket/mydb --local replica.db --interval 5s
-```
-
-This polls S3 every 5 seconds, downloads new LTX files, and applies them to the local database.
-
-### How fresh is replica data?
-
-Freshness = `wal_sync_interval` (primary) + `interval` (replica) + S3 propagation time
-
-**Example:**
-- Primary syncs every 1 second
-- Replica polls every 5 seconds
-- S3 eventual consistency: ~1 second
-
-**Total lag:** ~7 seconds (P95)
-
-For near-real-time replication, use `--interval 1s`.
-
-### Can replicas write data?
-
-No. Replicas are read-only. Walrust will reject writes to replica databases to prevent conflicts.
-
-## Python Integration
-
-### How do I use walrust from Python?
-
-Install via pip:
-
-```bash
-pip install walrust
-```
-
-Use the Python API:
-
-```python
-from walrust import Walrust
-
-# Create instance
-ws = Walrust("s3://my-bucket", endpoint="https://fly.storage.tigris.dev")
-
-# Snapshot
-ws.snapshot("/path/to/app.db")
-
-# List databases
-dbs = ws.list()
-
-# Restore
-ws.restore("app", "/path/to/restored.db")
-```
-
-See [Python API Reference](/guide/python-api/) for full documentation.
-
-### Can I use walrust in a Jupyter notebook?
-
-Yes! Same Python API works in notebooks:
-
-```python
-from walrust import snapshot, restore
-
-# Backup
-snapshot("analysis.db", "s3://my-bucket")
-
-# Later... restore
-restore("analysis", "analysis-restored.db", "s3://my-bucket")
-```
-
-## Deployment
-
-### How do I run walrust in production?
-
-Use systemd, Docker, or Kubernetes. See [Deployment Guide](/config/deployment/) for examples.
-
-**Recommended: systemd**
-
-```ini
-[Service]
-ExecStart=/usr/local/bin/walrust watch /data/app.db --bucket my-backups
-Restart=always
-```
-
-### Can I run walrust in Docker?
-
-Yes. Mount your database volume:
-
-```yaml
-services:
-  walrust:
-    image: walrust
-    command: watch /data/app.db --bucket my-backups
-    volumes:
-      - app-data:/data:ro
-    environment:
-      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
-      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
-```
-
-### Should walrust run as a separate process or in-app?
-
-**Separate process (recommended):**
-- Easier to restart independently
-- Simpler deployment
-- Works with any language
-
-**In-app (Python only):**
-- Fewer moving parts
-- Tighter integration
-- Good for simple deployments
-
-For production, run walrust as a separate process (sidecar, systemd service, etc.).
-
-## Troubleshooting
-
-### Walrust isn't uploading to S3
-
-1. Check credentials:
-
-```bash
-echo $AWS_ACCESS_KEY_ID
-echo $AWS_SECRET_ACCESS_KEY
-```
-
-2. Verify bucket exists:
-
-```bash
-walrust list --bucket my-backups
-```
-
-3. Enable debug logging:
-
-```bash
-export RUST_LOG=walrust=debug
-walrust watch app.db --bucket my-backups
-```
-
-See [Troubleshooting Guide](/guide/troubleshooting/) for more.
-
-### How do I see what walrust is doing?
-
-Enable logging:
-
-```bash
-export RUST_LOG=walrust=info
-walrust watch app.db --bucket my-backups
-```
-
-Log levels: `error`, `warn`, `info`, `debug`, `trace`
-
-### Backups are failing silently
-
-Check exit codes in your systemd service:
-
-```bash
-sudo journalctl -u walrust -n 50
-```
-
-Walrust uses structured exit codes (0-6) to indicate different error types. See [Troubleshooting](/guide/troubleshooting/) for details.
-
-## Advanced
-
-### Can I use walrust with Raft or distributed SQLite?
-
-No. Walrust is designed for single-node SQLite databases. For distributed setups, consider:
-
-- [rqlite](https://rqlite.io) (Raft-based distributed SQLite)
-- [LiteFS](https://github.com/superfly/litefs) (FUSE-based replication)
-- Primary-replica with walrust (one primary, multiple read replicas)
-
-### Does walrust support encryption at rest?
-
-Not built-in. Use your S3 provider's server-side encryption:
-
-- AWS S3: SSE-S3 or SSE-KMS
-- Tigris: Enabled by default
-- MinIO: Configure via encryption settings
-
-Client-side encryption may be added in a future version.
-
-### Can I contribute?
-
-Yes! Walrust is open source (Apache 2.0). See the [GitHub repo](https://github.com/russellromney/walrust) for:
-
-- Issues and feature requests
-- Pull requests
-- Development setup
-
-### How do I stay updated?
-
-- Watch the [GitHub repo](https://github.com/russellromney/walrust)
-- Check [CHANGELOG.md](https://github.com/russellromney/walrust/blob/main/CHANGELOG.md)
-- Follow [@russellromney](https://github.com/russellromney) on GitHub
+Replicas bootstrap from a published native snapshot and apply contiguous
+deltas. Treat the replica as read-only.
+
+## Is there a one-shot snapshot or Python API?
+
+No. One-shot snapshot paths bypass the mandatory local spool/checkpoint state
+machine and are not part of the native-only CLI. Embed the native
+`walrust-core` Replicator protocol when building a library integration; its
+wire layout is separate from CLI native-v1.

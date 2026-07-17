@@ -1,83 +1,9 @@
-//! Compaction: merge many small changesets into fewer, larger ones.
+//! Native HADBP compaction: merge many small changesets into fewer objects.
 //!
-//! This is the **write side** of walrust's leveled compaction (wave C2a).
-//! It merges N contiguous source changesets at one level into a single
-//! `COMPACTED` (HADBP version 2) changeset at the next level, so a long-history
-//! database restores from a snapshot + a few coarse-grain files + a fine tail
-//! instead of tens of thousands of one-second objects.
-//!
-//! ## Read side + config exposure (wave C2b)
-//!
-//! The C2b read side ships here: the greedy [`planner`] (newest snapshot ≤
-//! target, then the file that extends the contiguous range furthest), the
-//! layout-agnostic [`restore`] executor (bounded parallel prefetch, strict-order
-//! apply, chain linkage through [`chain_end`](hadb_changeset::physical::chain_end)),
-//! level-aware verify [`coverage`], and the level-aware prune watermark
-//! ([`prune`]). Compaction is now controlled by the **single** user knob
-//! [`CompactionSettings`] / `[compaction] enabled` (default **false** — ship-dark
-//! for version skew: an old binary cannot restore a leveled bucket). The C2a
-//! internal flags (`Replicator::set_compaction_enabled`, `const
-//! COMPACTION_ENABLED`) are gone; the config is the only control.
-//!
-//! ## Key naming is forever
-//!
-//! The level-key scheme fossilizes like a wire format. It is fixed here and
-//! must not change:
-//!
-//! - **Range name** (a merged object covering an inclusive seq span
-//!   `[min, max]`): `{min:016x}-{max:016x}.{ext}`. Both bounds are `u64`
-//!   rendered as **16 lowercase zero-padded hex digits** (generous, `u64`-safe),
-//!   joined by `-` (0x2D). The separator sorts before every hex digit
-//!   (`0`..=`f`), so a listing is ordered by `min` and a point file
-//!   (`{s}-{s}`) interleaves correctly with ranges. `ext` is `hadbp`
-//!   (`ChangesetKind::Physical`) for the seq layout and `ltx` for the
-//!   litestream-heritage range layout.
-//! - **Level → directory**: Level 0 (raw) is the existing incremental pool at
-//!   `{prefix}{db}/0000/` (hadb's `GENERATION_INCREMENTAL`); the compaction
-//!   engine only *reads* it. Level `L >= 1` lives under a **dedicated
-//!   `{prefix}{db}/levels/L{L}/` sub-path**, deliberately *not* a hex generation
-//!   folder.
-//!
-//! ### Why levels are not generation folders (the collision that shaped this)
-//!
-//! The litestream-heritage legacy layout also lives under `{prefix}{db}/`, and
-//! it stores **snapshots in generation folders whose number increments by one
-//! per snapshot** (`snapshot_gen = current_gen + 1`, `legacy_wal_sync`). So the
-//! 16th snapshot of any long-lived database lands in `0010/`. An earlier design
-//! put compaction L1 at generation `0x0010` — the *same folder*. That was a
-//! two-way corruption:
-//!   - `legacy_manifest::discover_legacy_snapshots` treats **every** file in
-//!     generations `1..=max` as a snapshot, so it would classify compaction
-//!     merged objects (HADBP payloads, `.ltx` extension) as snapshot bases in
-//!     discovery / restore / verify / prune.
-//!   - Compaction's `list_level(1)` would list `0010/` and `parse_range_name`
-//!     the real `{min}-{max}.ltx` snapshots there, ingesting them as merge
-//!     sources.
-//! The dedicated `levels/L{L}/` sub-path is **structurally invisible** to every
-//! existing scanner: legacy discovery only accepts the `{gen}/{file}` (2-part)
-//! and `{file}` (1-part) relative shapes and parses the generation with
-//! `from_str_radix(_, 16)`, which rejects `levels` and `L1`. Owned-mode
-//! discovery only scans `0000/` (incrementals) and the fixed snapshot
-//! generation. No consumer of generation numbers can misread a compaction
-//! object.
-//!
-//! The **seq layout** (owned mode) names level-0 files `{seq:016x}.hadbp` (one
-//! seq per file; hadb's canonical `format_key`) and every merged level with the
-//! range-name scheme above, under `levels/L{L}/`. The **range layout**
-//! (litestream heritage) uses the range-name scheme at every level — `0000/` for
-//! L0 (its live LTX pool) and `levels/L{L}/` for merged levels.
-//!
-//! ## Decision: both adapters carry HADBP payloads
-//!
-//! The merge engine produces a COMPACTED v2 changeset — a HADBP-format
-//! construct. Rather than invent an LTX-format merge, both adapters read and
-//! write **HADBP** payloads; the range layout contributes the litestream
-//! *range-key discipline* (gen folders, `{min}-{max}` filenames), not the LTX
-//! byte format. Legacy `.ltx` payloads are read by the existing restore path,
-//! not the compactor; walrust has emitted HADBP changesets since the C1
-//! migration. This keeps the engine format-uniform and "built once for both
-//! layouts", exactly as the roadmap requires. (Documented per "decide and
-//! document; no one answers questions.")
+//! The engine merges contiguous native HADBP source changesets into a
+//! COMPACTED changeset at the next level. Level 0 uses the fixed native
+//! incremental generation; higher levels use `levels/L{n}`. Object names and
+//! chain checks remain versioned native HADBP invariants.
 //!
 //! ## Memory bound (hard requirement) — the honest two-part statement
 //!
@@ -123,7 +49,6 @@ pub mod layout;
 pub mod merge;
 pub mod planner;
 pub mod prune;
-pub mod range_layout;
 pub mod restore;
 pub mod seq_layout;
 pub mod trigger;
@@ -139,7 +64,6 @@ pub use planner::{
     plan_restore, refine_gap_with_snapshot_spans, PlanCandidate, PlanError, RestorePlan,
 };
 pub use prune::{list_level_files, plan_level_prune};
-pub use range_layout::RangeLayout;
 pub use restore::{apply_plan, gather_candidates, plan_over_layout, DEFAULT_PREFETCH_DEPTH};
 pub use seq_layout::SeqLayout;
 pub use trigger::{CompactionSettings, CompactionTriggers, TriggerConfig};

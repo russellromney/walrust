@@ -1131,9 +1131,9 @@ async fn test_rollover_observer_fires_on_fenced_external_refusal() -> Result<()>
     Ok(())
 }
 
-/// flush() after writing WAL frames should upload an LTX file and return frame count > 0.
+/// flush() after writing WAL frames should upload a HADBP file and return frame count > 0.
 #[tokio::test]
-async fn test_flush_uploads_ltx() {
+async fn test_flush_uploads_native_hadbp() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("test.db");
 
@@ -1161,7 +1161,7 @@ async fn test_flush_uploads_ltx() {
     // initial WAL frames. flush() syncs whatever is pending at this moment.
     let _frames = replicator.flush("test").await.unwrap();
 
-    // Verify LTX files were uploaded (either by flush or background sync).
+    // Verify HADBP files were uploaded (either by flush or background sync).
     let keys_after_flush = storage.keys();
     let ltx_keys: Vec<_> = keys_after_flush
         .iter()
@@ -1713,7 +1713,7 @@ async fn test_external_mode_duplicate_publish_waits_for_visible_existing_object(
 }
 
 #[tokio::test]
-async fn test_walrust_owned_reopen_uses_legacy_state_json() {
+async fn test_walrust_owned_reopen_uses_persistent_state_json() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("walrust-owned-reopen.db");
     let conn = create_wal_db(&db_path, 3);
@@ -1753,7 +1753,7 @@ async fn test_walrust_owned_reopen_uses_legacy_state_json() {
     assert_eq!(
         second.current_seq("owned").await,
         Some(saved_seq),
-        "walrust-owned add_without_snapshot should still use legacy state.json"
+        "walrust-owned add_without_snapshot should persist state.json"
     );
     // D2: reopen opens a pinned-frame checkpoint blocker, which writes one
     // `_walrust_seq` bookkeeping frame into the WAL. That single new frame may be
@@ -1812,7 +1812,7 @@ async fn test_walrust_owned_new_stream_writes_lineage_state_and_keys() {
                 || key.starts_with("wal/owned-lineage/0001/"))
                 && key.ends_with(".hadbp")
         }),
-        "new walrust-owned streams must not write legacy unlineaged HADBP keys; keys={keys:?}"
+        "new lineaged walrust-owned streams must not write unlineaged HADBP keys; keys={keys:?}"
     );
 
     drop(conn);
@@ -2036,7 +2036,7 @@ async fn test_flush_multiple_rounds() {
     let keys2 = storage.keys();
     let ltx_count_2 = keys2.iter().filter(|k| k.ends_with(".hadbp")).count();
 
-    // The new WAL data should have produced additional LTX files
+    // The new WAL data should have produced additional HADBP files
     // (either via flush() or the background sync loop)
     assert!(
         ltx_count_2 > ltx_count_1,

@@ -1,15 +1,11 @@
 //! Walrust - Lightweight SQLite WAL sync to S3/Tigris
 //!
-//! This library provides Python bindings for syncing SQLite WAL files to S3-compatible storage.
-//!
 //! The byte-level storage trait (`StorageBackend`) lives in `hadb-storage` and
 //! is what walrust composes on top of. Consumers wire in any concrete impl
 //! (`hadb-storage-s3`, `hadb-storage-cinch`, `hadb-storage-mem`, ...). The
 //! `s3` feature (default) pulls in `hadb-storage-s3` and exposes the
 //! convenience constructor [`s3_backend_from_env`].
 
-#[cfg(feature = "s3")]
-pub mod cache;
 pub mod config;
 #[cfg(feature = "s3")]
 pub mod dashboard;
@@ -25,17 +21,11 @@ pub mod s3;
 pub mod shadow;
 #[cfg(feature = "s3")]
 pub mod sync;
-// Test-only sync/snapshot/restore primitives over the StorageBackend trait,
-// used by the DST harness to inject storage faults and assert on the outcome.
-// Depends only on the always-available ltx/retry layers, not the s3 watch path.
-pub mod testable;
-#[cfg(feature = "s3")]
-pub mod uploader;
 pub mod wal;
 #[cfg(feature = "s3")]
 pub mod webhook;
 
-// Re-export retry types for DST
+// Re-export retry types for library consumers and integration tests.
 pub use retry::{RetryConfig, RetryPolicy};
 
 // Re-export walrust-core for library consumers
@@ -59,9 +49,3 @@ pub async fn s3_backend_from_env(
     let s3 = hadb_storage_s3::S3Storage::from_env(bucket, endpoint).await?;
     Ok(std::sync::Arc::new(s3))
 }
-
-#[cfg(feature = "python")]
-mod python;
-
-#[cfg(feature = "python")]
-pub use python::*;

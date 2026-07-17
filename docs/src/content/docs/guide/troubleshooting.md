@@ -1,426 +1,101 @@
 ---
 title: Troubleshooting
-description: Common issues and how to fix them
+description: Diagnose native spool, checkpoint, publication, and restore failures
 ---
 
-Quick guide to diagnosing and fixing common walrust issues.
-
-## Exit Codes
-
-Walrust uses structured exit codes for scripting and automation:
-
-| Code | Name | Meaning |
-|------|------|---------|
-| 0 | Success | Operation completed successfully |
-| 1 | General | Unknown or uncategorized error |
-| 2 | Config | Configuration error (invalid config file, missing CLI args) |
-| 3 | Database | Database error (file not found, WAL corruption, SQLite issues) |
-| 4 | S3 | S3 error (network, authentication, bucket access) |
-| 5 | Integrity | Integrity error (checksum mismatch, LTX verification failed) |
-| 6 | Restore | Restore error (no snapshot found, PITR unavailable) |
-
-**Use in scripts:**
-```bash
-walrust verify mydb -b s3://bucket
-case $? in
-  0) echo "Verification passed" ;;
-  5) echo "Integrity error - backup may be corrupted" ;;
-  4) echo "S3 error - check credentials/connectivity" ;;
-  *) echo "Other error: $?" ;;
-esac
-```
+## Start with the observable state
 
-## Configuration Errors (Exit Code 2)
+Run walrust with `RUST_LOG=info` or `RUST_LOG=debug`, record the exact database,
+bucket/prefix, spool root, and process exit code, then inspect these independent
+signals:
 
-### Missing --bucket Argument
+- `remote_lag` objects, bytes, age, and last error
+- `local_spool_high` / `local_spool_full`
+- live WAL bytes and shadow bytes
+- local HADBP stage/fsync duration
+- SQLite checkpoint duration
+- remote upload duration
 
-**Error:**
-```
-Error: --bucket is required when no config file is present
-```
+A healthy process can still have remote lag; process liveness is not proof of a
+current remote recovery point.
 
-**Solution:**
-Provide the bucket via CLI or config file:
+## Watch will not start
 
-```bash
-# CLI option
-walrust watch app.db --bucket my-backups
+Common fail-closed causes are:
 
-# Or create walrust.toml
-cat > walrust.toml <<EOF
-[s3]
-bucket = "s3://my-backups"
-EOF
-walrust watch app.db
-```
+- first-ever startup cannot contact storage to prove remote absence;
+- a remote native stream exists but the matching local identity/base is absent;
+- the configured spool resolves to a different canonical database/destination;
+- an unproven or divergent local HADBP orphan exists;
+- another watcher owns the local spool;
+- `[compaction] enabled = true` was set for CLI native-v1.
 
-### Invalid TOML Syntax
+Do not delete the spool to suppress an identity or orphan error. It may contain
+the only complete local recovery chain. Preserve it and investigate the stated
+lineage, sequence, checksum, and destination mismatch.
 
-**Error:**
-```
-Failed to parse walrust.toml: invalid key at line 5
-```
+## `remote_lag` keeps increasing
 
-**Solution:**
-Check for syntax errors in your config file:
+Application WAL ingestion may continue in default local mode while storage is
+unavailable. Check credentials, endpoint, DNS, TLS, bucket permissions, and
+clock skew. Walrust retries from the on-disk journal with bounded backoff.
 
-```toml
-# Bad - quotes missing
-bucket = s3://my-bucket
+When storage returns, publication revalidates the recorded predecessor. A
+`split brain/equivocation` error means the remote head changed incompatibly.
+Walrust deliberately retains the local spool and refuses to rebase or overwrite.
 
-# Good
-bucket = "s3://my-bucket"
-```
+## `local_spool_high` or `local_spool_full`
 
-### Invalid Duration Format
+The capacity calculation uses the actual spool filesystem and reserves peak
+space for WAL/shadow data, snapshot and payload temporaries, installed payloads,
+journal rewrites, and `min_free_space`.
 
-**Error:**
-```
-Invalid duration '5x'. Use format like '5s', '5m', '5h', '5d'
-```
+At full capacity walrust keeps the blocker and stops checkpointing. Free space
+outside the spool only if it is unrelated data, expand the filesystem, increase
+the configured cap when real space exists, or repair remote publication. Never
+delete pending `.hadbp`, intent, or journal files by hand.
 
-**Solution:**
-Use valid duration suffixes:
+## WAL remains large
 
-```toml
-[cache]
-retention = "24h"  # hours
-# retention = "7d"   # days
-# retention = "30m"  # minutes
-# retention = "60s"  # seconds
-```
+Check whether the spool is full, the checkpoint preflight is continuously busy,
+a reader pins old WAL frames, or an emergency TRUNCATE is contended. A partial
+PASSIVE checkpoint is expected contention and is retried with the blocker
+rearmed. Emergency TRUNCATE is bounded; failure leaves a loud degraded state.
 
-## Database Errors (Exit Code 3)
+## Restore reports no recovery point
 
-### Database File Not Found
+Raw object upload is insufficient. Restore requires `stream.json`, a contiguous
+chain of `published/<seq>.json` records, and a snapshot base at/before the
+target. Check the requested native sequence against the current retention floor.
 
-**Error:**
-```
-Database not found: /path/to/app.db
-```
+For local restore, specify the same spool root used by watch. Restore refuses an
+active owner, ambiguous candidate spools, mismatched destination identity, or an
+incomplete chain.
 
-**Solution:**
-Verify the database path exists:
+## Verify exits with integrity status
 
-```bash
-ls -la /path/to/app.db
-```
+Do not retry past or delete the reported object. Preserve the bucket and local
+spool for investigation. Verify checks immutable SHA-256, HADBP structure,
+sequence/lineage, predecessor and ending checksums, database size, and final
+SQLite integrity. An existing remote key with different bytes is a hard
+equivocation, not an overwrite opportunity.
 
-If using a config file with wildcards, check the pattern:
+## Replica reboots from a snapshot
 
-```toml
-[[databases]]
-path = "/data/*.db"  # Make sure this matches actual files
-```
+This is expected when retention removed the replica's next required delta. The
+replica selects a currently published snapshot and contiguous suffix. Keep the
+replica database read-only; local writes make it divergent.
 
-### WAL Not Enabled
+## Graceful shutdown takes time
 
-**Error:**
-```
-WAL mode not enabled for database
-```
+Shutdown first admits pending local work, then optionally drains cloud for at
+most `spool.shutdown_drain_seconds`. Pending work remains on disk whether the
+drain succeeds or the process is SIGKILLed. A forced kill is recovered from the
+durable spool on restart.
 
-**Solution:**
-Enable WAL mode on your database:
+## Collecting a support bundle
 
-```sql
-PRAGMA journal_mode=WAL;
-```
-
-Or from the command line:
-
-```bash
-sqlite3 app.db "PRAGMA journal_mode=WAL;"
-```
-
-### Invalid Page Size
-
-**Error:**
-```
-Invalid page size: 512
-```
-
-**Solution:**
-SQLite databases must use supported page sizes (512, 1024, 2048, 4096, 8192, 16384, 32768, or 65536 bytes). Most databases use 4096 bytes by default. This error usually indicates a corrupted database.
-
-Verify your database:
-
-```bash
-sqlite3 app.db "PRAGMA integrity_check;"
-```
-
-## S3 Errors (Exit Code 4)
-
-### Access Denied
-
-**Error:**
-```
-AccessDenied: Access to bucket denied
-```
-
-**Solution:**
-1. Check your credentials:
-
-```bash
-echo $AWS_ACCESS_KEY_ID
-echo $AWS_SECRET_ACCESS_KEY
-```
-
-2. Verify bucket permissions (AWS IAM policy needs `s3:PutObject`, `s3:GetObject`, `s3:ListBucket`)
-
-3. For Tigris, ensure you're using the correct access key format:
-
-```bash
-export AWS_ACCESS_KEY_ID=tid_xxxxx
-export AWS_SECRET_ACCESS_KEY=tsec_xxxxx
-export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
-```
-
-### No Such Bucket
-
-**Error:**
-```
-NoSuchBucket: The specified bucket does not exist
-```
-
-**Solution:**
-1. Create the bucket first:
-
-```bash
-# AWS
-aws s3 mb s3://my-bucket
-
-# Tigris (via Fly.io)
-fly storage create
-```
-
-2. Check bucket name spelling in your config
-
-### Connection Timeout
-
-**Error:**
-```
-Failed to connect to S3: connection timeout
-```
-
-**Solution:**
-1. Check network connectivity:
-
-```bash
-ping fly.storage.tigris.dev
-# or
-ping s3.amazonaws.com
-```
-
-2. Verify endpoint URL is correct:
-
-```bash
-# For Tigris
-export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
-
-# For AWS (usually not needed)
-unset AWS_ENDPOINT_URL_S3
-```
-
-3. Check firewall rules allow outbound HTTPS (port 443)
-
-## Integrity Errors (Exit Code 5)
-
-### Checksum Mismatch
-
-**Error:**
-```
-Checksum mismatch: expected 0x123abc, got 0x456def
-```
-
-**Solution:**
-1. Run verification:
-
-```bash
-walrust verify mydb --bucket my-backups
-```
-
-2. If specific files are corrupted, restore from an earlier snapshot:
-
-```bash
-# List snapshots
-walrust list --bucket my-backups
-
-# Restore through a specific TXID/sequence number
-walrust restore mydb -o restored.db \
-  --bucket my-backups \
-  --point-in-time 100
-```
-
-3. Check S3 storage for corruption (rare but possible)
-
-### TXID Continuity Broken
-
-**Error:**
-```
-TXID continuity broken: gap between file 5 (TXID 100) and file 6 (TXID 110)
-```
-
-**Solution:**
-This indicates missing LTX files. Possible causes:
-
-1. Manual file deletion from S3
-2. Failed uploads that weren't retried
-3. Compaction bug (unlikely)
-
-**Recovery:**
-Use point-in-time restore to the last valid TXID:
-
-```bash
-walrust restore mydb -o restored.db \
-  --bucket my-backups \
-  --point-in-time 100
-```
-
-## Restore Errors (Exit Code 6)
-
-### No Snapshot Found
-
-**Error:**
-```
-No snapshot found for database 'mydb'
-```
-
-**Solution:**
-1. Check database name:
-
-```bash
-walrust list --bucket my-backups
-```
-
-2. Verify S3 prefix:
-
-```bash
-# If you used a custom prefix in config
-[[databases]]
-path = "/data/app.db"
-prefix = "production"  # Use this name for restore
-
-# Restore
-walrust restore production -o app.db --bucket my-backups
-```
-
-### PITR Unavailable
-
-**Error:**
-```
-Point-in-time restore unavailable: no snapshot found at or before TXID 100
-```
-
-**Solution:**
-The requested TXID/sequence is before your first available snapshot. List available snapshots:
-
-```bash
-walrust list --bucket my-backups
-```
-
-Restore to the earliest available snapshot instead:
-
-```bash
-walrust restore mydb -o restored.db --bucket my-backups
-```
-
-## Performance Issues
-
-### High CPU Usage
-
-**Symptoms:**
-- walrust consuming 30%+ CPU continuously
-
-**Solutions:**
-1. Increase `wal_sync_interval` to batch WAL syncs:
-
-```toml
-[sync]
-wal_sync_interval = 5  # Sync every 5 seconds
-```
-
-2. Check for extremely high write rates (10K+ writes/sec per DB)
-
-### High Memory Usage
-
-**Symptoms:**
-- walrust using more than 50 MB for small databases
-
-**Solutions:**
-1. Check for WAL file growth:
-
-```bash
-ls -lh /data/*.db-wal
-```
-
-If WAL files are huge (>100 MB), enable checkpointing:
-
-```toml
-[sync]
-checkpoint_interval = 60
-min_checkpoint_page_count = 1000
-wal_truncate_threshold_pages = 121359
-```
-
-Default shadow watch deliberately pins a WAL read mark so application
-checkpoints cannot destroy frames that have not reached its fsynced native HADBP
-spool and journal. That makes walrust
-responsible for releasing the WAL. If the threshold is crossed, walrust logs an
-ERROR and sends the optional `wal_size_exceeded` webhook before durably staging
-and running its controlled TRUNCATE checkpoint. `remote_lag` means S3 is behind;
-`local_spool_high` and `local_spool_full` mean local capacity needs attention.
-At full capacity walrust keeps the blocker and stops checkpointing, so repeated
-alarms can precede slow or stalled application writes.
-
-2. Reduce snapshot interval for memory relief:
-
-```toml
-[sync]
-snapshot_interval = 1800  # 30 minutes instead of 1 hour
-```
-
-### Slow Uploads
-
-**Symptoms:**
-- S3 uploads taking several seconds
-
-**Solutions:**
-1. Enable local cache for faster encoding:
-
-```toml
-[cache]
-enabled = true
-retention = "24h"
-max_size = 5368709120  # 5GB
-```
-
-2. Check network bandwidth to S3
-
-3. Consider using a CDN or S3 in a closer region
-
-## Getting Help
-
-If you're stuck:
-
-1. **Enable debug logging:**
-
-```bash
-export RUST_LOG=walrust=debug
-walrust watch app.db -b my-bucket 2>&1 | tee walrust.log
-```
-
-2. **Run verify to check backup integrity:**
-
-```bash
-walrust verify mydb --bucket my-backups
-```
-
-3. **Check recent issues:** [GitHub Issues](https://github.com/russellromney/walrust/issues)
-
-4. **Ask for help:** Open a new issue with:
-   - walrust version (`walrust --version`)
-   - Operating system
-   - Full error message
-   - Relevant config (redact credentials!)
-   - Debug logs
+Capture configuration with secrets removed, `walrust explain`, relevant logs,
+filesystem free space for both database and custom spool mounts, the exact CLI
+version, and `walrust verify` output. Do not include credential values or alter
+the spool before copying it for analysis.

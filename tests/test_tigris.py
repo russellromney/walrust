@@ -54,7 +54,7 @@ def main():
         print(f"Bucket: {bucket}")
         print()
 
-        # Run walrust with independent tasks mode
+        # Run native walrust watch.
         env = os.environ.copy()
         env["RUST_LOG"] = "walrust=trace"
 
@@ -62,7 +62,6 @@ def main():
             "./target/release/walrust",
             "watch",
             "--bucket", f"s3://{bucket}/tigris-test/",
-            "--independent-tasks",
             "--no-metrics",
             db_path,
         ]

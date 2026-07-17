@@ -69,10 +69,10 @@ More commands:
 ```bash
 walrust restore mydb -o restored.db -b s3://my-bucket                        # restore from S3
 walrust restore mydb -o restored.db -b s3://my-bucket --point-in-time 42     # restore through TXID/sequence 42
-walrust snapshot app.db -b s3://my-bucket                  # immediate snapshot (errors if a watcher owns the DB)
 walrust verify mydb -b s3://my-bucket                      # check backup integrity
 walrust list -b s3://my-bucket                             # list backups
-walrust prune -b s3://my-bucket                            # GFS retention cleanup
+walrust prune mydb -b s3://my-bucket                       # GFS retention dry run
+walrust prune mydb -b s3://my-bucket --force               # publish floor and delete expired history
 walrust explain                                            # preview resolved config
 ```
 
@@ -113,8 +113,8 @@ Notes for embedders:
   database: use `add_without_snapshot()`, not `add()` (`add()` refuses with
   compaction on). See that section for why.
 
-Bindings for other languages are planned; Python bindings exist today behind
-the `python` feature.
+Bindings for other languages are not part of the native-only CLI protocol.
+Use `walrust-core` for an embedded Rust integration.
 
 ## Safety and design
 
@@ -157,23 +157,13 @@ behavior breaks:
   spool. Set `checkpoint_release = "remote"` only when checkpoints should also
   wait for the contiguous remote publish cursor; this does not make each SQLite
   commit synchronously cloud-durable.
-- **Restart re-anchors with a full snapshot (`--independent-tasks`).** On every
-  restart against an existing stream, walrust re-anchors by uploading a fresh
-  full snapshot of the current `.db`, not by resuming an incremental. This is a
-  deliberate cost/safety trade, and it happens on *clean* restarts too (deploys,
-  host reboots), not just crashes. Why unconditional: the in-memory checksum
-  chain that an incremental would resume from is not reconstructible from the
-  on-disk `.db` (the chain is a running page-hash; the `.db` only yields a
-  whole-file hash, a different space), and — the decisive reason — if SQLite
-  checkpointed and truncated the WAL for pages walrust had not yet shipped, only
-  a snapshot of the live `.db` captures them; resuming an incremental from the
-  (now-truncated) WAL would silently drop them. walrust cannot cheaply tell that
-  safe case from the lossy one at startup, so it always takes the safe path.
-  **Cost:** each restart uploads ~one DB's worth of data and delays replication
-  of new writes until the snapshot finishes — cost scales with DB size (a 10 GB
-  database re-ships ~10 GB and stalls startup for tens of seconds to minutes on
-  every restart). A persisted local chain cursor to skip the snapshot on a
-  provably-clean restart is possible future work (see ROADMAP).
+- **Restart is proven from durable native state.** A watcher can resume while
+  S3 is unavailable only when its local journal, native snapshot base, lineage,
+  source cursor, and payload checksums all validate. First startup without that
+  proof must verify remote absence or the existing native stream before it can
+  stage data. A dirty controlled-checkpoint window, downtime WAL reset, or other
+  cursor discontinuity forces a full native HADBP snapshot re-anchor before the
+  next checkpoint is released. Unproven or mismatched state fails loudly.
 - **Single writer, enforced.** A lock file (`.walrust-<db>.lock`) makes a
   second watcher on the same host fail fast instead of corrupting the backup.
 - **Retention never orphans a restore point.** `prune` keeps every object a
@@ -215,35 +205,19 @@ and cost). It is **off by default**:
 
 ```toml
 [compaction]
-enabled = false          # default; see the version-skew warning below
+enabled = false          # default
 keep_fine_window = "1h"  # never merge L0 objects younger than this
 l1_batch = 60            # L0 objects folded per L1 merge
 l2_batch = 24            # L1 objects folded per L2 merge
 ```
 
-Compaction works in **both** the `walrust` CLI (`walrust watch
---independent-tasks` compacts, `walrust restore` / `verify` read the leveled
-bucket across the LTX→HADBP seam) and **library / owned mode** via the
-`Replicator`. On the CLI, compaction ticks **only in independent-tasks mode**;
-the default shadow watch loop does not compact, so starting it with `[compaction]
-enabled = true` fails loudly and points you at `--independent-tasks` (it will not
-silently ignore the knob and let the bucket grow).
+Leveled compaction applies to the native library/owned layout through
+`Replicator`. Native CLI watch uses full snapshot boundaries plus retention;
+starting CLI watch with `[compaction] enabled = true` fails loudly because that
+knob does not apply to the CLI native-v1 stream.
 
 Two honest caveats, one sentence each:
 
-- **Version skew (empirically confirmed, not theoretical):** a leveled bucket
-  is **not restorable by walrust binaries older than this release** — they
-  don't know the `levels/` layout exists — so compaction ships dark; only
-  enable it once every binary that might restore the bucket understands
-  levels. `drills/version-skew.sh` (manual/`make drill-version-skew` only)
-  builds a real leveled bucket and runs a real pre-compaction `walrust
-  restore` (crates.io `0.5.1`) against it. Observed outcome: **exit 0** — no
-  error reported to the operator — producing a **corrupt database**
-  (`PRAGMA integrity_check` fails with `btreeInitPage() returns error code
-  11` on the pages that existed only inside the merged-and-deleted range).
-  That is worse than a short restore: silent corruption with a success exit
-  code. This is the confirmed hazard the `enabled = false` default exists to
-  prevent.
 - **PITR granularity decays with age:** point-in-time restore stays second-exact
   inside `keep_fine_window`, but a target that falls *strictly inside* an older
   merged window fails loudly, naming the nearest restorable points on both sides,
@@ -317,16 +291,6 @@ request cost matters more than a tight recovery point, raise
 **Restore speed with compaction.** Leveled compaction folds a long incremental
 history into a handful of merged objects, so cold restore-to-latest fetches far
 fewer objects. Measured on a ~10,000-row history built at 1s sync to local MinIO
-(release binary, 3-run median, fresh output path each; `bench/restore-speed.sh`,
-`bench/results-20260710T141118Z`): walrust **with** compaction restored in
-**0.29 s fetching 5 objects**, versus **1.98 s fetching 242 objects** without —
-so compaction makes walrust restore **~7x faster and fetch ~48x fewer objects**
-on this history, and the gap widens as the history grows. Honest caveat: against
-litestream's own compaction, walrust-compacted fetches fewer objects (5 vs 25)
-but does **not** win wall-clock at this scale — litestream restored in 0.09 s vs
-walrust's 0.29 s, because litestream's per-object apply path is more optimized
-and walrust does more per object (LTX→HADBP decode + chain verify +
-`integrity_check`). Re-run `bench/restore-speed.sh` against your own workload.
 
 ## vs Litestream
 

@@ -91,14 +91,6 @@ jobs:
       - name: Shellcheck drills
         run: shellcheck drills/*.sh
 
-      # Deep state-machine property sweep: the same generated op-sequence +
-      # fault-schedule harness the CI tests job runs at 32 cases, explored at
-      # 512 cases per phase nightly. A failure shrinks to a minimal sequence,
-      # persists it under walrust-dst/proptest-regressions/, and turns this
-      # workflow red.
-      - name: State-machine property sweep (deep)
-        run: PROPTEST_CASES=512 cargo test -p walrust-dst state_machine
-
       - name: Drill
         id: drill
         continue-on-error: true

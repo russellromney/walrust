@@ -39,12 +39,6 @@ See [Why Walrust?](/start/why-walrust/) for detailed comparisons and use cases.
 cargo install walrust
 ```
 
-### Python
-
-```bash
-pip install walrust
-```
-
 ### Verify
 
 ```bash
@@ -63,30 +57,23 @@ export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev
 
 See [S3 Providers](/config/s3-providers/) for AWS, R2, MinIO, and other providers.
 
-## Take a Snapshot
+## Start the durable watcher
 
-Back up your database to S3:
-
-```bash
-walrust snapshot myapp.db --bucket my-backups
-```
-
-Output:
-```
-Snapshotting myapp.db to s3://my-backups/myapp.db/...
-✓ Snapshot complete (1.2 MB, 445ms)
-  Checksum: a3f2b9c8d4e5f6a7...
-```
-
-## Watch for Changes
-
-Continuously sync WAL changes:
+Start the native local-first pipeline. The initial snapshot is admitted to the
+fsynced local spool before asynchronous publication:
 
 ```bash
 walrust watch myapp.db --bucket my-backups
 ```
 
-This watches for database changes and syncs them to S3. Run this as a background service in production.
+Output:
+```
+native HADBP snapshot admitted to durable local spool ...
+uploaded exact native HADBP spool object ...
+```
+
+Keep the watcher running with your application. By default, controlled SQLite
+checkpoint completion depends on local spool durability, not S3 latency.
 
 ## Restore
 
@@ -127,7 +114,7 @@ Poll interval: 5s
 Press Ctrl+C to stop
 
 Bootstrapped from snapshot: 1024 pages, TXID 100
-[10:30:05] Applied 1 LTX file(s), now at TXID 101
+[10:30:05] Published native sequence 101 locally
 ```
 
 The replica auto-bootstraps from the latest snapshot if it doesn't exist, then applies incremental updates.

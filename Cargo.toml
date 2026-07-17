@@ -14,13 +14,13 @@ exclude = [
     "bench/",
     "experiments/",
     ".github/",
+    "tests/fixtures/format-stability/cli-v0.7.0/",
 ]
 
 [workspace]
 members = [
     ".",
     "crates/walrust-core",
-    "walrust-dst",
 ]
 resolver = "2"
 
@@ -41,17 +41,13 @@ required-features = ["s3"]
 # `hadb_storage::StorageBackend` impl.
 default = ["s3"]
 s3 = ["dep:aws-sdk-s3", "dep:hadb-storage-s3", "hadb-io/s3", "walrust-core/s3"]
-python = ["pyo3"]
 
 [dependencies]
-# Python bindings
-pyo3 = { version = "0.22", features = ["extension-module"], optional = true }
-
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
 
-# Parallelization for LTX encoding (CPU-bound compression)
+# Parallelization for native HADBP encoding (CPU-bound compression)
 rayon = "1.10"
 
 # CLI
@@ -86,7 +82,7 @@ walrust-core = { version = "0.7.0", path = "crates/walrust-core" }
 hadb-storage = { version = "0.5.0" }
 hadb-storage-s3 = { version = "0.5.0", optional = true }
 
-# Legacy config/webhook/retention/s3 helpers. Default-features = false so
+# Shared config/webhook/retention/S3 helpers. Default-features = false so
 # `walrust --no-default-features` can build without aws-sdk; the `s3` feature
 # above re-enables hadb-io's `s3` (and pulls in aws-sdk-s3 transitively).
 hadb-io = { version = "0.5.0", default-features = false }

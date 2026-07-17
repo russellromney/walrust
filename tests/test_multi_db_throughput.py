@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Test multi-DB throughput with independent tasks mode."""
+"""Test multi-DB throughput with native shadow watch."""
 
 import os
 import sqlite3
@@ -78,7 +78,7 @@ def main():
         print(f"Created {num_dbs} databases in {tmpdir}")
         print()
 
-        # Run walrust with independent tasks mode
+        # Run native walrust watch.
         env = os.environ.copy()
         env["RUST_LOG"] = "walrust=info"
 
@@ -86,7 +86,6 @@ def main():
             "./target/release/walrust",
             "watch",
             "--bucket", f"s3://{bucket}/multidb-test/",
-            "--independent-tasks",
             "--no-metrics",
         ] + db_paths
 
@@ -174,7 +173,7 @@ def main():
         print(f"  Duration: {duration:.1f}s")
         if 'cpu_samples' in locals() and cpu_samples:
             print(f"  Average CPU: {avg_cpu:.1f}%")
-        print("  Status: SUCCESS - Independent tasks handled {num_dbs} DBs")
+        print(f"  Status: SUCCESS - native watch handled {num_dbs} DBs")
         print("="*80)
 
 if __name__ == "__main__":

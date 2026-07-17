@@ -124,14 +124,6 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y sqlite3
 
-      - name: Install Litestream
-        run: |
-          curl -fsSL -o litestream.tar.gz \
-            https://github.com/benbjohnson/litestream/releases/download/v0.5.14/litestream-0.5.14-linux-x86_64.tar.gz
-          tar -xzf litestream.tar.gz
-          sudo mv litestream /usr/local/bin/
-          litestream version
-
       - name: Create MinIO bucket
         run: |
           python -m pip install --user minio

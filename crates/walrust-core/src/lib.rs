@@ -13,15 +13,6 @@
 pub mod compaction;
 pub mod errors;
 pub mod external_delta;
-pub mod legacy_cache;
-pub mod legacy_ltx;
-pub mod legacy_manifest;
-pub mod legacy_replica;
-pub mod legacy_restore;
-pub mod legacy_shadow;
-pub mod legacy_shadow_watch;
-pub mod legacy_uploader;
-pub mod legacy_wal_sync;
 pub mod ltx;
 pub mod native_publish;
 pub mod native_restore;
@@ -30,6 +21,7 @@ pub mod native_spool;
 pub mod replay_sink;
 pub mod replicator;
 pub mod shadow;
+pub mod shadow_watch;
 pub mod snapshot_source;
 pub mod sync;
 pub mod wal;
@@ -37,7 +29,7 @@ pub mod wal;
 // `StorageBackend` lives in `hadb-storage`; consumers import it directly.
 // No re-export from here — one path per trait keeps the dep graph honest.
 
-// Legacy shared infrastructure from hadb-io (retry, circuit breaker). Step i
+// Shared infrastructure from hadb-io (retry, circuit breaker).
 // of Phase Anvil moves the remaining helpers elsewhere and drops hadb-io.
 pub use hadb_io;
 pub use hadb_io::{classify_error, is_retryable, CircuitBreaker, CircuitState, ErrorKind};

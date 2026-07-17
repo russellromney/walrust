@@ -27,7 +27,7 @@ Memory stays flat because walrust shares one S3 client (with connection pooling)
 
 - You're watching many SQLite databases (10+) and memory matters
 - You want TOML config instead of YAML
-- You want a Python API for scripting backups
+- You need checkpoint latency isolated from temporary cloud latency by a durable local spool
 
 ## When to use Litestream
 
@@ -38,6 +38,7 @@ Memory stays flat because walrust shares one S3 client (with connection pooling)
 ## Implementation
 
 - Written in Rust (async/await on tokio)
-- Uses the [LTX file format](https://github.com/superfly/ltx) (derived from Litestream, but not compatible with Litestream restores)
+- Uses native HADBP snapshot/delta objects with a versioned publication chain;
+  it does not read or write Litestream LTX
 - One shared S3 client with connection pooling; each database gets its own upload task for concurrency
 - ~8 MB binary

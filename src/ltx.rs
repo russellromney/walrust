@@ -1,6 +1,3 @@
-//! Compatibility shim for the legacy Litestream-derived LTX implementation.
-//!
-//! Phase 4 convergence keeps the existing root CLI object format stable while
-//! moving the codec and its invariants into `walrust-core`.
+//! Native HADBP codec re-export.
 
-pub use walrust_core::legacy_ltx::*;
+pub use walrust_core::ltx::*;
