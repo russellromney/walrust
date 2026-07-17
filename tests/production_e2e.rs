@@ -155,6 +155,32 @@ fn force_truncate_checkpoint(conn: &Connection) -> Result<(i64, i64, i64)> {
     Ok(row)
 }
 
+fn force_truncate_busy_result(conn: &Connection) -> Result<i64> {
+    match force_truncate_checkpoint(conn) {
+        Ok((busy, _, _)) => Ok(busy),
+        Err(error) => {
+            let is_busy = error
+                .downcast_ref::<rusqlite::Error>()
+                .is_some_and(|error| {
+                    matches!(
+                        error,
+                        rusqlite::Error::SqliteFailure(code, _)
+                            if matches!(
+                                code.code,
+                                rusqlite::ErrorCode::DatabaseBusy
+                                    | rusqlite::ErrorCode::DatabaseLocked
+                            )
+                    )
+                });
+            anyhow::ensure!(
+                is_busy,
+                "external TRUNCATE failed for a reason other than SQLITE_BUSY/LOCKED: {error:#}"
+            );
+            Ok(1)
+        }
+    }
+}
+
 fn append_rows(conn: &Connection, start: i64, end: i64, label: &str) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE;")?;
     let result = (|| -> Result<()> {
@@ -4185,10 +4211,7 @@ async fn e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss() -> 
     //    (busy != 0); the WAL is not reset, so A2's frames survive and ship on the
     //    next flush. A busy DB can also surface as a SQLITE_BUSY error rather than a
     //    busy!=0 result row — either is proof the pin engaged.
-    let busy = match force_truncate_checkpoint(&writer) {
-        Ok((busy, _log, _ckpt)) => busy,
-        Err(_) => 1,
-    };
+    let busy = force_truncate_busy_result(&writer)?;
     anyhow::ensure!(
         busy != 0,
         "the D2 checkpoint blocker must refuse a racing external TRUNCATE (busy={busy})"
@@ -4601,12 +4624,7 @@ fn e2e_cli_watch_blocks_app_checkpoint_underneath_without_data_loss() -> Result<
         let start = 6 + batch * 30;
         append_wide_rows(&writer, start, start + 29, "cli-race")?;
         // Race an explicit TRUNCATE against the in-flight watch sync.
-        match force_truncate_checkpoint(&writer) {
-            Ok((busy, _log, _ckpt)) => busy_results.push(busy),
-            // A busy DB can surface as SQLITE_BUSY rather than a busy!=0 row; that
-            // is also proof the pin engaged.
-            Err(_) => busy_results.push(1),
-        }
+        busy_results.push(force_truncate_busy_result(&writer)?);
         std::thread::sleep(Duration::from_millis(400));
     }
     anyhow::ensure!(

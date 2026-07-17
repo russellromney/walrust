@@ -65,6 +65,11 @@ pub struct PublishRecord {
     pub object_key: String,
     pub payload_length: u64,
     pub payload_sha256: String,
+    /// Local durable-admission time. Retention must use the recovery point's
+    /// creation time, not S3 Last-Modified, because an outage can upload days
+    /// of history in one burst.
+    #[serde(default)]
+    pub created_unix_ms: u64,
 }
 
 impl PublishRecord {
@@ -82,6 +87,7 @@ impl PublishRecord {
             object_key: object.intended_remote_key.clone(),
             payload_length: object.payload_length,
             payload_sha256: object.payload_sha256.clone(),
+            created_unix_ms: object.created_unix_ms,
         }
     }
 
@@ -376,16 +382,42 @@ impl NativeUploader {
         }
 
         let record = PublishRecord::from_object(&object, previous_publish_sha256);
-        let record_bytes = record.bytes()?;
+        let record_key = record.key(&self.descriptor.prefix, &self.descriptor.database);
+        let proposed_record_bytes = record.bytes()?;
         self.verify_predecessor(&record, previous_object.as_ref(), retained_base.as_ref())
             .await?;
-        put_immutable_exact(
-            self.storage.as_ref(),
-            &record.key(&self.descriptor.prefix, &self.descriptor.database),
-            &record_bytes,
-            "native publish record",
-        )
-        .await?;
+        let record_bytes = match self.storage.get(&record_key).await? {
+            Some(existing) => {
+                let existing_record: PublishRecord = serde_json::from_slice(&existing)
+                    .with_context(|| {
+                        format!(
+                            "split brain/equivocation: existing native publish record is invalid at seq {}",
+                            object.seq
+                        )
+                    })?;
+                if !publish_record_matches_object(
+                    &existing_record,
+                    &object,
+                    record.previous_publish_sha256.clone(),
+                ) {
+                    bail!(
+                        "split brain/equivocation: existing native publish record differs at seq {}",
+                        object.seq
+                    );
+                }
+                existing
+            }
+            None => {
+                put_immutable_exact(
+                    self.storage.as_ref(),
+                    &record_key,
+                    &proposed_record_bytes,
+                    "native publish record",
+                )
+                .await?;
+                proposed_record_bytes
+            }
+        };
         durability_failpoint("publish_record_committed");
 
         let mut guard = self
@@ -521,7 +553,7 @@ impl NativeUploader {
                 object.seq
             );
         }
-        if record != PublishRecord::from_object(object, record.previous_publish_sha256.clone()) {
+        if !publish_record_matches_object(&record, object, record.previous_publish_sha256.clone()) {
             bail!(
                 "split brain: remote native publish record differs from local object at seq {}",
                 object.seq
@@ -566,6 +598,21 @@ impl NativeUploader {
             };
         }
     }
+}
+
+fn publish_record_matches_object(
+    record: &PublishRecord,
+    object: &SpoolObject,
+    previous_publish_sha256: Option<String>,
+) -> bool {
+    let mut expected = PublishRecord::from_object(object, previous_publish_sha256);
+    // Early PR #43 native-v1 records predate the durable creation timestamp.
+    // Missing serde-defaults to zero; accept that exact legacy shape while all
+    // newly published records carry the local admission time.
+    if record.created_unix_ms == 0 {
+        expected.created_unix_ms = 0;
+    }
+    record == &expected
 }
 
 async fn put_immutable_exact(
@@ -701,6 +748,37 @@ mod tests {
         Arc::new(Mutex::new(spool))
     }
 
+    #[test]
+    fn native_v1_publish_record_json_is_frozen_and_legacy_timestamp_defaults() {
+        let record = PublishRecord {
+            version: 1,
+            stream_digest: "stream-digest".into(),
+            lineage_id: "lineage-id".into(),
+            seq: 42,
+            kind: ObjectKind::Snapshot,
+            previous_publish_sha256: None,
+            previous_chain_checksum: 7,
+            ending_chain_checksum: 9,
+            end_page_count: 11,
+            object_key: "p/db/native/v1/lineages/lineage-id/0001/000000000000002a.hadbp".into(),
+            payload_length: 13,
+            payload_sha256: "00".repeat(32),
+            created_unix_ms: 123_456_789,
+        };
+        let mut encoded = record.bytes().unwrap();
+        encoded.push(b'\n');
+        assert_eq!(
+            encoded,
+            include_bytes!("../tests/fixtures/native-v1-publish-record.json")
+        );
+
+        let mut legacy: serde_json::Value =
+            serde_json::from_slice(&record.bytes().unwrap()).unwrap();
+        legacy.as_object_mut().unwrap().remove("created_unix_ms");
+        let decoded: PublishRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(decoded.created_unix_ms, 0);
+    }
+
     #[tokio::test]
     async fn publishes_object_then_contiguous_record_and_is_idempotent() {
         let dir = tempdir().unwrap();
@@ -716,7 +794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn restart_adopts_exact_remote_put_and_publish_before_local_state_commit() {
+    async fn restart_adopts_legacy_remote_record_before_local_state_commit() {
         let dir = tempdir().unwrap();
         let spool = staged_spool(dir.path());
         let storage = Arc::new(MemoryStorage::default());
@@ -729,6 +807,13 @@ mod tests {
             )
         };
         let record = PublishRecord::from_object(&object, None);
+        let mut legacy_record: serde_json::Value =
+            serde_json::from_slice(&record.bytes().unwrap()).unwrap();
+        legacy_record
+            .as_object_mut()
+            .unwrap()
+            .remove("created_unix_ms");
+        let legacy_record_bytes = serde_json::to_vec_pretty(&legacy_record).unwrap();
         storage
             .put(&descriptor.key(), &descriptor.bytes().unwrap())
             .await
@@ -740,7 +825,7 @@ mod tests {
         storage
             .put(
                 &record.key(&descriptor.prefix, &descriptor.database),
-                &record.bytes().unwrap(),
+                &legacy_record_bytes,
             )
             .await
             .unwrap();
@@ -751,6 +836,10 @@ mod tests {
         let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool.clone()).unwrap();
         assert!(uploader.publish_pending_once().await.unwrap());
         assert_eq!(spool.lock().unwrap().remote_published_seq(), Some(1));
+        assert_eq!(
+            spool.lock().unwrap().get(1).unwrap().publish_record_sha256,
+            Some(sha256_hex(&legacy_record_bytes))
+        );
         assert_eq!(
             storage.get(&object.intended_remote_key).await.unwrap(),
             Some(payload)
@@ -1052,6 +1141,12 @@ mod tests {
                 payload: &delta,
             })
             .unwrap();
+        let expected_payload_bytes = spool
+            .lock()
+            .unwrap()
+            .objects()
+            .map(|object| object.payload_length)
+            .sum();
 
         let storage = Arc::new(MemoryStorage::default());
         let (uploader, _wake, _lag) = NativeUploader::new(storage.clone(), spool.clone()).unwrap();
@@ -1061,7 +1156,10 @@ mod tests {
             crate::native_restore::verify_native_v1(storage.as_ref(), "bucket", "p/", "db")
                 .await
                 .unwrap(),
-            Some(2)
+            Some(crate::native_restore::NativeVerifyStats {
+                object_count: 2,
+                payload_bytes: expected_payload_bytes,
+            })
         );
 
         for (target, expected_count) in [(Some(1), 1i64), (None, 2i64)] {

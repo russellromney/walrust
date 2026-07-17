@@ -232,10 +232,11 @@ pub(crate) async fn validate_backup_integrity(
     db_name: &str,
 ) -> Result<ValidationResult> {
     let native_storage = ClassifiedS3Storage(S3Storage::new(client.clone(), bucket.to_string()));
-    let native_verified =
+    let native_stats =
         walrust_core::native_restore::verify_native_v1(&native_storage, bucket, prefix, db_name)
-            .await?
-            .unwrap_or(0);
+            .await?;
+    let native_verified = native_stats.map_or(0, |stats| stats.object_count);
+    let native_verified_bytes = native_stats.map_or(0, |stats| stats.payload_bytes);
     let discovered = discover_all_ltx_from_s3(client, bucket, prefix, db_name)
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
@@ -252,7 +253,7 @@ pub(crate) async fn validate_backup_integrity(
             verified_count: native_verified,
             total_files: native_verified,
             issues: Vec::new(),
-            verified_size_bytes: 0,
+            verified_size_bytes: native_verified_bytes,
             is_valid: true,
         });
     }
@@ -322,7 +323,7 @@ pub(crate) async fn validate_backup_integrity(
         verified_count: verified_count + native_verified,
         total_files: discovered.len() + native_verified,
         issues: issues.clone(),
-        verified_size_bytes: total_size,
+        verified_size_bytes: total_size.saturating_add(native_verified_bytes),
         is_valid: issues.is_empty(),
     })
 }
@@ -591,7 +592,7 @@ pub async fn verify(
     )
     .await
     .map_err(|error| classify_or_else(error, WalrustError::integrity))?
-    .unwrap_or(0);
+    .map_or(0, |stats| stats.object_count);
     if native_verified > 0 {
         println!(
             "Native HADBP: verified {} contiguous published object(s)",

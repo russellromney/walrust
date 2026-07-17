@@ -247,6 +247,7 @@ pub enum CapacityState {
 struct Journal {
     version: u32,
     identity: SpoolIdentity,
+    #[serde(default, skip_serializing)]
     objects: BTreeMap<u64, SpoolObject>,
     local_base_seq: u64,
     admitted_seq: Option<u64>,
@@ -255,6 +256,8 @@ struct Journal {
     checkpointed_source_cursor: Option<SourceCursor>,
     remote_published_seq: Option<u64>,
     checkpoint_window: CheckpointWindow,
+    #[serde(default)]
+    cleanup_target_base_seq: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -338,12 +341,15 @@ pub struct SnapshotPreparation {
 pub struct NativeSpool {
     root: PathBuf,
     objects_dir: PathBuf,
+    records_dir: PathBuf,
     intents_dir: PathBuf,
     snapshots_dir: PathBuf,
     journal_path: PathBuf,
     snapshot_intent_path: PathBuf,
     journal: Journal,
     capacity: CapacityPolicy,
+    used_bytes_cached: Cell<u64>,
+    capacity_checks: Cell<u64>,
     last_stage_duration_ms: u64,
     last_capacity_state: Cell<CapacityState>,
     // The advisory lock is held for this instance's lifetime. It prevents a
@@ -427,7 +433,14 @@ impl NativeSpool {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error.into()),
         };
-        let (journal, _) = load_journal(&bytes, &path)?;
+        let (mut journal, _) = load_journal(&bytes, &path)?;
+        let records = load_object_records(&root.join("records"))?
+            .into_iter()
+            .filter(|(seq, _)| journal.admitted_seq.is_some_and(|head| *seq <= head))
+            .collect::<BTreeMap<_, _>>();
+        if !records.is_empty() {
+            journal.objects = records;
+        }
         if &journal.identity != expected_identity {
             bail!("native spool identity mismatch while validating local base");
         }
@@ -493,9 +506,11 @@ impl NativeSpool {
         sync_dir(root.parent().unwrap_or_else(|| Path::new(".")))?;
         let owner_lock = acquire_owner_lock(root)?;
         let objects_dir = root.join("objects");
+        let records_dir = root.join("records");
         let intents_dir = root.join("intents");
         let snapshots_dir = root.join("snapshots");
         fs::create_dir_all(&objects_dir)?;
+        fs::create_dir_all(&records_dir)?;
         fs::create_dir_all(&intents_dir)?;
         fs::create_dir_all(&snapshots_dir)?;
         sync_dir(root)?;
@@ -524,6 +539,7 @@ impl NativeSpool {
                     checkpointed_source_cursor: None,
                     remote_published_seq: None,
                     checkpoint_window: CheckpointWindow::Closed,
+                    cleanup_target_base_seq: None,
                 };
                 persist_json(root, &journal_path, &journal)?;
                 (journal, false)
@@ -531,23 +547,59 @@ impl NativeSpool {
             Err(e) => return Err(e).context("read native spool journal"),
         };
 
+        let embedded_objects = journal.objects.clone();
+        let all_record_objects = load_object_records(&records_dir)?;
+        let record_objects = all_record_objects
+            .into_iter()
+            .filter(|(seq, _)| journal.admitted_seq.is_some_and(|head| *seq <= head))
+            .collect::<BTreeMap<_, _>>();
+        if !embedded_objects.is_empty()
+            && record_objects.iter().any(|(seq, object)| {
+                embedded_objects
+                    .get(seq)
+                    .is_none_or(|embedded| embedded != object)
+            })
+        {
+            bail!("native spool embedded journal objects differ from durable object records");
+        }
+        // Rewriting every record is idempotent, so a crash halfway through
+        // migration resumes from the embedded v2 journal instead of treating
+        // the already-written subset as corruption.
+        let records_need_migration = !embedded_objects.is_empty();
+        let mut journal = journal;
+        journal.objects = if records_need_migration {
+            embedded_objects
+        } else {
+            record_objects
+        };
+
+        let initial_used_bytes = directory_bytes(root)?;
         let mut spool = Self {
             root: root.to_path_buf(),
             objects_dir,
+            records_dir,
             intents_dir,
             snapshots_dir,
             journal_path,
             snapshot_intent_path: root.join("snapshot-intent.json"),
             journal,
             capacity,
+            used_bytes_cached: Cell::new(initial_used_bytes),
+            capacity_checks: Cell::new(0),
             last_stage_duration_ms: 0,
             last_capacity_state: Cell::new(CapacityState::Healthy),
             _owner_lock: owner_lock,
         };
-        if migrated {
+        if records_need_migration {
+            for object in spool.journal.objects.values() {
+                spool.persist_object(object)?;
+            }
+        }
+        if migrated || records_need_migration {
             spool.persist_journal()?;
         }
         spool.complete_interrupted_cleanup()?;
+        spool.reconcile_published_cursor()?;
         spool.verify_journal_payloads()?;
         spool.reconcile_orphans()?;
         spool.reconcile_snapshot_intent()?;
@@ -793,8 +845,12 @@ impl NativeSpool {
     pub fn verify_durable_admission(&self, seq: u64) -> Result<()> {
         let bytes = fs::read(&self.journal_path)
             .with_context(|| format!("re-read durable journal for native seq {seq}"))?;
-        let durable: Journal = serde_json::from_slice(&bytes)
+        let (mut durable, _) = load_journal(&bytes, &self.journal_path)
             .with_context(|| format!("parse durable journal for native seq {seq}"))?;
+        durable.objects = load_object_records(&self.records_dir)?
+            .into_iter()
+            .filter(|(record_seq, _)| durable.admitted_seq.is_some_and(|head| *record_seq <= head))
+            .collect();
         if durable.version != JOURNAL_VERSION || durable.identity != self.journal.identity {
             bail!("durable native spool journal identity/version mismatch");
         }
@@ -902,22 +958,26 @@ impl NativeSpool {
         // Reserve the complete write-order peak before creating the intent:
         // intent JSON, payload temporary/installed bytes, and the full new
         // journal temporary while the old journal remains installed.
-        let mut projected_journal = self.journal.clone();
-        projected_journal.objects.insert(stage.seq, object.clone());
-        projected_journal.admitted_seq = Some(stage.seq);
         let intent_bytes = serialized_json_len(&InstallIntent {
             version: SPOOL_VERSION,
             object: object.clone(),
         })?;
-        let journal_bytes = serialized_json_len(&projected_journal)?;
+        let record_bytes = serialized_json_len(&object)?;
+        // Object metadata lives in its own bounded record, so admitting one
+        // object changes only a few scalar bytes in the state journal.
+        let journal_bytes = serialized_json_len(&self.journal)?.saturating_add(64);
         let payload_path = self.payload_path(&object);
-        let prepared_temp_exists = payload_temp_path(&payload_path).exists();
+        let payload_temp = payload_temp_path(&payload_path);
+        let prepared_temp_exists = payload_temp.exists();
+        let payload_storage_before =
+            file_len(&payload_path).saturating_add(file_len(&payload_temp));
         let additional_peak = (if prepared_temp_exists {
             0
         } else {
             (stage.payload.len() as u64).saturating_mul(2)
         })
         .saturating_add(intent_bytes)
+        .saturating_add(record_bytes)
         .saturating_add(journal_bytes);
         self.ensure_capacity(additional_peak)?;
 
@@ -962,8 +1022,14 @@ impl NativeSpool {
             }
             Err(e) => return Err(e.into()),
         }
+        let payload_storage_after = file_len(&payload_path).saturating_add(file_len(&payload_temp));
+        self.adjust_cached_file_size(payload_storage_before, payload_storage_after);
 
         let previous_admitted = self.journal.admitted_seq;
+        // Object metadata is an immutable-size record. Commit it before the
+        // bounded state journal; the install intent makes this ordering
+        // recoverable if the process dies between the two fsyncs.
+        self.persist_object(&object)?;
         self.journal.objects.insert(stage.seq, object.clone());
         self.journal.admitted_seq = Some(stage.seq);
         if let Err(error) = self.persist_journal() {
@@ -1132,19 +1198,21 @@ impl NativeSpool {
     }
 
     pub fn mark_uploaded(&mut self, seq: u64) -> Result<()> {
-        let old = self.journal.clone();
-        let object = self
+        let old = self
             .journal
             .objects
-            .get_mut(&seq)
+            .get(&seq)
+            .cloned()
             .ok_or_else(|| anyhow!("cannot upload unknown native spool sequence {seq}"))?;
-        if object.remote_upload_state == RemoteUploadState::Published {
+        if old.remote_upload_state == RemoteUploadState::Published {
             return Ok(());
         }
-        object.remote_upload_state = RemoteUploadState::Uploaded;
-        object.uploaded_unix_ms = Some(unix_ms());
-        if let Err(error) = self.persist_journal() {
-            self.journal = old;
+        let mut updated = old.clone();
+        updated.remote_upload_state = RemoteUploadState::Uploaded;
+        updated.uploaded_unix_ms = Some(unix_ms());
+        self.journal.objects.insert(seq, updated.clone());
+        if let Err(error) = self.persist_object(&updated) {
+            self.journal.objects.insert(seq, old);
             return Err(error);
         }
         Ok(())
@@ -1160,21 +1228,29 @@ impl NativeSpool {
         if seq != expected {
             bail!("cannot publish native seq {seq}; contiguous next seq is {expected}");
         }
-        let old = self.journal.clone();
-        let object = self
+        let old_object = self
             .journal
             .objects
-            .get_mut(&seq)
+            .get(&seq)
+            .cloned()
             .ok_or_else(|| anyhow!("cannot publish unknown native spool sequence {seq}"))?;
-        if object.remote_upload_state != RemoteUploadState::Uploaded {
+        if old_object.remote_upload_state != RemoteUploadState::Uploaded {
             bail!("cannot publish native seq {seq} before exact object upload verification");
         }
-        object.remote_upload_state = RemoteUploadState::Published;
-        object.published_unix_ms = Some(unix_ms());
-        object.publish_record_sha256 = Some(sha256_hex(publish_record));
+        let mut updated = old_object.clone();
+        updated.remote_upload_state = RemoteUploadState::Published;
+        updated.published_unix_ms = Some(unix_ms());
+        updated.publish_record_sha256 = Some(sha256_hex(publish_record));
+        self.journal.objects.insert(seq, updated.clone());
+        if let Err(error) = self.persist_object(&updated) {
+            self.journal.objects.insert(seq, old_object);
+            return Err(error);
+        }
+        let old_remote_published_seq = self.journal.remote_published_seq;
         self.journal.remote_published_seq = Some(seq);
         if let Err(error) = self.persist_journal() {
-            self.journal = old;
+            self.journal.remote_published_seq = old_remote_published_seq;
+            self.journal.objects.insert(seq, old_object);
             return Err(error);
         }
         Ok(())
@@ -1189,7 +1265,9 @@ impl NativeSpool {
     }
 
     pub fn used_bytes(&self) -> Result<u64> {
-        directory_bytes(&self.root)
+        let used = directory_bytes(&self.root)?;
+        self.used_bytes_cached.set(used);
+        Ok(used)
     }
 
     pub fn free_bytes(&self) -> Result<u64> {
@@ -1197,7 +1275,15 @@ impl NativeSpool {
     }
 
     pub fn capacity_state(&self, additional_peak_bytes: u64) -> Result<CapacityState> {
-        let used = self.used_bytes()?;
+        let checks = self.capacity_checks.get().saturating_add(1);
+        self.capacity_checks.set(checks);
+        // Periodically reconcile unexpected/operator-created files without
+        // making every local admission walk an ever-growing outage backlog.
+        let used = if checks.is_multiple_of(128) {
+            self.used_bytes()?
+        } else {
+            self.used_bytes_cached.get()
+        };
         let free = self.free_bytes()?;
         let state = if used.saturating_add(additional_peak_bytes) > self.capacity.hard_bytes
             || free.saturating_sub(additional_peak_bytes) < self.capacity.minimum_free_bytes
@@ -1218,6 +1304,10 @@ impl NativeSpool {
 
     pub fn last_capacity_state(&self) -> CapacityState {
         self.last_capacity_state.get()
+    }
+
+    pub fn minimum_free_bytes(&self) -> u64 {
+        self.capacity.minimum_free_bytes
     }
 
     /// Bytes needed for an atomic rewrite of the current journal plus a
@@ -1260,16 +1350,19 @@ impl NativeSpool {
             bail!("native spool cleanup would delete pending/unpublished recovery data");
         }
         let old = self.journal.clone();
+        self.journal.cleanup_target_base_seq = Some(base_seq);
+        if let Err(error) = self.persist_journal() {
+            self.journal = old;
+            return Err(error);
+        }
         for seq in &victims {
             self.journal
                 .objects
                 .get_mut(seq)
                 .unwrap()
                 .local_creation_state = LocalCreationState::Deleting;
-        }
-        if let Err(error) = self.persist_journal() {
-            self.journal = old;
-            return Err(error);
+            let object = self.journal.objects.get(seq).unwrap().clone();
+            self.persist_object(&object)?;
         }
         durability_failpoint("cleanup_marked_deleting");
         for seq in &victims {
@@ -1277,11 +1370,13 @@ impl NativeSpool {
             remove_and_sync(&path, &self.objects_dir)?;
         }
         durability_failpoint("cleanup_payloads_deleted");
+        self.journal.local_base_seq = base_seq;
+        self.journal.cleanup_target_base_seq = None;
+        self.persist_journal()?;
         for seq in &victims {
+            remove_and_sync(&self.object_record_path(*seq), &self.records_dir)?;
             self.journal.objects.remove(seq);
         }
-        self.journal.local_base_seq = base_seq;
-        self.persist_journal()?;
         Ok(victims.len() as u64)
     }
 
@@ -1483,7 +1578,49 @@ impl NativeSpool {
         Ok(())
     }
 
+    fn reconcile_published_cursor(&mut self) -> Result<()> {
+        let mut derived = None;
+        for object in self.journal.objects.values() {
+            if object.remote_upload_state != RemoteUploadState::Published {
+                break;
+            }
+            derived = Some(object.seq);
+        }
+        if derived > self.journal.remote_published_seq {
+            self.journal.remote_published_seq = derived;
+            self.persist_journal()?;
+        }
+        Ok(())
+    }
+
     fn complete_interrupted_cleanup(&mut self) -> Result<()> {
+        if let Some(target) = self.journal.cleanup_target_base_seq {
+            let base = self.journal.objects.get(&target).ok_or_else(|| {
+                anyhow!("native spool cleanup target snapshot {target} is missing")
+            })?;
+            if base.kind != ObjectKind::Snapshot
+                || base.local_creation_state != LocalCreationState::Installed
+                || base.remote_upload_state != RemoteUploadState::Published
+            {
+                bail!("native spool cleanup target {target} is not a complete published snapshot");
+            }
+            let victims = self
+                .journal
+                .objects
+                .range(..target)
+                .map(|(seq, object)| (*seq, object.clone()))
+                .collect::<Vec<_>>();
+            for (seq, mut object) in victims {
+                if object.remote_upload_state != RemoteUploadState::Published {
+                    bail!("native spool interrupted cleanup includes unpublished seq {seq}");
+                }
+                if object.local_creation_state != LocalCreationState::Deleting {
+                    object.local_creation_state = LocalCreationState::Deleting;
+                    self.persist_object(&object)?;
+                    self.journal.objects.insert(seq, object);
+                }
+            }
+        }
         let deleting = self
             .journal
             .objects
@@ -1492,6 +1629,9 @@ impl NativeSpool {
             .map(|object| object.seq)
             .collect::<Vec<_>>();
         if deleting.is_empty() {
+            if self.journal.cleanup_target_base_seq.is_some() {
+                bail!("native spool cleanup intent has no deletable prefix");
+            }
             return Ok(());
         }
         let first_remaining = self
@@ -1551,13 +1691,18 @@ impl NativeSpool {
             })?;
             prior = Some(object);
         }
-        for seq in deleting {
+        for seq in &deleting {
             let object = self.journal.objects.get(&seq).unwrap().clone();
             remove_and_sync(&self.payload_path(&object), &self.objects_dir)?;
-            self.journal.objects.remove(&seq);
         }
         self.journal.local_base_seq = new_base_seq;
-        self.persist_journal()
+        self.journal.cleanup_target_base_seq = None;
+        self.persist_journal()?;
+        for seq in deleting {
+            remove_and_sync(&self.object_record_path(seq), &self.records_dir)?;
+            self.journal.objects.remove(&seq);
+        }
+        Ok(())
     }
 
     fn reconcile_orphans(&mut self) -> Result<()> {
@@ -1623,6 +1768,7 @@ impl NativeSpool {
                 continue;
             }
             self.validate_next_object(&object)?;
+            self.persist_object(&object)?;
             self.journal.objects.insert(object.seq, object.clone());
             self.journal.admitted_seq = Some(object.seq);
             self.persist_journal()?;
@@ -1848,9 +1994,66 @@ impl NativeSpool {
         self.intents_dir.join(format!("{seq:016x}.json"))
     }
 
-    fn persist_journal(&self) -> Result<()> {
-        persist_json(&self.root, &self.journal_path, &self.journal)
+    fn object_record_path(&self, seq: u64) -> PathBuf {
+        self.records_dir.join(format!("{seq:016x}.json"))
     }
+
+    fn persist_object(&self, object: &SpoolObject) -> Result<()> {
+        let path = self.object_record_path(object.seq);
+        let old = file_len(&path);
+        persist_json(&self.records_dir, &path, object)?;
+        self.adjust_cached_file_size(old, file_len(&path));
+        Ok(())
+    }
+
+    fn persist_journal(&self) -> Result<()> {
+        let old = file_len(&self.journal_path);
+        persist_json(&self.root, &self.journal_path, &self.journal)?;
+        self.adjust_cached_file_size(old, file_len(&self.journal_path));
+        Ok(())
+    }
+
+    fn adjust_cached_file_size(&self, old: u64, new: u64) {
+        self.used_bytes_cached.set(
+            self.used_bytes_cached
+                .get()
+                .saturating_sub(old)
+                .saturating_add(new),
+        );
+    }
+}
+
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0)
+}
+
+fn load_object_records(records_dir: &Path) -> Result<BTreeMap<u64, SpoolObject>> {
+    let mut objects = BTreeMap::new();
+    let entries = match fs::read_dir(records_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(objects),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("json") {
+            continue;
+        }
+        let stem = path
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("native spool object record has a non-UTF8 filename"))?;
+        let seq = u64::from_str_radix(stem, 16)
+            .with_context(|| format!("invalid native spool object record {}", path.display()))?;
+        let object: SpoolObject = serde_json::from_slice(&fs::read(&path)?)
+            .with_context(|| format!("parse native spool object record {}", path.display()))?;
+        if object.seq != seq || objects.insert(seq, object).is_some() {
+            bail!("native spool object record sequence/filename mismatch at {seq}");
+        }
+    }
+    Ok(objects)
 }
 
 fn same_snapshot_identity(a: &SnapshotIntent, b: &SnapshotIntent) -> bool {
@@ -1922,6 +2125,7 @@ fn load_journal(bytes: &[u8], path: &Path) -> Result<(Journal, bool)> {
                     checkpointed_source_cursor,
                     remote_published_seq: old.remote_published_seq,
                     checkpoint_window,
+                    cleanup_target_base_seq: None,
                 },
                 true,
             ))
@@ -2391,6 +2595,50 @@ mod tests {
     }
 
     #[test]
+    fn embedded_v2_journal_migrates_to_bounded_object_records() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let (bytes, checksum, pages) = snapshot(&db, 1, 0);
+        let id = identity(&db);
+        let root = NativeSpool::path_for(dir.path(), &id);
+        let mut spool = NativeSpool::create_or_open(&root, id.clone(), generous()).unwrap();
+        spool
+            .stage(StageObject {
+                seq: 1,
+                kind: ObjectKind::Snapshot,
+                previous_chain_checksum: 0,
+                ending_chain_checksum: checksum,
+                end_page_count: pages,
+                intended_remote_key: "snapshot-1.hadbp".into(),
+                source_cursor: SourceCursor::snapshot(),
+                payload: &bytes,
+            })
+            .unwrap();
+
+        // Freeze the exact v2 shape used by the earlier PR commits: object
+        // metadata embedded in journal.json and no records directory entries.
+        let mut embedded = serde_json::to_value(&spool.journal).unwrap();
+        embedded["objects"] = serde_json::to_value(&spool.journal.objects).unwrap();
+        persist_json(&root, &spool.journal_path, &embedded).unwrap();
+        for entry in fs::read_dir(&spool.records_dir).unwrap() {
+            fs::remove_file(entry.unwrap().path()).unwrap();
+        }
+        sync_dir(&spool.records_dir).unwrap();
+        drop(spool);
+
+        let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        assert_eq!(reopened.admitted_seq(), Some(1));
+        assert_eq!(reopened.read_payload(1).unwrap(), bytes);
+        assert!(reopened.object_record_path(1).exists());
+        let bounded: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join("journal.json")).unwrap()).unwrap();
+        assert!(
+            bounded.get("objects").is_none(),
+            "migration must remove the unbounded embedded object map"
+        );
+    }
+
+    #[test]
     fn admitted_snapshot_intent_reconciles_after_restart() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
@@ -2800,7 +3048,7 @@ mod tests {
     }
 
     #[test]
-    fn journal_peak_dominates_after_thousand_tiny_objects() {
+    fn thousand_tiny_objects_keep_state_journal_bounded() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
         let (snapshot_bytes, mut checksum, pages) = snapshot(&db, 1, 0);
@@ -2820,6 +3068,7 @@ mod tests {
             })
             .unwrap();
         let page_size = 4096u32;
+        let started = std::time::Instant::now();
         for seq in 2..=1001u64 {
             let page = vec![(seq & 0xff) as u8; page_size as usize];
             let (payload, ending) = ltx::encode_wal_changes_with_end_page_count(
@@ -2847,50 +3096,19 @@ mod tests {
             checksum = ending;
         }
         let journal_len = std::fs::metadata(root.join("journal.json")).unwrap().len();
-        let page = vec![0xA5; page_size as usize];
-        let (payload, ending) = ltx::encode_wal_changes_with_end_page_count(
-            &[(1, page)],
-            page_size,
-            1002,
-            checksum,
-            pages,
-        )
-        .unwrap();
         assert!(
-            journal_len > payload.len() as u64 * 10,
-            "test setup must make journal rewrite, not payload, the dominant peak"
+            journal_len < 64 * 1024,
+            "bounded state journal regressed to embedding the full outage backlog ({journal_len} bytes)"
         );
-        let used = spool.used_bytes().unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "1,000 local admissions regressed to quadratic journal rewrites: {:?}",
+            started.elapsed()
+        );
         drop(spool);
-        let old_payload_only_hard = used
-            .saturating_add(payload.len() as u64 * 2)
-            .saturating_add(1);
-        let mut tight = NativeSpool::create_or_open(
-            &root,
-            id,
-            CapacityPolicy {
-                warning_bytes: old_payload_only_hard,
-                hard_bytes: old_payload_only_hard,
-                minimum_free_bytes: 0,
-            },
-        )
-        .unwrap();
-        let mut cursor = SourceCursor::snapshot();
-        cursor.shadow_frame_index = 1002;
-        let error = tight
-            .stage(StageObject {
-                seq: 1002,
-                kind: ObjectKind::Delta,
-                previous_chain_checksum: checksum,
-                ending_chain_checksum: ending,
-                end_page_count: pages,
-                intended_remote_key: "0000000000001002.hadbp".into(),
-                source_cursor: cursor,
-                payload: &payload,
-            })
-            .unwrap_err();
-        assert!(format!("{error:#}").contains("local_spool_full"));
-        assert_eq!(tight.admitted_seq(), Some(1001));
+        let reopened = NativeSpool::create_or_open(&root, id, generous()).unwrap();
+        assert_eq!(reopened.admitted_seq(), Some(1001));
+        assert_eq!(reopened.objects().count(), 1001);
     }
 
     #[test]
@@ -3174,7 +3392,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .local_creation_state = LocalCreationState::Deleting;
-        spool.persist_journal().unwrap();
+        spool.persist_object(spool.get(1).unwrap()).unwrap();
 
         assert!(NativeSpool::validate_existing_complete_base(&root, &id).unwrap());
         remove_and_sync(
@@ -3193,7 +3411,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .local_creation_state = LocalCreationState::Installed;
-        spool.persist_journal().unwrap();
+        spool.persist_object(spool.get(1).unwrap()).unwrap();
         assert!(
             NativeSpool::validate_existing_complete_base(&root, &id).is_err(),
             "a missing ordinary base payload must fail loudly"
@@ -3240,7 +3458,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .local_creation_state = LocalCreationState::Deleting;
-        spool.persist_journal().unwrap();
+        spool.persist_object(spool.get(1).unwrap()).unwrap();
         drop(spool);
 
         let error = NativeSpool::create_or_open(&root, id, generous())
@@ -3301,7 +3519,7 @@ mod tests {
             .get_mut(&1)
             .unwrap()
             .local_creation_state = LocalCreationState::Deleting;
-        spool.persist_journal().unwrap();
+        spool.persist_object(spool.get(1).unwrap()).unwrap();
         fs::write(&replacement_path, b"corrupt replacement snapshot").unwrap();
         drop(spool);
 

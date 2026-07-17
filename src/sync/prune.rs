@@ -125,9 +125,18 @@ pub(crate) async fn prune_with_client(
             let meta = s3::head_object_meta(client, bucket_name, &key)
                 .await
                 .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+            let record_bytes = s3::download_bytes(client, bucket_name, &key)
+                .await
+                .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+            let record: walrust_core::native_publish::PublishRecord =
+                serde_json::from_slice(&record_bytes)?;
+            let created_at = i64::try_from(record.created_unix_ms)
+                .ok()
+                .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
+                .unwrap_or(meta.last_modified);
             native_snapshots.push(SnapshotEntry {
                 key,
-                created_at: meta.last_modified,
+                created_at,
                 sequence: *seq,
                 size: meta.size,
             });

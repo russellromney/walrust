@@ -277,6 +277,29 @@ impl ShadowWal {
         Ok(())
     }
 
+    /// Acquire SQLite's writer lock and stage (but do not commit) the blocker
+    /// heartbeat. While this transaction is open no application writer can
+    /// cross the caller's final `PRAGMA data_version` sample.
+    pub fn begin_checkpoint_heartbeat_transaction(conn: &Connection) -> Result<()> {
+        if !conn.is_autocommit() {
+            conn.execute_batch("ROLLBACK;")?;
+        }
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        match conn.execute("UPDATE _walrust_seq SET value = value + 1 WHERE id = 1", []) {
+            Ok(1) => Ok(()),
+            Ok(updated) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(anyhow!(
+                    "checkpoint heartbeat update affected {updated} rows instead of one"
+                ))
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(error.into())
+            }
+        }
+    }
+
     /// Pin a heartbeat already committed by the retained monitor.
     ///
     /// Controlled checkpoint handoffs reuse the existing blocker connection

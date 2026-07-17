@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "stream_digest": "stream-digest",
+  "lineage_id": "lineage-id",
+  "seq": 42,
+  "kind": "snapshot",
+  "previous_publish_sha256": null,
+  "previous_chain_checksum": 7,
+  "ending_chain_checksum": 9,
+  "end_page_count": 11,
+  "object_key": "p/db/native/v1/lineages/lineage-id/0001/000000000000002a.hadbp",
+  "payload_length": 13,
+  "payload_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+  "created_unix_ms": 123456789
+}

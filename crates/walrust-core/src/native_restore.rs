@@ -50,6 +50,12 @@ pub struct NativePruneOutcome {
     pub visible_head_seq: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NativeVerifyStats {
+    pub object_count: usize,
+    pub payload_bytes: u64,
+}
+
 /// Discover only the contiguous, chain-verified published native recovery
 /// point. Raw objects or records beyond a gap are deliberately invisible.
 pub async fn inspect_native_v1(
@@ -169,7 +175,7 @@ pub async fn verify_native_v1(
     bucket: &str,
     prefix: &str,
     database: &str,
-) -> Result<Option<usize>> {
+) -> Result<Option<NativeVerifyStats>> {
     let descriptor_key = format!("{}{database}/native/v1/stream.json", prefix);
     let Some(bytes) = storage.get(&descriptor_key).await? else {
         return Ok(None);
@@ -224,7 +230,13 @@ pub async fn verify_native_v1(
     let cleanup_result = remove_if_exists(&scratch);
     verify_result?;
     cleanup_result?;
-    Ok(Some(records.len()))
+    Ok(Some(NativeVerifyStats {
+        object_count: records.len(),
+        payload_bytes: records
+            .iter()
+            .map(|(record, _)| record.payload_length)
+            .sum(),
+    }))
 }
 
 pub async fn restore_native_v1(
@@ -346,6 +358,35 @@ async fn load_visible_records(
     storage: &dyn StorageBackend,
     descriptor: &StreamDescriptor,
 ) -> Result<Vec<(PublishRecord, Vec<u8>)>> {
+    // Retention publishes a new immutable floor before deleting the old
+    // prefix. A reader may list the old floor/records and then race those
+    // deletions. Retry discovery only when the floor demonstrably advanced;
+    // without that proof, a vanished or corrupt object remains a hard error.
+    for attempt in 0..3 {
+        let floor_before = latest_retention_floor_seq(storage, descriptor).await?;
+        match load_visible_records_once(storage, descriptor).await {
+            Ok(records) => return Ok(records),
+            Err(error) => {
+                let floor_after = latest_retention_floor_seq(storage, descriptor).await?;
+                if floor_after > floor_before && attempt < 2 {
+                    tracing::warn!(
+                        ?floor_before,
+                        ?floor_after,
+                        "native retention floor advanced during discovery; restarting from the new floor"
+                    );
+                    continue;
+                }
+                return Err(error);
+            }
+        }
+    }
+    unreachable!("bounded native retention discovery loop returns on every branch")
+}
+
+async fn load_visible_records_once(
+    storage: &dyn StorageBackend,
+    descriptor: &StreamDescriptor,
+) -> Result<Vec<(PublishRecord, Vec<u8>)>> {
     let publish_prefix = format!(
         "{}{}/native/v1/lineages/{}/published/",
         descriptor.prefix, descriptor.database, descriptor.lineage_id,
@@ -398,6 +439,22 @@ async fn load_visible_records(
     }
 
     Ok(records)
+}
+
+async fn latest_retention_floor_seq(
+    storage: &dyn StorageBackend,
+    descriptor: &StreamDescriptor,
+) -> Result<Option<u64>> {
+    let floor_prefix = format!(
+        "{}{}/native/v1/retention/v1/",
+        descriptor.prefix, descriptor.database
+    );
+    Ok(storage
+        .list(&floor_prefix, None)
+        .await?
+        .into_iter()
+        .filter_map(|key| parse_record_seq(&key, &floor_prefix))
+        .max())
 }
 
 async fn load_retention_floor(
@@ -742,7 +799,7 @@ mod tests {
     use async_trait::async_trait;
     use hadb_storage::CasResult;
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::tempdir;
 
     #[derive(Default)]
@@ -784,6 +841,58 @@ mod tests {
         }
     }
 
+    struct FloorAdvanceStorage {
+        objects: Mutex<BTreeMap<String, Vec<u8>>>,
+        trigger_key: String,
+        advance: Mutex<Option<Vec<(String, Option<Vec<u8>>)>>>,
+    }
+
+    #[async_trait]
+    impl StorageBackend for FloorAdvanceStorage {
+        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+            let mut objects = self.objects.lock().unwrap();
+            if key == self.trigger_key {
+                if let Some(actions) = self.advance.lock().unwrap().take() {
+                    for (key, value) in actions {
+                        match value {
+                            Some(value) => {
+                                objects.insert(key, value);
+                            }
+                            None => {
+                                objects.remove(&key);
+                            }
+                        }
+                    }
+                    return Ok(None);
+                }
+            }
+            Ok(objects.get(key).cloned())
+        }
+
+        async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
+            bail!("unused")
+        }
+        async fn delete(&self, _key: &str) -> Result<()> {
+            bail!("unused")
+        }
+        async fn list(&self, prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|key| key.starts_with(prefix))
+                .cloned()
+                .collect())
+        }
+        async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<CasResult> {
+            bail!("unused")
+        }
+        async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
+            bail!("unused")
+        }
+    }
+
     #[tokio::test]
     async fn record_beyond_missing_snapshot_base_does_not_create_visible_head() {
         let dir = tempdir().unwrap();
@@ -813,6 +922,7 @@ mod tests {
             ),
             payload_length: 1,
             payload_sha256: "00".repeat(32),
+            created_unix_ms: 0,
         };
         storage
             .put(
@@ -828,5 +938,114 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn discovery_restarts_when_prune_advances_floor_mid_read() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("db.sqlite");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY); INSERT INTO t DEFAULT VALUES;")
+            .unwrap();
+        let page_size = conn
+            .query_row("PRAGMA page_size", [], |row| row.get::<_, u32>(0))
+            .unwrap();
+        let first = ltx::encode_snapshot_with_checksum(&db, page_size, 1, 0).unwrap();
+        let first_pages = fs::metadata(&db).unwrap().len() / page_size as u64;
+        conn.execute("INSERT INTO t DEFAULT VALUES", []).unwrap();
+        let second = ltx::encode_snapshot_with_checksum(&db, page_size, 2, first.checksum).unwrap();
+        drop(conn);
+        let pages = fs::metadata(&db).unwrap().len() / page_size as u64;
+        let identity =
+            SpoolIdentity::new(&db, "bucket", "p/", "db", "lineage", 1, None, true).unwrap();
+        let descriptor = StreamDescriptor::from(&identity);
+        let object_key = |seq: u64| {
+            format!(
+                "p/db/native/v1/lineages/{}/0001/{seq:016x}.hadbp",
+                descriptor.lineage_id
+            )
+        };
+        let first_record = PublishRecord {
+            version: REMOTE_LAYOUT_VERSION,
+            stream_digest: descriptor.stream_digest.clone(),
+            lineage_id: descriptor.lineage_id.clone(),
+            seq: 1,
+            kind: ObjectKind::Snapshot,
+            previous_publish_sha256: None,
+            previous_chain_checksum: 0,
+            ending_chain_checksum: first.checksum,
+            end_page_count: first_pages,
+            object_key: object_key(1),
+            payload_length: first.bytes.len() as u64,
+            payload_sha256: sha256_hex(&first.bytes),
+            created_unix_ms: 1,
+        };
+        let first_record_bytes = first_record.bytes().unwrap();
+        let second_record = PublishRecord {
+            version: REMOTE_LAYOUT_VERSION,
+            stream_digest: descriptor.stream_digest.clone(),
+            lineage_id: descriptor.lineage_id.clone(),
+            seq: 2,
+            kind: ObjectKind::Snapshot,
+            previous_publish_sha256: Some(sha256_hex(&first_record_bytes)),
+            previous_chain_checksum: first.checksum,
+            ending_chain_checksum: second.checksum,
+            end_page_count: pages,
+            object_key: object_key(2),
+            payload_length: second.bytes.len() as u64,
+            payload_sha256: sha256_hex(&second.bytes),
+            created_unix_ms: 2,
+        };
+        let second_record_bytes = second_record.bytes().unwrap();
+        let publish_key = |seq: u64| {
+            format!(
+                "p/db/native/v1/lineages/{}/published/{seq:016x}.json",
+                descriptor.lineage_id
+            )
+        };
+        let floor_key = |seq: u64| format!("p/db/native/v1/retention/v1/{seq:016x}.json");
+        let floor1 = RetentionFloor {
+            version: RETENTION_FLOOR_VERSION,
+            stream_digest: descriptor.stream_digest.clone(),
+            lineage_id: descriptor.lineage_id.clone(),
+            floor_seq: 1,
+            snapshot_publish_sha256: sha256_hex(&first_record_bytes),
+            previous_publish_sha256: None,
+        };
+        let floor2 = RetentionFloor {
+            version: RETENTION_FLOOR_VERSION,
+            stream_digest: descriptor.stream_digest.clone(),
+            lineage_id: descriptor.lineage_id.clone(),
+            floor_seq: 2,
+            snapshot_publish_sha256: sha256_hex(&second_record_bytes),
+            previous_publish_sha256: second_record.previous_publish_sha256.clone(),
+        };
+        let mut objects = BTreeMap::from([
+            (descriptor.key(), descriptor.bytes().unwrap()),
+            (first_record.object_key.clone(), first.bytes),
+            (second_record.object_key.clone(), second.bytes),
+            (publish_key(1), first_record_bytes),
+            (publish_key(2), second_record_bytes),
+            (floor_key(1), serde_json::to_vec_pretty(&floor1).unwrap()),
+        ]);
+        let storage = Arc::new(FloorAdvanceStorage {
+            objects: Mutex::new(std::mem::take(&mut objects)),
+            trigger_key: publish_key(1),
+            advance: Mutex::new(Some(vec![
+                (
+                    floor_key(2),
+                    Some(serde_json::to_vec_pretty(&floor2).unwrap()),
+                ),
+                (publish_key(1), None),
+                (first_record.object_key, None),
+            ])),
+        });
+
+        let visible = inspect_native_v1(storage.as_ref(), "bucket", "p/", "db")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(visible.retention_floor_seq, 2);
+        assert_eq!(visible.head_seq, 2);
     }
 }

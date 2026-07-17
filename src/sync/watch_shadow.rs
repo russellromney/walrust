@@ -26,8 +26,9 @@ use rusqlite::Connection;
 use walrust_core::legacy_shadow_watch::{
     apply_shadow_sync_result_to_state, apply_shadow_sync_results_strict,
     checkpoint_blocker_heartbeat_is_live, checkpoint_data_version, load_shadow_progress,
-    rearm_checkpoint_blocker, save_shadow_watch_progress as save_shadow_progress,
-    shadow_sync_input, wait_for_cache_checkpoint_durability, ShadowProgress,
+    rearm_checkpoint_blocker, rearm_checkpoint_blocker_after_checkpoint,
+    save_shadow_watch_progress as save_shadow_progress, shadow_sync_input,
+    wait_for_cache_checkpoint_durability, ShadowProgress,
 };
 use walrust_core::native_publish::{object_key as native_object_key, NativeUploader, UploadWake};
 use walrust_core::native_shadow::{
@@ -205,6 +206,80 @@ fn source_footprint_on_spool_filesystem(state: &ShadowDbState, spool: &NativeSpo
         .saturating_add(shadow_storage_bytes(state)))
 }
 
+fn pending_shadow_copy_bytes(state: &ShadowDbState) -> u64 {
+    let wal_bytes = std::fs::metadata(&state.wal_path)
+        .map(|metadata| metadata.len())
+        .unwrap_or(0);
+    if state.wal_copy_offset <= wal_bytes {
+        wal_bytes.saturating_sub(state.wal_copy_offset)
+    } else {
+        // A reset means the new generation must be read from its beginning.
+        wal_bytes
+    }
+}
+
+fn ensure_source_shadow_copy_reserve(state: &ShadowDbState, reserve_bytes: u64) -> Result<()> {
+    let source_filesystem = state
+        .db_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let free = filesystem_available_bytes(source_filesystem)?;
+    let projected_copy = pending_shadow_copy_bytes(state);
+    if free.saturating_sub(projected_copy) < reserve_bytes {
+        bail!(
+            "local_spool_full: {} source WAL/shadow filesystem cannot copy {} pending WAL bytes while preserving {} free bytes (free={})",
+            state.name,
+            projected_copy,
+            reserve_bytes,
+            free
+        );
+    }
+    Ok(())
+}
+
+fn checkpoint_schedule(
+    sync_configs: &HashMap<PathBuf, SyncConfig>,
+    started_at: tokio::time::Instant,
+    disabled_duration: Duration,
+) -> (Duration, HashMap<PathBuf, tokio::time::Instant>) {
+    let deadlines = sync_configs
+        .iter()
+        .filter_map(|(db_path, sync)| {
+            (sync.checkpoint_interval > 0).then(|| {
+                (
+                    db_path.clone(),
+                    started_at + Duration::from_secs(sync.checkpoint_interval),
+                )
+            })
+        })
+        .collect::<HashMap<_, _>>();
+    let poll_interval = sync_configs
+        .values()
+        .filter_map(|sync| {
+            (sync.checkpoint_interval > 0).then(|| Duration::from_secs(sync.checkpoint_interval))
+        })
+        .min()
+        .unwrap_or(disabled_duration);
+    (poll_interval, deadlines)
+}
+
+async fn save_required_native_progress(state: &ShadowDbState, boundary: &str) {
+    loop {
+        match save_shadow_progress(state) {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::error!(
+                    database = %state.name,
+                    boundary,
+                    error = %error,
+                    "durable native progress persistence failed; retaining the checkpoint blocker and retrying"
+                );
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+}
+
 async fn verify_legacy_migration_head(
     storage: &dyn StorageBackend,
     prefix: &str,
@@ -330,7 +405,7 @@ async fn reconcile_shadow_progress_from_spool(
     }
     state.current_txid = head.seq;
     state.db_checksum = Some(head.ending_chain_checksum);
-    save_shadow_progress(state)?;
+    save_required_native_progress(state, "spool_reconciliation").await;
     Ok(())
 }
 
@@ -502,6 +577,8 @@ async fn stage_native_snapshot(
     spool_state: &NativeSpoolState,
 ) -> Result<u64> {
     let stage_started = std::time::Instant::now();
+    let source_reserve = spool_lock(&spool_state.0)?.minimum_free_bytes();
+    ensure_source_shadow_copy_reserve(state, source_reserve)?;
     // Freeze the source at an exact committed, checksum-validated, fsynced
     // shadow boundary. Application commits after this copy remain only in the
     // live WAL and are deliberately excluded from this snapshot.
@@ -665,6 +742,9 @@ async fn stage_native_snapshot(
     };
     let stage_result = (|| -> Result<()> {
         let mut spool = spool_lock(&spool_state.0)?;
+        // The snapshot encoder wrote its temporary directly into the spool
+        // directory; refresh bounded-capacity accounting before admission.
+        spool.used_bytes()?;
         // The fsynced payload temporary is already included in used_bytes and
         // admission renames that exact inode. Only journal/intent rewrite and
         // source-filesystem reserve remain as additional peak here.
@@ -722,7 +802,7 @@ async fn stage_native_snapshot(
         preparation.source_cursor.wal_salt,
         preparation.source_cursor.wal_checksum_chain,
     );
-    save_shadow_progress(state)?;
+    save_required_native_progress(state, "snapshot_admission").await;
     tracing::info!(
         database = %state.name,
         seq,
@@ -795,9 +875,9 @@ async fn checkpoint_with_state_blocker_attempt(
     data_version_before: i64,
 ) -> Result<CheckpointAttempt> {
     // End the blocker read transaction, then run the checkpoint on the
-    // lifetime monitor. Its own checkpoint does not change its connection-local
-    // data_version; any app commit since the caller's final copy baseline does,
-    // including one in the unblocked window.
+    // lifetime monitor. SQLite does not advance a connection's own
+    // data_version for its checkpoint, so any change still proves another
+    // connection committed since the caller's final copy baseline.
     let blocker = state
         .checkpoint_blocker
         .as_ref()
@@ -836,16 +916,6 @@ async fn checkpoint_with_state_blocker_attempt(
         });
     durability_failpoint("sqlite_checkpoint_returned");
 
-    // Keep the monitor opened before the blocker for its whole lifetime. Its
-    // data_version advances once for every commit from another connection,
-    // while the checkpoint above is an operation on the monitor itself. The
-    // blocker's refreshed heartbeat is written on that monitor, so it does
-    // not change the monitor's own value. Sampling both sides of rearm catches
-    // an app commit anywhere in the
-    // release/reacquire window, including the old sample-to-heartbeat gap that
-    // could otherwise be checkpointed away before the retained blocker
-    // repinned it.
-    let data_version_before_rearm = checkpoint_data_version(state);
     if cfg!(debug_assertions) {
         if let Some(path) = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_FILE") {
             let selected_db = std::env::var_os("WALRUST_TEST_NATIVE_CHECKPOINT_PAUSE_DB");
@@ -861,35 +931,29 @@ async fn checkpoint_with_state_blocker_attempt(
             }
         }
     }
-    let rearm_result = rearm_checkpoint_blocker(state);
-    let heartbeat_live = match &rearm_result {
-        Ok(()) => checkpoint_blocker_heartbeat_is_live(state),
-        Err(_) => Ok(false),
+    // Once ROLLBACK opens the checkpoint window, normal watch operation may
+    // never resume without a live blocker. Transient writer/checkpoint races
+    // are retried here, loudly and conservatively dirty, until the same
+    // connection owns a verified read mark again.
+    let data_version_dirty = loop {
+        match rearm_checkpoint_blocker_after_checkpoint(state, data_version_before) {
+            Ok(dirty) => break dirty,
+            Err(error) => {
+                tracing::error!(
+                    database = %state.name,
+                    error = %error,
+                    "checkpoint blocker rearm failed; remaining in the controlled window and retrying"
+                );
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
     };
-    if rearm_result.is_ok() {
-        durability_failpoint("blocker_reacquired");
-    }
-    let data_version_after_rearm = checkpoint_data_version(state);
-    let checkpoint_result = checkpoint_result.and_then(|completed| {
-        let before_rearm = data_version_before_rearm?;
-        let after_rearm = data_version_after_rearm?;
-        let dirty_before_rearm = before_rearm != data_version_before;
-        let dirty_during_rearm = after_rearm != before_rearm;
-        Ok((completed, dirty_before_rearm || dirty_during_rearm))
-    });
-    match (checkpoint_result, rearm_result) {
-        (Ok((completed, data_version_dirty)), Ok(())) => Ok(CheckpointAttempt {
-            completed,
-            dirty: data_version_dirty || !heartbeat_live?,
-        }),
-        (Err(checkpoint_error), Ok(())) => Err(checkpoint_error),
-        (Ok(_), Err(rearm_error)) => Err(rearm_error),
-        (Err(checkpoint_error), Err(rearm_error)) => Err(anyhow!(
-            "{}; additionally failed to rearm CLI checkpoint blocker: {}",
-            checkpoint_error,
-            rearm_error
-        )),
-    }
+    durability_failpoint("blocker_reacquired");
+    let heartbeat_live = checkpoint_blocker_heartbeat_is_live(state)?;
+    checkpoint_result.map(|completed| CheckpointAttempt {
+        completed,
+        dirty: data_version_dirty || !heartbeat_live,
+    })
 }
 
 async fn checkpoint_with_state_blocker(
@@ -956,12 +1020,20 @@ async fn run_shadow_syncs(
     join_all(sync_futures).await
 }
 
-async fn copy_final_shadow_frames(db_states: &mut HashMap<PathBuf, ShadowDbState>) -> Result<()> {
+async fn copy_final_shadow_frames(
+    db_states: &mut HashMap<PathBuf, ShadowDbState>,
+    native_spools: &HashMap<PathBuf, NativeSpoolState>,
+) -> Result<()> {
     for state in db_states.values_mut() {
         if !state.wal_path.exists() {
             continue;
         }
 
+        let reserve = match native_spools.get(&state.db_path) {
+            Some(spool) => spool_lock(&spool.0)?.minimum_free_bytes(),
+            None => 0,
+        };
+        ensure_source_shadow_copy_reserve(state, reserve)?;
         let (frames, new_offset) = state
             .shadow
             .copy_frames(state.wal_copy_offset)
@@ -983,13 +1055,26 @@ async fn finish_shutdown_local_admission(
 ) {
     loop {
         let attempt = async {
-            copy_final_shadow_frames(db_states).await?;
+            copy_final_shadow_frames(db_states, native_spools).await?;
             let mut final_results = Vec::with_capacity(db_states.len());
-            for (db_path, state) in db_states.iter() {
-                final_results.push(match native_spools.get(db_path) {
-                    Some(spool) => stage_native_shadow(state, spool).await,
-                    None => Err(anyhow!("{}: native spool missing", state.name)),
-                });
+            let db_paths = db_states.keys().cloned().collect::<Vec<_>>();
+            for db_path in db_paths {
+                let state = db_states
+                    .get_mut(&db_path)
+                    .ok_or_else(|| anyhow!("shutdown database state disappeared"))?;
+                let spool = native_spools
+                    .get(&db_path)
+                    .ok_or_else(|| anyhow!("{}: native spool missing", state.name))?;
+                if spool_lock(&spool.0)?.requires_checkpoint_reanchor() {
+                    // A delta is deliberately forbidden while a controlled
+                    // checkpoint window is open. Graceful shutdown must close
+                    // that durable boundary with the required snapshot rather
+                    // than retrying an impossible delta forever.
+                    let reanchor_seq = stage_native_snapshot(state, spool).await?;
+                    spool_lock(&spool.0)?.complete_checkpoint_reanchor(reanchor_seq)?;
+                } else {
+                    final_results.push(stage_native_shadow(state, spool).await);
+                }
             }
             apply_shadow_sync_results_strict(db_states, final_results).await
         }
@@ -1140,6 +1225,7 @@ async fn checkpoint_shadow_after_native_admission(
     let mut preflight_drain = 0usize;
     let admitted_seq = loop {
         preflight_drain += 1;
+        ensure_source_shadow_copy_reserve(state, spool_lock(&spool_state.0)?.minimum_free_bytes())?;
         let shadow_generation_before = state.shadow.generation();
         let wal_offset_before = state.wal_copy_offset;
         let (frames, new_offset) = state
@@ -1289,7 +1375,7 @@ async fn skip_rearm_heartbeat_transaction(state: &mut ShadowDbState) -> Result<(
         "{}: blocker heartbeat cursor exceeds fsynced shadow tail",
         state.name
     );
-    save_shadow_progress(state)?;
+    save_required_native_progress(state, "checkpoint_heartbeat_cursor").await;
     Ok(())
 }
 
@@ -1437,6 +1523,7 @@ async fn shutdown_shadow_uploaders(
 /// Returns the set of database paths that should be snapshotted eagerly (D3).
 async fn initial_shadow_copy(
     db_states: &mut HashMap<PathBuf, ShadowDbState>,
+    source_reserve_bytes: u64,
 ) -> Result<HashSet<PathBuf>> {
     let mut eager_snapshot: HashSet<PathBuf> = HashSet::new();
 
@@ -1453,6 +1540,7 @@ async fn initial_shadow_copy(
         if !state.wal_path.exists() {
             continue;
         }
+        ensure_source_shadow_copy_reserve(state, source_reserve_bytes)?;
 
         let generation_before = state.shadow.generation();
         match state.shadow.copy_frames(state.wal_copy_offset).await {
@@ -2021,7 +2109,8 @@ pub async fn watch_with_shadow(
     // changed while we were down, `copy_frames` bumps the shadow generation;
     // those databases need an eager snapshot instead of waiting for the periodic
     // timer (D3).
-    let eager_snapshot_paths = initial_shadow_copy(&mut db_states).await?;
+    let eager_snapshot_paths =
+        initial_shadow_copy(&mut db_states, spool_config.min_free_space).await?;
 
     let mut startup_reanchored = HashSet::new();
     for db_path in required_native_reanchors.clone() {
@@ -2109,12 +2198,16 @@ pub async fn watch_with_shadow(
     let mut compact_timer = tokio::time::interval(compact_interval_duration);
     compact_timer.tick().await;
 
-    // Shadow mode: checkpoint is manual via shadow.checkpoint()
-    let checkpoint_interval_duration = if global_sync.checkpoint_interval > 0 {
-        Duration::from_secs(global_sync.checkpoint_interval)
-    } else {
-        disabled_timer_duration
-    };
+    // Checkpoint cadence is independently configurable per database. Poll at
+    // the shortest enabled cadence and keep a deadline for each DB; using only
+    // the global interval silently ignored overrides (including global=0 with
+    // a database-level opt-in).
+    let checkpoint_started_at = tokio::time::Instant::now();
+    let (checkpoint_interval_duration, mut checkpoint_deadlines) = checkpoint_schedule(
+        &sync_configs,
+        checkpoint_started_at,
+        disabled_timer_duration,
+    );
     let mut checkpoint_timer = tokio::time::interval(checkpoint_interval_duration);
     checkpoint_timer.tick().await;
 
@@ -2194,14 +2287,17 @@ pub async fn watch_with_shadow(
                         .db_path
                         .parent()
                         .unwrap_or_else(|| std::path::Path::new("."));
-                    if filesystem_available_bytes(source_filesystem)?
+                    let filesystem_free_bytes = filesystem_available_bytes(source_filesystem)?;
+                    let projected_copy_bytes = pending_shadow_copy_bytes(state);
+                    if filesystem_free_bytes.saturating_sub(projected_copy_bytes)
                         < spool_config.min_free_space
                     {
                         tracing::error!(
                             database = %state.name,
                             event = "local_spool_full",
                             filesystem = %source_filesystem.display(),
-                            filesystem_free_bytes = filesystem_available_bytes(source_filesystem)?,
+                            filesystem_free_bytes,
+                            projected_copy_bytes,
                             reserve_bytes = spool_config.min_free_space,
                             "source WAL/shadow filesystem is below its free-space reserve; retaining blocker and pausing admission/checkpoints"
                         );
@@ -2581,9 +2677,17 @@ pub async fn watch_with_shadow(
             }
 
             // Checkpoint timer - copy, sync, verify durability, then checkpoint.
-            _ = checkpoint_timer.tick(), if global_sync.checkpoint_interval > 0 => {
+            _ = checkpoint_timer.tick(), if !checkpoint_deadlines.is_empty() => {
                 for (db_path, state) in db_states.iter_mut() {
                     let sync_config = sync_configs.get(&state.db_path).unwrap_or(&global_sync);
+                    let Some(deadline) = checkpoint_deadlines.get_mut(db_path) else {
+                        continue;
+                    };
+                    if tokio::time::Instant::now() < *deadline {
+                        continue;
+                    }
+                    *deadline = tokio::time::Instant::now()
+                        + Duration::from_secs(sync_config.checkpoint_interval);
                     let Some(spool_state) = native_spools.get(db_path) else {
                         return Err(anyhow!("{}: native spool missing", state.name));
                     };
@@ -2890,6 +2994,31 @@ mod tests {
         async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
             panic!("local checkpoint path performed remote CAS")
         }
+    }
+
+    #[test]
+    fn checkpoint_schedule_honors_each_database_override() {
+        let start = tokio::time::Instant::now();
+        let mut fast = SyncConfig::default();
+        fast.checkpoint_interval = 2;
+        let mut slow = SyncConfig::default();
+        slow.checkpoint_interval = 7;
+        let mut disabled = SyncConfig::default();
+        disabled.checkpoint_interval = 0;
+        let fast_path = PathBuf::from("fast.db");
+        let slow_path = PathBuf::from("slow.db");
+        let disabled_path = PathBuf::from("disabled.db");
+        let configs = HashMap::from([
+            (fast_path.clone(), fast),
+            (slow_path.clone(), slow),
+            (disabled_path.clone(), disabled),
+        ]);
+
+        let (poll, deadlines) = checkpoint_schedule(&configs, start, Duration::from_secs(999));
+        assert_eq!(poll, Duration::from_secs(2));
+        assert_eq!(deadlines[&fast_path], start + Duration::from_secs(2));
+        assert_eq!(deadlines[&slow_path], start + Duration::from_secs(7));
+        assert!(!deadlines.contains_key(&disabled_path));
     }
 
     struct FailingMigrationStorage;
@@ -3441,7 +3570,9 @@ mod tests {
             },
         );
 
-        copy_final_shadow_frames(&mut db_states).await.unwrap();
+        copy_final_shadow_frames(&mut db_states, &HashMap::new())
+            .await
+            .unwrap();
         assert!(
             db_states.get(&db_path).unwrap().wal_copy_offset > 0,
             "final shutdown copy must consume real WAL frames"
@@ -3510,7 +3641,9 @@ mod tests {
             },
         );
 
-        copy_final_shadow_frames(&mut db_states).await.unwrap();
+        copy_final_shadow_frames(&mut db_states, &HashMap::new())
+            .await
+            .unwrap();
 
         let cache = Arc::new(LocalCache::new(&db_path).unwrap());
         let (upload_tx, _upload_rx) = mpsc::channel(10);
@@ -4135,6 +4268,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn controlled_checkpoint_does_not_return_while_blocker_rearm_fails() {
+        struct RemoveEnv(&'static str);
+        impl Drop for RemoveEnv {
+            fn drop(&mut self) {
+                unsafe { std::env::remove_var(self.0) };
+            }
+        }
+
+        let (temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: "native-rearm-retry".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let baseline = checkpoint_data_version(&state).unwrap();
+        let fail = temp.path().join("rearm.fail");
+        std::fs::write(&fail, b"fail").unwrap();
+        const FAIL_ENV: &str = "WALRUST_TEST_NATIVE_REARM_FAIL_FILE";
+        const DB_ENV: &str = "WALRUST_TEST_NATIVE_REARM_FAIL_DB";
+        unsafe { std::env::set_var(FAIL_ENV, &fail) };
+        unsafe { std::env::set_var(DB_ENV, &db_path) };
+        let _remove_fail_env = RemoveEnv(FAIL_ENV);
+        let _remove_db_env = RemoveEnv(DB_ENV);
+
+        let release_file = fail.clone();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            std::fs::remove_file(release_file).unwrap();
+        });
+        let started = std::time::Instant::now();
+        let attempt = checkpoint_with_state_blocker_attempt(
+            &mut state,
+            ShadowCheckpointMode::Passive,
+            baseline,
+        )
+        .await
+        .unwrap();
+        release.join().unwrap();
+
+        assert!(
+            started.elapsed() >= Duration::from_millis(200),
+            "the controlled checkpoint returned to the watch loop while rearm was still failing"
+        );
+        assert!(attempt.completed);
+        assert!(checkpoint_blocker_heartbeat_is_live(&state).unwrap());
+        assert!(state
+            .checkpoint_blocker
+            .as_ref()
+            .is_some_and(|blocker| !blocker.is_autocommit()));
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_closes_dirty_checkpoint_window_with_snapshot() {
+        let (temp, db_path, _conn) = create_real_wal_db();
+        let shadow = ShadowWal::new_without_checkpoint_blocker(&db_path)
+            .await
+            .unwrap();
+        let mut state = ShadowDbState {
+            name: "native-shutdown-reanchor".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            checkpoint_blocker: Some(ShadowWal::open_checkpoint_blocker(&db_path).unwrap()),
+            data_version_monitor: Some(Connection::open(&db_path).unwrap()),
+            source_db_file: test_source_db_file(&db_path),
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let spool_state = test_native_spool_state(&db_path, temp.path());
+        let base_seq = stage_native_snapshot(&mut state, &spool_state)
+            .await
+            .unwrap();
+        {
+            let mut spool = spool_lock(&spool_state.0).unwrap();
+            spool.begin_checkpoint_window(base_seq).unwrap();
+            spool
+                .mark_checkpoint_window_rearmed_dirty(base_seq, true)
+                .unwrap();
+        }
+        let mut states = HashMap::from([(db_path.clone(), state)]);
+        let spools = HashMap::from([(db_path, spool_state)]);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            finish_shutdown_local_admission(&mut states, &spools),
+        )
+        .await
+        .expect("graceful shutdown retried an impossible delta forever");
+
+        let spool = spool_lock(&spools.values().next().unwrap().0).unwrap();
+        assert!(!spool.requires_checkpoint_reanchor());
+        assert_eq!(spool.admitted_seq(), Some(base_seq + 1));
+        assert_eq!(spool.get(base_seq + 1).unwrap().kind, ObjectKind::Snapshot);
+    }
+
+    #[tokio::test]
     async fn app_commit_during_quiet_interval_is_admitted_before_checkpoint_release() {
         struct RemoveEnv(&'static str);
         impl Drop for RemoveEnv {
@@ -4478,7 +4724,7 @@ mod tests {
             },
         );
 
-        let eager = initial_shadow_copy(&mut db_states).await.unwrap();
+        let eager = initial_shadow_copy(&mut db_states, 0).await.unwrap();
         assert!(
             eager.contains(&db_path),
             "initial copy must flag a downtime-checkpointed DB for eager snapshot"
@@ -4534,7 +4780,7 @@ mod tests {
             },
         );
 
-        let eager = initial_shadow_copy(&mut db_states).await.unwrap();
+        let eager = initial_shadow_copy(&mut db_states, 0).await.unwrap();
         assert!(
             !eager.contains(&db_path),
             "no salt mismatch means no eager snapshot must be scheduled"

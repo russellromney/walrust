@@ -77,15 +77,10 @@ pub struct ShadowWatchState {
 ///
 /// POSIX advisory locks are process-scoped. The old read transaction must end
 /// before the retained data-version monitor writes a fresh heartbeat, then the
-/// same blocker connection pins it again. Writing on the monitor keeps its own
-/// `data_version` unchanged, so application commits remain detectable across
-/// the entire handoff. Reusing the already-last-opened blocker avoids a
-/// close/open POSIX lock gap.
+/// same blocker connection pins it again. Reusing the already-last-opened
+/// blocker avoids a close/open POSIX lock gap. The data-version observer never
+/// participates in this write path.
 pub fn rearm_checkpoint_blocker(state: &mut ShadowWatchState) -> Result<()> {
-    let monitor = state
-        .data_version_monitor
-        .as_ref()
-        .ok_or_else(|| anyhow!("{}: CLI data_version monitor was not held", state.name))?;
     let blocker = state
         .checkpoint_blocker
         .as_ref()
@@ -95,7 +90,7 @@ pub fn rearm_checkpoint_blocker(state: &mut ShadowWatchState) -> Result<()> {
     }
     let mut last_open_error = None;
     for attempt in 1..=3 {
-        if let Err(error) = ShadowWal::write_checkpoint_heartbeat(monitor, &state.db_path) {
+        if let Err(error) = ShadowWal::write_checkpoint_heartbeat(blocker, &state.db_path) {
             tracing::error!(
                 "{}: checkpoint heartbeat write failed (attempt {}/3): {}",
                 state.name,
@@ -135,6 +130,109 @@ pub fn rearm_checkpoint_blocker(state: &mut ShadowWatchState) -> Result<()> {
         "{}: checkpoint blocker heartbeat was reset during all rearm attempts{}",
         state.name,
         last_open_error
+            .as_ref()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
+    ))
+}
+
+/// Rearm after a controlled checkpoint without allowing the heartbeat write to
+/// erase dirty-window evidence.
+///
+/// The blocker first takes `BEGIN IMMEDIATE`, excluding application writers.
+/// Only then does the dedicated read-only observer sample `data_version`.
+/// Therefore every application commit from `data_version_before` through
+/// writer-lock acquisition is detected. The staged heartbeat is then committed
+/// and immediately pinned. A checkpoint/reset in that final commit-to-pin gap
+/// invalidates the heartbeat and is retried rather than accepted.
+pub fn rearm_checkpoint_blocker_after_checkpoint(
+    state: &mut ShadowWatchState,
+    data_version_before: i64,
+) -> Result<bool> {
+    if cfg!(debug_assertions)
+        && std::env::var_os("WALRUST_TEST_NATIVE_REARM_FAIL_FILE")
+            .is_some_and(|path| std::path::Path::new(&path).exists())
+        && std::env::var_os("WALRUST_TEST_NATIVE_REARM_FAIL_DB")
+            .is_none_or(|selected| std::path::Path::new(&selected) == state.db_path)
+    {
+        return Err(anyhow!(
+            "{}: test-injected checkpoint blocker rearm failure",
+            state.name
+        ));
+    }
+    let blocker = state
+        .checkpoint_blocker
+        .as_ref()
+        .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
+    if !blocker.is_autocommit() {
+        blocker.execute_batch("ROLLBACK;")?;
+    }
+
+    let mut dirty = false;
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        if let Err(error) = ShadowWal::begin_checkpoint_heartbeat_transaction(blocker) {
+            tracing::error!(
+                "{}: checkpoint heartbeat writer lock failed (attempt {}/3): {}",
+                state.name,
+                attempt,
+                error
+            );
+            last_error = Some(error);
+            continue;
+        }
+
+        let observed = match checkpoint_data_version(state) {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = blocker.execute_batch("ROLLBACK;");
+                return Err(error);
+            }
+        };
+        dirty |= observed != data_version_before;
+
+        if let Err(error) = blocker.execute_batch("COMMIT;") {
+            let _ = blocker.execute_batch("ROLLBACK;");
+            tracing::error!(
+                "{}: checkpoint heartbeat commit failed (attempt {}/3): {}",
+                state.name,
+                attempt,
+                error
+            );
+            last_error = Some(error.into());
+            continue;
+        }
+        if let Err(error) = ShadowWal::pin_checkpoint_heartbeat(blocker) {
+            if !blocker.is_autocommit() {
+                let _ = blocker.execute_batch("ROLLBACK;");
+            }
+            tracing::error!(
+                "{}: checkpoint blocker pin failed (attempt {}/3): {}",
+                state.name,
+                attempt,
+                error
+            );
+            last_error = Some(error);
+            continue;
+        }
+        if checkpoint_blocker_heartbeat_is_live(state)? {
+            tracing::info!("{}: CLI checkpoint blocker rearmed", state.name);
+            return Ok(dirty);
+        }
+        tracing::error!(
+            "{}: checkpoint blocker heartbeat was reset in the release/reacquire window (attempt {}/3)",
+            state.name,
+            attempt
+        );
+        dirty = true;
+        if !blocker.is_autocommit() {
+            blocker.execute_batch("ROLLBACK;")?;
+        }
+    }
+    Err(anyhow!(
+        "{}: checkpoint blocker heartbeat was reset during all rearm attempts{}",
+        state.name,
+        last_error
             .as_ref()
             .map(|error| format!(": {error}"))
             .unwrap_or_default()
