@@ -3,8 +3,9 @@
 //! [`CompactionLayout`] is the *thin* seam the merge engine speaks to. It only
 //! exposes what the engine needs: list files at a level (with seq range and a
 //! last-modified timestamp), open one for streaming reads, write a ranged
-//! merged object, and delete a set. [`super::seq_layout::SeqLayout`] implements
-//! it for native HADBP object keys.
+//! merged object, and delete a set. Two adapters implement it —
+//! [`super::seq_layout::SeqLayout`] and [`super::range_layout::RangeLayout`] —
+//! and they must never diverge in capability.
 //!
 //! The key-naming functions here ([`format_range_name`], [`parse_range_name`],
 //! [`level_subpath`]) are the **forever** scheme; see the module header.
@@ -20,9 +21,23 @@ use super::CompactionError;
 /// Compaction level. `0` = raw (L0), `1` = L1, `2` = L2, …
 pub type Level = u32;
 
-/// Storage sub-path (under `{prefix}{db}/`) that holds native compaction levels.
-/// Levels `L >= 1` live under this dedicated directory, not in the fixed `0000`
-/// incremental or `0001` snapshot generations. **Forever.**
+/// Storage sub-path (under `{prefix}{db}/`) that holds a compaction level's
+/// merged objects. Levels `L >= 1` live under this dedicated directory, **not**
+/// in a hex generation folder. **Forever.**
+///
+/// Why not a generation number: the litestream-heritage legacy layout stores
+/// both live incrementals and *snapshots* under `{db}/{gen:04x}/`, and its
+/// snapshot generation **increments by one per snapshot** (`snapshot_gen =
+/// current_gen + 1` in `legacy_wal_sync`). The 16th snapshot therefore lands in
+/// `0010/` — exactly where a `0x0010`-based compaction L1 would have gone. That
+/// is a two-way corruption: legacy discovery (`discover_legacy_snapshots`,
+/// which treats every file in generations `1..=max` as a snapshot) would
+/// classify compaction merged objects as snapshots, and compaction's
+/// `list_level` would ingest real LTX snapshots as merge sources. A dedicated
+/// non-hex sub-path is structurally invisible to every existing discovery path:
+/// legacy scanners only accept `{gen}/{file}` (2 parts) and `{file}` (1 part)
+/// relative shapes, and `parse_generation("levels")` / `("L1")` fail because
+/// they are not hex.
 pub const LEVELS_DIR: &str = "levels";
 
 /// Directory name for compaction level 0 — the existing incremental pool that
@@ -35,7 +50,8 @@ pub const SEQ_HEX_WIDTH: usize = 16;
 /// Map a compaction level to its storage sub-path (under `{prefix}{db}/`).
 ///
 /// - Level 0 → `0000` (the incremental pool; read-only for compaction).
-/// - Level `L >= 1` → `levels/L{L}` (see [`LEVELS_DIR`]).
+/// - Level `L >= 1` → `levels/L{L}` (a dedicated namespace no existing
+///   discovery path can misread — see [`LEVELS_DIR`]).
 pub fn level_subpath(level: Level) -> String {
     if level == 0 {
         L0_DIR.to_string()
@@ -270,7 +286,130 @@ fn body_offset(header: &SourceHeader) -> u64 {
     }
 }
 
-/// Read a native HADBP source header from storage.
+/// Litestream LTX file magic (`litepages`). A legacy L0 object begins with this;
+/// a merged (HADBP) object begins with `HADBP`. Sniffing the magic lets one
+/// layout read **both** heritages: real LTX at L0, HADBP at the merged levels.
+const LTX_MAGIC: &[u8; 4] = b"LTX1";
+
+/// Parse an LTX (litestream-heritage) L0 object into a [`SourceHeader`].
+///
+/// The seam (wave C3a): a legacy L0 pool holds **real LTX** bytes, but the merge
+/// engine speaks HADBP page geometry and an HADBP chain. We present each LTX
+/// source as a **pseudo-COMPACTED** header carrying its **LTX-domain** chain
+/// values — `prev_checksum` = the LTX `pre_apply_checksum`, `declared_end` =
+/// the LTX `post_apply_checksum` (from the trailer). The merge then:
+///   - checks contiguity in the LTX domain (`source[i+1].prev == source[i]`'s
+///     declared end), exactly the chain the LTX writer built, and
+///   - stamps the produced HADBP object's `prev`/`declared_end` with those same
+///     LTX values, so a mixed LTX→HADBP→LTX restore chain links with **one**
+///     running checksum in the LTX domain.
+/// The HADBP content checksum over the merged pages is independent and still
+/// protects page integrity. Pages are `PageIdSize::U32` (LTX `PageNum` is u32).
+///
+/// Reads/decodes the whole object (LTX files are small per-second incrementals)
+/// because the `post_apply_checksum` lives in the trailer; `finish()` also
+/// verifies the file checksum, so a torn LTX source is caught here.
+pub(crate) fn parse_ltx_source_header(bytes: &[u8]) -> Result<SourceHeader, CompactionError> {
+    use crate::legacy_ltx::Decoder;
+    let (mut decoder, header) = Decoder::new(std::io::Cursor::new(bytes.to_vec()))
+        .map_err(|e| CompactionError::Storage(format!("ltx header decode: {e}")))?;
+    let page_size = header.page_size.into_inner();
+    let mut buf = vec![0u8; page_size as usize];
+    let mut page_count: u32 = 0;
+    while decoder
+        .decode_page(&mut buf)
+        .map_err(|e| CompactionError::Storage(format!("ltx page decode: {e}")))?
+        .is_some()
+    {
+        page_count = page_count.saturating_add(1);
+    }
+    let trailer = decoder
+        .finish()
+        .map_err(|e| CompactionError::Storage(format!("ltx trailer verify: {e}")))?;
+    let created_ms = header
+        .timestamp
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    Ok(SourceHeader {
+        page_id_size: PageIdSize::U32,
+        page_size,
+        seq: header.max_txid.into_inner(),
+        prev_checksum: header
+            .pre_apply_checksum
+            .map(|c| c.into_inner())
+            .unwrap_or(0),
+        page_count,
+        created_ms,
+        declared_end_checksum: Some(trailer.post_apply_checksum.into_inner()),
+    })
+}
+
+/// A [`ChangesetPageStream`] over a real **LTX** L0 object. Yields the LTX pages
+/// (decompressed, `U32` page ids) in ascending order, then a single synthetic
+/// **empty end-page-count marker** at `commit + 1`. The marker makes the merged
+/// HADBP object declare the final DB size exactly as walrust's HADBP
+/// incrementals do (an empty page at `end_page_count + 1`), so a restore
+/// truncates/grows correctly; intermediate sources' markers are elided by the
+/// merge, leaving one canonical marker. Streams one page at a time (the litepages
+/// decoder is itself streaming), so the merge stays memory-bounded.
+struct LtxChangesetStream {
+    decoder: crate::legacy_ltx::Decoder<'static, std::io::Cursor<Vec<u8>>>,
+    page_size: usize,
+    /// Final DB page count (LTX header `commit`); the marker sits at `commit + 1`.
+    commit: u64,
+    pages_done: bool,
+    marker_pending: bool,
+}
+
+impl LtxChangesetStream {
+    fn open(bytes: Vec<u8>) -> Result<Self, CompactionError> {
+        let (decoder, header) = crate::legacy_ltx::Decoder::new(std::io::Cursor::new(bytes))
+            .map_err(|e| CompactionError::Storage(format!("ltx open: {e}")))?;
+        Ok(Self {
+            page_size: header.page_size.into_inner() as usize,
+            commit: header.commit.into_inner() as u64,
+            decoder,
+            pages_done: false,
+            marker_pending: true,
+        })
+    }
+}
+
+#[async_trait]
+impl ChangesetPageStream for LtxChangesetStream {
+    async fn next_page(&mut self) -> Result<Option<PageEntry>, CompactionError> {
+        if !self.pages_done {
+            let mut data = vec![0u8; self.page_size];
+            match self
+                .decoder
+                .decode_page(&mut data)
+                .map_err(|e| CompactionError::Storage(format!("ltx page decode: {e}")))?
+            {
+                Some(pn) => {
+                    return Ok(Some(PageEntry {
+                        page_id: PageId::U32(pn.into_inner()),
+                        data,
+                    }));
+                }
+                None => self.pages_done = true,
+            }
+        }
+        if self.marker_pending {
+            self.marker_pending = false;
+            return Ok(Some(PageEntry {
+                page_id: PageId::U32((self.commit + 1) as u32),
+                data: Vec::new(),
+            }));
+        }
+        Ok(None)
+    }
+}
+
+/// Read a source header from storage, sniffing the object format. HADBP objects
+/// (merged levels) parse from a single 48-byte ranged GET; real LTX L0 objects
+/// require the full object (the `post_apply_checksum` is in the trailer) — they
+/// are small per-second incrementals, and this cost is paid only at merge time.
 pub(crate) async fn read_header_from_storage(
     storage: &dyn StorageBackend,
     key: &str,
@@ -280,10 +419,20 @@ pub(crate) async fn read_header_from_storage(
         .await
         .map_err(|e| CompactionError::Storage(e.to_string()))?
         .ok_or_else(|| CompactionError::Storage(format!("missing object {key}")))?;
+    if head.len() >= 4 && &head[0..4] == LTX_MAGIC {
+        let bytes = storage
+            .get(key)
+            .await
+            .map_err(|e| CompactionError::Storage(e.to_string()))?
+            .ok_or_else(|| CompactionError::Storage(format!("missing object {key}")))?;
+        return parse_ltx_source_header(&bytes);
+    }
     parse_source_header(&head)
 }
 
-/// Open a native HADBP source for streaming page reads.
+/// Open a source for streaming page reads, sniffing the object format: HADBP →
+/// ranged-GET [`StorageChangesetStream`]; real LTX → whole-object
+/// [`LtxChangesetStream`] (the litepages decoder needs the framed stream).
 pub(crate) async fn open_source_stream(
     storage: Arc<dyn StorageBackend>,
     key: &str,
@@ -293,6 +442,14 @@ pub(crate) async fn open_source_stream(
         .await
         .map_err(|e| CompactionError::Storage(e.to_string()))?
         .ok_or_else(|| CompactionError::Storage(format!("missing object {key}")))?;
+    if head.len() >= 4 && &head[0..4] == LTX_MAGIC {
+        let bytes = storage
+            .get(key)
+            .await
+            .map_err(|e| CompactionError::Storage(e.to_string()))?
+            .ok_or_else(|| CompactionError::Storage(format!("missing object {key}")))?;
+        return Ok(Box::new(LtxChangesetStream::open(bytes)?));
+    }
     let header = parse_source_header(&head)?;
     Ok(Box::new(StorageChangesetStream::open(
         storage, key, &header,
@@ -373,9 +530,11 @@ impl ChangesetPageStream for StorageChangesetStream {
     }
 }
 
-/// Shared native generation-directory layout logic. Level-0 files are parsed
-/// tolerantly because [`parse_range_name`] accepts both seq-point and merged
-/// min-max forms.
+/// Shared generation-directory layout logic. Both adapters ([`SeqLayout`],
+/// [`RangeLayout`][super::range_layout::RangeLayout]) are thin wrappers over
+/// this: they differ only in the filename extension. Level-0 files are parsed
+/// tolerantly ([`parse_range_name`] accepts both the seq-point and min-max
+/// forms), so one code path serves both heritages.
 pub(crate) struct GenLayoutCore {
     storage: Arc<dyn StorageBackend>,
     prefix: String,
@@ -517,7 +676,7 @@ mod tests {
     fn level_subpath_scheme_is_frozen() {
         // L0 is the existing incremental pool (read-only for compaction).
         assert_eq!(level_subpath(0), "0000");
-        // L>=1 live under a dedicated non-hex namespace so no owned
+        // L>=1 live under a dedicated non-hex namespace so no legacy/owned
         // generation scanner can misread them (see the collision note on
         // LEVELS_DIR).
         assert_eq!(level_subpath(1), "levels/L1");
@@ -526,7 +685,11 @@ mod tests {
     }
 
     #[test]
-    fn level_dirs_are_outside_fixed_raw_generations() {
+    fn level_dirs_are_not_valid_generation_hex() {
+        // The legacy layout parses a generation folder with
+        // `u64::from_str_radix(component, 16)`. Every component of a compaction
+        // L>=1 sub-path must fail that parse, so a legacy scan can never treat a
+        // compaction object as a snapshot generation.
         for level in 1..=8u32 {
             for component in level_subpath(level).split('/') {
                 assert!(

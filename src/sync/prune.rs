@@ -1,17 +1,29 @@
 use anyhow::Result;
 use chrono::Utc;
+use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
-use walrust_core::native_publish::StreamDescriptor;
+use std::path::Path;
+use std::sync::Arc;
+use walrust_core::compaction::{list_level_files, plan_level_prune, RangeLayout};
+use walrust_core::legacy_manifest::plan_legacy_prune;
+use walrust_core::legacy_wal_sync::{checkpoint_wal_truncate, snapshot_database_to_storage};
 
 use crate::errors::{classify_or_else, WalrustError};
 use crate::retention::{RetentionPolicy, SnapshotEntry};
 use crate::s3::{self, create_client, parse_bucket};
+
+use super::manifest::discover_snapshots_from_s3;
 
 fn native_retention_floor(
     snapshots: &[SnapshotEntry],
     policy: &RetentionPolicy,
     now: chrono::DateTime<Utc>,
 ) -> Option<u64> {
+    // hadb-io's generic safety minimum fills from the oldest entry because
+    // some formats need their original base. Every native-v1 entry here is a
+    // complete HADBP snapshot, so retaining the oldest would pin the immutable
+    // floor forever. Preserve all GFS tier selections, then satisfy the same
+    // minimum with the newest complete snapshots.
     let mut tier_policy = policy.clone();
     tier_policy.minimum = 0;
     let tier_plan = crate::retention::analyze_retention(snapshots, &tier_policy, now);
@@ -43,10 +55,13 @@ pub async fn prune(
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = create_client(endpoint)
         .await
-        .map_err(|error| classify_or_else(error, WalrustError::s3))?;
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
     prune_with_client(&client, &bucket_name, &prefix, name, policy, force).await
 }
 
+/// Shared retention implementation for the interactive command and watcher.
+/// The watcher runs this only on its retention timer, never on the local WAL
+/// admission/checkpoint path.
 pub(crate) async fn prune_with_client(
     client: &aws_sdk_s3::Client,
     bucket_name: &str,
@@ -55,88 +70,356 @@ pub(crate) async fn prune_with_client(
     policy: &RetentionPolicy,
     force: bool,
 ) -> Result<()> {
+    // During legacy -> native migration the immutable descriptor can be
+    // published before its full native snapshot's visibility record. Until
+    // that record exists, the legacy base/history is the only remote recovery
+    // point and pruning it could strand unpublished local descendants.
     let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
-    let descriptor_bytes = match s3::download_bytes(client, bucket_name, &descriptor_key).await {
-        Ok(bytes) => bytes,
-        Err(error) if s3::download_error_is_not_found(&error) => {
-            println!("No native-v1 stream found for database '{}'", name);
-            return Ok(());
+    let (native_state, native_descriptor) = match s3::download_bytes(
+        client,
+        bucket_name,
+        &descriptor_key,
+    )
+    .await
+    {
+        Ok(descriptor_bytes) => {
+            let descriptor = serde_json::from_slice::<
+                walrust_core::native_publish::StreamDescriptor,
+            >(&descriptor_bytes)?;
+            let storage = S3Storage::new(client.clone(), bucket_name.to_string());
+            // A non-empty `published/` listing is not a visibility proof: the
+            // only record may be beyond a gap, malformed, or belong to an
+            // incompatible chain. Use the same contiguous descriptor-selected
+            // head calculation as restore/list before allowing destructive
+            // legacy retention.
+            let visible = walrust_core::native_restore::inspect_native_v1(
+                &storage,
+                bucket_name,
+                prefix,
+                name,
+            )
+            .await?;
+            if visible.is_none() {
+                println!(
+                    "Native migration for '{}' has no contiguous published snapshot base; refusing legacy prune",
+                    name
+                );
+                return Ok(());
+            }
+            (visible, Some(descriptor))
         }
+        Err(error) if s3::download_error_is_not_found(&error) => (None, None),
         Err(error) => return Err(classify_or_else(error, WalrustError::s3)),
     };
-    let descriptor: StreamDescriptor = serde_json::from_slice(&descriptor_bytes)?;
-    let storage = S3Storage::new(client.clone(), bucket_name.to_string());
-    let native =
-        walrust_core::native_restore::inspect_native_v1(&storage, bucket_name, prefix, name)
-            .await
-            .map_err(|error| {
-                if error
-                    .chain()
-                    .any(|cause| cause.is::<walrust_core::native_restore::NativeStorageError>())
-                {
-                    classify_or_else(error, WalrustError::s3)
-                } else {
-                    classify_or_else(error, WalrustError::integrity)
-                }
-            })?
-            .ok_or_else(|| {
-                WalrustError::restore(format!(
-                    "native-v1 stream '{}' has no contiguous published snapshot base",
-                    name
-                ))
-            })?;
 
-    let mut snapshots = Vec::with_capacity(native.snapshot_seqs.len());
-    for seq in &native.snapshot_seqs {
-        let key = format!(
-            "{}{}/native/v1/lineages/{}/published/{seq:016x}.json",
-            prefix, name, descriptor.lineage_id
+    if let Some(native) = &native_state {
+        let descriptor = native_descriptor
+            .as_ref()
+            .expect("native state and descriptor are created together");
+        let mut native_snapshots = Vec::with_capacity(native.snapshot_seqs.len());
+        for seq in &native.snapshot_seqs {
+            let key = format!(
+                "{}{}/native/v1/lineages/{}/published/{seq:016x}.json",
+                prefix, name, descriptor.lineage_id
+            );
+            let meta = s3::head_object_meta(client, bucket_name, &key)
+                .await
+                .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+            native_snapshots.push(SnapshotEntry {
+                key,
+                created_at: meta.last_modified,
+                sequence: *seq,
+                size: meta.size,
+            });
+        }
+        let floor = native_retention_floor(&native_snapshots, policy, Utc::now())
+            .unwrap_or(native.retention_floor_seq);
+        let delete_count = floor.saturating_sub(native.retention_floor_seq) as usize;
+        println!(
+            "Native HADBP retention: keep floor sequence {} through visible head {} ({} older object(s) eligible)",
+            floor,
+            native.head_seq,
+            delete_count
         );
-        let meta = s3::head_object_meta(client, bucket_name, &key)
+        if force && floor > native.retention_floor_seq {
+            let storage = S3Storage::new(client.clone(), bucket_name.to_string());
+            let outcome = walrust_core::native_restore::prune_native_before_snapshot(
+                &storage,
+                bucket_name,
+                prefix,
+                name,
+                floor,
+            )
+            .await?;
+            println!(
+                "Native HADBP prune complete: deleted {} object/record pair(s); earliest native PIT is {}",
+                outcome.deleted_objects,
+                outcome.floor_seq
+            );
+        } else if !force && floor > native.retention_floor_seq {
+            println!("Native HADBP prune is a dry run; use --force to advance the floor.");
+        }
+    }
+
+    // Discover snapshots from the S3 listing — the production watch path never
+    // writes a manifest.json, so reading one made prune a silent no-op (F6).
+    // The key here is the FULL S3 key (verify/restore use full keys too).
+    let discovered = discover_snapshots_from_s3(client, bucket_name, prefix, name)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+
+    if discovered.is_empty() && native_state.is_none() {
+        println!("No snapshots found for database '{}'", name);
+        return Ok(());
+    }
+    if discovered.is_empty() {
+        return Ok(());
+    }
+
+    // HEAD each snapshot for size + last-modified to build retention entries.
+    let mut snapshot_entries: Vec<SnapshotEntry> = Vec::with_capacity(discovered.len());
+    for (key, _gen, _min, max) in &discovered {
+        let meta = s3::head_object_meta(client, bucket_name, key)
             .await
-            .map_err(|error| classify_or_else(error, WalrustError::s3))?;
-        snapshots.push(SnapshotEntry {
-            key,
+            .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+        snapshot_entries.push(SnapshotEntry {
+            key: key.clone(),
             created_at: meta.last_modified,
-            sequence: *seq,
+            sequence: *max,
             size: meta.size,
         });
     }
-    let floor = native_retention_floor(&snapshots, policy, Utc::now())
-        .unwrap_or(native.retention_floor_seq);
-    println!(
-        "Native HADBP retention: keep floor sequence {} through visible head {}",
-        floor, native.head_seq
-    );
-    if floor <= native.retention_floor_seq {
-        println!("Nothing to delete - native snapshots fit retention policy.");
+
+    if snapshot_entries.is_empty() {
+        println!("No snapshots found for database '{}'", name);
         return Ok(());
     }
-    if !force {
-        println!("Native HADBP prune is a dry run; use --force to advance the floor.");
+
+    let now = Utc::now();
+    let storage = S3Storage::new(client.clone(), bucket_name.to_string());
+    let plan_before_reachability =
+        crate::retention::analyze_retention(&snapshot_entries, policy, now);
+    let plan = plan_legacy_prune(&storage, prefix, name, &snapshot_entries, policy, now)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+    let before = plan.delete.len();
+    let rescued = plan_before_reachability.delete.len().saturating_sub(before);
+    if rescued > 0 {
+        tracing::info!(
+            "Prune: retained {} snapshot(s) as reachability base for the incremental chain (F7)",
+            rescued
+        );
+    }
+
+    // Level-aware watermark prune (E2, now level-aware): the oldest surviving
+    // snapshot's seq is the earliest restorable point; merged compaction objects
+    // (under `{db}/levels/L*/`) whose whole range ends below it can never be part
+    // of a retained restore and are deletable — keeping the newest object per
+    // level and never a watermark-straddling object a retained PITR still needs.
+    let watermark = plan.keep.iter().map(|e| e.sequence).min().unwrap_or(0);
+    let level_storage: Arc<dyn StorageBackend> =
+        Arc::new(S3Storage::new(client.clone(), bucket_name.to_string()));
+    let level_layout = RangeLayout::new(level_storage, prefix, name);
+    // E10 sibling (fail-loud, not fail-silent): this DELETION plan must come
+    // from a complete levels listing. Swallowing a failed LIST with
+    // `unwrap_or_default()` silently skipped the level prune and misreported
+    // "Nothing to delete" — a decision made from a defaulted view. The
+    // direction was at least conservative (nothing extra deleted), but a
+    // persistent LIST failure would leak level objects forever without a word.
+    // Propagate instead; the operator retries the prune.
+    let level_files = list_level_files(&level_layout)
+        .await
+        .map_err(|e| classify_or_else(anyhow::Error::from(e), WalrustError::s3))?;
+    let level_delete = plan_level_prune(&level_files, watermark);
+
+    // Print summary
+    println!("Prune plan for '{}':", name);
+    println!("  {}", plan.summary());
+    println!();
+
+    if !plan.has_deletions() && level_delete.is_empty() {
+        println!("Nothing to delete - all snapshots fit retention policy.");
         return Ok(());
     }
-    let outcome = walrust_core::native_restore::prune_native_before_snapshot(
-        &storage,
-        bucket_name,
-        prefix,
-        name,
-        floor,
-    )
-    .await
-    .map_err(|error| {
-        if error
-            .chain()
-            .any(|cause| cause.is::<walrust_core::native_restore::NativeStorageError>())
-        {
-            classify_or_else(error, WalrustError::s3)
-        } else {
-            classify_or_else(error, WalrustError::integrity)
+
+    // Print what will be kept
+    println!("Keeping {} snapshots:", plan.keep.len());
+    for entry in &plan.keep {
+        println!(
+            "  {} (TXID: {}, {})",
+            entry.key,
+            entry.sequence,
+            format_age(now, entry.created_at)
+        );
+    }
+    // Declare the retained restore floor explicitly (E2): the oldest kept
+    // snapshot is the earliest point-in-time that stays restorable after this
+    // prune. Anything below it is being dropped on purpose.
+    if let Some(floor) = plan.keep.iter().map(|e| e.sequence).min() {
+        println!(
+            "Earliest restorable point-in-time after pruning: TXID {} \
+             (older point-in-time restores are no longer available)",
+            floor
+        );
+    }
+    println!();
+
+    // Print what will be deleted
+    println!("Deleting {} snapshots:", plan.delete.len());
+    for entry in &plan.delete {
+        println!(
+            "  {} (TXID: {}, {})",
+            entry.key,
+            entry.sequence,
+            format_age(now, entry.created_at)
+        );
+    }
+    if !level_delete.is_empty() {
+        println!(
+            "Deleting {} merged compaction object(s) below the retained watermark (TXID {}):",
+            level_delete.len(),
+            watermark
+        );
+        for f in &level_delete {
+            println!("  {} (seq range {}-{})", f.key, f.range.min, f.range.max);
         }
-    })?;
+    }
+    println!();
+
+    if !force {
+        println!("Dry-run mode: no files deleted. Use --force to actually delete.");
+        return Ok(());
+    }
+
+    // Actually delete files. `e.key` is already the full S3 key from listing.
+    println!("Deleting files...");
+
+    let mut keys_to_delete: Vec<String> = plan.delete.iter().map(|e| e.key.clone()).collect();
+    keys_to_delete.extend(level_delete.iter().map(|f| f.key.clone()));
+
+    let deleted_count = s3::delete_objects(client, bucket_name, &keys_to_delete)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+
+    tracing::info!("Deleted {} snapshot files", deleted_count);
+
+    // No manifest to update — discovery is by S3 listing, so the next prune
+    // run simply re-lists and sees the deletions reflected.
+
     println!(
-        "Native HADBP prune complete: deleted {} object/record pair(s); earliest native PIT is {}",
-        outcome.deleted_objects, outcome.floor_seq
+        "Prune complete: deleted {} snapshots, freed {:.2} MB",
+        deleted_count,
+        plan.bytes_freed as f64 / (1024.0 * 1024.0)
+    );
+
+    Ok(())
+}
+
+/// Format age of a snapshot in human-readable form
+fn format_age(now: chrono::DateTime<Utc>, created_at: chrono::DateTime<Utc>) -> String {
+    let age = now.signed_duration_since(created_at);
+
+    if age.num_hours() < 1 {
+        format!("{} min ago", age.num_minutes())
+    } else if age.num_hours() < 24 {
+        format!("{} hours ago", age.num_hours())
+    } else if age.num_days() < 7 {
+        format!("{} days ago", age.num_days())
+    } else if age.num_weeks() < 12 {
+        format!("{} weeks ago", age.num_weeks())
+    } else {
+        format!("{} months ago", age.num_days() / 30)
+    }
+}
+
+/// Take immediate snapshot as LTX file
+pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> Result<()> {
+    if !database.exists() {
+        return Err(
+            WalrustError::database(format!("Database not found: {}", database.display())).into(),
+        );
+    }
+
+    let name = database
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| WalrustError::database("Invalid database path"))?;
+
+    // E6: a running watcher pins the WAL via its checkpoint blocker, so a manual
+    // snapshot's fail-closed TRUNCATE would surface a confusing "checkpoint
+    // incomplete (busy=1...)" error. Detect that case up front via the E5 lock
+    // and return an actionable message instead.
+    if crate::lock::DbLock::is_held_by_another(database) {
+        return Err(WalrustError::database(format!(
+            "a walrust watch process holds the checkpoint blocker for {}. \
+             Snapshots are taken automatically by the watcher — use its snapshot \
+             interval/triggers, or stop the watcher before taking a manual snapshot.",
+            database.display()
+        ))
+        .into());
+    }
+
+    let (bucket_name, prefix) = parse_bucket(bucket);
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+    let storage = S3Storage::new(client, bucket_name.clone());
+    // The one-shot `walrust snapshot` command has no shadow WAL to carry
+    // un-folded frames as incrementals, so fully fold the WAL into the base image
+    // with a completeness-checked TRUNCATE (busy_timeout + result-row check)
+    // before encoding. This hard-fails if another process (e.g. a running
+    // watcher) pins the WAL — correct fail-closed behavior for a manual snapshot,
+    // rather than silently producing a base missing recent commits (B10).
+    checkpoint_wal_truncate(database).await?;
+    let output = snapshot_database_to_storage(&storage, &prefix, name, database).await?;
+
+    println!(
+        "Snapshot uploaded: s3://{}/{} (gen {}, TXID 1-{})",
+        bucket_name, output.key, output.generation, output.max_txid
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    #[test]
+    fn native_minimum_selects_newest_complete_snapshot_bases() {
+        let now = Utc::now();
+        let snapshots = (1..=7)
+            .map(|sequence| SnapshotEntry {
+                key: format!("snapshot-{sequence}"),
+                created_at: now - chrono::Duration::minutes((7 - sequence) as i64),
+                sequence,
+                size: 1,
+            })
+            .collect::<Vec<_>>();
+        let policy = RetentionPolicy::new(1, 0, 0, 0);
+        assert_eq!(native_retention_floor(&snapshots, &policy, now), Some(6));
+    }
+
+    /// E6: when a watcher holds the single-writer lock, `snapshot` must return
+    /// an actionable error naming the watcher — before it ever reaches the
+    /// fail-closed WAL TRUNCATE that would otherwise surface a confusing
+    /// "checkpoint incomplete (busy=1...)".
+    #[tokio::test]
+    async fn e6_snapshot_reports_actionable_error_when_watcher_holds_lock() {
+        let dir = tempdir().unwrap();
+        let db = dir.path().join("app.db");
+        std::fs::write(&db, b"SQLite format 3\0").unwrap();
+
+        // Simulate a running watcher owning the DB.
+        let _watcher_lock = crate::lock::DbLock::acquire(&db).unwrap();
+
+        let err = snapshot(&db, "s3://bucket/prefix", None)
+            .await
+            .expect_err("snapshot must refuse while a watcher owns the DB");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("holds the checkpoint blocker") && msg.contains("stop the watcher"),
+            "message must be actionable, got: {msg}"
+        );
+    }
 }

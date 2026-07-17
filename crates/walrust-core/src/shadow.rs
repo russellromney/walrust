@@ -250,10 +250,10 @@ impl ShadowWal {
 
     /// Commit the frame a later blocker transaction will pin.
     ///
-    /// Controlled checkpoint handoffs call this on the retained blocker after
-    /// ending its read transaction. The data-version observer is deliberately
-    /// a different, read-only connection: a heartbeat write must never refresh
-    /// the observer's pager state and hide an application commit.
+    /// Controlled checkpoint handoffs call this on the long-lived
+    /// `data_version` monitor. A connection does not advance its own
+    /// `PRAGMA data_version`, so any observed change still proves that an
+    /// application connection committed during the unblocked window.
     pub fn write_checkpoint_heartbeat(conn: &Connection, db_path: &Path) -> Result<()> {
         ensure_connection_in_wal_mode(conn, db_path)?;
 
@@ -275,31 +275,6 @@ impl ShadowWal {
         )?;
 
         Ok(())
-    }
-
-    /// Acquire SQLite's writer lock and stage (but do not commit) the blocker
-    /// heartbeat. While this transaction is open no application writer can
-    /// cross the caller's final `PRAGMA data_version` sample. The heartbeat
-    /// table and row are created by `open_checkpoint_blocker()` before this is
-    /// ever used.
-    pub fn begin_checkpoint_heartbeat_transaction(conn: &Connection) -> Result<()> {
-        if !conn.is_autocommit() {
-            conn.execute_batch("ROLLBACK;")?;
-        }
-        conn.execute_batch("BEGIN IMMEDIATE;")?;
-        match conn.execute("UPDATE _walrust_seq SET value = value + 1 WHERE id = 1", []) {
-            Ok(1) => Ok(()),
-            Ok(updated) => {
-                let _ = conn.execute_batch("ROLLBACK;");
-                Err(anyhow!(
-                    "checkpoint heartbeat update affected {updated} rows instead of one"
-                ))
-            }
-            Err(error) => {
-                let _ = conn.execute_batch("ROLLBACK;");
-                Err(error.into())
-            }
-        }
     }
 
     /// Pin a heartbeat already committed by the retained monitor.
@@ -1368,6 +1343,45 @@ mod tests {
         frame
     }
 
+    /// Reproduces the exact drill symptom at the read layer: when a shadow
+    /// segment has a torn (non-frame-aligned) tail followed by more frame bytes,
+    /// the frame-by-frame reader misaligns and decodes a header out of a frame's
+    /// zero-padded region, producing page number 0 — which litepages surfaces as
+    /// "Invalid page num: transaction ID must be non-zero".
+    #[tokio::test]
+    async fn e1_torn_segment_tail_decodes_as_invalid_page_num() {
+        use crate::legacy_shadow::{encode_shadow_to_ltx, ShadowSyncInput};
+
+        let dir = tempdir().unwrap();
+        let shadow_dir = dir.path().join(".walrust-app");
+        std::fs::create_dir_all(&shadow_dir).unwrap();
+
+        let mut bytes = e1_frame(1, 1, 0xAB); // committed frame, page 1
+        bytes.extend_from_slice(&[0u8; 4]); // torn 4-byte tail (all zero)
+        bytes.extend_from_slice(&e1_frame(2, 2, 0xCD)); // appended committed frame
+        std::fs::write(shadow_dir.join(format_segment_name(0, 0)), &bytes).unwrap();
+
+        let input = ShadowSyncInput {
+            db_path: dir.path().join("app.db"),
+            name: "app".into(),
+            current_txid: 10,
+            db_checksum: Some(123), // avoid reading the (absent) db file for the checksum
+            generation: 0,
+            shadow_sync_offset: 0,
+            page_size: E1_PAGE_SIZE,
+            shadow_dir: shadow_dir.clone(),
+        };
+
+        let err = match encode_shadow_to_ltx(&input) {
+            Err(e) => e,
+            Ok(_) => panic!("misaligned torn tail must fail to encode"),
+        };
+        assert!(
+            err.to_string().contains("Invalid page num"),
+            "misaligned torn tail must surface the page-num error, got: {err}"
+        );
+    }
+
     /// Upgrade gate: a markerless aligned tail is not proof of fsync. It may be
     /// a complete corrupt frame from a power-loss image, so startup must remove
     /// it and force the watch layer through a full snapshot before any delta.
@@ -1569,6 +1583,109 @@ mod tests {
         assert!(
             !orphan.exists(),
             "startup must finish a marker-first cleanup instead of adopting or retaining its orphan"
+        );
+    }
+
+    /// Priority 1(b) — the REWIND question. A torn trailing frame was a
+    /// partially-copied REAL committed WAL frame. After healing, resume must
+    /// RE-COPY that frame from the live WAL (no silent data loss) AND must NOT
+    /// duplicate the whole frames that preceded the tear in the same
+    /// not-yet-persisted copy batch (no TXID-stream corruption). Both directions
+    /// are asserted against a clean-copy oracle built from the same live WAL.
+    #[tokio::test]
+    async fn e1_heal_then_resume_recopies_torn_frame_without_loss_or_corruption() {
+        use crate::legacy_shadow::{encode_shadow_to_ltx, ShadowSyncInput};
+
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("app.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t (v) VALUES ('a0');",
+        )
+        .unwrap();
+
+        // --- Durable checkpoint: copy commit A, persist its cursor. ---
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let (_frames_a, off_a) = shadow.copy_frames(0).await.unwrap();
+        let salt_a = shadow.wal_read_salt();
+        let chain_a = shadow.wal_read_chain();
+        let page_size = shadow.page_size();
+        let seg = shadow.shadow_dir().join(format_segment_name(0, 0));
+        assert!(off_a > 0, "commit A must have produced frames");
+
+        // --- Commit B: several more frames land in the live WAL. ---
+        for i in 0..5 {
+            conn.execute("INSERT INTO t (v) VALUES (?1)", [format!("b{i}")])
+                .unwrap();
+        }
+
+        // The interrupted copy of B: its whole frames reach the shadow on disk,
+        // but the crash happens before wal_copy_offset is persisted (it stays
+        // off_a) and the final frame is left torn.
+        let (_frames_b, _off_b) = shadow.copy_frames(off_a).await.unwrap();
+        let clean_len = std::fs::metadata(&seg).unwrap().len();
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
+            f.write_all(&[0u8; 30]).unwrap(); // torn partial frame
+        }
+        drop(shadow);
+
+        // --- Restart: heal must drop the torn tail back to whole frames. ---
+        let mut restarted = ShadowWal::new(&db_path).await.unwrap();
+        assert_eq!(
+            std::fs::metadata(&seg).unwrap().len(),
+            clean_len,
+            "heal must truncate the torn tail to the whole-frame boundary"
+        );
+
+        // Resume from the PERSISTED (pre-B) cursor — the rewind under test.
+        restarted.restore_read_cursor(salt_a, chain_a);
+        let (_resumed, _new_off) = restarted.copy_frames(off_a).await.unwrap();
+
+        // Oracle: a pristine shadow built once from the same final live WAL.
+        let oracle_dir = tempdir().unwrap();
+        let oracle_db = oracle_dir.path().join("app.db");
+        std::fs::copy(&db_path, &oracle_db).unwrap();
+        std::fs::copy(
+            db_path.with_extension("db-wal"),
+            oracle_db.with_extension("db-wal"),
+        )
+        .unwrap();
+        let mut oracle = ShadowWal::new(&oracle_db).await.unwrap();
+        oracle.copy_frames(0).await.unwrap();
+        let oracle_seg = oracle.shadow_dir().join(format_segment_name(0, 0));
+        let oracle_len = std::fs::metadata(&oracle_seg).unwrap().len();
+
+        let healed_len = std::fs::metadata(&seg).unwrap().len();
+
+        // The encoded LTX is what actually ships. It must carry every distinct
+        // page exactly once with the same TXID range as a clean copy — the torn
+        // frame present (no loss) and any structurally duplicated frames
+        // collapsed by the page-dedup reader (no TXID-stream corruption).
+        let encode_one = |sdir: &std::path::Path, gen| {
+            encode_shadow_to_ltx(&ShadowSyncInput {
+                db_path: db_path.clone(),
+                name: "app".into(),
+                current_txid: 50,
+                db_checksum: Some(123),
+                generation: gen,
+                shadow_sync_offset: 0,
+                page_size,
+                shadow_dir: sdir.to_path_buf(),
+            })
+            .unwrap()
+            .map(|(r, _)| (r.unique_pages, r.min_txid, r.max_txid))
+        };
+        let healed = encode_one(restarted.shadow_dir(), restarted.generation());
+        let oracle_res = encode_one(oracle.shadow_dir(), oracle.generation());
+        assert_eq!(
+            healed, oracle_res,
+            "healed shadow must decode the same unique pages and TXID range as a \
+             clean copy (healed_seg_len={healed_len}, oracle_seg_len={oracle_len})"
         );
     }
 

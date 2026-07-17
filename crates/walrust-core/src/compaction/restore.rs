@@ -2,7 +2,9 @@
 //!
 //! This is the read-side consumer of the compaction write side. It is
 //! **layout-agnostic** — it speaks only [`CompactionLayout`] and the pure
-//! [`plan_restore`] planner over native HADBP objects.
+//! [`plan_restore`] planner, so the owned seq layout and the litestream-heritage
+//! range layout share one code path (both carry HADBP payloads; see the module
+//! header's "both adapters carry HADBP payloads" decision).
 //!
 //! ## Parallel prefetch, strict-order apply
 //!

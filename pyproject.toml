@@ -1,0 +1,48 @@
+[build-system]
+requires = ["maturin>=1.4,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "walrust"
+version = "0.4.0"
+description = "Lightweight SQLite WAL sync to S3/Tigris - Production-grade database backup with explicit data integrity verification"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.8"
+authors = [
+    { name = "Russell Romney", email = "russellromney@gmail.com" }
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Rust",
+    "Topic :: Database",
+    "Topic :: System :: Backup",
+    "Operating System :: OS Independent",
+]
+keywords = ["sqlite", "wal", "s3", "backup", "sync", "tigris", "database"]
+dependencies = [
+    "boto3>=1.37.38",
+    "psutil>=7.2.1",
+    "pyyaml>=6.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/russellromney/walrust"
+Repository = "https://github.com/russellromney/walrust"
+Documentation = "https://github.com/russellromney/walrust#readme"
+"Issue Tracker" = "https://github.com/russellromney/walrust/issues"
+
+[tool.maturin]
+features = ["python"]
+strip = true
+# Build wheels for multiple Python versions
+profile = "release"

@@ -422,7 +422,8 @@ fn spawn_cli_watch(
         .arg("999999")
         .arg("--on-startup")
         .arg(on_startup.to_string())
-        .arg("--no-metrics");
+        .arg("--no-metrics")
+        .arg("--no-cache");
     if let Some(endpoint) = endpoint {
         watch.arg("--endpoint").arg(endpoint);
     }
@@ -626,6 +627,7 @@ fn spawn_cli_watch_logged_with_options(
                 .to_string(),
         )
         .arg("--no-metrics")
+        .arg("--no-cache")
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err));
     if let Some(policy) = checkpoint_release {
@@ -834,8 +836,9 @@ fn wait_for_restore_exact(
     }
 }
 
-/// Spawn native watch with a short periodic snapshot interval.
-fn spawn_cli_watch_periodic_snapshot(
+/// Spawn `walrust watch --independent-tasks` with a short snapshot interval, for
+/// exercising the independent (poll) mode's periodic-snapshot re-anchor (B6).
+fn spawn_cli_watch_independent(
     db_path: &Path,
     bucket_arg: &str,
     endpoint: Option<&str>,
@@ -847,6 +850,7 @@ fn spawn_cli_watch_periodic_snapshot(
         .arg(db_path)
         .arg("--bucket")
         .arg(bucket_arg)
+        .arg("--independent-tasks")
         .arg("--snapshot-interval")
         .arg(snapshot_interval_secs.to_string())
         .arg("--wal-sync-interval")
@@ -855,11 +859,14 @@ fn spawn_cli_watch_periodic_snapshot(
         .arg("999999")
         .arg("--on-startup")
         .arg("true")
-        .arg("--no-metrics");
+        .arg("--no-metrics")
+        .arg("--no-cache");
     if let Some(endpoint) = endpoint {
         watch.arg("--endpoint").arg(endpoint);
     }
-    watch.spawn().context("spawn native walrust watch")
+    watch
+        .spawn()
+        .context("spawn walrust watch --independent-tasks")
 }
 
 struct CoreSigkillHelperArgs<'a> {
@@ -938,6 +945,19 @@ fn wait_for_cli_restore_rows(
     }
 }
 
+fn run_cli_snapshot(db_path: &Path, bucket_arg: &str, endpoint: Option<&str>) -> Result<()> {
+    let mut snapshot = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    snapshot
+        .arg("snapshot")
+        .arg(db_path)
+        .arg("--bucket")
+        .arg(bucket_arg);
+    if let Some(endpoint) = endpoint {
+        snapshot.arg("--endpoint").arg(endpoint);
+    }
+    run_cmd(snapshot, "walrust snapshot")
+}
+
 #[test]
 fn e2e_cli_watch_restore_round_trips_sqlite_rows() -> Result<()> {
     require_s3!("e2e_cli_watch_restore_round_trips_sqlite_rows");
@@ -948,7 +968,6 @@ fn e2e_cli_watch_restore_round_trips_sqlite_rows() -> Result<()> {
     let endpoint = test_endpoint();
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
-    let replica_path = temp.path().join("replica.db");
 
     let setup = create_source_db(&db_path, 5)?;
     let writer = open_external_autocheckpoint_connection(&db_path)?;
@@ -969,53 +988,6 @@ fn e2e_cli_watch_restore_round_trips_sqlite_rows() -> Result<()> {
     )?;
     drop(read_pin);
     stop_child(&mut child);
-
-    let mut list = Command::new(env!("CARGO_BIN_EXE_walrust"));
-    list.arg("list").arg("--bucket").arg(&bucket_arg);
-    if let Some(endpoint) = endpoint.as_deref() {
-        list.arg("--endpoint").arg(endpoint);
-    }
-    let listed = list.output()?;
-    anyhow::ensure!(
-        listed.status.success() && String::from_utf8_lossy(&listed.stdout).contains(&name),
-        "native list did not discover the published stream:\n{}{}",
-        String::from_utf8_lossy(&listed.stdout),
-        String::from_utf8_lossy(&listed.stderr)
-    );
-
-    let source = format!("s3://{}/{prefix}/{name}", test_bucket());
-    let mut replicate = Command::new(env!("CARGO_BIN_EXE_walrust"));
-    replicate
-        .arg("replicate")
-        .arg(&source)
-        .arg("--local")
-        .arg(&replica_path)
-        .arg("--interval")
-        .arg("100ms");
-    if let Some(endpoint) = endpoint.as_deref() {
-        replicate.arg("--endpoint").arg(endpoint);
-    }
-    let mut replica = replicate.spawn().context("spawn native CLI replica")?;
-    let deadline = Instant::now() + e2e_poll_deadline(30);
-    loop {
-        let caught_up = replica_path.exists()
-            && assert_integrity_ok(&replica_path).is_ok()
-            && rows(&replica_path).is_ok_and(|actual| actual == expected_rows);
-        if caught_up {
-            break;
-        }
-        if let Some(status) = replica.try_wait()? {
-            anyhow::bail!("native CLI replica exited before catch-up: {status}");
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "native CLI replica did not catch up to the contiguous published head"
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    stop_child(&mut replica);
-    assert_integrity_ok(&replica_path)?;
-    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
 
     Ok(())
 }
@@ -1052,107 +1024,7 @@ fn e2e_cli_watch_restore_round_trips_64kb_pages() -> Result<()> {
     stop_child(&mut child);
 
     assert_eq!(sqlite_page_size(&restored_path)?, 65_536);
-    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
 
-    Ok(())
-}
-
-#[test]
-fn e2e_cli_verify_accepts_exact_native_chain_and_rejects_corrupt_payload() -> Result<()> {
-    require_s3!("e2e_cli_verify_accepts_exact_native_chain_and_rejects_corrupt_payload");
-    let temp = TempDir::new()?;
-    let name = unique_name("cli-native-verify");
-    let prefix = format!("e2e/{name}");
-    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
-    let endpoint = test_endpoint();
-    let db_path = temp.path().join(format!("{name}.db"));
-    let restored_path = temp.path().join("restored.db");
-    let log_path = temp.path().join("watch.log");
-    let writer = create_source_db(&db_path, 5)?;
-
-    let mut child = spawn_cli_watch_logged(LoggedWatchArgs {
-        db_path: &db_path,
-        bucket_arg: &bucket_arg,
-        endpoint: endpoint.as_deref(),
-        log_path: &log_path,
-        config_path: None,
-        checkpoint_interval: 999_999,
-        min_checkpoint_pages: 1,
-        wal_truncate_threshold: 100_000,
-        native_upload_pause_file: None,
-        durability_failpoint: None,
-        durability_failpoint_marker: None,
-    })?;
-    wait_for_shadow_blocker(&db_path, &mut child)?;
-    append_rows(&writer, 6, 12, "verify")?;
-    let expected = rows(&db_path)?;
-    wait_for_cli_restore_rows(
-        &name,
-        &bucket_arg,
-        endpoint.as_deref(),
-        &restored_path,
-        &expected,
-    )?;
-    stop_child(&mut child);
-
-    let mut verify = Command::new(env!("CARGO_BIN_EXE_walrust"));
-    verify
-        .arg("verify")
-        .arg(&name)
-        .arg("--bucket")
-        .arg(&bucket_arg);
-    if let Some(endpoint) = endpoint.as_deref() {
-        verify.arg("--endpoint").arg(endpoint);
-    }
-    let verified = verify.output()?;
-    anyhow::ensure!(
-        verified.status.success()
-            && String::from_utf8_lossy(&verified.stdout)
-                .contains("contiguous published native HADBP object"),
-        "native verify rejected an exact published chain:\n{}{}",
-        String::from_utf8_lossy(&verified.stdout),
-        String::from_utf8_lossy(&verified.stderr)
-    );
-
-    let runtime = tokio::runtime::Runtime::new()?;
-    runtime.block_on(async {
-        let storage = walrust::s3_backend_from_env(test_bucket(), endpoint.as_deref()).await?;
-        let remote_prefix = format!("{prefix}/{name}/native/v1/");
-        let keys =
-            hadb_storage::StorageBackend::list(storage.as_ref(), &remote_prefix, None).await?;
-        let payload_key = keys
-            .into_iter()
-            .find(|key| key.contains("/lineages/") && key.ends_with(".hadbp"))
-            .context("published native payload missing")?;
-        let mut payload = hadb_storage::StorageBackend::get(storage.as_ref(), &payload_key)
-            .await?
-            .context("published native payload disappeared")?;
-        anyhow::ensure!(!payload.is_empty(), "published native payload was empty");
-        let last = payload.len() - 1;
-        payload[last] ^= 0x5a;
-        hadb_storage::StorageBackend::put(storage.as_ref(), &payload_key, &payload).await
-    })?;
-
-    let rejected = verify.output()?;
-    anyhow::ensure!(
-        !rejected.status.success() && rejected.status.code() == Some(5),
-        "corrupt native payload was not rejected as integrity failure:\n{}{}",
-        String::from_utf8_lossy(&rejected.stdout),
-        String::from_utf8_lossy(&rejected.stderr)
-    );
-    let diagnostic = format!(
-        "{}{}",
-        String::from_utf8_lossy(&rejected.stdout),
-        String::from_utf8_lossy(&rejected.stderr)
-    );
-    anyhow::ensure!(
-        diagnostic.contains("checksum")
-            || diagnostic.contains("digest")
-            || diagnostic.contains("payload"),
-        "corrupt native verify lacked a useful integrity diagnostic: {diagnostic}"
-    );
-
-    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())
 }
 
@@ -1823,9 +1695,10 @@ fn e2e_cli_custom_spool_isolates_multiple_databases_collision_safely() -> Result
         .arg("999999")
         .arg("--on-startup")
         .arg("true")
-        .arg("--spool-dir")
+        .arg("--cache-dir")
         .arg(&custom_spool)
         .arg("--no-metrics")
+        .arg("--no-cache")
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err));
     if let Some(endpoint) = endpoint.as_deref() {
@@ -2574,6 +2447,33 @@ fn e2e_cli_native_prune_publishes_floor_preserves_latest_and_expires_old_pitr() 
         String::from_utf8_lossy(&expired.stderr)
     );
 
+    let mut compact = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    compact
+        .arg("compact")
+        .arg(&name)
+        .arg("--bucket")
+        .arg(&bucket_arg)
+        .arg("--hourly")
+        .arg("1")
+        .arg("--daily")
+        .arg("0")
+        .arg("--weekly")
+        .arg("0")
+        .arg("--monthly")
+        .arg("0")
+        .arg("--force");
+    if let Some(endpoint) = endpoint.as_deref() {
+        compact.arg("--endpoint").arg(endpoint);
+    }
+    let compact_output = compact.output()?;
+    anyhow::ensure!(
+        compact_output.status.success(),
+        "native compact alias failed"
+    );
+    anyhow::ensure!(
+        String::from_utf8_lossy(&compact_output.stderr).contains("deprecated"),
+        "compact alias did not identify its prune semantics"
+    );
     cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())
 }
@@ -2867,7 +2767,7 @@ fn e2e_cli_offline_reconnect_divergent_writer_head_is_rejected_and_retained() ->
         .arg(&local_restore)
         .arg("--bucket")
         .arg(&bucket_arg)
-        .arg("--spool-dir")
+        .arg("--cache-dir")
         .arg(&spool_base)
         .arg("--endpoint")
         .arg("http://127.0.0.1:9");
@@ -3382,6 +3282,8 @@ fn e2e_cli_offline_restart_refuses_identity_only_spool() -> Result<()> {
         name.clone(),
         "identity-only-lineage",
         1,
+        None,
+        true,
     )?;
     let spool_base = temp.path().join(".walrust-spool");
     let root = walrust::walrust_core::native_spool::NativeSpool::path_for(&spool_base, &identity);
@@ -3423,81 +3325,10 @@ fn e2e_cli_offline_restart_refuses_identity_only_spool() -> Result<()> {
     };
     anyhow::ensure!(!status.success(), "identity-only offline startup succeeded");
     anyhow::ensure!(
-        watch_log(&log).contains("no remotely published snapshot base"),
+        watch_log(&log).contains("local native spool has no complete snapshot base"),
         "offline refusal did not name the missing local base:\n{}",
         watch_log(&log)
     );
-    Ok(())
-}
-
-#[test]
-fn e2e_cli_offline_restart_refuses_complete_but_never_published_local_base() -> Result<()> {
-    require_s3!("e2e_cli_offline_restart_refuses_complete_but_never_published_local_base");
-    let temp = TempDir::new()?;
-    let name = unique_name("cli-offline-unpublished-base");
-    let prefix = format!("e2e/{name}");
-    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
-    let endpoint = test_endpoint();
-    let db_path = temp.path().join(format!("{name}.db"));
-    let pause = temp.path().join("pause-uploader");
-    let first_log = temp.path().join("first.log");
-    let offline_log = temp.path().join("offline.log");
-    std::fs::write(&pause, b"paused")?;
-    create_source_db(&db_path, 5)?;
-
-    let mut first = spawn_cli_watch_logged(LoggedWatchArgs {
-        db_path: &db_path,
-        bucket_arg: &bucket_arg,
-        endpoint: endpoint.as_deref(),
-        log_path: &first_log,
-        config_path: None,
-        checkpoint_interval: 999_999,
-        min_checkpoint_pages: 1,
-        wal_truncate_threshold: 100_000,
-        native_upload_pause_file: Some(&pause),
-        durability_failpoint: None,
-        durability_failpoint_marker: None,
-    })?;
-    wait_for_cli_startup_rearms(&first_log, &mut first)?;
-    anyhow::ensure!(
-        watch_log(&first_log).contains("native HADBP snapshot admitted to durable local spool"),
-        "startup did not admit its local snapshot:\n{}",
-        watch_log(&first_log)
-    );
-    stop_child(&mut first);
-
-    let mut offline = spawn_cli_watch_logged(LoggedWatchArgs {
-        db_path: &db_path,
-        bucket_arg: &bucket_arg,
-        endpoint: Some("http://127.0.0.1:9"),
-        log_path: &offline_log,
-        config_path: None,
-        checkpoint_interval: 1,
-        min_checkpoint_pages: 1,
-        wal_truncate_threshold: 100_000,
-        native_upload_pause_file: None,
-        durability_failpoint: None,
-        durability_failpoint_marker: None,
-    })?;
-    let deadline = Instant::now() + e2e_poll_deadline(20);
-    let status = loop {
-        if let Some(status) = offline.try_wait()? {
-            break status;
-        }
-        anyhow::ensure!(
-            Instant::now() < deadline,
-            "offline watcher accepted a never-published local base:\n{}",
-            watch_log(&offline_log)
-        );
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    anyhow::ensure!(!status.success(), "offline startup unexpectedly succeeded");
-    anyhow::ensure!(
-        watch_log(&offline_log).contains("no remotely published snapshot base"),
-        "offline refusal did not distinguish local admission from published ownership:\n{}",
-        watch_log(&offline_log)
-    );
-    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())
 }
 
@@ -3628,7 +3459,7 @@ fn e2e_cli_local_restore_rejects_ambiguous_native_spools_without_s3() -> Result<
         let local_db = temp.path().join(format!("{lineage}.sqlite"));
         std::fs::File::create(&local_db)?;
         let identity = walrust::walrust_core::native_spool::SpoolIdentity::new(
-            &local_db, bucket, prefix, database, lineage, 1,
+            &local_db, bucket, prefix, database, lineage, 1, None, true,
         )?;
         let root =
             walrust::walrust_core::native_spool::NativeSpool::path_for(&spool_base, &identity);
@@ -4082,83 +3913,19 @@ fn e2e_cli_partial_passive_checkpoint_rearms_and_retries_without_exit() -> Resul
 fn e2e_prune_during_restore_keeps_backup_restorable() -> Result<()> {
     require_s3!("e2e_prune_during_restore_keeps_backup_restorable");
     let temp = TempDir::new()?;
-    let name = unique_name("native-prune-restore-race");
+    let name = unique_name("compact-race-e2e");
     let prefix = format!("e2e/{name}");
     let bucket_arg = format!("{}/{}", test_bucket(), prefix);
     let endpoint = test_endpoint();
     let db_path = temp.path().join(format!("{name}.db"));
     let restored_path = temp.path().join("restored.db");
-    let log_path = temp.path().join("watch.log");
 
     let writer = create_source_db(&db_path, 4)?;
-    let mut watcher = spawn_cli_watch_logged_with_options(
-        LoggedWatchArgs {
-            db_path: &db_path,
-            bucket_arg: &bucket_arg,
-            endpoint: endpoint.as_deref(),
-            log_path: &log_path,
-            config_path: None,
-            checkpoint_interval: 999_999,
-            min_checkpoint_pages: 1,
-            wal_truncate_threshold: 100_000,
-            native_upload_pause_file: None,
-            durability_failpoint: None,
-            durability_failpoint_marker: None,
-        },
-        None,
-        None,
-        None,
-        Some(TriggerOptions {
-            snapshot_interval: 1,
-            max_changes: 0,
-            max_interval: 0,
-            on_idle: 0,
-        }),
-        None,
-        None,
-        None,
-        None,
-    )?;
-    wait_for_shadow_blocker(&db_path, &mut watcher)?;
-    let wait_for_snapshot_count = |count: usize, watcher: &mut Child| -> Result<()> {
-        let deadline = Instant::now() + e2e_poll_deadline(30);
-        loop {
-            if watch_log(&log_path)
-                .matches("native HADBP snapshot admitted to durable local spool")
-                .count()
-                >= count
-            {
-                return Ok(());
-            }
-            if let Some(status) = watcher.try_wait()? {
-                anyhow::bail!(
-                    "native snapshot watcher exited ({status}):\n{}",
-                    watch_log(&log_path)
-                );
-            }
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "timed out waiting for native snapshot {count}:\n{}",
-                watch_log(&log_path)
-            );
-            std::thread::sleep(Duration::from_millis(100));
-        }
-    };
-    wait_for_snapshot_count(1, &mut watcher)?;
+    run_cli_snapshot(&db_path, &bucket_arg, endpoint.as_deref())?;
     append_rows(&writer, 5, 7, "snapshot-two")?;
-    wait_for_snapshot_count(2, &mut watcher)?;
+    run_cli_snapshot(&db_path, &bucket_arg, endpoint.as_deref())?;
     append_rows(&writer, 8, 12, "snapshot-three")?;
-    wait_for_snapshot_count(3, &mut watcher)?;
-    let expected = rows(&db_path)?;
-    wait_for_cli_restore_rows(
-        &name,
-        &bucket_arg,
-        endpoint.as_deref(),
-        &restored_path,
-        &expected,
-    )?;
-    stop_child(&mut watcher);
-    let _ = std::fs::remove_file(&restored_path);
+    run_cli_snapshot(&db_path, &bucket_arg, endpoint.as_deref())?;
 
     let mut restore = Command::new(env!("CARGO_BIN_EXE_walrust"));
     restore
@@ -4207,9 +3974,8 @@ fn e2e_prune_during_restore_keeps_backup_restorable() -> Result<()> {
     );
 
     assert_integrity_ok(&restored_path)?;
-    assert_eq!(expected, rows(&restored_path)?);
+    assert_eq!(rows(&db_path)?, rows(&restored_path)?);
 
-    cleanup_remote_prefix(&format!("{prefix}/"), endpoint.as_deref())?;
     Ok(())
 }
 
@@ -4677,10 +4443,10 @@ fn e2e_cli_snapshot_freezes_exact_shadow_cursor_and_keeps_blocker() -> Result<()
 }
 
 #[test]
-fn e2e_cli_markerless_crash_tail_reanchors_then_emits_new_generation_delta() -> Result<()> {
-    require_s3!("e2e_cli_markerless_crash_tail_reanchors_then_emits_new_generation_delta");
+fn e2e_cli_markerless_upgrade_reanchors_then_emits_new_generation_delta() -> Result<()> {
+    require_s3!("e2e_cli_markerless_upgrade_reanchors_then_emits_new_generation_delta");
     let temp = TempDir::new()?;
-    let name = unique_name("cli-markerless-crash-tail");
+    let name = unique_name("cli-markerless-upgrade");
     let prefix = format!("e2e/{name}");
     let bucket_arg = format!("{}/{}", test_bucket(), prefix);
     let endpoint = test_endpoint();
@@ -4971,14 +4737,15 @@ fn e2e_cli_watch_wal_backpressure_alarms_and_preserves_data() -> Result<()> {
     Ok(())
 }
 
-/// The native watch snapshot timer re-anchors a low-write database on cadence.
-/// Drive the real watcher through an application checkpoint attempt and prove
-/// the published recovery point remains exact.
+/// B6: the independent (poll) watch mode now runs a periodic snapshot timer, so a
+/// low-write DB whose WAL is reset by an external checkpoint still re-anchors its
+/// remote base on a cadence. Drive the real independent watch task through a
+/// checkpoint reset and assert the backup still round-trips.
 #[test]
-fn e2e_cli_watch_periodic_snapshot_timer_round_trips_through_reset() -> Result<()> {
-    require_s3!("e2e_cli_watch_periodic_snapshot_timer_round_trips_through_reset");
+fn e2e_cli_watch_independent_snapshot_timer_round_trips_through_reset() -> Result<()> {
+    require_s3!("e2e_cli_watch_independent_snapshot_timer_round_trips_through_reset");
     let temp = TempDir::new()?;
-    let name = unique_name("cli-periodic-snapshot");
+    let name = unique_name("cli-indep");
     let prefix = format!("e2e/{name}");
     let bucket_arg = format!("{}/{}", test_bucket(), prefix);
     let endpoint = test_endpoint();
@@ -4989,8 +4756,7 @@ fn e2e_cli_watch_periodic_snapshot_timer_round_trips_through_reset() -> Result<(
     let writer = open_external_autocheckpoint_connection(&db_path)?;
 
     // Short snapshot interval so the periodic re-anchor fires during the test.
-    let mut child =
-        spawn_cli_watch_periodic_snapshot(&db_path, &bucket_arg, endpoint.as_deref(), 2)?;
+    let mut child = spawn_cli_watch_independent(&db_path, &bucket_arg, endpoint.as_deref(), 2)?;
     std::thread::sleep(Duration::from_secs(2));
 
     append_rows(&writer, 6, 10, "indep")?;
@@ -5231,9 +4997,69 @@ fn e2e_core_replicator_sigkill_child() -> Result<()> {
     })
 }
 
+// ── Compaction CLI e2e (wave C3a): watch compacts, restore/verify read levels ─
+
+/// Write a `walrust.toml` enabling leveled compaction with tiny batches and a
+/// zero keep-fine window, so L1 and L2 fire within a short test.
+fn write_compaction_config(path: &Path) -> Result<()> {
+    std::fs::write(
+        path,
+        "[compaction]\n\
+         enabled = true\n\
+         keep_fine_window = \"0s\"\n\
+         l1_batch = 4\n\
+         l2_batch = 2\n",
+    )?;
+    Ok(())
+}
+
+fn spawn_cli_watch_compaction(
+    db_path: &Path,
+    config_path: &Path,
+    bucket_arg: &str,
+    endpoint: Option<&str>,
+) -> Result<Child> {
+    let mut watch = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    watch
+        .arg("--config")
+        .arg(config_path)
+        .arg("watch")
+        .arg(db_path)
+        .arg("--bucket")
+        .arg(bucket_arg)
+        .arg("--independent-tasks")
+        .arg("--snapshot-interval")
+        .arg("999999")
+        .arg("--wal-sync-interval")
+        .arg("1")
+        .arg("--checkpoint-interval")
+        .arg("999999")
+        .arg("--on-startup")
+        .arg("true")
+        .arg("--no-metrics")
+        .arg("--no-cache");
+    if let Some(endpoint) = endpoint {
+        watch.arg("--endpoint").arg(endpoint);
+    }
+    watch
+        .spawn()
+        .context("spawn walrust watch (compaction, independent)")
+}
+
 async fn list_keys(prefix: &str) -> Result<Vec<String>> {
     let storage = walrust::s3_backend_from_env(test_bucket(), test_endpoint().as_deref()).await?;
     hadb_storage::StorageBackend::list(storage.as_ref(), prefix, None).await
+}
+
+/// Parse `{min:016x}-{max:016x}.ltx` (a merged level object) from a full key.
+fn parse_level_range(key: &str) -> Option<(u64, u64)> {
+    let filename = key.rsplit('/').next()?;
+    let stem = filename.strip_suffix(".ltx")?;
+    let (lo, hi) = stem.split_once('-')?;
+    Some((
+        u64::from_str_radix(lo, 16).ok()?,
+        u64::from_str_radix(hi, 16).ok()?,
+    ))
 }
 
 /// Run `walrust restore --point-in-time <pit>` and return the process output
@@ -5263,7 +5089,166 @@ fn run_cli_restore_pit_output(
         .context("run walrust restore --point-in-time")
 }
 
-// ── Native compaction embedder crash e2e ─────────────────────────────────
+/// The wave's CLI proof: a real `walrust watch` with `[compaction] enabled`
+/// fires L1 and L2, deletes the superseded L0 tail, and the leveled bucket is
+/// then fully readable — restore-to-latest is row-exact + integrity-clean,
+/// PITR to a merged boundary succeeds, PITR strictly inside a merged window is a
+/// loud decay error, and `walrust verify` exits 0.
+#[tokio::test]
+async fn e2e_cli_compaction_fires_levels_and_restore_reads_them() -> Result<()> {
+    require_s3!("e2e_cli_compaction_fires_levels_and_restore_reads_them");
+    let temp = TempDir::new()?;
+    let name = unique_name("cli-compaction");
+    let prefix = format!("e2e/{name}");
+    let bucket_arg = format!("{}/{}", test_bucket(), prefix);
+    let endpoint = test_endpoint();
+    let db_path = temp.path().join(format!("{name}.db"));
+    let restored_path = temp.path().join("restored.db");
+    let config_path = temp.path().join("walrust.toml");
+    write_compaction_config(&config_path)?;
+
+    // Object key roots (db name == file stem == `name`).
+    let l0_prefix = format!("{prefix}/{name}/0000/");
+    let l1_prefix = format!("{prefix}/{name}/levels/L1/");
+    let l2_prefix = format!("{prefix}/{name}/levels/L2/");
+
+    let setup = create_source_db(&db_path, 5)?;
+    // A compaction e2e needs a **contiguous** L0 chain to fold up the levels, so
+    // the writer must not auto-checkpoint (which would restart the WAL / roll the
+    // salt and make walrust punch a snapshot seq-gap per commit — every L0 a lone
+    // straddler the liveness rule correctly refuses to merge). walrust's own
+    // snapshot/checkpoint timers are pinned to 999999s here, so the only snapshot
+    // is the on-startup base and every later sync is a chaining incremental.
+    let writer = open_external_no_autocheckpoint_connection(&db_path)?;
+    write_pin_frame(&setup, "cli-compaction")?;
+
+    let mut child =
+        spawn_cli_watch_compaction(&db_path, &config_path, &bucket_arg, endpoint.as_deref())?;
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Drive ~16 separate sync cycles so the L0 pool fills L1 (batch 4) three
+    // times and then L2 (batch 2); one commit per >1s poll window == one L0.
+    // We track whether L1 was **ever** observed (not whether it is present at the
+    // end): the L1→L2 merge deletes its L1 sources, so at the instant L2 first
+    // appears L1 can legitimately be empty. "L1 was seen" ∧ "L2 fired" is the
+    // race-free proof that the full L0→L1→L2 cascade ran.
+    let mut next_id = 100i64;
+    let l2_deadline = Instant::now() + e2e_poll_deadline(90);
+    let mut fired_l2 = false;
+    let mut seen_l1 = false;
+    for _ in 0..24 {
+        append_rows(&writer, next_id, next_id + 1, "compact")?;
+        next_id += 2;
+        std::thread::sleep(Duration::from_millis(1200));
+        if !list_keys(&l1_prefix).await?.is_empty() {
+            seen_l1 = true;
+        }
+        if !list_keys(&l2_prefix).await?.is_empty() {
+            fired_l2 = true;
+            break;
+        }
+        if Instant::now() >= l2_deadline {
+            break;
+        }
+    }
+    assert!(fired_l2, "L2 must fire within the deadline");
+
+    // The superseded L0 objects were deleted by the engine, so the L0 pool is far
+    // smaller than the ~16+ incrementals produced. L2's presence already proves
+    // L1 fired (L2 can only be built from L1 sources); `seen_l1` additionally
+    // pins that an L1 object was materialized on the wire.
+    let l1 = list_keys(&l1_prefix).await?;
+    let l2 = list_keys(&l2_prefix).await?;
+    let l0 = list_keys(&l0_prefix).await?;
+    assert!(
+        seen_l1 || !l1.is_empty(),
+        "L1 must have fired (seen during the run or still present): {l1:?}"
+    );
+    assert!(!l2.is_empty(), "L2 must be present: {l2:?}");
+    assert!(
+        l0.len() < 10,
+        "superseded L0 objects must be deleted (found {}): {l0:?}",
+        l0.len()
+    );
+
+    // Restore-to-latest reads across the LTX→HADBP seam: row-exact + integrity.
+    // Settle so the periodic 1s sync uploads the final committed state, then stop
+    // driving and poll restore until the rows match.
+    std::thread::sleep(Duration::from_secs(3));
+    let expected_rows = rows(&db_path)?;
+    stop_child(&mut child);
+    wait_for_cli_restore_rows(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &restored_path,
+        &expected_rows,
+    )?;
+
+    // PITR to the L2 window boundary (its max txid) restores cleanly.
+    let (l2_min, l2_max) = parse_level_range(&l2[0]).context("parse L2 range")?;
+    let boundary_out = temp.path().join("boundary.db");
+    let out = run_cli_restore_pit_output(
+        &name,
+        &bucket_arg,
+        endpoint.as_deref(),
+        &boundary_out,
+        l2_max,
+    )?;
+    anyhow::ensure!(
+        out.status.success(),
+        "PITR to the L2 boundary txid {l2_max} must succeed:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_integrity_ok(&boundary_out)?;
+
+    // PITR strictly inside the L2 window is the loud typed decay error. walrust's
+    // tracing subscriber logs to stdout (not stderr), so the typed error surfaces
+    // on stdout; assert on the combined streams so the check is stream-agnostic.
+    if l2_max > l2_min + 1 {
+        let inside = l2_min + 1;
+        let inside_out = temp.path().join("inside.db");
+        let out = run_cli_restore_pit_output(
+            &name,
+            &bucket_arg,
+            endpoint.as_deref(),
+            &inside_out,
+            inside,
+        )?;
+        anyhow::ensure!(
+            !out.status.success(),
+            "PITR inside a merged window (txid {inside}) must fail loudly"
+        );
+        let stderr = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        anyhow::ensure!(
+            stderr.contains("falls inside merged window"),
+            "decay error must name the merged window: {stderr}"
+        );
+        anyhow::ensure!(
+            !inside_out.exists(),
+            "a failed PITR must not publish a partial database"
+        );
+    }
+
+    // verify exits 0 on the healthy leveled bucket.
+    let mut verify = Command::new(env!("CARGO_BIN_EXE_walrust"));
+    verify
+        .arg("verify")
+        .arg(&name)
+        .arg("--bucket")
+        .arg(&bucket_arg);
+    if let Some(endpoint) = endpoint.as_deref() {
+        verify.arg("--endpoint").arg(endpoint);
+    }
+    run_cmd(verify, "walrust verify")?;
+
+    Ok(())
+}
 
 // ── Compaction embedder crash e2e (gap 4) ──────────────────────────────────
 

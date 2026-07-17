@@ -1,0 +1,71 @@
+{
+  "checksum_definition": "SHA-256 over the concatenation of '{id}|{value}\\n' for SELECT id, value FROM items ORDER BY id",
+  "config": {
+    "checkpoint_interval": 999999,
+    "compaction": {
+      "enabled": true,
+      "keep_fine_window": "0s",
+      "l1_batch": 4,
+      "l2_batch": 3
+    },
+    "mode": "watch --independent-tasks",
+    "prune": {
+      "command": "walrust prune --hourly 2 --daily 0 --weekly 0 --monthly 0 --force",
+      "floor_workaround": "hand-deleted snapshots older than the PITR snapshot before pruning (hadb-io RetentionPolicy minimum-2 floor; see drills/prune-retained.sh)"
+    },
+    "snapshot_interval": 999999,
+    "snapshots": "on-startup + restart re-anchor (2 restarts)",
+    "wal_sync_interval": 1
+  },
+  "db_name": "fixturecli",
+  "fixture": "cli-v0.7.0",
+  "generator": {
+    "artifact": "crates.io CLI binary",
+    "install": "cargo install walrust --version 0.7.0 --locked",
+    "version": "0.7.0",
+    "version_output": "walrust 0.7.0"
+  },
+  "latest": {
+    "row_count": 453,
+    "rows_sha256": "5e97225e86383dc46b7015e0a8db63169e9fe1c7eba054b0624d9991bfb0125a"
+  },
+  "objects": [
+    {
+      "key": "fixturecli/0000/0000000000000014-0000000000000017.ltx",
+      "size": 6714
+    },
+    {
+      "key": "fixturecli/0000/000000000000003d-000000000000003d.ltx",
+      "size": 1399
+    },
+    {
+      "key": "fixturecli/0002/0000000000000001-0000000000000018.ltx",
+      "size": 9650
+    },
+    {
+      "key": "fixturecli/0005/0000000000000001-0000000000000033.ltx",
+      "size": 18663
+    },
+    {
+      "key": "fixturecli/levels/L1/0000000000000034-0000000000000036.ltx",
+      "size": 4168
+    },
+    {
+      "key": "fixturecli/levels/L1/0000000000000037-000000000000003c.ltx",
+      "size": 16480
+    },
+    {
+      "key": "fixturecli/levels/L2/000000000000001a-0000000000000028.ltx",
+      "size": 20584
+    },
+    {
+      "key": "fixturecli/levels/L2/0000000000000029-0000000000000031.ltx",
+      "size": 16480
+    }
+  ],
+  "pitr": {
+    "row_count": 203,
+    "rows_sha256": "37b1df10fe734ee022ea84abdeb4f9be27928d81506edfa5ffd7ab5a2cb762bc",
+    "txid": 24
+  }
+}

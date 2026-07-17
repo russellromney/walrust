@@ -30,7 +30,8 @@ use hadb_storage::{CasResult, StorageBackend};
 use rusqlite::Connection;
 
 use walrust_core::compaction::{
-    apply_plan, gather_candidates, plan_restore, run_level_compaction, CompactionLayout, SeqLayout,
+    apply_plan, gather_candidates, plan_restore, run_level_compaction, CompactionLayout,
+    RangeLayout, SeqLayout,
 };
 use walrust_core::ltx;
 use walrust_core::{OwnedResumeLease, RetryConfig, RetryPolicy, SyncState};
@@ -146,8 +147,14 @@ fn snapshot_key(prefix: &str, db: &str, seq: u64) -> String {
 fn l0_seq_key(prefix: &str, db: &str, seq: u64) -> String {
     format!("{prefix}{db}/0000/{seq:016x}.hadbp")
 }
-/// Build a real SQLite history and upload snapshot(seq 1) plus native incrementals.
-fn build_fixture(prefix: &str, db: &str, n_incrementals: u64) -> Fixture {
+fn l0_range_key(prefix: &str, db: &str, seq: u64) -> String {
+    format!("{prefix}{db}/0000/{seq:016x}-{seq:016x}.ltx")
+}
+
+/// Build a real SQLite history and upload snapshot(seq 1) + incrementals
+/// (seq 2..=n_incrementals+1). `ext_range` selects the L0 key style: `false` =
+/// seq layout (`.hadbp`), `true` = range layout (`.ltx`).
+fn build_fixture(prefix: &str, db: &str, n_incrementals: u64, ext_range: bool) -> Fixture {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("ground.db");
     let store = MemStore::new();
@@ -196,7 +203,11 @@ fn build_fixture(prefix: &str, db: &str, n_incrementals: u64) -> Fixture {
         let (bytes, checksum) =
             ltx::encode_wal_changes_with_end_page_count(&pages, PS, seq, prev, end_page_count)
                 .unwrap();
-        let key = l0_seq_key(prefix, db, seq);
+        let key = if ext_range {
+            l0_range_key(prefix, db, seq)
+        } else {
+            l0_seq_key(prefix, db, seq)
+        };
         futures_put(&store, &key, &bytes);
 
         state_at.insert(seq, new_bytes.clone());
@@ -277,7 +288,7 @@ async fn compact_to_l1_l2<L: CompactionLayout>(layout: &L) {
 
 #[tokio::test]
 async fn seq_layout_e2e_restore_through_merged_objects() {
-    let fx = build_fixture("p/", "db", 13); // seqs 1..=14
+    let fx = build_fixture("p/", "db", 13, false); // seqs 1..=14
     let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
     compact_to_l1_l2(&layout).await;
 
@@ -349,7 +360,7 @@ async fn seq_layout_e2e_restore_through_merged_objects() {
 
 #[tokio::test]
 async fn owned_resume_after_leveled_restore_uses_planner_checksum() {
-    let fx = build_fixture("resume-levels/", "db", 13);
+    let fx = build_fixture("resume-levels/", "db", 13, false);
     let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
     compact_to_l1_l2(&layout).await;
 
@@ -412,7 +423,7 @@ async fn owned_resume_after_leveled_restore_uses_planner_checksum() {
 
 #[tokio::test]
 async fn seq_layout_crash_overlap_restores_without_double_apply() {
-    let fx = build_fixture("q/", "db", 13);
+    let fx = build_fixture("q/", "db", 13, false);
     let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
     compact_to_l1_l2(&layout).await;
 
@@ -455,7 +466,7 @@ async fn seq_layout_crash_overlap_restores_without_double_apply() {
 #[tokio::test]
 async fn restore_finds_l2_when_l1_is_fully_promoted_away() {
     // 16 incrementals (seqs 2..=17) → four L1 files [2,5],[6,9],[10,13],[14,17].
-    let fx = build_fixture("promo/", "db", 16);
+    let fx = build_fixture("promo/", "db", 16, false);
     let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
     for _ in 0..4 {
         let o = run_level_compaction(&layout, 0, 4, Duration::from_secs(0), NOW)
@@ -502,9 +513,41 @@ async fn restore_finds_l2_when_l1_is_fully_promoted_away() {
     assert_eq!(std::fs::read(&out).unwrap(), fx.state_at[&fx.max_seq]);
 }
 
+// ── Range layout: the shared planner + executor over the `.ltx` adapter ──────
+
+#[tokio::test]
+async fn range_layout_e2e_restore_through_merged_objects() {
+    let fx = build_fixture("r/", "db", 13, true); // range layout L0 keys
+    let layout = RangeLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
+    compact_to_l1_l2(&layout).await;
+
+    // Apply the snapshot to a staged file, then drive the shared executor.
+    let dir = tempfile::tempdir().unwrap();
+    let staged = dir.path().join("staged.db");
+    let snap_bytes = fx
+        .store
+        .get(&snapshot_key(&fx.prefix, &fx.db, 1))
+        .await
+        .unwrap()
+        .unwrap();
+    let decode = ltx::decode_to_db(&snap_bytes, &staged).unwrap();
+
+    let candidates = gather_candidates(&layout, 1, u64::MAX).await.unwrap();
+    let plan = plan_restore(&candidates, 1, fx.max_seq).unwrap();
+    // Coarse L2 [2,9] + coarse L1 [10,13] + fine L0 [14] == 3 objects.
+    assert_eq!(plan.files.len(), 3);
+    let seq = apply_plan(&layout, &plan, &staged, decode.checksum, 4)
+        .await
+        .unwrap();
+    assert_eq!(seq, fx.max_seq);
+    assert!(integrity_ok(&staged));
+    assert_eq!(query_rows(&staged), fx.rows);
+    assert_eq!(std::fs::read(&staged).unwrap(), fx.state_at[&fx.max_seq]);
+}
+
 #[tokio::test]
 async fn prefetch_concurrency_1_vs_4_byte_identical() {
-    let fx = build_fixture("s/", "db", 13);
+    let fx = build_fixture("s/", "db", 13, false);
     let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
     compact_to_l1_l2(&layout).await;
 
@@ -670,7 +713,7 @@ async fn owned_vacuum_shrink_merges_and_restores_row_exact() {
 // ── E10 siblings (H8 class): restore must not CLASSIFY from a listing that
 //    silently defaulted on a transient fault ──────────────────────────────────
 //
-// PR #36 fixed the earlier restore gap-vs-decay classifier, which swallowed a
+// PR #36 fixed the legacy restore's gap-vs-decay classifier, which swallowed a
 // transient snapshot LIST with `unwrap_or_default()` and mis-classified a
 // foreclosed PITR as a bare chain gap. The MODERN `sync::restore` had the same
 // bug in two places:
@@ -733,7 +776,7 @@ impl StorageBackend for FaultyListStore {
 /// as un-leveled and walk the linear path off the deleted L0 tail.
 #[tokio::test]
 async fn leveled_check_transient_list_failure_propagates_not_misread_as_unleveled() {
-    let fx = build_fixture("e10a/", "db", 13); // seqs 1..=14
+    let fx = build_fixture("e10a/", "db", 13, false); // seqs 1..=14
     let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
     compact_to_l1_l2(&layout).await; // L0 2..=13 deleted; only seq 14 remains
 
@@ -767,7 +810,7 @@ async fn leveled_check_transient_list_failure_propagates_not_misread_as_unlevele
 /// the typed RestoreNotFound decay outcome into a bare, non-retryable gap.
 #[tokio::test]
 async fn decay_refinement_transient_list_failure_propagates_not_bare_gap() {
-    let fx = build_fixture("e10b/", "db", 13); // seqs 1..=14
+    let fx = build_fixture("e10b/", "db", 13, false); // seqs 1..=14
     let layout = SeqLayout::new(fx.store.clone(), &fx.prefix, &fx.db);
     compact_to_l1_l2(&layout).await;
 

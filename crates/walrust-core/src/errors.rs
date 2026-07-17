@@ -6,7 +6,7 @@
 //! - 2: Configuration error (invalid config file, missing CLI args)
 //! - 3: Database error (file not found, WAL corruption, SQLite issues)
 //! - 4: S3 error (network, authentication, bucket access)
-//! - 5: Integrity error (checksum, lineage, or native stream verification failed)
+//! - 5: Integrity error (checksum mismatch, LTX verification failed)
 //! - 6: Restore error (no snapshot found, PITR unavailable)
 
 use std::fmt;
@@ -40,7 +40,7 @@ pub enum WalrustError {
     Database(String),
     /// S3 errors (network, authentication, bucket access)
     S3(String),
-    /// Integrity errors (checksum, lineage, or native stream verification failed)
+    /// Integrity errors (checksum mismatch, LTX verification failed)
     Integrity(String),
     /// Restore errors (no snapshot found, PITR unavailable)
     Restore(String),

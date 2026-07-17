@@ -42,11 +42,13 @@ if [ -n "$ENDPOINT" ]; then
     gtimeout 15 ./target/release/walrust watch \
         --bucket "s3://$BUCKET/simple-test/" \
         --endpoint "$ENDPOINT" \
+        --independent-tasks \
         --no-metrics \
         "$ORIG_DB" &
 else
     gtimeout 15 ./target/release/walrust watch \
         --bucket "s3://$BUCKET/simple-test/" \
+        --independent-tasks \
         --no-metrics \
         "$ORIG_DB" &
 fi

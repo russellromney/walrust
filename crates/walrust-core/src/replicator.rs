@@ -32,7 +32,7 @@ use hadb_storage::StorageBackend;
 /// Fenced external delta-shipping state for a database.
 ///
 /// When present on a [`DbState`], the replicator ships fenced TLM_DELTA
-/// envelopes via [`sync::sync_wal_fenced_delta`] instead of unlineaged `.hadbp`
+/// envelopes via [`sync::sync_wal_fenced_delta`] instead of legacy `.hadbp`
 /// changesets. `epoch` + `writer_id` are constant for a leadership term
 /// (set by the integration layer at base publish); `prev_checksum` advances
 /// after each delta to the published envelope's BLAKE3.
@@ -50,7 +50,7 @@ struct DbState {
     state: SyncState,
     prefix: String,
     /// `Some` when this database ships fenced TLM_DELTA envelopes.
-    /// `None` = unlineaged owned/external `.hadbp` behavior.
+    /// `None` = legacy behavior (walrust-owned or external `.hadbp`).
     fenced_delta_chain: Option<FencedDeltaChainState>,
     /// In-memory compaction trigger state (owned-mode `.hadbp` chain only).
     /// `None` until seeded on the first compaction tick. Never touched unless
@@ -81,7 +81,7 @@ struct SavedSyncState {
 }
 
 /// Dispatch one sync for a database: fenced TLM_DELTA when configured,
-/// else unlineaged WAL sync (external `.hadbp` or walrust-owned). Centralises
+/// else legacy WAL sync (external `.hadbp` or walrust-owned). Centralises
 /// the three call sites (background loop, flush, remove) so the envelope
 /// branch lives in one place. Returns the frame count.
 async fn sync_one_db(
@@ -759,16 +759,16 @@ impl Replicator {
     /// each prior envelope automatically. Also aligns the SyncState seq
     /// to `base_seq` so the first delta is `base_seq + 1`.
     ///
-    /// Calling this switches a database from unlineaged `.hadbp` deltas to
+    /// Calling this switches a database from legacy `.hadbp` deltas to
     /// fenced `.tlmd` deltas. Until it is called, the database stays on
-    /// the unlineaged external-base path.
+    /// the legacy external-base path.
     ///
     /// Returns `Ok(false)` if the database is not registered yet. Callers
     /// MUST treat `false` as a hard failure: ignoring it silently leaves
-    /// the database on the unlineaged `.hadbp` path forever. Re-call after the
+    /// the database on the legacy `.hadbp` path forever. Re-call after the
     /// db is registered.
     #[must_use = "set_external_delta_base returns false when the db is not registered; \
-                  ignoring it leaves the database on the unlineaged delta path"]
+                  ignoring it leaves the database on the legacy delta path"]
     pub async fn set_external_delta_base(
         &self,
         name: &str,

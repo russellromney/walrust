@@ -103,7 +103,7 @@ RUST_LOG=walrust=debug,aws_config=debug walrust list --bucket my-bucket
 
 **Permission errors:**
 ```bash
-RUST_LOG=walrust=debug,aws_sdk_s3=debug walrust watch mydb.db --bucket my-bucket
+RUST_LOG=walrust=debug,aws_sdk_s3=debug walrust snapshot mydb.db --bucket my-bucket
 ```
 
 **WAL sync issues:**

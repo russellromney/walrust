@@ -29,6 +29,7 @@ export default defineConfig({
           label: 'Guides',
           items: [
             { label: 'CLI Reference', link: '/guide/cli/' },
+            { label: 'Python API', link: '/guide/python-api/' },
             { label: 'Multi-Database Sync', link: '/guide/multi-database/' },
             { label: 'Read Replicas', link: '/guide/read-replicas/' },
             { label: 'Deployment with App', link: '/guide/deployment-with-app/' },

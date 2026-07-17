@@ -107,7 +107,7 @@ matched knobs (set explicitly on both tools):
                   ${BENCH_BURST_ON_SECONDS}s on / ${BENCH_BURST_OFF_SECONDS}s off at the same rate
 
 known asymmetries:
-  - walrust runs product defaults otherwise (--no-metrics);
+  - walrust runs product defaults otherwise (--no-metrics --no-cache);
     litestream v0.5 always runs its built-in compaction monitor.
 ============================================================
 HDR

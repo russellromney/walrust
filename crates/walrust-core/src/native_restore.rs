@@ -8,38 +8,27 @@ use anyhow::{anyhow, bail, Context, Result};
 use hadb_storage::StorageBackend;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::ffi::OsString;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
-/// Typed boundary for failures returned by the remote storage backend. Callers
-/// use this to distinguish network/authentication failures from malformed or
-/// checksum-invalid native recovery data without parsing error strings.
-#[derive(Debug, thiserror::Error)]
-#[error("native remote storage operation failed: {0}")]
-pub struct NativeStorageError(#[source] anyhow::Error);
-
-fn storage_error(error: anyhow::Error) -> anyhow::Error {
-    NativeStorageError(error).into()
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NativeRestoreAvailability {
-    /// No descriptor or no contiguous published native snapshot base.
-    Missing,
+    /// No descriptor or no published native base; legacy history remains active.
+    LegacyOnly,
+    /// The requested PIT is at/before the verified legacy boundary.
+    LegacyPoint { boundary_txid: u64 },
     /// Native restore completed at this sequence.
     Restored { seq: u64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NativeVisibleState {
-    pub stream_digest: String,
-    pub lineage_id: String,
     pub head_seq: u64,
     pub object_count: usize,
     pub latest_snapshot_seq: u64,
     pub retention_floor_seq: u64,
     pub snapshot_seqs: Vec<u64>,
+    pub legacy_boundary_txid: Option<u64>,
 }
 
 pub const RETENTION_FLOOR_VERSION: u32 = 1;
@@ -70,7 +59,7 @@ pub async fn inspect_native_v1(
     database: &str,
 ) -> Result<Option<NativeVisibleState>> {
     let descriptor_key = format!("{}{database}/native/v1/stream.json", prefix);
-    let Some(bytes) = storage.get(&descriptor_key).await.map_err(storage_error)? else {
+    let Some(bytes) = storage.get(&descriptor_key).await? else {
         return Ok(None);
     };
     let descriptor: StreamDescriptor = serde_json::from_slice(&bytes)?;
@@ -91,13 +80,12 @@ pub async fn inspect_native_v1(
         .map(|(record, _)| record.seq)
         .collect::<Vec<_>>();
     Ok(Some(NativeVisibleState {
-        stream_digest: descriptor.stream_digest.clone(),
-        lineage_id: descriptor.lineage_id.clone(),
         head_seq: head.seq,
         object_count: records.len(),
         latest_snapshot_seq,
         retention_floor_seq: records.first().unwrap().0.seq,
         snapshot_seqs,
+        legacy_boundary_txid: descriptor.legacy_boundary_txid,
     }))
 }
 
@@ -106,7 +94,6 @@ pub fn restore_local_spool(
     output: &Path,
     point_in_time: Option<u64>,
 ) -> Result<Option<u64>> {
-    ensure_fresh_restore_destination(output)?;
     let head = match spool.admitted_seq() {
         Some(seq) => seq,
         None => return Ok(None),
@@ -165,7 +152,8 @@ pub fn restore_local_spool(
         }
         validate_sqlite_integrity(&tmp)?;
         File::open(&tmp)?.sync_all()?;
-        install_restored_database(&tmp, output)?;
+        fs::rename(&tmp, output)?;
+        sync_parent(output)?;
         Ok(seq)
     })();
     if result.is_err() {
@@ -183,7 +171,7 @@ pub async fn verify_native_v1(
     database: &str,
 ) -> Result<Option<usize>> {
     let descriptor_key = format!("{}{database}/native/v1/stream.json", prefix);
-    let Some(bytes) = storage.get(&descriptor_key).await.map_err(storage_error)? else {
+    let Some(bytes) = storage.get(&descriptor_key).await? else {
         return Ok(None);
     };
     let descriptor: StreamDescriptor = serde_json::from_slice(&bytes)?;
@@ -247,24 +235,36 @@ pub async fn restore_native_v1(
     output: &Path,
     point_in_time: Option<u64>,
 ) -> Result<NativeRestoreAvailability> {
-    ensure_fresh_restore_destination(output)?;
     let descriptor_key = format!("{}{database}/native/v1/stream.json", prefix);
-    let Some(descriptor_bytes) = storage.get(&descriptor_key).await.map_err(storage_error)? else {
-        return Ok(NativeRestoreAvailability::Missing);
+    let Some(descriptor_bytes) = storage.get(&descriptor_key).await? else {
+        return Ok(NativeRestoreAvailability::LegacyOnly);
     };
     let descriptor: StreamDescriptor =
         serde_json::from_slice(&descriptor_bytes).context("decode native CLI stream descriptor")?;
     validate_descriptor(&descriptor, bucket, prefix, database)?;
 
+    if let (Some(target), Some(boundary)) = (point_in_time, descriptor.legacy_boundary_txid) {
+        if target <= boundary {
+            return Ok(NativeRestoreAvailability::LegacyPoint {
+                boundary_txid: boundary,
+            });
+        }
+    }
+
     let records = load_visible_records(storage, &descriptor).await?;
     if records.is_empty() {
-        return Ok(NativeRestoreAvailability::Missing);
+        return Ok(NativeRestoreAvailability::LegacyOnly);
     }
     let visible_head = records.last().unwrap().0.seq;
     let target = point_in_time.unwrap_or(visible_head);
     if target < descriptor.first_native_seq {
+        if let Some(boundary) = descriptor.legacy_boundary_txid {
+            return Ok(NativeRestoreAvailability::LegacyPoint {
+                boundary_txid: boundary,
+            });
+        }
         bail!(
-            "native PIT {} predates stream base {}",
+            "native PIT {} predates stream base {} and no legacy boundary exists",
             target,
             descriptor.first_native_seq
         );
@@ -331,7 +331,8 @@ pub async fn restore_native_v1(
         validate_sqlite_integrity(&tmp)?;
         let file = File::open(&tmp)?;
         file.sync_all()?;
-        install_restored_database(&tmp, output)?;
+        fs::rename(&tmp, output)?;
+        sync_parent(output)?;
         Ok::<u64, anyhow::Error>(applied_seq)
     }
     .await;
@@ -349,10 +350,7 @@ async fn load_visible_records(
         "{}{}/native/v1/lineages/{}/published/",
         descriptor.prefix, descriptor.database, descriptor.lineage_id,
     );
-    let mut keys = storage
-        .list(&publish_prefix, None)
-        .await
-        .map_err(storage_error)?;
+    let mut keys = storage.list(&publish_prefix, None).await?;
     keys.sort();
     let floor = load_retention_floor(storage, descriptor).await?;
     let mut expected_seq = floor
@@ -376,8 +374,7 @@ async fn load_visible_records(
         }
         let bytes = storage
             .get(&key)
-            .await
-            .map_err(storage_error)?
+            .await?
             .ok_or_else(|| anyhow!("native publish record vanished during restore: {key}"))?;
         let record: PublishRecord = serde_json::from_slice(&bytes)
             .with_context(|| format!("decode native publish record {key}"))?;
@@ -413,8 +410,7 @@ async fn load_retention_floor(
     );
     let mut candidates = storage
         .list(&floor_prefix, None)
-        .await
-        .map_err(storage_error)?
+        .await?
         .into_iter()
         .filter_map(|key| parse_record_seq(&key, &floor_prefix).map(|seq| (seq, key)))
         .collect::<Vec<_>>();
@@ -424,8 +420,7 @@ async fn load_retention_floor(
     };
     let bytes = storage
         .get(&key)
-        .await
-        .map_err(storage_error)?
+        .await?
         .ok_or_else(|| anyhow!("native retention floor vanished during discovery: {key}"))?;
     let floor: RetentionFloor = serde_json::from_slice(&bytes)
         .with_context(|| format!("decode native retention floor {key}"))?;
@@ -441,13 +436,9 @@ async fn load_retention_floor(
         "{}{}/native/v1/lineages/{}/published/{:016x}.json",
         descriptor.prefix, descriptor.database, descriptor.lineage_id, floor.floor_seq
     );
-    let publish_bytes = storage
-        .get(&publish_key)
-        .await
-        .map_err(storage_error)?
-        .ok_or_else(|| {
-            anyhow!("native retention floor snapshot record is missing: {publish_key}")
-        })?;
+    let publish_bytes = storage.get(&publish_key).await?.ok_or_else(|| {
+        anyhow!("native retention floor snapshot record is missing: {publish_key}")
+    })?;
     if sha256_hex(&publish_bytes) != floor.snapshot_publish_sha256 {
         bail!("native retention floor snapshot publish digest mismatch");
     }
@@ -476,8 +467,7 @@ pub async fn prune_native_before_snapshot(
     let descriptor_key = format!("{}{database}/native/v1/stream.json", prefix);
     let descriptor_bytes = storage
         .get(&descriptor_key)
-        .await
-        .map_err(storage_error)?
+        .await?
         .ok_or_else(|| anyhow!("native stream descriptor is missing"))?;
     let descriptor: StreamDescriptor = serde_json::from_slice(&descriptor_bytes)?;
     validate_descriptor(&descriptor, bucket, prefix, database)?;
@@ -524,11 +514,8 @@ pub async fn prune_native_before_snapshot(
             "{}{}/native/v1/lineages/{}/published/{:016x}.json",
             descriptor.prefix, descriptor.database, descriptor.lineage_id, record.seq
         );
-        storage.delete(&publish_key).await.map_err(storage_error)?;
-        storage
-            .delete(&record.object_key)
-            .await
-            .map_err(storage_error)?;
+        storage.delete(&publish_key).await?;
+        storage.delete(&record.object_key).await?;
     }
     Ok(NativePruneOutcome {
         floor_seq,
@@ -538,17 +525,13 @@ pub async fn prune_native_before_snapshot(
 }
 
 async fn put_immutable_exact(storage: &dyn StorageBackend, key: &str, bytes: &[u8]) -> Result<()> {
-    let result = storage
-        .put_if_absent(key, bytes)
-        .await
-        .map_err(storage_error)?;
+    let result = storage.put_if_absent(key, bytes).await?;
     if result.success {
         return Ok(());
     }
     let existing = storage
         .get(key)
-        .await
-        .map_err(storage_error)?
+        .await?
         .ok_or_else(|| anyhow!("native retention floor vanished after CAS conflict"))?;
     if existing != bytes {
         bail!("split brain/equivocation: divergent native retention floor at {key}");
@@ -563,7 +546,6 @@ fn validate_descriptor(
     database: &str,
 ) -> Result<()> {
     if descriptor.version != REMOTE_LAYOUT_VERSION
-        || descriptor.hadbp_format_version != ltx::HADBP_FORMAT_VERSION
         || descriptor.bucket != bucket
         || descriptor.prefix != prefix
         || descriptor.database != database
@@ -574,7 +556,6 @@ fn validate_descriptor(
     }
     let mut digest = Sha256::new();
     digest.update(descriptor.version.to_be_bytes());
-    digest.update([descriptor.hadbp_format_version]);
     for value in [
         descriptor.bucket.as_str(),
         descriptor.prefix.as_str(),
@@ -585,6 +566,7 @@ fn validate_descriptor(
         digest.update(value.as_bytes());
     }
     digest.update(descriptor.first_native_seq.to_be_bytes());
+    digest.update(descriptor.legacy_boundary_txid.unwrap_or(0).to_be_bytes());
     let digest = digest.finalize();
     let mut expected_digest = String::with_capacity(64);
     for byte in digest {
@@ -640,8 +622,7 @@ pub(crate) async fn get_verified_object(
 ) -> Result<Vec<u8>> {
     let bytes = storage
         .get(&record.object_key)
-        .await
-        .map_err(storage_error)?
+        .await?
         .ok_or_else(|| anyhow!("published native object is missing: {}", record.object_key))?;
     if bytes.len() as u64 != record.payload_length || sha256_hex(&bytes) != record.payload_sha256 {
         bail!(
@@ -721,51 +702,6 @@ fn restore_temp_path(output: &Path) -> PathBuf {
     output.with_file_name(format!(".{name}.walrust-native-restore.tmp"))
 }
 
-fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = OsString::from(path.as_os_str());
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
-fn ensure_fresh_restore_destination(output: &Path) -> Result<()> {
-    for path in [
-        output.to_path_buf(),
-        sqlite_sidecar_path(output, "-wal"),
-        sqlite_sidecar_path(output, "-shm"),
-    ] {
-        match fs::symlink_metadata(&path) {
-            Ok(_) => bail!(
-                "refusing native restore over existing SQLite destination or sidecar: {}",
-                path.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                return Err(error).with_context(|| {
-                    format!("inspect native restore destination {}", path.display())
-                })
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Install without ever replacing an existing path. `hard_link` is the
-/// no-clobber publication primitive here because the temporary database is
-/// created in the destination directory and therefore on the same filesystem.
-fn install_restored_database(tmp: &Path, output: &Path) -> Result<()> {
-    ensure_fresh_restore_destination(output)?;
-    fs::hard_link(tmp, output).with_context(|| {
-        format!(
-            "install native restore at fresh destination {}",
-            output.display()
-        )
-    })?;
-    sync_parent(output)?;
-    fs::remove_file(tmp)?;
-    sync_parent(output)?;
-    Ok(())
-}
-
 fn remove_if_exists(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),
@@ -802,7 +738,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::native_spool::{CapacityPolicy, ObjectKind, SpoolIdentity};
+    use crate::native_spool::{ObjectKind, SpoolIdentity};
     use async_trait::async_trait;
     use hadb_storage::CasResult;
     use std::collections::BTreeMap;
@@ -848,61 +784,13 @@ mod tests {
         }
     }
 
-    struct SelectiveFailureStorage {
-        objects: BTreeMap<String, Vec<u8>>,
-        listed_keys: Vec<String>,
-        failing_get: Option<String>,
-        failing_list: Option<String>,
-    }
-
-    #[async_trait]
-    impl StorageBackend for SelectiveFailureStorage {
-        async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
-            if self.failing_get.as_deref() == Some(key) {
-                bail!("injected get failure")
-            }
-            Ok(self.objects.get(key).cloned())
-        }
-
-        async fn put(&self, _key: &str, _data: &[u8]) -> Result<()> {
-            bail!("unused")
-        }
-
-        async fn delete(&self, _key: &str) -> Result<()> {
-            bail!("unused")
-        }
-
-        async fn list(&self, prefix: &str, _after: Option<&str>) -> Result<Vec<String>> {
-            if self.failing_list.as_deref() == Some(prefix) {
-                bail!("injected list failure")
-            }
-            Ok(self
-                .listed_keys
-                .iter()
-                .filter(|key| key.starts_with(prefix))
-                .cloned()
-                .collect())
-        }
-
-        async fn put_if_absent(&self, _key: &str, _data: &[u8]) -> Result<CasResult> {
-            bail!("unused")
-        }
-
-        async fn put_if_match(&self, _key: &str, _data: &[u8], _etag: &str) -> Result<CasResult> {
-            bail!("unused")
-        }
-    }
-
-    fn is_typed_storage_error(error: &anyhow::Error) -> bool {
-        error.chain().any(|cause| cause.is::<NativeStorageError>())
-    }
-
     #[tokio::test]
     async fn record_beyond_missing_snapshot_base_does_not_create_visible_head() {
         let dir = tempdir().unwrap();
         let db = dir.path().join("db.sqlite");
         File::create(&db).unwrap();
-        let identity = SpoolIdentity::new(&db, "bucket", "p/", "db", "lineage", 1).unwrap();
+        let identity =
+            SpoolIdentity::new(&db, "bucket", "p/", "db", "lineage", 1, None, true).unwrap();
         let descriptor = StreamDescriptor::from(&identity);
         let storage = MemoryStorage::default();
         storage
@@ -940,83 +828,5 @@ mod tests {
                 .unwrap(),
             None
         );
-    }
-
-    #[tokio::test]
-    async fn discovery_preserves_storage_error_type_beyond_descriptor_fetch() {
-        let dir = tempdir().unwrap();
-        let db = dir.path().join("db.sqlite");
-        File::create(&db).unwrap();
-        let identity = SpoolIdentity::new(&db, "bucket", "p/", "db", "lineage", 1).unwrap();
-        let descriptor = StreamDescriptor::from(&identity);
-        let descriptor_key = descriptor.key();
-        let floor_prefix = "p/db/native/v1/retention/v1/".to_string();
-        let storage = SelectiveFailureStorage {
-            objects: BTreeMap::from([(descriptor_key, descriptor.bytes().unwrap())]),
-            listed_keys: Vec::new(),
-            failing_get: None,
-            failing_list: Some(floor_prefix),
-        };
-
-        let error = inspect_native_v1(&storage, "bucket", "p/", "db")
-            .await
-            .unwrap_err();
-        assert!(is_typed_storage_error(&error), "{error:#}");
-
-        let publish_key = format!(
-            "p/db/native/v1/lineages/{}/published/0000000000000001.json",
-            descriptor.lineage_id
-        );
-        let storage = SelectiveFailureStorage {
-            objects: BTreeMap::from([(descriptor.key(), descriptor.bytes().unwrap())]),
-            listed_keys: vec![publish_key.clone()],
-            failing_get: Some(publish_key),
-            failing_list: None,
-        };
-        let error = inspect_native_v1(&storage, "bucket", "p/", "db")
-            .await
-            .unwrap_err();
-        assert!(is_typed_storage_error(&error), "{error:#}");
-    }
-
-    #[test]
-    fn native_restore_refuses_existing_destination_or_sqlite_sidecars() {
-        let dir = tempdir().unwrap();
-        let db = dir.path().join("source.sqlite");
-        File::create(&db).unwrap();
-        let identity = SpoolIdentity::new(&db, "bucket", "p/", "db", "lineage", 1).unwrap();
-        let spool = NativeSpool::create_or_open(
-            &dir.path().join("spool"),
-            identity,
-            CapacityPolicy {
-                warning_bytes: u64::MAX - 1,
-                hard_bytes: u64::MAX,
-                minimum_free_bytes: 0,
-            },
-        )
-        .unwrap();
-        let output = dir.path().join("restore.sqlite");
-
-        for blocker in [
-            output.clone(),
-            sqlite_sidecar_path(&output, "-wal"),
-            sqlite_sidecar_path(&output, "-shm"),
-        ] {
-            fs::write(&blocker, b"must survive").unwrap();
-            let error = restore_local_spool(&spool, &output, None).unwrap_err();
-            assert!(
-                error.to_string().contains("refusing native restore"),
-                "{error:#}"
-            );
-            assert_eq!(fs::read(&blocker).unwrap(), b"must survive");
-            fs::remove_file(blocker).unwrap();
-        }
-
-        let tmp = dir.path().join("complete.tmp");
-        fs::write(&tmp, b"new database").unwrap();
-        fs::write(&output, b"racing destination").unwrap();
-        assert!(install_restored_database(&tmp, &output).is_err());
-        assert_eq!(fs::read(&output).unwrap(), b"racing destination");
-        assert_eq!(fs::read(&tmp).unwrap(), b"new database");
     }
 }

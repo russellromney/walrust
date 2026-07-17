@@ -1,6 +1,6 @@
 ---
 title: How It Works
-description: SQLite WAL capture, the local HADBP spool, publication, and restore
+description: SQLite pages, WAL mode, LTX files, and retention
 ---
 
 A quick tour of what happens when you run `walrust watch`.
@@ -37,35 +37,33 @@ app.db-shm  ← shared memory (ignore this)
 
 The durable local spool keeps S3 latency out of SQLite checkpointing by default.
 
-## Native HADBP format and publication
+## LTX Format
 
-Walrust encodes snapshots and deltas as native HADBP changesets. Every object
-binds its sequence, predecessor checksum, ending checksum, declared database
-size, source cursor, destination, payload length, and SHA-256 in the durable
-local journal. The remote namespace is versioned and does not use Litestream
-LTX keys:
+LTX (Lite Transaction) is a compact format for storing SQLite page changes. Each LTX file contains:
+
+- **Header** - page size, page count, transaction IDs
+- **Page data** - the actual 4KB pages that changed
+- **Checksum** - SHA256-based integrity check
+
+Files are named by transaction ID range:
 
 ```
-s3://bucket/mydb/native/v1/
-├── stream.json
-└── lineages/<lineage>/
-    ├── 0001/<sequence>.hadbp       # immutable snapshots
-    ├── 0000/<sequence>.hadbp       # immutable deltas
-    └── published/<sequence>.json   # contiguous visibility records
+s3://bucket/mydb/
+├── 00000001-00000001.ltx   ← snapshot (TXID 1)
+├── 00000002-00000010.ltx   ← incremental (TXID 2-10)
+├── 00000011-00000050.ltx   ← incremental (TXID 11-50)
+└── manifest.json           ← index of all LTX files
 ```
 
-An uploaded object is not visible to restore until its publish record is part
-of the verified contiguous chain and a snapshot base exists.
+The format originates from [Litestream](https://litestream.io) via the [litepages crate](https://github.com/superfly/ltx). Walrust's LTX files are not compatible with Litestream (walrust enables checksums that Litestream doesn't expect).
 
 ## Checksums
 
-Walrust verifies the HADBP header/content checksum, the page-chain checksum,
-the journal SHA-256, and the remote publication chain. Restore aborts on any
-mismatch; it never skips a corrupt or divergent object.
+Every LTX file includes a checksum computed from SHA256, truncated to 64 bits. On restore, walrust verifies checksums. If verification fails, the restore aborts with an integrity error (exit code 5).
 
 ## GFS Retention
 
-Walrust uses Grandfather-Father-Son (GFS) snapshot retention:
+Left unchecked, you'd accumulate LTX files forever. Walrust uses Grandfather-Father-Son (GFS) rotation to keep storage bounded:
 
 | Tier | Default | Keeps |
 |------|---------|-------|
@@ -74,23 +72,19 @@ Walrust uses Grandfather-Father-Son (GFS) snapshot retention:
 | Weekly | 12 | One per week for 12 weeks |
 | Monthly | 12 | One per month beyond that |
 
-Run `walrust prune` for a dry run and add `--force` to publish a new native
-retention floor and remove only objects no longer needed by that floor. Watch
-can invoke the same policy with `--prune-after-snapshot` or `--prune-interval`.
+Run `walrust compact` to clean up old files, or use `--compact-after-snapshot` in watch mode.
 
 ## Restore
 
 Restoring is the reverse:
 
-1. Discover the versioned stream descriptor and contiguous publish records
-2. Download the selected snapshot HADBP object
-3. Apply subsequent native deltas in sequence while verifying every link
+1. Download the latest snapshot LTX
+2. Apply incremental LTX files in order
+3. Verify checksums along the way
 4. Output a complete, consistent database
 
 Point-in-time restore works by stopping at a specific transaction ID/sequence number. Timestamp-based PITR is not currently implemented.
 
 ---
 
-**Summary:** Walrust fsyncs WAL-derived native HADBP objects locally before it
-allows a controlled SQLite checkpoint, then publishes those exact bytes to S3
-asynchronously and exposes only a contiguous verified recovery chain.
+**Summary:** Walrust monitors SQLite WAL files, encodes changes as LTX files, uploads them to S3, and manages storage with GFS retention policies.

@@ -324,9 +324,12 @@ fn range_subset(a: SeqRange, b: SeqRange) -> bool {
 ///    (`put_if_absent`) and merged objects are written once by the single
 ///    compactor; no live key is ever rewritten. A present source therefore
 ///    holds exactly the bytes the merge that produced the cover read.
-/// 2. **Seq monotonicity.** The single writer discovers its native head across
-///    raw and compacted levels, and a resumed stream re-anchors before adding
-///    descendants. No new L0 is created at a seq ≤ an existing cover's `max`.
+/// 2. **Seq monotonicity.** The single writer (flock) discovers its head at
+///    startup as the max over L0 seqs, snapshot generations AND `levels/L*/`
+///    coverage (`discover_legacy_state` folds merged level ranges — pinned by
+///    `discover_head_reflects_merged_level_coverage`), and a resumed stream
+///    re-anchors with a snapshot that consumes its own seq. So no new L0 is
+///    ever created at a seq ≤ an existing cover's `max`.
 /// 3. **Batch tiling.** A cover `[a,b]` is only created from a batch that tiles
 ///    `[a,b]` exactly: the level listing is sorted by `(min, max)` and
 ///    [`contiguous_batch`] takes a greedy `max + 1 == next.min` run, so an
@@ -436,7 +439,7 @@ async fn endpoint_chain_evidence(
 }
 
 /// Authoritative `chain_end()` of a source: its declared end when the header
-/// carries one (COMPACTED sources), else one bounded object read (a
+/// carries one (COMPACTED / LTX sources), else one bounded object read (a
 /// normal HADBP source's chain end is its trailer content checksum).
 async fn source_chain_end(
     layout: &dyn CompactionLayout,
@@ -561,7 +564,7 @@ mod tests {
 
     #[test]
     fn contiguous_ranges_not_just_points() {
-        // Multi-seq compacted ranges chain by max+1 == next.min.
+        // Multi-seq incrementals (legacy [min,max]) chain by max+1 == next.min.
         let r = [(2, 5), (6, 9), (10, 13)];
         assert_eq!(contiguous_batch(&r, 2), Some((0, 2)));
     }

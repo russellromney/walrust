@@ -126,7 +126,7 @@ matched knobs (set explicitly on both tools):
 known asymmetries (cannot be matched knob-for-knob):
   - walrust runs product defaults otherwise: on-startup snapshot,
     snapshot-interval ${BENCH_WALRUST_SNAPSHOT_INTERVAL}s,
-    checkpoint-interval ${BENCH_WALRUST_CHECKPOINT_INTERVAL}s, --no-metrics.
+    checkpoint-interval ${BENCH_WALRUST_CHECKPOINT_INTERVAL}s, --no-metrics, --no-cache.
   - litestream v0.5 always runs its built-in multi-level compaction
     monitor (L1 30s upward) and snapshot levels; it has no off switch.
     Its compaction requests are counted as litestream requests.

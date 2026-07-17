@@ -58,9 +58,11 @@ Each database gets its own prefix:
 ```
 s3://my-bucket/
 ├── users/
-│   └── native/v1/...
+│   ├── 00000001-00000001.ltx
+│   └── manifest.json
 ├── orders/
-│   └── native/v1/...
+│   ├── 00000001-00000001.ltx
+│   └── manifest.json
 └── tenants/
     ├── acme/
     │   └── ...
@@ -76,9 +78,7 @@ s3://my-bucket/
 | 10 | 55 MB | 19 MB | 65% |
 | 100 | 160 MB | 20 MB | 88% |
 
-Walrust shares one S3 client (with connection pooling) across all databases.
-Each database has a collision-safe local spool directory and its own durable
-journal, lineage, checkpoint blocker, and asynchronous uploader.
+Walrust shares one S3 client (with connection pooling) across all databases. Each database gets its own upload task for concurrency. Memory remains ~19-20 MB regardless of database count.
 
 ## Restoring Individual Databases
 

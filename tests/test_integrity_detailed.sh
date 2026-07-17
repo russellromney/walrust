@@ -51,6 +51,7 @@ echo "2. Syncing to S3..."
 gtimeout 15 ./target/release/walrust watch \
     --bucket "s3://$BUCKET/detailed-test/" \
     --endpoint "$ENDPOINT" \
+    --independent-tasks \
     --no-metrics \
     "$ORIG_DB" &
 

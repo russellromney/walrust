@@ -1,4 +1,4 @@
-.PHONY: build release test basic-e2e drill clean install dev check fmt lint publish bench bench-compare bench-multidb help
+.PHONY: build release test basic-e2e drill drill-version-skew clean install dev check fmt lint publish publish-pypi build-python bench bench-compare bench-multidb help
 
 SOUP_PROJECT ?= turbolite
 SOUP_ENV ?= development
@@ -23,6 +23,10 @@ build:
 release:
 	cargo build --release
 
+# Build Python wheel
+build-python:
+	maturin build --release
+
 # Run all workspace tests with live storage credentials from Soup.
 # nextest runs everything in parallel except the tests pinned to the
 # `serial` test-group in .config/nextest.toml (real SIGKILLs, deliberate
@@ -40,6 +44,13 @@ basic-e2e: build
 
 drill: release
 	$(TEST_RUNNER) sh -c '$(TEST_ENV); WALRUST_BIN="$$(pwd)/target/release/walrust" drills/run-all.sh'
+
+# Version-skew drill: empirically characterizes an old walrust binary restoring
+# a leveled bucket. MANUAL ONLY -- deliberately not part of `make drill` / the
+# nightly workflow, because obtaining the old binary needs crates.io network
+# access (flaky in CI) and can fall back to an expensive from-source build.
+drill-version-skew: release
+	$(TEST_RUNNER) sh -c '$(TEST_ENV); WALRUST_BIN="$$(pwd)/target/release/walrust" drills/version-skew.sh'
 
 # Run micro-benchmarks (cargo bench)
 bench:
@@ -62,6 +73,10 @@ clean:
 # Install locally
 install: release
 	cargo install --path .
+
+# Install Python package locally (for development)
+install-python:
+	maturin develop
 
 # Development mode - watch and rebuild
 dev:
@@ -87,6 +102,13 @@ lint:
 publish:
 	cargo publish
 
+# Publish to PyPI
+publish-pypi:
+	maturin publish
+
+# Publish to both crates.io and PyPI
+publish-all: publish publish-pypi
+
 # Bump version (requires cargo-edit: cargo install cargo-edit)
 bump-patch:
 	cargo set-version --bump patch
@@ -103,13 +125,16 @@ help:
 	@echo "  Build:"
 	@echo "    make build        - Build debug binary"
 	@echo "    make release      - Build release binary"
+	@echo "    make build-python - Build Python wheel"
 	@echo "    make install      - Install CLI locally"
+	@echo "    make install-python - Install Python package for development"
 	@echo ""
 	@echo "  Test:"
 	@echo "    make test           - Run all tests (with S3 credentials via soup)"
 	@echo "    make test-verbose   - Run tests with output"
 	@echo "    make basic-e2e      - Run the fast basic_e2e drill tier"
 	@echo "    make drill          - Run the full drill suite"
+	@echo "    make drill-version-skew - Manual-only: old binary vs a leveled bucket"
 	@echo ""
 	@echo "  Benchmark:"
 	@echo "    make bench          - Run micro-benchmarks (cargo bench)"
@@ -123,6 +148,8 @@ help:
 	@echo ""
 	@echo "  Publish:"
 	@echo "    make publish      - Publish to crates.io"
+	@echo "    make publish-pypi - Publish to PyPI"
+	@echo "    make publish-all  - Publish to both"
 	@echo ""
 	@echo "  Other:"
 	@echo "    make clean        - Remove build artifacts"

@@ -62,48 +62,6 @@ pub struct NativeSnapshotFileOutput {
     pub payload_length: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NativeSnapshotSourceProof {
-    pub ending_chain_checksum: u64,
-    pub end_page_count: u64,
-    pub page_image_sha256: String,
-}
-
-/// Hash the exact main-file + pinned-shadow page image before persisting the
-/// snapshot intent. The same retained source descriptor is used by encoding,
-/// so this does not open/close the SQLite inode after blocker acquisition.
-pub fn snapshot_source_proof(
-    input: &NativeSnapshotInput,
-    db: &mut fs::File,
-) -> Result<NativeSnapshotSourceProof> {
-    use sha2::{Digest, Sha256};
-
-    let (shadow_pages, _, end_page_count) = snapshot_source(input)?;
-    let mut hasher = Sha256::new();
-    for page in 1..=u32::try_from(end_page_count)
-        .map_err(|_| anyhow::anyhow!("native snapshot source exceeds U32 page range"))?
-    {
-        hasher.update(read_resolved_page(input, &shadow_pages, db, page)?);
-    }
-    let digest: [u8; 32] = hasher.finalize().into();
-    let ending_chain_checksum =
-        u64::from_be_bytes(digest[0..8].try_into().expect("sha256 is 32 bytes"));
-    Ok(NativeSnapshotSourceProof {
-        ending_chain_checksum,
-        end_page_count,
-        page_image_sha256: hex_digest(&digest),
-    })
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        use std::fmt::Write as _;
-        let _ = write!(&mut out, "{byte:02x}");
-    }
-    out
-}
-
 /// Resolve a complete SQLite image at one immutable, fsynced shadow commit
 /// boundary. This is the Litestream page-selection rule with a native HADBP
 /// encoder: the latest shadow frame wins; pages absent from the WAL generation
@@ -362,72 +320,6 @@ fn read_shadow_prefix(
     Ok((pages, frame_count, final_db_size))
 }
 
-/// Select the last transaction boundary at or before a durable shadow tail.
-/// Snapshot timers may fire while SQLite has spilled an uncommitted
-/// transaction into WAL; those frames stay in the shadow for the next delta
-/// but must not make snapshot creation fail or leak uncommitted pages.
-pub fn committed_shadow_prefix_offset(
-    shadow_dir: &Path,
-    wanted_generation: u64,
-    durable_end_offset: u64,
-    page_size: u32,
-) -> Result<u64> {
-    let frame_size = 24u64 + page_size as u64;
-    if !durable_end_offset.is_multiple_of(frame_size) {
-        bail!("durable native shadow tail is not frame-aligned");
-    }
-    let mut entries = fs::read_dir(shadow_dir)?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".wal"))
-        .collect::<Vec<_>>();
-    entries.sort_by_key(|entry| entry.file_name());
-    let mut logical_offset = 0u64;
-    let mut last_commit = 0u64;
-    for entry in entries {
-        let text = entry.file_name().to_string_lossy().into_owned();
-        let Some((generation, _)) = text.trim_end_matches(".wal").split_once('-') else {
-            continue;
-        };
-        if u64::from_str_radix(generation, 16).ok() != Some(wanted_generation)
-            || logical_offset >= durable_end_offset
-        {
-            continue;
-        }
-        let available = entry.metadata()?.len();
-        let take = available.min(durable_end_offset.saturating_sub(logical_offset));
-        if !take.is_multiple_of(frame_size) {
-            bail!(
-                "durable native shadow prefix crosses a torn frame in {}",
-                entry.path().display()
-            );
-        }
-        let mut file = fs::File::open(entry.path())?;
-        for _ in 0..take / frame_size {
-            let mut header = [0u8; 24];
-            file.read_exact(&mut header)?;
-            let page = u32::from_be_bytes(header[0..4].try_into().unwrap());
-            if page == 0 {
-                bail!("native shadow frame contains invalid page number 0");
-            }
-            let db_size = u32::from_be_bytes(header[4..8].try_into().unwrap());
-            file.seek(SeekFrom::Current(i64::from(page_size)))?;
-            logical_offset = logical_offset.saturating_add(frame_size);
-            if db_size != 0 {
-                last_commit = logical_offset;
-            }
-        }
-    }
-    if logical_offset != durable_end_offset {
-        bail!(
-            "durable native shadow cursor {} exceeds readable generation {} bytes {}",
-            durable_end_offset,
-            wanted_generation,
-            logical_offset
-        );
-    }
-    Ok(last_commit)
-}
-
 /// Encode only the committed prefix after `shadow_sync_offset`. Frames after
 /// the last commit marker remain for the next admission.
 pub fn encode_shadow_to_hadbp(input: &NativeShadowInput) -> Result<Option<NativeShadowOutput>> {
@@ -574,47 +466,6 @@ mod tests {
         assert_eq!(decoded.header.seq, 2);
         assert_eq!(decoded.header.prev_checksum, 11);
         assert_eq!(ltx::changeset_end_page_count(&decoded).unwrap(), Some(2));
-    }
-
-    #[test]
-    fn snapshot_boundary_selects_last_commit_before_uncommitted_tail() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("0000000000000000-0000000000000000.wal");
-        let mut file = fs::File::create(path).unwrap();
-        file.write_all(&frame(1, 2, 1, 512)).unwrap();
-        file.write_all(&frame(2, 0, 2, 512)).unwrap();
-        file.write_all(&frame(3, 0, 3, 512)).unwrap();
-        file.sync_all().unwrap();
-        let frame_size = (24 + 512) as u64;
-        assert_eq!(
-            committed_shadow_prefix_offset(dir.path(), 0, frame_size * 3, 512).unwrap(),
-            frame_size
-        );
-
-        file.write_all(&frame(4, 4, 4, 512)).unwrap();
-        file.sync_all().unwrap();
-        let delta = encode_shadow_to_hadbp(&NativeShadowInput {
-            seq: 2,
-            previous_chain_checksum: 11,
-            generation: 0,
-            shadow_sync_offset: frame_size,
-            page_size: 512,
-            shadow_dir: dir.path().to_path_buf(),
-        })
-        .unwrap()
-        .expect("committed successor must emit the formerly in-flight tail");
-        assert_eq!(delta.frame_count, 3);
-        assert_eq!(delta.new_shadow_sync_offset, frame_size * 4);
-        let decoded = ltx::decode_sqlite_changeset(&delta.payload).unwrap();
-        assert_eq!(ltx::changeset_end_page_count(&decoded).unwrap(), Some(4));
-        assert_eq!(
-            decoded
-                .pages
-                .iter()
-                .filter(|page| page.page_id.to_u64() <= 4)
-                .count(),
-            3
-        );
     }
 
     #[test]

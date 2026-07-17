@@ -315,6 +315,10 @@ stop_driver() {
 start_walrust() {
   local db=$1
   shift || true
+  local extra_args=()
+  if [ "${WALRUST_DRILL_INDEPENDENT_TASKS:-0}" = "1" ]; then
+    extra_args+=(--independent-tasks)
+  fi
   "$WALRUST_BIN" watch "$db" \
     --bucket "$DRILL_BUCKET_URI" \
     --endpoint "$DRILL_ENDPOINT" \
@@ -323,6 +327,8 @@ start_walrust() {
     --checkpoint-interval "${WALRUST_DRILL_CHECKPOINT_INTERVAL:-999999}" \
     --on-startup true \
     --no-metrics \
+    --no-cache \
+    ${extra_args[@]+"${extra_args[@]}"} \
     "$@" >"$DRILL_WORKDIR/walrust.log" 2>&1 &
   DRILL_WALRUST_PID=$!
   log "walrust pid=$DRILL_WALRUST_PID"
@@ -493,9 +499,9 @@ import sys
 max_txid = 0
 with open(sys.argv[1], encoding="utf-8") as handle:
   for key in handle:
-    m = re.search(r'/published/([0-9a-f]{16})\.json$', key.strip())
+    m = re.search(r'/([0-9a-f]{16})-([0-9a-f]{16})\.ltx$', key.strip())
     if m:
-        max_txid = max(max_txid, int(m.group(1), 16))
+        max_txid = max(max_txid, int(m.group(2), 16))
 print(max_txid)
 PY
 }
@@ -510,20 +516,21 @@ vals = set()
 with open(sys.argv[1], encoding="utf-8") as handle:
   for key in handle:
     key = key.strip()
-    m = re.search(r'/lineages/[^/]+/([0-9a-f]{4})/([0-9a-f]{16})\.hadbp$', key)
+    m = re.search(r'/([0-9a-f]{4})/([0-9a-f]{16})-([0-9a-f]{16})\.ltx$', key)
     if not m:
         continue
     generation = int(m.group(1), 16)
-    seq = int(m.group(2), 16)
-    if generation == 1:
-        vals.add(seq)
+    min_txid = int(m.group(2), 16)
+    max_txid = int(m.group(3), 16)
+    if generation != 0 and min_txid == 1:
+        vals.add(max_txid)
 for txid in sorted(vals):
     print(txid)
 PY
 }
 
 first_incremental_key() {
-  s3_list_prefix "$DRILL_RUN_PREFIX/" | awk '/\/lineages\/[^/]+\/0000\/[0-9a-f]+\.hadbp$/ { print; exit }'
+  s3_list_prefix "$DRILL_RUN_PREFIX/" | awk '/\/0000\/.*\.ltx$/ { print; exit }'
 }
 
 run_prune() {
@@ -538,6 +545,12 @@ run_prune() {
     --force
 }
 
+run_snapshot() {
+  local db=$1
+  "$WALRUST_BIN" snapshot "$db" \
+    --bucket "$DRILL_BUCKET_URI" \
+    --endpoint "$DRILL_ENDPOINT"
+}
 
 expect_future_txid_error() {
   local name=$1
@@ -778,6 +791,7 @@ start_walrust_config() {
     --bucket "$bucket_uri" \
     --endpoint "$DRILL_ENDPOINT" \
     --no-metrics \
+    --no-cache \
     >"$logfile" 2>&1 &
   DRILL_WALRUST_PID=$!
   log "walrust (config mode) pid=$DRILL_WALRUST_PID"

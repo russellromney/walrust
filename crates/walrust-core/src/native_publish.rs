@@ -17,26 +17,26 @@ pub const REMOTE_LAYOUT_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StreamDescriptor {
     pub version: u32,
-    pub hadbp_format_version: u8,
     pub stream_digest: String,
     pub bucket: String,
     pub prefix: String,
     pub database: String,
     pub lineage_id: String,
     pub first_native_seq: u64,
+    pub legacy_boundary_txid: Option<u64>,
 }
 
 impl From<&SpoolIdentity> for StreamDescriptor {
     fn from(value: &SpoolIdentity) -> Self {
         Self {
             version: REMOTE_LAYOUT_VERSION,
-            hadbp_format_version: value.hadbp_format_version,
             stream_digest: value.stream_digest(),
             bucket: value.bucket.clone(),
             prefix: value.prefix.clone(),
             database: value.database.clone(),
             lineage_id: value.lineage_id.clone(),
             first_native_seq: value.first_native_seq,
+            legacy_boundary_txid: value.legacy_boundary_txid,
         }
     }
 }
@@ -671,7 +671,8 @@ mod tests {
             .query_row("PRAGMA page_size", [], |r| r.get::<_, u32>(0))
             .unwrap();
         drop(conn);
-        let identity = SpoolIdentity::new(&db, "bucket", "p/", "db", "lineage", 1).unwrap();
+        let identity =
+            SpoolIdentity::new(&db, "bucket", "p/", "db", "lineage", 1, None, true).unwrap();
         let encoded = ltx::encode_snapshot_with_checksum(&db, page_size, 1, 0).unwrap();
         let pages = std::fs::metadata(&db).unwrap().len() / page_size as u64;
         let root = NativeSpool::path_for(dir, &identity);
@@ -869,6 +870,16 @@ mod tests {
             })
             .unwrap();
         assert!(uploader.publish_pending_once().await.unwrap());
+        crate::native_restore::prune_native_before_snapshot(
+            storage.as_ref(),
+            "bucket",
+            "p/",
+            "db",
+            2,
+        )
+        .await
+        .unwrap();
+
         let (delta, ending) = ltx::encode_wal_changes_with_end_page_count(
             &[(1, vec![0u8; page_size as usize])],
             page_size,
@@ -891,18 +902,9 @@ mod tests {
                 payload: &delta,
             })
             .unwrap();
-        crate::native_restore::prune_native_before_snapshot(
-            storage.as_ref(),
-            "bucket",
-            "p/",
-            "db",
-            2,
-        )
-        .await
-        .unwrap();
         assert!(
             uploader.publish_pending_once().await.unwrap(),
-            "remote retention must preserve the base needed by an already-unpublished local descendant"
+            "remote retention must not pin publication to a pruned older local snapshot"
         );
         assert_eq!(spool.lock().unwrap().remote_published_seq(), Some(3));
     }

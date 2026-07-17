@@ -37,8 +37,8 @@ visible-failures and revert-proof tests).
 
 ## Layout notes
 
-- Engine lives in `crates/walrust-core`; `src/` is the CLI plus re-export shims.
-  The CLI watch/restore protocol is native HADBP v1 only. Don't add logic to shims.
+- Engine lives in `crates/walrust-core` (including `legacy_*` modules from the old
+  `src/` tree); `src/` is the CLI plus re-export shims. Don't add logic to shims.
 - Core `ltx.rs` implements **HADBP**, not Litestream LTX (checksum-incompatible);
   the `ltx` name is a legacy alias. Don't claim litestream compatibility in docs.
 - `hadb-*` deps are pinned to a git rev in `Cargo.toml`; bump the rev deliberately,

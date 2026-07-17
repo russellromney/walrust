@@ -62,11 +62,15 @@ the ledger, same rules as the adversarial reviews.
 
 Order of work (each lands as its own PR through the normal gate):
 
-1. **Native format-stability fixture.** The frozen 0.7.0 owned-mode HADBP
-   fixture remains an immutable decoder/restore guard. The retired CLI LTX
-   fixture and generator are not part of the native-only product or package.
-   **DONE** — `tests/fixtures/format-stability/owned-v0.7.0`, proven by
-   `tests/format_stability.rs`.
+1. **Format-stability fixture (now-or-never).** Freeze a bucket written by the
+   published 0.7.0 binary — snapshots, L0 tail, L1+L2 levels, a prune
+   boundary — into `tests/fixtures/`, with recorded expected rows and PITR
+   points. An S3-gated test uploads the fixture objects to a scratch prefix
+   and proves current code restores them row-exact (latest + PITR). Every
+   future version must pass it: buckets written today restore forever. Cheap
+   now, impossible to create retroactively.
+   **DONE** — `tests/fixtures/format-stability/` (cli-v0.7.0 + owned-v0.7.0 +
+   `generate.sh`), proven by `tests/format_stability.rs`; see CHANGELOG.
 2. **Fresh-user drill.** Clean container, `cargo install walrust` from
    crates.io, follow the README *verbatim* to a verified restore — no repo
    checkout, no improvising. Every deviation forced by reality is a docs bug.
@@ -130,190 +134,560 @@ Order of work (each lands as its own PR through the normal gate):
 
 ---
 
-## Lossless native CLI watch
+## Lossless watch: adopt the checkpoint-blocker model (the litestream contract)
 
-The default and only CLI watch protocol is native HADBP. Compatibility-only
-Litestream LTX writers, readers, caches, manifests, mixed-format compaction
-adapters, migration boundaries, and independent-task mode are removed. The
-public library Replicator remains a separate native HADBP protocol; changing
-that wire format is outside this CLI cutover.
+**This is the key correctness issue for walrust as a litestream replacement.**
+Surfaced by dogfooding (DF1/DF2) and confirmed at the primitive level with a
+direct SQLite probe.
 
-### Required pipeline
+### Current state (the problem, with evidence)
 
-```text
-SQLite WAL
-  -> checksum-validated shadow frames + fsync
-  -> immutable native HADBP snapshot/delta + fsync/rename/dir fsync
-  -> durable local journal admission + journal/dir fsync
-  -> controlled SQLite checkpoint + immediate blocker reacquisition
-  -> asynchronous upload of those exact admitted bytes
+walrust's CLI `watch` is built on a checkpoint race it can lose. A SQLite
+checkpoint folds WAL frames into the main `.db` and can reset/truncate the
+`-wal` file. If that happens **before** walrust has read those frames, they are
+gone from the sync stream. Measured directly:
+
+```
+[file-tailer, no held reader]  WAL 12392B -> 0B after an app wal_checkpoint(TRUNCATE)  => unread frames GONE
+[held read-mark]               WAL 12392B -> 12392B, checkpoint returns busy=1        => BLOCKED, frames preserved
 ```
 
-A channel notification is only a coalesced wake hint. Durable on-disk journal
-state is the uploader queue.
+Three ways the race bites, all the same root: an app autocheckpoint burst
+(default 1000 pages) between walrust polls; an explicit app
+`wal_checkpoint(TRUNCATE)`; an ephemeral-connection writer whose last-close
+checkpoint deletes the WAL (DF1 = crash on the zeroed WAL, DF2 = silent loss
+when the reset isn't detected). Today walrust survives *most* of these by
+detecting a WAL reset (salt mismatch) and re-anchoring with a full snapshot —
+**lossy-but-recovered**. DF2 is the case the recovery missed.
 
-### Native identity and remote layout
+Per-mode reality (verified in code):
+- **Owned / library mode (`Replicator`) already does it right.** It holds
+  `crate::shadow::ShadowWal::open_checkpoint_blocker` for the DB's lifetime:
+  `wal_autocheckpoint=0`, a `_walrust_seq` heartbeat row, and a `BEGIN DEFERRED`
+  read transaction pinning a real WAL frame — exactly litestream's
+  `_litestream_seq`. The held read-mark is what makes it lossless: another
+  connection's checkpoint cannot truncate past walrust's mark. `sync.rs` already
+  has the controlled `release_checkpoint_blocker` / `reacquire_checkpoint_blocker`
+  dance around walrust's own checkpoints (D2).
+- **CLI shadow mode (`src/sync/watch_shadow.rs`) holds no connection at all.**
+  `ShadowWal::new()` opens no SQLite connection; it tails the `-wal` file on
+  disk. Its "checkpoint" (`checkpoint_shadow_after_durable_sync`) only flushes
+  the shadow segment to S3 — it never checkpoints the real DB. So WAL truncation
+  is entirely at the app's mercy. `git log -S open_checkpoint_blocker` confirms
+  this path has **never** held the blocker (despite an old ledger note claiming
+  "shadow mode uses" it — the note was aspirational).
+- **CLI independent mode (`crates/walrust-core/src/legacy_wal_sync.rs`)** runs
+  `wal_checkpoint(PASSIVE/TRUNCATE)` through **one-shot** `Connection::open`s, so
+  it holds no persistent read-mark either, and by opening/closing may itself
+  trigger last-close checkpoints.
 
-Every spool identity binds canonical database path, bucket, prefix, database
-name, lineage, first native sequence, and format version. The durable journal's
-contiguous published snapshot state—not an identity boolean—proves whether an
-offline restart has a verified remote base. Every object record binds destination, lineage, sequence,
-snapshot/delta kind, predecessor and ending chain checksums, end-page count,
-source cursor, intended remote key, payload length and SHA-256, local creation
-state, and upload/publication state.
+### What must not change
 
-Remote CLI streams use:
+- **Data correctness and every never-weaken test.** This is a durability path.
+- **Restore-side WAL-header strictness** (`wal::read_header`) — watch-side only.
+- **Owned/library mode's existing blocker semantics** (D2) — we are extending
+  the *same* proven mechanism to the CLI, not inventing a second one.
+- **The single-writer / fencing / split-brain guarantees.**
 
-```text
+### The fix, phased (each phase its own PR through the full adversarial gate)
+
+- **Phase 0 — prove the primitive on a real DB.** Formalize the probe above as a
+  test: a held `open_checkpoint_blocker` on a real SQLite DB makes a concurrent
+  app `wal_checkpoint(TRUNCATE)` return `busy=1` and preserves the WAL, across
+  every WAL config walrust supports (page sizes, `synchronous` levels). This is
+  the load-bearing assumption; pin it before building on it.
+- **Phase 1 — CLI shadow watch holds the blocker.** Give `ShadowDbState` a
+  persistent `open_checkpoint_blocker` connection per DB, reuse the
+  release/reacquire dance for walrust's own controlled checkpoints, and add
+  **WAL-size backpressure** (see new failure mode below). With the blocker held,
+  the DF1/DF2 e2es must pass with **zero re-anchors and zero storm** — a strictly
+  stronger result than PR #41's. Add an "app-checkpoints-underneath" e2e: an app
+  connection issues `wal_checkpoint(TRUNCATE)` mid-stream and **nothing is lost**.
+- **Phase 2 — CLI independent mode holds the blocker.** Replace its one-shot
+  checkpoint connections with the held blocker + controlled dance; same proofs.
+- **Phase 3 — demote the file-tailer to an explicit, labeled degraded mode.**
+  For the genuine "can't open the DB" case (read-only mount, no write access,
+  strict no-touch policy), keep the connection-free tailer behind an explicit
+  opt-in (e.g. `--file-tailer` / `watch_mode = "file-tailer"`), documented as
+  **best-effort, lossy under checkpoint races, mitigated by resnapshot**. This is
+  where PR #41's surviving machinery lives: `read_header_classified`
+  (missing/zero-length vs nonzero-garbage magic) and the re-anchor-on-reset path
+  become the degraded mode's hardening — not the default's front line. Decide
+  during this phase whether the degraded mode earns its keep at all.
+- **Phase 4 — docs & positioning.** The "lossless like litestream" claim becomes
+  true *and provable*; update README (the ephemeral-writer known-issue note flips
+  once a release ships the fix — until then a crates.io 0.7.0 user is still
+  exposed, so no false safety claim), and the fresh-user drill's DF2 probe flips
+  from "record known-buggy" to "enforce replication."
+
+### The new failure mode this introduces (must be handled, not just accepted)
+
+Once walrust holds the read-mark, **walrust becomes the only thing that can let
+the WAL truncate.** If walrust falls behind or wedges, no one can checkpoint, the
+WAL grows unbounded, and the app's writes eventually slow or stall. This is the
+litestream tradeoff — a strictly *better* failure mode than silent data loss
+("backup is behind, WAL is growing" is loud and observable) but it is a real new
+responsibility. Phase 1 must: bound WAL growth via walrust's own checkpoint
+cadence, and **alarm loudly (webhook + error log) when the WAL exceeds a
+threshold** rather than let it bloat silently. Register this as the explicit cost
+of the model in the docs, next to the `_walrust_seq` write (shadow mode stops
+being "zero-touch": it opens the DB and writes one heartbeat row, exactly as
+litestream does — call it out plainly for operators).
+
+### Known traps (greppable)
+
+- **Wrong:** disabling the app's autocheckpoint to stop truncation. You can't —
+  `wal_autocheckpoint` is per-connection and you don't own the app's connection.
+  **Right:** the held read-mark blocks truncation *past your mark* regardless of
+  the app's autocheckpoint; the WAL grows, you read it, then you checkpoint.
+- **Wrong:** using SQLite's file change counter (header offset 24) as a
+  dirty-check — it does **not** advance per-commit in WAL mode (verified). **Use
+  `PRAGMA data_version`** (verified: bumps on another connection's commit,
+  pre-checkpoint) for any residual dirty-check, not a whole-file hash.
+- **Wrong:** treating the blocker as free. It creates `_walrust_seq` and holds a
+  read txn — a real, litestream-precedented change to shadow mode's contract.
+- **Wrong:** opening and closing the main database file after taking the
+  blocker. On systems without open-file-description locks, closing any file
+  descriptor for that inode can release the process's SQLite locks while the
+  transaction object still appears live. Open one read-only source descriptor
+  before the blocker, retain it until every SQLite source handle is closed, and
+  reuse that exact descriptor for native snapshot base-page reads.
+- **Wrong:** letting the WAL grow without a loud alarm. Silent bloat that stalls
+  the app's writes is a fail-loudly violation.
+- The release/reacquire window around walrust's own checkpoint is the one place a
+  reset can still slip in — that boundary keeps the re-anchor handling (this is
+  what survives from PR #41).
+
+### How we prove it's done
+
+- Phase 0 primitive test green.
+- DF1/DF2 e2es pass with **zero re-anchors, zero storm** (grep the logs), both
+  modes.
+- New app-checkpoint-underneath e2e: nothing lost, live S3.
+- WAL-bloat alarm fires (revert-proof: neuter the alarm, watch the test catch a
+  silent bloat).
+- The "lossless like litestream" claim ships as a passing drill, not prose.
+
+### Disposition of the open PRs
+
+- **PR #41 stays open, unmerged**, until Phase 1/3 land and cherry-pick the parts
+  that survive (`read_header_classified`, degraded-mode re-anchor). Do not merge
+  it as the primary fix; do not close it and lose the machinery.
+- **PR #40 (fresh-user drill)** can merge independently — its DF2 known-issue note
+  and version-gated probe are accurate while 0.7.0 is the shipped (lossy) binary.
+
+## Local-first native HADBP spool for lossless CLI watch (required Phase 1 refinement)
+
+**Do not merge PR #43 as it stands.** Its real SQLite checkpoint blocker is the
+right primitive, but its checkpoint gate still waits for a confirmed S3 PUT. The
+default CLI shadow-watch pipeline must instead be:
+
+```
+SQLite WAL -> fsynced shadow frames -> fsynced native HADBP object + journal
+           -> controlled SQLite checkpoint + immediate blocker reacquisition
+           -> asynchronous upload of those exact HADBP bytes
+```
+
+`crates/walrust-core/src/ltx.rs` is the native HADBP codec despite its historical
+module name. `legacy_ltx.rs`, `legacy_shadow*`, `legacy_wal_sync`, `LocalCache`,
+and `.ltx` spool files are actual Litestream-heritage compatibility machinery.
+They remain readers for published 0.7 history, not the new write architecture.
+
+### Proven current format map
+
+- Fresh CLI snapshots are actual LTX1 snapshot files at
+  `{prefix}{db}/{generation:04x}/0000000000000001-{txid:016x}.ltx`.
+  CLI incrementals are actual LTX1 files in generation `0000` named
+  `{min_txid:016x}-{max_txid:016x}.ltx`. `manifest.json`, legacy discovery,
+  verify, pruning, replication, and CLI restore all use this TXID/checksum
+  domain. `LocalCache` stores the same LTX1 bytes as `ltx/{txid:08}.ltx`.
+- CLI compaction's RangeLayout consumes those LTX1 objects. Its `levels/L*`
+  merged payloads are HADBP but retain the historical `.ltx` key suffix; the
+  legacy restore path sniffs their `HADBP` magic and bridges them in the LTX
+  checksum domain. This frozen compatibility seam is not a precedent for new
+  HADBP keys.
+- Owned/library replication uses native HADBP snapshots and deltas under
+  generation directories with `.hadbp` suffixes (and optional `lineages/`
+  scope). SeqLayout compaction also writes HADBP under `levels/L*/*.hadbp`.
+  Native restore enforces HADBP sequence, predecessor, checksum, page-count,
+  lineage, and fencing rules.
+- Published 0.7 CLI restore-to-latest/PITR therefore remains the legacy reader;
+  published 0.7 owned buckets remain the native reader. New CLI restore first
+  resolves the versioned native boundary below, and uses the legacy reader for
+  targets before that boundary.
+
+### Versioned remote layout and visibility
+
+New CLI-native streams use this disjoint namespace:
+
+```
 {prefix}{db}/native/v1/stream.json
-{prefix}{db}/native/v1/lineages/{lineage}/0001/{seq}.hadbp  # snapshot
-{prefix}{db}/native/v1/lineages/{lineage}/0000/{seq}.hadbp  # delta
-{prefix}{db}/native/v1/lineages/{lineage}/published/{seq}.json
+{prefix}{db}/native/v1/lineages/{lineage}/0001/{seq:016x}.hadbp  # snapshot
+{prefix}{db}/native/v1/lineages/{lineage}/0000/{seq:016x}.hadbp  # delta
+{prefix}{db}/native/v1/lineages/{lineage}/published/{seq:016x}.json
 ```
 
-The descriptor and contiguous publish records are the visibility protocol. Raw
-objects alone are not recovery points. This namespace is distinct from the
-library raw generations and `levels/L*`; HADBP bytes are never stored under
-`.ltx` keys.
+`stream.json` is an immutable, create-if-absent descriptor binding the canonical
+stream/destination identity, lineage, first native snapshot sequence, and an
+optional verified legacy-LTX boundary TXID. A full native snapshot is always the
+migration boundary; no LTX-to-HADBP incremental checksum seam is invented.
 
-### Snapshot source and crash ordering
+Each `published/` record is immutable and binds the exact object key, kind,
+sequence, predecessor publish-record digest, HADBP predecessor/ending checksums,
+declared end-page count, payload length, and SHA-256 payload digest. Publication
+uses create-if-absent and verifies exact existing bytes after a failed CAS. The
+visible remote head is the highest contiguous verified publish-record chain
+starting at the descriptor's snapshot base. A raw object PUT without its record
+is not a recovery point. Restore, verify, prune, replicate, and compaction must
+never traverse past that visible head. This makes PUT-before-record crashes
+retryable and prevents a delta from becoming visible before its base.
 
-Snapshots are encoded directly from SQLite's stable main-file pages plus the
-pinned WAL boundary into a same-directory HADBP temporary. The watcher does not
-use `VACUUM INTO` or SQLite's online backup API. It durably records the source
-intent before encoding and admits only a payload whose header, sequence,
-predecessor, cursor, page size, end-page count, and checksum match that intent.
+The namespace cannot collide with legacy LTX: legacy object discovery accepts
+`.ltx` generation/range shapes, while this layout uses an extra `native/v1`
+scope and `.hadbp`. It cannot collide with compaction levels because no path has
+the structural `levels/L{n}` pair. Frozen legacy and `levels/L*` readers remain
+unchanged except for combined boundary selection in current CLI commands.
 
-Recovery is deterministic at every boundary:
+### Durable local identities and object record
 
-1. Before shadow fsync: recopy from the live pinned WAL.
-2. After shadow fsync/before encode: resume from the durable shadow cursor.
-3. After HADBP rename/before journal: adopt only through the durable install
-   intent after full header/payload/chain validation.
-4. After journal/before checkpoint: the admitted object is retryable and the
-   blocker remains held.
-5. After checkpoint/before rearm: the durable opening window forces a snapshot
-   re-anchor; rearm is the final SQLite operation.
-6. After PUT/before uploaded commit: verify the existing immutable remote bytes,
-   then record uploaded locally.
-7. After uploaded commit/before visibility: retry fenced contiguous publish.
-8. During cleanup: delete only objects durably marked deleting; never a pending
-   object or the only local snapshot base.
-9. During snapshot creation: incomplete unadmitted temporaries may be removed;
-   valid intent-bound HADBP is adopted; divergent valid bytes are retained and
-   fail loudly.
-10. During shutdown: persist all local work, optionally drain cloud for a
-    bounded interval, and never delete pending work.
+The spool is independent of `LocalCache` and is rooted in a collision-safe hash
+of canonical database path plus destination bucket/prefix/database identity.
+Its immutable payload filenames end in `.hadbp`, never `.ltx`. The versioned
+stream journal binds canonical local and remote identity, lineage, verified
+remote base/boundary, local source cursor, local admitted cursor, and contiguous
+remote publish cursor. Every immutable object record binds at least:
 
-An existing sequence with different bytes, identity, predecessor, or checksums
-is equivocation and a hard error.
+- journal/object schema version and canonical stream/lineage identity;
+- destination bucket, prefix, and database identity;
+- native sequence and snapshot/delta kind;
+- previous and ending chain checksums and declared end-page count;
+- intended remote key, payload length, and SHA-256 payload digest;
+- source shadow/WAL cursor covered by the object;
+- local creation state and remote upload/publication state.
+
+Payload installation is: write a same-directory temporary file, fsync it,
+rename atomically, fsync the directory, then atomically write/fsync/rename the
+journal and fsync its directory. A channel message is only a coalesced wake hint.
+An existing sequence is accepted only after header, lineage, predecessor,
+sequence, source cursor, length, and digest all match; any divergence is a hard
+equivocation error.
+
+### Exact crash/restart state machine
+
+The blocker is held except for the bounded controlled-checkpoint window.
+
+1. **Before shadow fsync:** the live WAL remains pinned; restart recopies only a
+   validated committed frame prefix. No cursor advances.
+2. **After shadow fsync, before HADBP encode:** the durable shadow cursor is
+   replayed into the next native object; SQLite is not checkpointed.
+3. **After payload fsync, before or after payload rename, before journal
+   commit:** the snapshot source intent plus the fixed same-directory temporary,
+   or the generic install intent plus temporary/final payload, binds the exact
+   source cursor and object identity. Startup validates the HADBP header/body,
+   predecessor, sequence, page size/count, checksum, source cursor, intended
+   key, length, and digest. It adopts a uniquely proven object by installing the
+   exact bytes and committing the journal; otherwise a complete divergent object
+   is retained and fails loudly. A demonstrably incomplete pre-admission encode
+   may be removed because no checkpoint was released for it.
+4. **After journal commit, before SQLite checkpoint:** the object is locally
+   admitted. Restart may checkpoint that exact admitted cursor without S3.
+5. **After SQLite checkpoint, before blocker reacquisition:** startup opens and
+   pins the blocker before any other mutable work, compares `data_version`, WAL
+   salt/cursor, shadow/admitted cursor, and main DB. A dirty controlled window
+   creates a full native snapshot re-anchor through the same spool before any
+   delta continuation. On POSIX, blocker reacquisition is the final SQLite
+   operation in the successful checkpoint path.
+   Before opening that window, checkpoint preflight repeats the checked shadow
+   copy and native delta admission until one complete `data_version` sample to
+   sample interval is stable. A commit copied and admitted while the blocker is
+   still held is therefore drained as another delta, not misclassified as a
+   dirty-window re-anchor. Sustained writers bound this preflight and defer the
+   checkpoint with the blocker held; a commit after the stable sample remains a
+   dirty controlled-window event and requires the full snapshot re-anchor.
+6. **After PUT, before uploaded-state commit:** the uploader GET-verifies exact
+   remote bytes and idempotently records the object uploaded locally. Divergent
+   remote bytes are split brain/equivocation and are never overwritten.
+7. **After uploaded-state commit, before visible-head advance:** the uploader
+   verifies the descriptor, remote predecessor publish record, base snapshot,
+   and object, then create-if-absent publishes the exact next record. Restart
+   repeats this operation; a divergent record is split brain.
+8. **During local cleanup:** journal state is authoritative. Temporary/orphan
+   files are removed only after validation; pending/unpublished objects and the
+   only locally restorable snapshot base are never removed. Each delete is
+   followed by directory fsync and is restart-idempotent.
+9. **During snapshot creation:** with the checkpoint blocker held, copy and
+   fsync the checked live-WAL committed prefix into shadow, then freeze its
+   generation/frame cursor, WAL salt/checksum chain, page size, and final commit
+   page count in a durable snapshot intent. Resolve each page at that exact
+   boundary from the latest shadow frame or (when absent) the pinned main DB,
+   and encode directly into the native HADBP payload temporary. Fsync/rename
+   the HADBP payload and commit its journal record before checkpoint release.
+   Main-database pages use the one descriptor opened before blocker acquisition;
+   snapshot creation never reopens/closes the source database inode, preserving
+   classic POSIX locks on non-OFD platforms.
+   The payload file and its directory entry are fsynced before the named crash
+   boundary. No intermediate SQLite backup/VACUUM database is part of this path.
+   Partial HADBP temporaries are validated or removed on restart; a complete
+   fsynced temporary or installed orphan with a matching intent is adopted; an
+   admitted snapshot is never regenerated at the same sequence.
+10. **During shutdown:** stop admitting new checkpoint windows, keep/reacquire
+    the blocker, durably finish any in-progress local admission, persist pending
+    uploader state, and optionally drain cloud for a bounded time. Timeout does
+    not delete pending work. SIGKILL follows the same startup reconciliation.
 
 ### Checkpoint release policy
 
-`checkpoint_release = "local"` is the default. It may open the controlled
-checkpoint window only after the matching native HADBP bytes and local
-cursor/window record are durable. It must not wait for S3 PUT/LIST/GET, retries,
-remote visibility, or an uploader channel slot.
+The explicit setting is `checkpoint_release = "local" | "remote"`.
 
-`checkpoint_release = "remote"` stages locally first and additionally waits
-for the contiguous remote published cursor. It does not make every SQLite commit
-synchronously cloud durable.
+- `local` is the default. Release requires durable native HADBP bytes and the
+  matching durable local cursor/lineage record. It never waits for S3 PUT,
+  LIST/GET, retries, uploader channel capacity, or remote-head advancement.
+- `remote` stages locally first, then waits for the contiguous remote publish
+  cursor covering the admitted object before release. This adds cloud latency
+  to walrust-controlled checkpoints; it does **not** make every SQLite commit
+  synchronously cloud-durable.
 
-PASSIVE busy/partial is expected contention: record progress, rearm, and retry.
-Emergency TRUNCATE is bounded and observable. Any failure or capacity stop keeps
-the blocker and watcher alive in a loud degraded/non-checkpointing state.
-`data_version` covers the controlled release window; on POSIX the blocker
-reacquisition remains the final SQLite operation.
+PASSIVE busy/partial results are contention: record progress, rearm, and retry.
+Emergency TRUNCATE is bounded and observable. Failure rearms the blocker and
+leaves watch alive in a degraded non-checkpointing state.
 
-### Uploader, ownership, and outage rules
+### Startup, ownership, and publication
 
-The uploader scans persistent pending records at startup and periodically,
-uploads immutable bytes idempotently, verifies any existing key byte-for-byte,
-and advances visibility only across a contiguous verified chain with an
-available snapshot base. Retry is bounded-backoff from disk. Cloud failures
-produce `remote_lag`, not watcher termination, while the spool is healthy.
+First startup must successfully verify remote absence or the existing legacy or
+native head before creating local identity. With a complete matching spool, a
+watcher may restart and stage offline only atop its last verified remote
+base/lineage. Missing or mismatched identity/base is a loud offline refusal.
+Reconnect verifies the recorded remote predecessor before every publication.
+An incompatible advanced head retains the spool and hard-fails publication as
+split brain; it is never rebased or overwritten. This is crash fencing and CAS
+equivocation protection, not a distributed lease, and does not make concurrent
+offline multi-host ownership safe.
 
-First startup without a complete matching local identity/base must verify remote
-absence or an existing native descriptor; unavailable remote storage is a hard
-startup failure. A watcher may stage offline only atop its last verified remote
-base/lineage. Reconnect revalidates the recorded predecessor through CAS/fencing.
-An incompatible remote head is split brain: retain the spool and stop
-publication without rebasing or overwriting. The design does not claim safe
-offline multi-host ownership without a renewable distributed lease.
+The uploader scans pending disk records at startup and periodically, retries
+with bounded backoff, and accepts only nonblocking/coalesced wake notifications.
+Dead/full notification channels cannot impede local admission. Cloud errors set
+a loud `remote_lag` state while local capture continues. Initial, periodic,
+max-changes, idle/max-interval, downtime, and dirty-window snapshots all enter
+this same native spool before upload.
 
-### Capacity, restore, prune, and shutdown
+### Capacity, restore, pruning, and shutdown invariants
 
-Capacity accounts for live WAL, shadow frames, HADBP temporary and installed
-payloads, snapshot temporaries, journal rewrite peak, and filesystem reserve.
-The configured spool filesystem is measured directly and per-database paths use
-a length-prefixed collision-safe identity digest. Warning and hard states emit
-distinct `local_spool_high` and `local_spool_full` signals. At hard capacity
-the blocker stays held and no pending object/base is deleted.
+Capacity accounts for the live WAL, fsynced shadow, HADBP encode temporary,
+installed payload, journal/intents, and a filesystem free-space reserve (on the
+actual custom spool filesystem). No full SQLite stable-copy or rollback-journal
+transient is part of native watcher snapshots. A warning watermark emits
+`local_spool_high`; hard capacity/reserve emits `local_spool_full`, retains the
+blocker, stops checkpointing, and keeps watch alive. `remote_lag` is separate.
+Pending objects and the only local snapshot base are never capacity victims.
 
-Local restore accepts only a complete matching native spool chain. Remote
-restore accepts only the contiguous published cursor. Prune never removes a
-remote base needed by unpublished local descendants. Graceful shutdown has an
-optional bounded cloud drain and SIGKILL recovery always starts from disk.
+Local restore may traverse a complete journal-verified native chain without S3.
+Remote restore exposes only descriptor-selected contiguous publish records.
+Pruning cannot remove a legacy/native base referenced by unpublished local
+descendants. Graceful shutdown never deletes pending work.
 
-### Revert-proof proof matrix
+Native-v1 retention uses immutable, versioned snapshot-floor records:
 
-Required call-site proofs:
+```
+{prefix}{db}/native/v1/retention/v1/{snapshot_seq:016x}.json
+```
 
-- default local release with a paused real uploader checkpoints and bounds WAL
-  while the remote object remains absent;
-- resuming that uploader publishes the exact staged bytes and restores row-exact
-  with `integrity_check=ok`;
-- remote release waits for contiguous publication;
-- removing journal admission prevents checkpoint release;
-- SIGKILL recovery covers every durability boundary;
-- offline restart/reconnect publishes in order; divergent remote head is rejected;
-- repeated snapshots do not collide and divergent sequence bytes fail;
-- full/dead notification channels do not block ingestion;
-- partial PASSIVE and failed TRUNCATE retain the blocker;
-- warning/full capacity and custom multi-database spool paths are exercised;
-- fresh native latest/PITR, pruning, verify, replicate, and local restore are
-  tested from the user-facing CLI;
-- DF1/DF2, app TRUNCATE underneath, WAL backpressure, racing checkpoint,
-  fenced follower, two-writer, and SIGKILL gates remain green;
-- injected S3 latency increases remote lag but not local checkpoint latency.
+A floor record binds the stream digest, lineage, snapshot sequence, exact
+snapshot publish-record digest, and that snapshot record's predecessor digest.
+Readers select the highest canonical floor, verify its publish record and exact
+HADBP snapshot payload, then traverse the normal contiguous publish chain from
+that snapshot. Publishing a floor is create-if-absent and exact-idempotent.
+Only after the new floor reproduces the prior visible head may prune delete
+older publish records and their payloads. A crash before the floor leaves the
+old chain authoritative; a crash after the floor leaves either extra old bytes
+or a complete new recovery base. A missing object at or above the selected
+floor remains corruption. A PIT below the floor is reported as intentionally
+expired, not as a chain gap.
 
-For every load-bearing gate, neuter its production call site, record the test
-failure, restore it, and rerun green. Live cloud gates use unique Tigris prefixes
-and cleanup only those prefixes.
+For CLI native-v1, a full native snapshot is the compaction output. The
+`compact` compatibility command already routes to retention pruning, so native
+compaction means: publish a normal durable spool snapshot, advance a verified
+retention floor according to policy, then delete history below it. Native-v1
+does not write `levels/L*`, merge immutable publish records, reuse legacy LTX
+identities, or mutate a delta in place. The `[compaction]` leveled-engine knob
+remains rejected in default shadow mode because it controls a different layout;
+the normal snapshot triggers plus native retention implement this stream's
+compaction model without changing Phase 2 semantics.
 
-### Native-only cutover status (2026-07-16)
+### Mandatory proof and PR disposition
 
-- [x] Remove active LTX writer/restore/cache/uploader/manifest modules.
-- [x] Remove independent-task and cache CLI/config surfaces.
-- [x] Remove the broken one-shot/Python snapshot surface rather than bypass the
-      mandatory native spool and checkpoint state machine.
-- [x] Make watch, restore, verify, prune, replicate, and list native-v1 only.
-- [x] Remove the LTX range compaction adapter; retain native SeqLayout compaction.
-- [x] Remove unpublished local spool compatibility states/path fallbacks.
-- [x] Re-enable native watcher call-site tests (no disabled historical module).
-- [x] Port production E2E invocations and operational drills to native flags/keys.
-- [x] Finish source/doc/fixture inventory; the retired binary fixture is package-excluded and no LTX code/artifact is shipped.
-- [x] Run every narrow native unit/integration target and all mandatory E2E gates.
-- [x] Run live Tigris pause/resume, outage/reconnect, split-brain, PITR, pruning,
-      restore, verify, and latency gates with unique prefixes.
-- [x] Perform a fresh independent adversarial review and apply all findings.
-- [x] Run replacement CI to green, then stop for user merge.
+Add call-site-revert-proof tests for local admission versus the old remote gate,
+remote policy, every crash boundary, orphan adoption/divergence, paused/dead
+uploader, offline restart/reconnect conflict, repeated snapshots, PASSIVE busy,
+capacity/custom paths, native latest/PITR, legacy migration latest/old PITR, and
+exact restore/integrity. Preserve DF1/DF2, app checkpoint, WAL backpressure,
+two-writer/fencing, racing checkpoint, SIGKILL, strict WAL header, native chain,
+S3 gating, and frozen 0.7 fixtures unchanged. Measure local stage/fsync,
+checkpoint time, upload time, remote lag, WAL bytes, spool bytes, and free space;
+injected PUT delay may increase lag but not local checkpoint latency.
 
-## Compaction (native library/owned mode only — default off)
+Amend PR #43 with atomic commits. Do not change Phase 2 independent semantics,
+PR #42, or PRs #40/#41; do not merge. After implementation, use a fresh
+independent reviewer/fixer on this worktree, run replacement CI and required
+unique-prefix live-Tigris gates, clean only those prefixes, and stop for the user
+to merge.
 
-The retained `SeqLayout` compaction engine is native HADBP and belongs to the
-public library/owned protocol. The native-v1 CLI stream uses full snapshot
-boundaries plus retention-floor pruning and does not publish `levels/L*`.
-`walrust watch` fails loudly when `[compaction] enabled = true`; the removed
-independent-task/LTX path is not an escape hatch. Extending compaction to the
-versioned native-v1 descriptor/publication protocol is separate future work.
+### PR #43 adversarial remediation gate — complete 2026-07-14
 
-### Retired historical record
+Two independent adversarial passes are closed. The second pass specifically
+proved and fixed seven gaps left by the first completion claim:
 
-The remainder of this section records pre-cutover compaction work and incidents.
-References to independent-task watch, LTX, range layout, migration seams, old
-drills, or removed modules describe deleted code and are not a current protocol
-or implementation specification.
+- every configured database is checkpoint-pinned before S3 client creation or
+  discovery, then unconditionally rearmed as the final startup SQLite action;
+- SIGTERM at local admission failure retries with the blocker held, and only a
+  deliberate SIGKILL forces an incomplete local shutdown;
+- an atomic fsynced shadow durable-tail marker, not frame alignment, defines the
+  restart-safe prefix;
+- snapshot preflight uses the exact fsynced shadow commit boundary and reserves
+  HADBP temporary/installed, journal, intent, source, and filesystem peaks;
+- ordinary object admission reserves install-intent and complete journal
+  rewrite peaks as well as payload bytes;
+- an advisory spool owner lock makes active local restore fail loudly and keeps
+  mutating recovery out of watcher write windows; offline restore remains exact;
+- v2 local paths length-prefix every identity component, discover matching v1
+  spools, reject duplicate v1/v2 ownership, and route a colliding foreign v1
+  tuple to its distinct v2 path.
+
+The live user-path gates cover startup discovery delay plus app TRUNCATE,
+shutdown at hard capacity and restart, WAL-grown snapshots on a custom spool,
+and active-refusal/offline local restore. The shadow SIGKILL matrix covers both
+sides of its fsync marker. Narrow tests construct an aligned pre-fsync crash
+image and adversarial identity segmentation collision. Each new call site was
+neutered and failed before restoration. See `CHANGELOG.md` and the atomic PR
+history for the proof ledger. The user retains merge authority.
+
+The final independent follow-up also closes upgrade and live-error boundaries:
+markerless shadow directories are never adopted as durable merely because they
+are aligned, but are discarded and rotated into a full-snapshot cursor domain;
+failed live appends restore both the fsynced marker/file boundary and the WAL
+checksum/generation cursor before retry. Native snapshots now use the
+Litestream-shaped page-selection proof directly: latest page from the exact
+fsynced shadow commit prefix, otherwise the main DB, encoded immediately as
+HADBP. This removes the SQLite Backup/VACUUM handoff, its full stable-copy and
+rollback-journal transients, and the possibility of binding a later SQLite
+snapshot to an older shadow cursor. Live gates pin the frozen-cursor exclusion,
+markerless snapshot→new-generation-delta path, and blocked application
+TRUNCATE with exact restore.
+
+The closing scheduled-retention audit found one more call-site gap: both shadow
+watch retention timers still invoked a legacy-only helper even though the
+interactive prune command already enforced native migration and floor rules.
+Both timers now call the same native-aware implementation. A valid native
+descriptor with no contiguous published snapshot base preserves every legacy
+object (disabling that guard deletes an asserted recovery object), while a live
+Tigris watcher producing repeated native snapshots automatically advances a
+verified native floor and still restores latest row-exact with
+`integrity_check = ok` (disabling the watcher call site leaves the floor at 1
+and fails). The watcher also checks its durable local migration journal before
+either remote prune call: while the first native snapshot is pending and even
+`stream.json` is absent, it preserves the legacy base. The gate opens only once
+the contiguous remote cursor covers native publication and a retained published
+snapshot exists; it remains open after safe local cleanup removes the original
+first snapshot. Neutering this pre-descriptor guard deletes the asserted legacy
+object. Replacement-CI hardening also made the legacy cursor fixtures write
+fsynced generation files plus their durable-tail marker, and made the snapshot
+handoff proof wait boundedly for the durable-delta observation after exact
+remote restore instead of racing log visibility.
+
+The direct-snapshot pivot has its own call-site proof ledger. Disabling the
+shadow-page-over-main selection made the frozen-boundary restore test fail on a
+page that exists only in WAL. Disabling exact prewritten-temp installation made
+the inode/byte-identity admission test reject a divergent rewrite. Skipping the
+durable snapshot-source intent made the default-local checkpoint test fail
+before release. Deleting a complete fsynced temp instead of adopting it made the
+pre-install-intent crash test fail; restoring production adoption returned it
+green. The first live frozen-cursor run also caught Tokio's immediate first
+snapshot-timer tick producing a second snapshot where the next recovery object
+had to be a delta; consuming that initial tick fixes the production call site
+without weakening the assertion. The live markerless-upgrade gate then exposed
+that discarded shadow bytes still left their old `wal_copy_offset` in progress;
+direct page selection correctly failed when a WAL-only page was absent from the
+shorter main DB. Markerless recovery now ignores that stale offset and
+checksum-recopies the pinned live WAL from zero before its native snapshot
+re-anchor, with a focused unit regression and the unchanged live restore gate.
+
+The macOS DF2 rerun exposed a further Litestream-shaped lock invariant: direct
+snapshot encoding reopened and closed the main database after blocker
+acquisition. On non-OFD POSIX locks that close invalidated SQLite's process
+locks even though the blocker transaction still appeared live. Watch startup
+now opens one source descriptor before any blocker and native snapshots reuse
+it until shutdown closes blocker, monitor, then descriptor. Neutering only that
+production call site made unchanged live DF2 fail immediately with
+`first_checkpoint=(1,5,4)` and a zero-byte WAL after every short-lived writer;
+restoring descriptor reuse returned DF2, DF1, app-TRUNCATE, paused-uploader,
+remote-release, partial-PASSIVE, and legacy-migration live gates to green.
+
+The final fresh review closed the remaining controlled-handoff gap. The old
+path sampled `data_version`, closed and replaced that monitor, then let the new
+blocker connection commit its own heartbeat. An application commit plus
+TRUNCATE in that interval could disappear while the replacement heartbeat made
+the later state look clean. The retained pre-blocker monitor now commits the
+heartbeat itself, so its own `data_version` remains unchanged; the existing
+already-last-opened blocker connection then reacquires the read mark without a
+source-handle close/open, and any application commit across the full handoff
+forces the journaled snapshot re-anchor. Candidate release additionally
+requires `data_version` to remain stable for a bounded 500ms interval; commits
+inside it are drained and admitted before release, and eight busy intervals
+defer checkpointing with the blocker held. Deterministic tests separately
+commit+TRUNCATE after the final sample and commit during the quiet interval;
+neutering either post-rearm detection or the second quiet sample fails its
+gate. Three consecutive live-Tigris DF1 runs then stayed at the single startup
+snapshot. The same pass made local PIT restore fall through to remote history
+below a cleaned local snapshot base and removed failed legacy-migration
+verification scratch files durably.
+
+Replacement CI then exposed one final startup/shutdown ordering gap: the
+watcher installed its SIGTERM stream only after initial native snapshot work.
+A signal arriving after that snapshot's durable admission but before the main
+select loop therefore took the OS default and skipped shutdown admission. The
+handler is now registered at watcher entry, before remote discovery and all
+snapshot work, so such a signal is queued for the normal bounded shutdown path.
+The pre-fix full-CI run failed the existing live
+`e2e_cli_sigkill_during_graceful_shutdown_recovers_pending_native_work` gate at
+that exact boundary; the same named live-Tigris test is green after the fix.
+
+The final branch-scope comparison against PR #42 also removed an obsolete
+pre-native detour: the original PR #43 blocker work had added source-close
+callbacks and `VACUUM INTO` staging to the shared legacy-LTX snapshot writer.
+Once default shadow watch moved fully to native HADBP those callbacks had no
+production caller, but they still changed Phase 2 independent-mode behavior.
+The legacy writer, wrapper, and integration target are now exactly the PR #42
+versions, and the unused legacy backpressure/re-anchor extension is deleted.
+The restored independent integration target and the native `watch_shadow`
+slice both pass, proving the cleanup changes scope rather than native behavior.
+
+---
+
+## Compaction (shipped — default off)
+
+**Status: SHIPPED behind `[compaction] enabled` (default `false`).** All five
+waves (C1 format, C2a engine, C2b planner/read-side, C3a CLI wiring, C3b proof
+layer) are merged; compaction works end to end for both the CLI and owned mode.
+The default staying `false` is a version-skew safety choice (an old binary
+cannot restore a leveled bucket); **flipping the default to `true` is a separate
+release decision** for once every binary that might restore a bucket understands
+the `levels/` layout.
+
+**Shadow-loop guard (C3b adversarial review): leveled compaction only ticks in
+the independent-tasks watch loop.** The default shadow loop has no compaction
+tick, so rather than silently ignore `[compaction] enabled = true` (a config
+no-op that would let a bucket the operator believes is compacting grow
+unbounded — an E7 fail-loudly violation), `walrust watch` now **refuses to
+start** in shadow mode with compaction enabled and points the operator at
+`--independent-tasks`. Unit-tested (`shadow_watch_rejects_enabled_compaction`);
+the drill and bench both run `--independent-tasks`.
+
+**Non-blocking residue** (small future items, not shipped in C3b): the C3a
+reviewer's note that the legacy L0→L1 idempotency path in
+`engine::verify_existing` re-reads the last source's full bytes to recompute
+`chain_end` (an extra bounded GET on the crash-recovery convergence path only —
+correct, just not the cheapest). Wiring a compaction tick into the shadow loop
+itself (so it need not sever) is possible future work, but not required for
+correctness now that the sever is loud.
 
 **Residue (e2e gap closure): `replicate` stays levels-blind by design.**
 `walrust replicate` only tails the flat gen-0 incremental pool; it never reads
@@ -724,6 +1098,22 @@ anything it covers.
   and the DST oracle models the window exactly. Suggested defensive
   narrowing: reverse the truncate/put order — critical-path work, take it
   deliberately.
+- **R4 — legacy CLI snapshots still go through `VACUUM INTO`.** The owned-mode
+  snapshot paths (`sync::take_snapshot` / `take_snapshot_with_retry`) were
+  fixed to encode the checkpointed main file directly, because VACUUM can
+  renumber b-tree/overflow pages and later WAL-frame incrementals then target
+  the wrong physical pages in the restored image (proven: reverting the owned
+  fix makes `public_owned_resume_round_trips_lineaged_mixed_workload` fail
+  integrity_check with a broken overflow chain and orphan pages). The legacy
+  CLI path (`legacy_ltx.rs` `StableSqliteSnapshot::create`) still snapshots
+  via `VACUUM INTO`, and its incrementals are also physical WAL frames of the
+  live layout — the same hazard class, unproven either way for legacy.
+  Trigger: a fragmented database whose vacuumed page layout differs from the
+  live layout, plus post-snapshot incrementals, then restore. Drills have not
+  hit it (append-heavy workloads vacuum to a near-identical layout).
+  Suggested fix: check whether the legacy checkpoint story pins the main file
+  the way owned mode's blocker does, and if so make the same swap there — its
+  own careful wave with a fragmented-layout regression test, not a drive-by.
 
 ## Future Considerations (v1.0+)
 

@@ -93,7 +93,7 @@ fn test_circuit_breaker_has_webhook_field() {
         secret: Some("test-secret".to_string()),
     }];
 
-    let _webhook_sender = Arc::new(WebhookSender::new(webhooks));
+    let webhook_sender = Arc::new(WebhookSender::new(webhooks));
     let config = RetryConfig::default();
     let policy = RetryPolicy::new(config);
 
@@ -216,7 +216,7 @@ async fn test_webhook_notify_corruption() -> Result<()> {
 
     // Send notification
     sender
-        .notify_corruption("test-database", "Checksum mismatch in file xyz.hadbp")
+        .notify_corruption("test-database", "Checksum mismatch in file xyz.ltx")
         .await;
 
     // Give webhook time to be received

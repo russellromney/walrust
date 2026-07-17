@@ -1580,7 +1580,7 @@ async fn external_same_seq_changeset_checksum(
 use crate::external_delta::{self, DeltaPayloadV1};
 
 /// File extension for fenced delta envelope objects. Distinct from the
-/// unlineaged `.hadbp` extension so the two never collide in one prefix and a
+/// legacy `.hadbp` extension so the two never collide in one prefix and a
 /// follower can tell them apart from a plain listing.
 const DELTA_ENVELOPE_EXT: &str = "tlmd";
 
@@ -1705,7 +1705,7 @@ pub async fn publish_delta_envelope(
 ///
 /// Decodes each envelope so callers can read the full tuple for
 /// filtering + chain verification. Skips non-`.tlmd` objects (e.g.
-/// unlineaged `.hadbp` leftovers). Does **not** filter by epoch/writer or
+/// legacy `.hadbp` leftovers). Does **not** filter by epoch/writer or
 /// verify the chain — that is the integration layer's responsibility.
 pub async fn list_delta_envelopes_after(
     storage: &dyn StorageBackend,
@@ -1845,7 +1845,7 @@ pub struct FencedFollowerResult {
 /// 5. **Byte-identity chain** — the recomputed BLAKE3 of the re-encoded
 ///    payload must equal the checksum discovery reported for the stored bytes.
 ///
-/// Only then is the native HADBP payload applied with the running DB checksum threaded
+/// Only then is the LTX payload applied with the running DB checksum threaded
 /// through [`ltx::apply_changeset_to_db`], whose own chain verify catches any
 /// base/page divergence. Every fence rejection is a typed
 /// [`WalrustError::Integrity`] whose message names the fence, and the function
@@ -1938,7 +1938,7 @@ pub async fn reconstruct_fenced_follower(
     })
 }
 
-/// Read pending WAL frames, encode them as a native HADBP changeset, wrap in a
+/// Read pending WAL frames, encode them as an LTX changeset, wrap in a
 /// fenced TLM_DELTA envelope, and publish.
 ///
 /// This is the fenced-envelope analogue of [`sync_wal_after_external_base`].
@@ -2251,10 +2251,11 @@ pub async fn restore(
         let plan = match crate::compaction::plan_restore(&candidates, snapshot.seq, target) {
             Ok(plan) => plan,
             Err(e) => {
-                // A later full snapshot absorbing the target is granularity
-                // decay, not a missing object.
+                // Same decay refinement as the legacy path: a later full
+                // snapshot absorbing the target is granularity decay, not a
+                // missing object.
                 //
-                // E10 sibling: classify a target inside a compacted window as
+                // E10 sibling: same rule as `legacy_restore` — classifying
                 // gap-vs-decay REQUIRES a complete snapshot listing. Swallowing
                 // a transient LIST here (`.ok()`) read as "no later snapshot
                 // absorbs the target", collapsing the typed RestoreNotFound
@@ -2273,7 +2274,7 @@ pub async fn restore(
                 .filter(|m| *m > snapshot.seq)
                 .collect();
                 let refined = crate::compaction::refine_gap_with_snapshot_spans(e, &later, target);
-                // Same typing rule as the unlineaged path: decay -> RestoreNotFound,
+                // Same typing rule as the legacy path: decay -> RestoreNotFound,
                 // genuine gap -> restore error.
                 let err = if matches!(
                     refined,
@@ -5655,9 +5656,9 @@ mod tests {
     #[tokio::test]
     async fn list_skips_non_tlmd_objects() {
         let storage = MutStorage::new();
-        // An unlineaged .hadbp object in the same directory must be ignored.
+        // A legacy .hadbp object in the same directory must be ignored.
         storage
-            .put("wal/db/0000/0000000000000001.hadbp", b"raw-hadbp")
+            .put("wal/db/0000/0000000000000001.hadbp", b"legacy-ltx")
             .await
             .unwrap();
         let p = delta_payload(2, 5, "w", vec![9]);

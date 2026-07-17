@@ -1,98 +1,30 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
 use hadb_storage_s3::S3Storage;
-use std::ffi::OsString;
 use std::fs::{self, File};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
+use walrust_core::legacy_replica;
 
-use super::types::ReplicaState;
 use crate::errors::{classify_or_else, WalrustError};
-use crate::s3::create_client;
+#[cfg(test)]
+use crate::ltx;
+use crate::s3::{self, create_client};
+
+use super::manifest::{discover_all_ltx_from_s3, DiscoveredLtx};
+use super::types::ReplicaState;
 
 fn fsync_parent_dir(path: &Path) -> Result<()> {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     File::open(parent)
-        .map_err(|error| {
+        .map_err(|e| {
             anyhow!(
-                "failed to open directory {} for fsync: {error}",
+                "failed to open directory {} for fsync: {e}",
                 parent.display()
             )
         })?
         .sync_all()
-        .map_err(|error| anyhow!("failed to fsync directory {}: {error}", parent.display()))
-}
-
-fn sqlite_sidecar_path(path: &Path, suffix: &str) -> PathBuf {
-    let mut value = OsString::from(path.as_os_str());
-    value.push(suffix);
-    PathBuf::from(value)
-}
-
-fn remove_replica_staging(tmp: &Path) -> Result<()> {
-    let mut removed = false;
-    for path in [
-        tmp.to_path_buf(),
-        sqlite_sidecar_path(tmp, "-wal"),
-        sqlite_sidecar_path(tmp, "-shm"),
-    ] {
-        match fs::remove_file(&path) {
-            Ok(()) => removed = true,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    if removed {
-        fsync_parent_dir(tmp)?;
-    }
-    Ok(())
-}
-
-fn ensure_replica_replace_safe(local: &Path) -> Result<()> {
-    for sidecar in [
-        sqlite_sidecar_path(local, "-wal"),
-        sqlite_sidecar_path(local, "-shm"),
-    ] {
-        match fs::symlink_metadata(&sidecar) {
-            Ok(_) => {
-                return Err(WalrustError::restore(format!(
-                    "refusing to replace native replica {} while SQLite sidecar {} exists",
-                    local.display(),
-                    sidecar.display()
-                ))
-                .into())
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    Ok(())
-}
-
-fn validate_replica_identity(
-    state: &ReplicaState,
-    source_identity: &str,
-    visible: &walrust_core::native_restore::NativeVisibleState,
-    local: &Path,
-) -> Result<()> {
-    if state.source != source_identity
-        || state.stream_digest != visible.stream_digest
-        || state.lineage_id != visible.lineage_id
-    {
-        return Err(WalrustError::restore(format!(
-            "native replica source identity changed for {}; refusing to keep a database from another stream/lineage",
-            local.display()
-        ))
-        .into());
-    }
-    if visible.head_seq < state.current_txid {
-        return Err(WalrustError::restore(format!(
-            "native replica remote head regressed from {} to {}",
-            state.current_txid, visible.head_seq
-        ))
-        .into());
-    }
-    Ok(())
+        .map_err(|e| anyhow!("failed to fsync directory {}: {e}", parent.display()))
 }
 
 pub async fn replicate(
@@ -101,263 +33,513 @@ pub async fn replicate(
     interval: Duration,
     endpoint: Option<&str>,
 ) -> Result<()> {
+    // Parse source: "s3://bucket/prefix/dbname" or "s3://bucket/dbname"
     let source = source.strip_prefix("s3://").unwrap_or(source);
-    let (bucket, path) = source.split_once('/').ok_or_else(|| {
-        WalrustError::config(
+    let parts: Vec<&str> = source.splitn(2, '/').collect();
+    if parts.len() < 2 {
+        return Err(WalrustError::config(
             "Invalid source format. Expected: s3://bucket/dbname or s3://bucket/prefix/dbname",
         )
-    })?;
-    let (prefix, database) = match path.rsplit_once('/') {
-        Some((prefix, database)) => (format!("{prefix}/"), database.to_string()),
-        None => (String::new(), path.to_string()),
-    };
-    if database.is_empty() {
-        return Err(WalrustError::config("native replica source database name is empty").into());
+        .into());
     }
 
+    let bucket_name = parts[0];
+    let path_part = parts[1];
+
+    // Split path into prefix and dbname (last component is dbname)
+    let (prefix, db_name) = if let Some(idx) = path_part.rfind('/') {
+        let p = &path_part[..=idx]; // Include trailing slash
+        let n = &path_part[idx + 1..];
+        (p.to_string(), n.to_string())
+    } else {
+        (String::new(), path_part.to_string())
+    };
+
+    // Single-writer guard: only one walrust instance may own the local replica
+    // target on this host (E5). Held for the lifetime of the replication loop.
     let _db_lock = crate::lock::DbLock::acquire(local)?;
+
     let client = create_client(endpoint)
         .await
-        .map_err(|error| classify_or_else(error, WalrustError::s3))?;
-    let source_identity = format!("s3://{bucket}/{prefix}{database}");
-    let mut replica_state = read_replica_state(local)?;
-    match (local.exists(), replica_state.is_some()) {
-        (true, false) => {
-            return Err(WalrustError::restore(format!(
-                "native replica database {} exists without its identity-bound state file",
-                local.display()
-            ))
-            .into())
-        }
-        (false, true) => {
-            return Err(WalrustError::restore(format!(
-                "native replica state exists but database {} is missing",
-                local.display()
-            ))
-            .into())
-        }
-        _ => {}
-    }
-    println!(
-        "Replicating native-v1 s3://{}/{}{} -> {}",
-        bucket,
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+
+    tracing::info!(
+        "Starting replica: source=s3://{}/{}{}, local={}",
+        bucket_name,
         prefix,
-        database,
+        db_name,
         local.display()
     );
 
+    // Track current TXID (0 = not yet initialized)
+    let mut current_txid: u64 = 0;
+
+    // Check if local database exists
+    if local.exists() {
+        // Try to determine current TXID from local state file
+        let state_path = local.with_extension("db-replica-state");
+        if state_path.exists() {
+            if let Ok(data) = std::fs::read_to_string(&state_path) {
+                if let Ok(state) = serde_json::from_str::<ReplicaState>(&data) {
+                    current_txid = state.current_txid;
+                    tracing::info!("Resuming replica from TXID {}", current_txid);
+                }
+            }
+        }
+    }
+
+    println!(
+        "Replicating s3://{}/{}{} -> {}",
+        bucket_name,
+        prefix,
+        db_name,
+        local.display()
+    );
+    println!("Poll interval: {:?}", interval);
+    println!("Press Ctrl+C to stop\n");
+
+    // Main replication loop
     loop {
         match replicate_poll(
             &client,
-            bucket,
+            bucket_name,
             &prefix,
-            &database,
-            &source_identity,
+            &db_name,
             local,
-            &mut replica_state,
+            &mut current_txid,
         )
         .await
         {
-            Ok(true) => println!(
-                "[{}] Published native sequence {} locally",
-                chrono::Local::now().format("%H:%M:%S"),
-                replica_state
-                    .as_ref()
-                    .map(|state| state.current_txid)
-                    .unwrap_or(0)
-            ),
-            Ok(false) => {}
-            Err(error) => {
-                tracing::error!(error = %error, "native replica poll failed");
-                eprintln!(
-                    "[{}] Error: {error:#}",
-                    chrono::Local::now().format("%H:%M:%S")
-                );
+            Ok(applied) => {
+                if applied > 0 {
+                    println!(
+                        "[{}] Applied {} LTX file(s), now at TXID {}",
+                        chrono::Local::now().format("%H:%M:%S"),
+                        applied,
+                        current_txid
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::error!("Replication error: {}", e);
+                eprintln!("[{}] Error: {}", chrono::Local::now().format("%H:%M:%S"), e);
             }
         }
+
         tokio::time::sleep(interval).await;
     }
 }
 
+/// Single poll iteration for replication
 async fn replicate_poll(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,
-    database: &str,
-    source_identity: &str,
+    db_name: &str,
     local: &Path,
-    replica_state: &mut Option<ReplicaState>,
-) -> Result<bool> {
-    let tmp = local.with_extension("db-native-replica.tmp");
-    let storage = S3Storage::new(client.clone(), bucket.to_string());
-    let visible =
-        walrust_core::native_restore::inspect_native_v1(&storage, bucket, prefix, database)
-            .await?
-            .ok_or_else(|| {
-                WalrustError::restore(format!(
-                    "no native-v1 HADBP recovery stream found for '{database}'"
-                ))
-            })?;
-    if let Some(state) = replica_state.as_ref() {
-        validate_replica_identity(state, source_identity, &visible, local)?;
-    }
-    // This path is private replica staging, never the user-visible database.
-    // A crash after a successful restore but before the atomic swap may leave
-    // it behind; remote immutable objects can deterministically rebuild it.
-    remove_replica_staging(&tmp)?;
-    let availability = walrust_core::native_restore::restore_native_v1(
-        &storage, bucket, prefix, database, &tmp, None,
+    current_txid: &mut u64,
+) -> Result<usize> {
+    let native_tmp = local.with_extension("db-native-replica.tmp");
+    let native_storage = S3Storage::new(client.clone(), bucket.to_string());
+    match walrust_core::native_restore::restore_native_v1(
+        &native_storage,
+        bucket,
+        prefix,
+        db_name,
+        &native_tmp,
+        None,
     )
-    .await?;
-    let seq = match availability {
-        walrust_core::native_restore::NativeRestoreAvailability::Restored { seq } => seq,
-        _ => {
-            return Err(WalrustError::restore(format!(
-                "no native-v1 HADBP recovery stream found for '{database}'"
-            ))
-            .into())
-        }
-    };
-    if replica_state
-        .as_ref()
-        .is_some_and(|state| seq <= state.current_txid)
-        && local.exists()
+    .await?
     {
-        let _ = fs::remove_file(&tmp);
-        return Ok(false);
+        walrust_core::native_restore::NativeRestoreAvailability::Restored { seq } => {
+            if seq <= *current_txid && local.exists() {
+                let _ = fs::remove_file(&native_tmp);
+                return Ok(0);
+            }
+            fs::rename(&native_tmp, local)?;
+            fsync_parent_dir(local)?;
+            *current_txid = seq;
+            save_replica_state(local, seq)?;
+            return Ok(1);
+        }
+        walrust_core::native_restore::NativeRestoreAvailability::LegacyOnly
+        | walrust_core::native_restore::NativeRestoreAvailability::LegacyPoint { .. } => {}
     }
-    ensure_replica_replace_safe(local)?;
-    fs::rename(&tmp, local)?;
-    fsync_parent_dir(local)?;
+
+    // Discover LTX files from the S3 listing. The production watch path writes
+    // litestream-format objects and never a manifest.json, so reading a
+    // manifest made replicate fail with "No LTX files found" (F6).
+    let files = discover_all_ltx_from_s3(client, bucket, prefix, db_name)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+
+    if files.is_empty() {
+        return Err(WalrustError::restore_not_found(format!(
+            "no LTX files found in S3 for '{}'",
+            db_name
+        ))
+        .into());
+    }
+
+    // If we haven't initialized yet (current_txid = 0), bootstrap from snapshot
+    if *current_txid == 0 || !local.exists() {
+        let snapshot = latest_snapshot(&files).ok_or_else(|| {
+            WalrustError::restore_not_found("snapshot unavailable for replica bootstrap")
+        })?;
+        bootstrap_replica_from_snapshot(client, bucket, local, snapshot).await?;
+        // After bootstrap, current_txid is the snapshot's max_txid
+        *current_txid = snapshot.max_txid;
+        save_replica_state(local, *current_txid)?;
+        return Ok(1);
+    }
+
+    // Find incremental LTX files we need to apply (min_txid > current_txid)
+    let mut incrementals: Vec<_> = files
+        .iter()
+        .filter(|f| !f.is_snapshot && f.min_txid > *current_txid)
+        .collect();
+
+    // Also check for newer snapshots that might be more efficient
+    // (e.g., if we're very far behind, a snapshot might be faster)
+    let latest_snapshot = latest_snapshot(&files);
+
+    // If there's a snapshot newer than our position + all incrementals we'd apply,
+    // and we're far behind, consider using the snapshot instead
+    if let Some(snap) = latest_snapshot {
+        if snap.max_txid > *current_txid && incrementals.is_empty() {
+            // We're behind but no incrementals bridge the gap - need snapshot
+            tracing::info!(
+                "Gap detected: at TXID {}, latest snapshot at TXID {}. Re-bootstrapping.",
+                current_txid,
+                snap.max_txid
+            );
+            bootstrap_replica_from_snapshot(client, bucket, local, snap).await?;
+            *current_txid = snap.max_txid;
+            save_replica_state(local, *current_txid)?;
+            return Ok(1);
+        }
+    }
+
+    if incrementals.is_empty() {
+        return Ok(0); // No new data
+    }
+
+    // Sort by min_txid to apply in order
+    incrementals.sort_by_key(|f| f.min_txid);
+
+    let mut applied = 0;
+
+    for ltx_entry in incrementals {
+        // Verify continuity: min_txid must be exactly current_txid + 1.
+        if ltx_entry.min_txid != *current_txid + 1 {
+            let gap_snapshot = files
+                .iter()
+                .filter(|f| f.is_snapshot)
+                .filter(|f| f.max_txid >= ltx_entry.min_txid)
+                .max_by_key(|f| f.max_txid)
+                .ok_or_else(|| {
+                    WalrustError::restore(format!(
+                        "TXID gap in incremental chain (expected {}, got {} at {}) and no \
+                         snapshot at or past TXID {} is available to re-bootstrap from",
+                        *current_txid + 1,
+                        ltx_entry.min_txid,
+                        ltx_entry.key,
+                        ltx_entry.min_txid
+                    ))
+                })?;
+            tracing::warn!(
+                "TXID gap in incremental chain: expected {}, got {}. Re-bootstrapping from \
+                 snapshot at TXID {}.",
+                *current_txid + 1,
+                ltx_entry.min_txid,
+                gap_snapshot.max_txid
+            );
+            bootstrap_replica_from_snapshot(client, bucket, local, gap_snapshot).await?;
+            *current_txid = gap_snapshot.max_txid;
+            save_replica_state(local, *current_txid)?;
+            return Ok(1);
+        }
+
+        tracing::debug!("Downloading incremental: {}", ltx_entry.key);
+
+        let ltx_data = s3::download_bytes(client, bucket, &ltx_entry.key)
+            .await
+            .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+        let apply_result = apply_incremental_atomically(&ltx_data, local)
+            .map_err(|e| classify_or_else(e, WalrustError::integrity))?;
+
+        tracing::info!(
+            "Applied {} (TXID {}-{}, checksum: {:016x})",
+            ltx_entry.key,
+            apply_result.header.min_txid.into_inner(),
+            apply_result.header.max_txid.into_inner(),
+            apply_result.post_apply_checksum.into_inner()
+        );
+
+        *current_txid = ltx_entry.max_txid;
+        applied += 1;
+
+        // Save state after each successful apply
+        save_replica_state(local, *current_txid)?;
+    }
+
+    Ok(applied)
+}
+
+/// Bootstrap replica from latest snapshot
+fn latest_snapshot(files: &[DiscoveredLtx]) -> Option<&DiscoveredLtx> {
+    files
+        .iter()
+        .filter(|f| f.is_snapshot)
+        .max_by_key(|f| f.max_txid)
+}
+
+async fn bootstrap_replica_from_snapshot(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    local: &Path,
+    snapshot: &DiscoveredLtx,
+) -> Result<()> {
+    tracing::info!(
+        "Bootstrapping replica from snapshot: {} (TXID: {})",
+        snapshot.key,
+        snapshot.max_txid
+    );
+
+    let ltx_data = s3::download_bytes(client, bucket, &snapshot.key)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+
+    let decode_result = legacy_replica::bootstrap_from_snapshot_bytes(&ltx_data, local)
+        .map_err(|e| classify_or_else(e, WalrustError::integrity))?;
+
+    println!(
+        "Bootstrapped from snapshot: {} pages, TXID {}, checksum: {:016x}",
+        decode_result.header.commit.into_inner(),
+        decode_result.header.max_txid.into_inner(),
+        decode_result.post_apply_checksum.into_inner()
+    );
+
+    Ok(())
+}
+
+fn apply_incremental_atomically(
+    ltx_data: &[u8],
+    local: &Path,
+) -> Result<walrust_core::legacy_ltx::ApplyResult> {
+    legacy_replica::apply_incremental_atomically(ltx_data, local)
+}
+
+/// Save replica state to local file
+fn save_replica_state(local: &Path, current_txid: u64) -> Result<()> {
+    let state_path = local.with_extension("db-replica-state");
     let state = ReplicaState {
-        source: source_identity.to_string(),
-        stream_digest: visible.stream_digest,
-        lineage_id: visible.lineage_id,
-        current_txid: seq,
+        current_txid,
         last_updated: Utc::now().to_rfc3339(),
     };
-    save_replica_state(local, &state)?;
-    *replica_state = Some(state);
-    Ok(true)
-}
-
-fn read_replica_state(local: &Path) -> Result<Option<ReplicaState>> {
-    let path = local.with_extension("db-replica-state");
-    let state = match std::fs::read_to_string(&path) {
-        Ok(state) => state,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    serde_json::from_str::<ReplicaState>(&state)
-        .map(Some)
-        .map_err(|error| {
-            anyhow!(
-                "native replica state {} is invalid; refusing an unbound resume: {error}",
-                path.display()
-            )
-        })
-}
-
-fn save_replica_state(local: &Path, state: &ReplicaState) -> Result<()> {
-    let state_path = local.with_extension("db-replica-state");
-    let tmp = state_path.with_extension("db-replica-state.tmp");
-    let bytes = serde_json::to_vec_pretty(state)?;
+    let data = serde_json::to_string_pretty(&state)?;
+    let tmp_path = state_path.with_extension("db-replica-state.tmp");
     {
+        let mut file = File::create(&tmp_path).map_err(|e| {
+            anyhow!(
+                "failed to create temporary replica state {}: {e}",
+                tmp_path.display()
+            )
+        })?;
         use std::io::Write;
-        let mut file = File::create(&tmp)?;
-        file.write_all(&bytes)?;
-        file.sync_all()?;
+        file.write_all(data.as_bytes()).map_err(|e| {
+            anyhow!(
+                "failed to write temporary replica state {}: {e}",
+                tmp_path.display()
+            )
+        })?;
+        file.sync_all().map_err(|e| {
+            anyhow!(
+                "failed to fsync temporary replica state {}: {e}",
+                tmp_path.display()
+            )
+        })?;
     }
-    fs::rename(&tmp, &state_path)?;
-    fsync_parent_dir(&state_path)
+    fs::rename(&tmp_path, &state_path).map_err(|e| {
+        anyhow!(
+            "failed to atomically publish replica state {} over {}: {e}",
+            tmp_path.display(),
+            state_path.display()
+        )
+    })?;
+    fsync_parent_dir(&state_path)?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ltx::Checksum;
+    use crate::sync::manifest::{build_ltx_key, GENERATION_LIVE};
+    use rusqlite::Connection;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    fn visible() -> walrust_core::native_restore::NativeVisibleState {
-        walrust_core::native_restore::NativeVisibleState {
-            stream_digest: "digest-a".into(),
-            lineage_id: "lineage-a".into(),
-            head_seq: 4,
-            object_count: 4,
-            latest_snapshot_seq: 1,
-            retention_floor_seq: 1,
-            snapshot_seqs: vec![1],
+    fn unique_name(prefix: &str) -> String {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{prefix}-{nanos}")
+    }
+
+    fn test_bucket_config() -> (String, Option<String>) {
+        let bucket = std::env::var("WALRUST_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026/replicate-test".to_string());
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        (bucket, endpoint)
+    }
+
+    fn create_marker_db(path: &Path, marker: &str) -> Result<u32> {
+        let conn = Connection::open(path)?;
+        conn.execute("CREATE TABLE marker (value TEXT NOT NULL);", [])?;
+        conn.execute(
+            "INSERT INTO marker (value) VALUES (?1)",
+            rusqlite::params![marker],
+        )?;
+        let page_size = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        drop(conn);
+        Ok(page_size)
+    }
+
+    fn marker_value(path: &Path) -> Result<String> {
+        let conn = Connection::open(path)?;
+        Ok(conn.query_row("SELECT value FROM marker", [], |row| row.get(0))?)
+    }
+
+    #[tokio::test]
+    async fn replica_failed_incremental_apply_preserves_existing_database() -> Result<()> {
+        if std::env::var("AWS_ENDPOINT_URL_S3").is_err()
+            && std::env::var("AWS_ENDPOINT_URL").is_err()
+            && std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        {
+            eprintln!("SKIP replica_failed_incremental_apply_preserves_existing_database: no S3 endpoint/credentials configured");
+            return Ok(());
         }
-    }
+        let (bucket_arg, endpoint) = test_bucket_config();
+        let (bucket, prefix) = s3::parse_bucket(&bucket_arg);
+        let client = create_client(endpoint.as_deref()).await?;
+        let db_name = unique_name("replica-failed-apply");
+        let tmp = tempfile::tempdir()?;
+        let local = tmp.path().join("local.db");
+        let page_size = create_marker_db(&local, "local-survives")?;
+        let original_bytes = std::fs::read(&local)?;
+        let pre_checksum = ltx::compute_checksum_from_file(&local)?;
 
-    #[test]
-    fn replica_resume_rejects_different_remote_identity_and_regressed_head() {
-        let local = Path::new("replica.db");
-        let state = ReplicaState {
-            source: "s3://bucket/db".into(),
-            stream_digest: "digest-a".into(),
-            lineage_id: "lineage-a".into(),
-            current_txid: 4,
-            last_updated: "now".into(),
-        };
-        validate_replica_identity(&state, "s3://bucket/db", &visible(), local).unwrap();
+        let pages = vec![(1, vec![0xAA; page_size as usize])];
+        let mut bad_incremental = Vec::new();
+        ltx::encode_wal_changes(
+            &mut bad_incremental,
+            &pages,
+            page_size,
+            2,
+            2,
+            1,
+            Some(pre_checksum),
+            Checksum::new(0x0bad_c0de),
+        )?;
+        let key = build_ltx_key(&prefix, &db_name, GENERATION_LIVE, 2, 2);
+        s3::upload_bytes(&client, &bucket, &key, bad_incremental).await?;
 
-        let mut changed = visible();
-        changed.lineage_id = "lineage-b".into();
-        assert!(
-            validate_replica_identity(&state, "s3://bucket/db", &changed, local)
-                .unwrap_err()
-                .to_string()
-                .contains("identity changed")
-        );
-
-        let mut regressed = visible();
-        regressed.head_seq = 3;
-        assert!(
-            validate_replica_identity(&state, "s3://bucket/db", &regressed, local)
-                .unwrap_err()
-                .to_string()
-                .contains("regressed")
-        );
-    }
-
-    #[test]
-    fn replica_state_missing_identity_fields_fails_loudly() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("replica.db");
-        std::fs::write(
-            local.with_extension("db-replica-state"),
-            r#"{"current_txid":4,"last_updated":"now"}"#,
+        let mut current_txid = 1;
+        let err = replicate_poll(
+            &client,
+            &bucket,
+            &prefix,
+            &db_name,
+            &local,
+            &mut current_txid,
         )
-        .unwrap();
-        assert!(read_replica_state(&local)
-            .unwrap_err()
-            .to_string()
-            .contains("unbound resume"));
+        .await
+        .expect_err("corrupt incremental must fail replication");
+
+        assert!(
+            err.to_string().contains("Post-apply checksum mismatch"),
+            "expected checksum failure, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&local)?,
+            original_bytes,
+            "failed replica apply must not mutate the live local database"
+        );
+        assert_eq!(marker_value(&local)?, "local-survives");
+        assert_eq!(current_txid, 1);
+        Ok(())
     }
 
-    #[test]
-    fn replica_refuses_live_or_stale_sqlite_sidecars_and_cleans_only_private_staging() {
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("replica.db");
-        fs::write(&local, b"visible replica").unwrap();
-        for sidecar in [
-            sqlite_sidecar_path(&local, "-wal"),
-            sqlite_sidecar_path(&local, "-shm"),
-        ] {
-            fs::write(&sidecar, b"must survive").unwrap();
-            assert!(ensure_replica_replace_safe(&local)
-                .unwrap_err()
-                .to_string()
-                .contains("refusing to replace"));
-            assert_eq!(fs::read(&sidecar).unwrap(), b"must survive");
-            fs::remove_file(sidecar).unwrap();
+    #[tokio::test]
+    async fn replica_gap_without_future_snapshot_errors_and_preserves_existing_database(
+    ) -> Result<()> {
+        if std::env::var("AWS_ENDPOINT_URL_S3").is_err()
+            && std::env::var("AWS_ENDPOINT_URL").is_err()
+            && std::env::var("AWS_ACCESS_KEY_ID").is_err()
+        {
+            eprintln!("SKIP replica_gap_without_future_snapshot_errors_and_preserves_existing_database: no S3 endpoint/credentials configured");
+            return Ok(());
         }
+        let (bucket_arg, endpoint) = test_bucket_config();
+        let (bucket, prefix) = s3::parse_bucket(&bucket_arg);
+        let client = create_client(endpoint.as_deref()).await?;
+        let db_name = unique_name("replica-gap");
+        let tmp = tempfile::tempdir()?;
+        let local = tmp.path().join("local.db");
+        let snapshot_db = tmp.path().join("snapshot.db");
 
-        let tmp = local.with_extension("db-native-replica.tmp");
-        fs::write(&tmp, b"stale staging").unwrap();
-        fs::write(sqlite_sidecar_path(&tmp, "-wal"), b"stale staging wal").unwrap();
-        remove_replica_staging(&tmp).unwrap();
-        assert!(!tmp.exists());
-        assert!(!sqlite_sidecar_path(&tmp, "-wal").exists());
-        assert_eq!(fs::read(&local).unwrap(), b"visible replica");
+        let page_size = create_marker_db(&local, "local-survives")?;
+        create_marker_db(&snapshot_db, "old-snapshot")?;
+        let original_bytes = std::fs::read(&local)?;
+
+        let mut snapshot = Vec::new();
+        ltx::encode_snapshot(&mut snapshot, &snapshot_db, page_size, 1)?;
+        let snapshot_key = build_ltx_key(&prefix, &db_name, 1, 1, 1);
+        s3::upload_bytes(&client, &bucket, &snapshot_key, snapshot).await?;
+
+        let snapshot_checksum = ltx::compute_checksum_from_file(&snapshot_db)?;
+        let pages = vec![(1, vec![0x33; page_size as usize])];
+        let post_checksum = ltx::chain_checksum(snapshot_checksum, &pages);
+        let mut skipped_incremental = Vec::new();
+        ltx::encode_wal_changes(
+            &mut skipped_incremental,
+            &pages,
+            page_size,
+            3,
+            3,
+            1,
+            Some(snapshot_checksum),
+            post_checksum,
+        )?;
+        let incremental_key = build_ltx_key(&prefix, &db_name, GENERATION_LIVE, 3, 3);
+        s3::upload_bytes(&client, &bucket, &incremental_key, skipped_incremental).await?;
+
+        let mut current_txid = 1;
+        let err = replicate_poll(
+            &client,
+            &bucket,
+            &prefix,
+            &db_name,
+            &local,
+            &mut current_txid,
+        )
+        .await
+        .expect_err("gap without a future snapshot must fail hard");
+
+        assert!(
+            err.to_string().contains("TXID gap"),
+            "expected hard TXID gap error, got: {err}"
+        );
+        assert_eq!(
+            std::fs::read(&local)?,
+            original_bytes,
+            "gap handling must not re-bootstrap to an old snapshot over the live replica"
+        );
+        assert_eq!(marker_value(&local)?, "local-survives");
+        assert_eq!(current_txid, 1);
+        Ok(())
     }
 }

@@ -8,8 +8,8 @@
 # A small number of tests are genuinely timing- or process-sensitive
 # (SIGKILL of real child processes, deliberate checkpoint/write races,
 # a watch-mode timer reset, a "two writers, one wins" race, split-brain
-# equivocation and fenced-follower reconstruction). Those are pinned to the
-# `serial` test group below (max-threads=1)
+# equivocation, fenced-follower reconstruction, and a real chaos process
+# kill). Those are pinned to the `serial` test group below (max-threads=1)
 # so they never run concurrently with each other or with themselves, which
 # is how they behaved under the old `--test-threads=1` execution. Everything
 # else runs fully parallel.
@@ -22,7 +22,11 @@ max-threads = 1
 # kill: real process-kill tests --
 #   tests/production_e2e.rs: e2e_cli_watch_sigkill_restart_round_trips_sqlite_rows,
 #     e2e_core_replicator_sigkill_restart_round_trips_sqlite_rows,
-#     e2e_core_replicator_sigkill_child (ignored spawn target).
+#     e2e_core_replicator_sigkill_child (ignored spawn target);
+#   walrust-dst/tests/crash_recovery.rs: chaos_crashes_survives_real_process_kill
+#     (the DST chaos --faults crashes path: real SIGKILLs of child writers);
+#   walrust-dst/src/disk_queue_tests.rs: test_kill_mid_upload_recovery
+#     (sleep-based kill/resume coordination).
 #
 # racing: deliberate checkpoint-vs-flush race tests --
 #   tests/production_e2e.rs: e2e_core_replicator_racing_checkpoint_reanchors_without_data_loss,
@@ -36,7 +40,7 @@ max-threads = 1
 #     cheap to serialize alongside it.
 #
 # timer / interval: watch-timer and interval-named tests (generous match) --
-#   tests/production_e2e.rs: e2e_cli_watch_periodic_snapshot_timer_round_trips_through_reset;
+#   tests/production_e2e.rs: e2e_cli_watch_independent_snapshot_timer_round_trips_through_reset;
 #   plus a few interval-named config/cursor logic tests that are cheap either way.
 #
 # two_watchers: "two concurrent writers, only one wins" race --
@@ -52,7 +56,8 @@ max-threads = 1
 #   crates/walrust-core/src/sync.rs:
 #     reconstruct_fenced_follower_replays_published_deltas,
 #     reconstruct_fenced_follower_rejects_forged_envelopes,
-#     reconstruct_fenced_follower_rejects_midstream_forge_atomically.
+#     reconstruct_fenced_follower_rejects_midstream_forge_atomically;
+#   walrust-dst/src/invariants.rs: test_prop_fenced_delta_restore.
 filter = '''
 test(~kill)
   | test(~racing)
