@@ -297,7 +297,7 @@ and cleanup only those prefixes.
 - [x] Run live Tigris pause/resume, outage/reconnect, split-brain, PITR, pruning,
       restore, verify, and latency gates with unique prefixes.
 - [x] Perform a fresh independent adversarial review and apply all findings.
-- [ ] Run replacement CI to green, then stop for user merge.
+- [x] Run replacement CI to green, then stop for user merge.
 
 ## Compaction (native library/owned mode only — default off)
 
