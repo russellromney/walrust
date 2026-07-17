@@ -1660,12 +1660,13 @@ pub async fn watch_with_shadow(
             db_config.path.clone(),
             ltx::compute_checksum_from_file(&db_config.path),
         );
-        let blocker = ShadowWal::open_checkpoint_blocker(&db_config.path).with_context(|| {
-            format!(
-                "{}: failed to pin CLI checkpoint blocker before remote startup",
-                db_config.prefix
-            )
-        })?;
+        let blocker =
+            ShadowWal::open_persistent_checkpoint_blocker(&db_config.path).with_context(|| {
+                format!(
+                    "{}: failed to pin CLI checkpoint blocker before remote startup",
+                    db_config.prefix
+                )
+            })?;
         startup_shadows.insert(db_config.path.clone(), shadow);
         startup_data_version_monitors.insert(db_config.path.clone(), data_version_monitor);
         startup_blockers.insert(db_config.path.clone(), blocker);

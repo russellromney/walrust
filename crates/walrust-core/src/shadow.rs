@@ -238,7 +238,24 @@ impl ShadowWal {
     /// Open a read connection that prevents SQLite from auto-checkpointing.
     /// Also used by walrust-owned replication to pin the live WAL (D2).
     pub fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
+        Self::open_checkpoint_blocker_inner(db_path, false)
+    }
+
+    /// Open the CLI watch blocker with persistent-WAL file control enabled.
+    ///
+    /// This is intentionally separate from `open_checkpoint_blocker`: owned
+    /// library mode predates the CLI lossless-watch contract and must retain
+    /// its existing SQLite file-lifecycle semantics.
+    pub fn open_persistent_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
+        Self::open_checkpoint_blocker_inner(db_path, true)
+    }
+
+    fn open_checkpoint_blocker_inner(db_path: &Path, persist_wal: bool) -> Result<Connection> {
         let conn = Connection::open(db_path)?;
+
+        if persist_wal {
+            Self::enable_persistent_wal(&conn, db_path)?;
+        }
 
         Self::write_checkpoint_heartbeat(&conn, db_path)?;
         Self::pin_checkpoint_heartbeat(&conn)?;
@@ -256,8 +273,6 @@ impl ShadowWal {
     /// application connection committed during the unblocked window.
     pub fn write_checkpoint_heartbeat(conn: &Connection, db_path: &Path) -> Result<()> {
         ensure_connection_in_wal_mode(conn, db_path)?;
-
-        Self::enable_persistent_wal(conn, db_path)?;
 
         // Disable auto-checkpoint on this connection without changing journal_mode.
         conn.execute_batch(
@@ -1009,6 +1024,48 @@ impl Drop for ShadowWal {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn persist_wal_setting(conn: &Connection) -> std::os::raw::c_int {
+        let mut value: std::os::raw::c_int = -1;
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                conn.handle(),
+                b"main\0".as_ptr().cast(),
+                rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+                (&mut value as *mut std::os::raw::c_int).cast(),
+            )
+        };
+        assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+        value
+    }
+
+    #[test]
+    fn owned_blocker_does_not_inherit_cli_persistent_wal_semantics() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("blocker-file-lifecycle.db");
+        let app = Connection::open(&db_path).unwrap();
+        app.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE app_data (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+
+        let owned = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+        assert_eq!(
+            persist_wal_setting(&owned),
+            0,
+            "the shared owned/library primitive must preserve its pre-CLI file lifecycle"
+        );
+        drop(owned);
+
+        let cli = ShadowWal::open_persistent_checkpoint_blocker(&db_path).unwrap();
+        assert_eq!(
+            persist_wal_setting(&cli),
+            1,
+            "CLI watch explicitly opts into persistent WAL"
+        );
+    }
 
     #[test]
     fn test_checkpoint_blocker_prevents_concurrent_truncate_across_supported_wal_configs() {

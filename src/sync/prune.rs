@@ -45,6 +45,23 @@ fn native_retention_floor(
     keep.into_iter().next()
 }
 
+fn native_publish_created_at(
+    record: &walrust_core::native_publish::PublishRecord,
+    last_modified: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    // Native records written before created_unix_ms was added deserialize the
+    // missing field as zero. Zero is a valid Unix timestamp, so attempting the
+    // conversion first would silently bucket every upgrade-era snapshot in
+    // January 1970 instead of using the object's historical S3 timestamp.
+    if record.created_unix_ms == 0 {
+        return last_modified;
+    }
+    i64::try_from(record.created_unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
+        .unwrap_or(last_modified)
+}
+
 pub async fn prune(
     name: &str,
     bucket: &str,
@@ -130,10 +147,7 @@ pub(crate) async fn prune_with_client(
                 .map_err(|e| classify_or_else(e, WalrustError::s3))?;
             let record: walrust_core::native_publish::PublishRecord =
                 serde_json::from_slice(&record_bytes)?;
-            let created_at = i64::try_from(record.created_unix_ms)
-                .ok()
-                .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
-                .unwrap_or(meta.last_modified);
+            let created_at = native_publish_created_at(&record, meta.last_modified);
             native_snapshots.push(SnapshotEntry {
                 key,
                 created_at,
@@ -407,6 +421,61 @@ mod tests {
             .collect::<Vec<_>>();
         let policy = RetentionPolicy::new(1, 0, 0, 0);
         assert_eq!(native_retention_floor(&snapshots, &policy, now), Some(6));
+    }
+
+    #[test]
+    fn missing_native_publish_timestamps_use_last_modified_for_gfs_buckets() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let months = ["2026-01-15", "2026-02-15", "2026-03-15", "2026-04-15"];
+        let snapshots = months
+            .into_iter()
+            .enumerate()
+            .map(|(index, day)| {
+                let sequence = index as u64 + 1;
+                let record: walrust_core::native_publish::PublishRecord =
+                    serde_json::from_value(serde_json::json!({
+                        "version": 1,
+                        "stream_digest": "stream",
+                        "lineage_id": "lineage",
+                        "seq": sequence,
+                        "kind": "snapshot",
+                        "previous_publish_sha256": null,
+                        "previous_chain_checksum": sequence - 1,
+                        "ending_chain_checksum": sequence,
+                        "end_page_count": 1,
+                        "object_key": format!("snapshot-{sequence}.hadbp"),
+                        "payload_length": 1,
+                        "payload_sha256": "00"
+                    }))
+                    .unwrap();
+                assert_eq!(record.created_unix_ms, 0);
+                let last_modified =
+                    chrono::DateTime::parse_from_rfc3339(&format!("{day}T12:00:00Z"))
+                        .unwrap()
+                        .with_timezone(&Utc);
+                SnapshotEntry {
+                    key: format!("snapshot-{sequence}"),
+                    created_at: native_publish_created_at(&record, last_modified),
+                    sequence,
+                    size: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let policy = RetentionPolicy {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: 3,
+            minimum: 1,
+        };
+
+        assert_eq!(
+            native_retention_floor(&snapshots, &policy, now),
+            Some(2),
+            "three distinct historical monthly buckets must survive upgrade-era timestamp fallback"
+        );
     }
 
     /// E6: when a watcher holds the single-writer lock, `snapshot` must return
