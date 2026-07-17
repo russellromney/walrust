@@ -16,6 +16,11 @@ for batch in 4 4 4 4; do
   sleep "$((WALRUST_DRILL_SNAPSHOT_INTERVAL + 1))"
 done
 
+# Freeze publication before taking the before-prune inventory. Otherwise the
+# periodic snapshot timer can publish a newer snapshot while this drill is
+# restoring the earlier points; prune can legitimately retain that newcomer,
+# and the test would then compare it against a stale history file.
+stop_walrust
 expected_latest=$(db_count "$DRILL_DB")
 snapshots_before="$DRILL_WORKDIR/snapshots-before.txt"
 snapshot_txids >"$snapshots_before"

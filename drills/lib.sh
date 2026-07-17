@@ -389,7 +389,10 @@ run_restore_to() {
   local name=$1
   local output=$2
   shift 2
-  rm -f "$output"
+  # Restore intentionally refuses any existing SQLite destination or sidecar.
+  # These paths are private drill artifacts, so clear the complete prior test
+  # destination rather than weakening the production no-clobber gate.
+  rm -f "$output" "$output-wal" "$output-shm"
   "$WALRUST_BIN" restore "$name" \
     --output "$output" \
     --bucket "$DRILL_BUCKET_URI" \
