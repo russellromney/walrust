@@ -614,8 +614,13 @@ async fn reset_wal_cursor_after_snapshot(state: &mut SyncState) {
 async fn controlled_checkpoint(state: &mut SyncState) -> Result<()> {
     if let Some(lifecycle) = state.checkpoint_blocker.as_ref() {
         let lifecycle = lifecycle.clone();
-        let guard = lifecycle.lock().await;
-        guard.controlled_checkpoint(true).map(|_| ())
+        tokio::task::spawn_blocking(move || {
+            // The dance can busy-wait on the writer lock up to busy_timeout;
+            // keep it off the async executor.
+            let guard = lifecycle.blocking_lock();
+            guard.controlled_checkpoint(true).map(|_| ())
+        })
+        .await?
     } else {
         checkpoint_wal(&state.db_path).await
     }

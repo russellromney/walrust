@@ -633,10 +633,14 @@ pub async fn snapshot_database_to_storage(
     // `sync::prune::snapshot`).
     match handles.as_ref() {
         Some(lifecycle) => {
-            let guard = lifecycle.lock().await;
-            guard
-                .monitor_conn()
-                .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")?;
+            let lifecycle = lifecycle.clone();
+            tokio::task::spawn_blocking(move || {
+                let guard = lifecycle.blocking_lock();
+                guard
+                    .monitor_conn()
+                    .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+            })
+            .await??;
         }
         None => checkpoint_wal_passive(database).await?,
     }
