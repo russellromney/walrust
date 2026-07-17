@@ -21,7 +21,7 @@ use anyhow::{anyhow, Result};
 use hadb_changeset::physical::{
     self, PageEntry, PageId, PageIdSize, PhysicalChangeset, PhysicalHeader,
 };
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -59,6 +59,132 @@ pub fn encode_snapshot(
 pub struct EncodedSnapshot {
     pub bytes: Vec<u8>,
     pub checksum: u64,
+}
+
+/// Encode a complete, already-resolved SQLite page image as a native HADBP
+/// snapshot. `pages` must contain every page exactly once from 1 through the
+/// declared database end. The returned checksum is the materialized database
+/// checksum used as the recovery-state anchor for successor deltas; it is
+/// intentionally distinct from both the payload SHA-256 and the HADBP trailer.
+pub fn encode_resolved_snapshot(
+    mut pages: Vec<(u32, Vec<u8>)>,
+    page_size: u32,
+    seq: u64,
+    prev_checksum: u64,
+) -> Result<EncodedSnapshot> {
+    pages.sort_by_key(|(page, _)| *page);
+    let page_count = u32::try_from(pages.len())
+        .map_err(|_| anyhow!("native snapshot exceeds SQLite U32 page-id limit"))?;
+    let mut pages = pages.into_iter();
+    encode_resolved_snapshot_with(page_count, page_size, seq, prev_checksum, move |expected| {
+        let (page, data) = pages
+            .next()
+            .ok_or_else(|| anyhow!("native snapshot is missing page {expected}"))?;
+        if page != expected {
+            return Err(anyhow!(
+                "native snapshot page set is not complete: expected page {}, got {}",
+                expected,
+                page
+            ));
+        }
+        Ok(data)
+    })
+}
+
+/// Stream resolved pages in numeric order into the canonical native HADBP v1
+/// encoding. Only the final payload buffer and one page need to be resident;
+/// callers do not need to construct a second full-database page vector.
+pub fn encode_resolved_snapshot_with<F>(
+    page_count: u32,
+    page_size: u32,
+    seq: u64,
+    prev_checksum: u64,
+    mut read_page: F,
+) -> Result<EncodedSnapshot>
+where
+    F: FnMut(u32) -> Result<Vec<u8>>,
+{
+    let capacity = HADBP_HEADER_SIZE
+        .saturating_add(
+            (page_count as usize).saturating_mul(8usize.saturating_add(page_size as usize)),
+        )
+        .saturating_add(HADBP_TRAILER_SIZE);
+    let mut bytes = Vec::with_capacity(capacity);
+    let checksum = write_resolved_snapshot_with(
+        &mut bytes,
+        page_count,
+        page_size,
+        seq,
+        prev_checksum,
+        &mut read_page,
+    )?;
+    // Decode with the canonical hadb-changeset implementation before these
+    // bytes can enter the spool. This pins manual streaming to the native
+    // format rather than trusting a second wire implementation.
+    physical::decode(&bytes)
+        .map_err(|error| anyhow!("streamed HADBP failed canonical decode: {error}"))?;
+    Ok(EncodedSnapshot { bytes, checksum })
+}
+
+/// Write the canonical native HADBP v1 snapshot bytes directly to a caller's
+/// payload temporary and return the materialized database checksum.
+pub fn write_resolved_snapshot_with<W, F>(
+    writer: &mut W,
+    page_count: u32,
+    page_size: u32,
+    seq: u64,
+    prev_checksum: u64,
+    mut read_page: F,
+) -> Result<u64>
+where
+    W: Write,
+    F: FnMut(u32) -> Result<Vec<u8>>,
+{
+    use sha2::{Digest, Sha256};
+
+    let page_size = validate_sqlite_page_size(page_size)?;
+    if page_count == 0 {
+        return Err(anyhow!("native SQLite snapshot cannot be empty"));
+    }
+    let created_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as i64)
+        .unwrap_or(0);
+    writer.write_all(&physical::HADBP_MAGIC)?;
+    writer.write_all(&[physical::HADBP_VERSION, 0, PageIdSize::U32 as u8])?;
+    writer.write_all(&(page_size as u32).to_be_bytes())?;
+    writer.write_all(&seq.to_be_bytes())?;
+    writer.write_all(&prev_checksum.to_be_bytes())?;
+    writer.write_all(&page_count.to_be_bytes())?;
+    writer.write_all(&created_ms.to_be_bytes())?;
+
+    let mut chain = Sha256::new();
+    chain.update(prev_checksum.to_be_bytes());
+    let mut database = Sha256::new();
+    for page in 1..=page_count {
+        let data = read_page(page)?;
+        if data.len() != page_size {
+            return Err(anyhow!(
+                "native snapshot page {} has {} bytes, expected {}",
+                page,
+                data.len(),
+                page_size
+            ));
+        }
+        let length = u32::try_from(data.len()).expect("SQLite page size fits u32");
+        writer.write_all(&page.to_be_bytes())?;
+        writer.write_all(&length.to_be_bytes())?;
+        writer.write_all(&data)?;
+        chain.update(page.to_be_bytes());
+        chain.update(length.to_be_bytes());
+        chain.update(&data);
+        database.update(&data);
+    }
+    writer.write_all(&chain.finalize()[0..8])?;
+    let database = database.finalize();
+    Ok(u64::from_be_bytes(
+        database[0..8].try_into().expect("sha256 is 32 bytes"),
+    ))
 }
 
 /// Create an HADBP snapshot from a stable SQLite backup copy.
@@ -619,10 +745,73 @@ pub fn compute_db_checksum_raw(data: &[u8]) -> u64 {
     u64::from_be_bytes(result[0..8].try_into().expect("sha256 is 32 bytes"))
 }
 
+/// Verify that a decoded changeset is a complete SQLite snapshot and compute
+/// its materialized database checksum without writing a second `.db` file.
+pub fn snapshot_checksum_and_page_count(changeset: &PhysicalChangeset) -> Result<(u64, u64)> {
+    use sha2::{Digest, Sha256};
+
+    if changeset_end_page_count(changeset)?.is_some() {
+        return Err(anyhow!("native snapshot carries a delta end-page marker"));
+    }
+    let page_size = validate_sqlite_page_size(changeset.header.page_size)?;
+    if changeset.pages.is_empty() {
+        return Err(anyhow!("native snapshot contains no pages"));
+    }
+    let mut pages = changeset.pages.iter().collect::<Vec<_>>();
+    pages.sort_by_key(|entry| entry.page_id);
+    let mut hasher = Sha256::new();
+    for (index, entry) in pages.iter().enumerate() {
+        let expected = u64::try_from(index + 1).expect("usize fits u64");
+        if entry.page_id.to_u64() != expected || entry.data.len() != page_size {
+            return Err(anyhow!(
+                "native snapshot is not a complete SQLite page image at page {}",
+                expected
+            ));
+        }
+        hasher.update(&entry.data);
+    }
+    let digest = hasher.finalize();
+    Ok((
+        u64::from_be_bytes(digest[0..8].try_into().expect("sha256 is 32 bytes")),
+        pages.len() as u64,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn streamed_resolved_snapshot_is_byte_identical_to_canonical_hadbp_encoder() {
+        let page_size = 512u32;
+        let pages = vec![
+            vec![0x11; page_size as usize],
+            vec![0x22; page_size as usize],
+            vec![0x33; page_size as usize],
+        ];
+        let streamed = encode_resolved_snapshot_with(3, page_size, 7, 0x1234, |page| {
+            Ok(pages[(page - 1) as usize].clone())
+        })
+        .unwrap();
+        let decoded = physical::decode(&streamed.bytes).unwrap();
+        let entries = pages
+            .iter()
+            .enumerate()
+            .map(|(index, data)| PageEntry {
+                page_id: PageId::U32((index + 1) as u32),
+                data: data.clone(),
+            })
+            .collect();
+        let mut canonical = PhysicalChangeset::new(7, 0x1234, PageIdSize::U32, page_size, entries);
+        canonical.header.created_ms = decoded.header.created_ms;
+        assert_eq!(streamed.bytes, physical::encode(&canonical));
+        assert_eq!(
+            streamed.checksum,
+            compute_db_checksum_raw(&pages.concat()),
+            "snapshot recovery anchor must remain the materialized DB checksum"
+        );
+    }
 
     #[test]
     fn test_snapshot_roundtrip_single_page() {

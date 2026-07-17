@@ -11,6 +11,8 @@
 
 use anyhow::{anyhow, Result};
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -24,6 +26,14 @@ use crate::wal::{self, ParsedFrame, FRAME_HEADER_SIZE};
 /// filename. Both are `u64`, so 16 hex digits keeps lexical order == numeric
 /// order across the full range.
 pub(crate) const SEGMENT_HEX_WIDTH: usize = 16;
+const DURABLE_TAIL_VERSION: u32 = 1;
+const DURABLE_TAIL_FILE: &str = "durable-tail-v1.json";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DurableShadowTail {
+    version: u32,
+    segments: BTreeMap<String, u64>,
+}
 
 /// Format a shadow segment filename: `{generation:016x}-{index:016x}.wal`.
 fn format_segment_name(generation: u64, index: u64) -> String {
@@ -94,6 +104,28 @@ pub struct ShadowWal {
     /// and `wal_salt` hold defaults; the first real header seeds them without
     /// being mistaken for a checkpoint rollover (B5).
     header_seeded: bool,
+    /// Whether lifecycle states may be probed by opening a one-shot SQLite
+    /// connection. Owned/library mode permits this because `ShadowWal` also
+    /// owns and can restore its blocker. CLI file-tailer mode must remain
+    /// connection-free: closing any SQLite handle in that process can erase
+    /// the separately owned blocker's process-scoped POSIX locks.
+    probe_wal_mode_on_lifecycle_state: bool,
+    /// Startup removed bytes beyond the last fsynced durable-tail marker.
+    /// The caller must either recopy them from the pinned WAL or re-anchor.
+    discarded_unproven_tail: bool,
+    /// A failed rollback means this process can no longer prove the append
+    /// boundary. Refuse every later write until restart recovery succeeds.
+    append_poisoned: Option<String>,
+    #[cfg(test)]
+    append_failure: Option<TestAppendFailure>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+enum TestAppendFailure {
+    Write,
+    Sync,
+    Marker,
 }
 
 /// A segment file in the shadow WAL
@@ -112,6 +144,17 @@ pub struct ShadowSegment {
 impl ShadowWal {
     /// Create a new shadow WAL for a database
     pub async fn new(db_path: &Path) -> Result<Self> {
+        Self::new_inner(db_path, true).await
+    }
+
+    /// Create a shadow WAL file tailer without owning a checkpoint blocker.
+    /// CLI shadow watch uses this constructor because its per-database state
+    /// owns the blocker connection explicitly.
+    pub async fn new_without_checkpoint_blocker(db_path: &Path) -> Result<Self> {
+        Self::new_inner(db_path, false).await
+    }
+
+    async fn new_inner(db_path: &Path, hold_checkpoint_blocker: bool) -> Result<Self> {
         let shadow_dir = Self::shadow_dir_for(db_path);
 
         // Create shadow directory if it doesn't exist
@@ -125,40 +168,63 @@ impl ShadowWal {
         };
 
         // Find highest existing generation
-        let generation = Self::find_latest_generation(&shadow_dir)
+        let mut generation = Self::find_latest_generation(&shadow_dir)
             .await?
             .unwrap_or(0);
 
-        // E1: heal any torn shadow-segment tail left by a crash mid-write.
-        //
-        // Shadow segments are a stream of fixed-size frames (24-byte header +
-        // page_size data). A `kill -9` between the header write and the page
-        // write (or partway through either) leaves a partial trailing frame.
-        // On restart `copy_frames` appends fresh frames after that torn tail in
-        // append mode, which shifts every following frame off its boundary. The
-        // reader (`encode_shadow_to_ltx`) then decodes garbage headers, and a
-        // header landing on a frame's zero-padded region yields page number 0,
-        // which litepages rejects as "Invalid page num: transaction ID must be
-        // non-zero" — sync then fails forever. Truncating every segment down to
-        // a whole-frame boundary before the first append removes the torn tail;
-        // the durable `wal_copy_offset` re-copies any dropped frames cleanly.
+        // Recover strictly to the atomically fsynced marker. Alignment alone
+        // cannot prove a tail survived power loss; markerless/unowned segments
+        // force a fresh source-cursor generation and full snapshot boundary.
         let frame_page_size = db_header_page_size(db_path).unwrap_or(page_size);
-        Self::align_truncate_segments(&shadow_dir, frame_page_size).await?;
+        let (discarded_unproven_tail, reset_generation) =
+            Self::recover_to_durable_tail(&shadow_dir, frame_page_size).await?;
+        if reset_generation {
+            // Never reuse the logical offset domain whose tail was discarded.
+            // The watch layer resets its source cursor to this generation only
+            // through the required full-snapshot boundary.
+            generation = generation.checked_add(1).ok_or_else(|| {
+                anyhow!("shadow generation exhausted while rotating unproven markerless tail")
+            })?;
+        }
+        let mut segment_offset = 0u64;
+        let mut entries = fs::read_dir(&shadow_dir).await?;
+        while let Some(entry) = entries.next_entry().await? {
+            let name = entry.file_name();
+            let text = name.to_string_lossy();
+            let Some((file_generation, _)) = text.trim_end_matches(".wal").split_once('-') else {
+                continue;
+            };
+            if text.ends_with(".wal")
+                && u64::from_str_radix(file_generation, 16).ok() == Some(generation)
+            {
+                segment_offset = segment_offset.saturating_add(entry.metadata().await?.len());
+            }
+        }
 
-        // Open read connection to prevent auto-checkpoint
-        let checkpoint_blocker = Self::open_checkpoint_blocker(db_path)?;
+        let checkpoint_blocker = if hold_checkpoint_blocker {
+            Some(Arc::new(Mutex::new(Self::open_checkpoint_blocker(
+                db_path,
+            )?)))
+        } else {
+            None
+        };
 
         Ok(Self {
             db_path: db_path.to_path_buf(),
             shadow_dir,
             generation,
             segment_index: 0,
-            segment_offset: 0,
+            segment_offset,
             page_size,
-            checkpoint_blocker: Some(Arc::new(Mutex::new(checkpoint_blocker))),
+            checkpoint_blocker,
             wal_salt: (salt1, salt2),
             wal_chain: None,
             header_seeded,
+            probe_wal_mode_on_lifecycle_state: hold_checkpoint_blocker,
+            discarded_unproven_tail,
+            append_poisoned: None,
+            #[cfg(test)]
+            append_failure: None,
         })
     }
 
@@ -171,10 +237,42 @@ impl ShadowWal {
 
     /// Open a read connection that prevents SQLite from auto-checkpointing.
     /// Also used by walrust-owned replication to pin the live WAL (D2).
-    pub(crate) fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
+    pub fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
+        Self::open_checkpoint_blocker_inner(db_path, false)
+    }
+
+    /// Open the CLI watch blocker with persistent-WAL file control enabled.
+    ///
+    /// This is intentionally separate from `open_checkpoint_blocker`: owned
+    /// library mode predates the CLI lossless-watch contract and must retain
+    /// its existing SQLite file-lifecycle semantics.
+    pub fn open_persistent_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
+        Self::open_checkpoint_blocker_inner(db_path, true)
+    }
+
+    fn open_checkpoint_blocker_inner(db_path: &Path, persist_wal: bool) -> Result<Connection> {
         let conn = Connection::open(db_path)?;
 
-        ensure_connection_in_wal_mode(&conn, db_path)?;
+        if persist_wal {
+            Self::enable_persistent_wal(&conn, db_path)?;
+        }
+
+        Self::write_checkpoint_heartbeat(&conn, db_path)?;
+        Self::pin_checkpoint_heartbeat(&conn)?;
+
+        tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
+
+        Ok(conn)
+    }
+
+    /// Commit the frame a later blocker transaction will pin.
+    ///
+    /// Controlled checkpoint handoffs call this on the long-lived
+    /// `data_version` monitor. A connection does not advance its own
+    /// `PRAGMA data_version`, so any observed change still proves that an
+    /// application connection committed during the unblocked window.
+    pub fn write_checkpoint_heartbeat(conn: &Connection, db_path: &Path) -> Result<()> {
+        ensure_connection_in_wal_mode(conn, db_path)?;
 
         // Disable auto-checkpoint on this connection without changing journal_mode.
         conn.execute_batch(
@@ -191,16 +289,68 @@ impl ShadowWal {
             ",
         )?;
 
+        Ok(())
+    }
+
+    /// Acquire SQLite's writer lock and stage (but do not commit) the blocker
+    /// heartbeat. While this transaction is open no application writer can
+    /// cross the caller's final `PRAGMA data_version` sample.
+    pub fn begin_checkpoint_heartbeat_transaction(conn: &Connection) -> Result<()> {
+        if !conn.is_autocommit() {
+            conn.execute_batch("ROLLBACK;")?;
+        }
+        conn.execute_batch("BEGIN IMMEDIATE;")?;
+        match conn.execute("UPDATE _walrust_seq SET value = value + 1 WHERE id = 1", []) {
+            Ok(1) => Ok(()),
+            Ok(updated) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(anyhow!(
+                    "checkpoint heartbeat update affected {updated} rows instead of one"
+                ))
+            }
+            Err(error) => {
+                let _ = conn.execute_batch("ROLLBACK;");
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Pin a heartbeat already committed by the retained monitor.
+    ///
+    /// Controlled checkpoint handoffs reuse the existing blocker connection
+    /// instead of closing and reopening the source inode. Besides preserving
+    /// classic POSIX process locks, this minimizes the only unblocked interval
+    /// to the monitor heartbeat followed by this read transaction.
+    pub fn pin_checkpoint_heartbeat(conn: &Connection) -> Result<()> {
         // Pin a real WAL frame. Reading sqlite_master can leave the blocker at
         // read-mark 0, which does not prevent walRestartLog on later frames.
         conn.execute_batch("BEGIN DEFERRED;")?;
         let _: i64 = conn.query_row("SELECT value FROM _walrust_seq WHERE id = 1", [], |row| {
             row.get(0)
         })?;
+        Ok(())
+    }
 
-        tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
-
-        Ok(conn)
+    /// Enable SQLite's connection-level persistent-WAL file control on every
+    /// long-lived watcher handle for a source database.
+    pub fn enable_persistent_wal(conn: &Connection, db_path: &Path) -> Result<()> {
+        let mut persist_wal: std::os::raw::c_int = 1;
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                conn.handle(),
+                b"main\0".as_ptr().cast(),
+                rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+                (&mut persist_wal as *mut std::os::raw::c_int).cast(),
+            )
+        };
+        if rc != rusqlite::ffi::SQLITE_OK {
+            return Err(anyhow!(
+                "failed to enable SQLITE_FCNTL_PERSIST_WAL for {}: SQLite result {}",
+                db_path.display(),
+                rc
+            ));
+        }
+        Ok(())
     }
 
     async fn ensure_database_in_wal_mode(db_path: &Path) -> Result<()> {
@@ -238,45 +388,122 @@ impl ShadowWal {
         Ok(max_gen)
     }
 
-    /// Truncate every shadow segment down to a whole-frame boundary, dropping
-    /// any partial trailing frame left by a crash mid-write (E1). Segments that
-    /// are already frame-aligned are left untouched, so this is a cheap no-op on
-    /// a clean start. `page_size` determines the frame size; a `page_size` of 0
-    /// (no header ever seen) means there can be no real frames yet, so nothing
-    /// is done.
-    async fn align_truncate_segments(shadow_dir: &Path, page_size: u32) -> Result<()> {
-        if page_size == 0 {
-            return Ok(());
-        }
-        let frame_size = FRAME_HEADER_SIZE + page_size as u64;
+    /// Recover only the prefix whose marker was atomically persisted after the
+    /// segment and directory fsync. A frame-aligned tail is not evidence of
+    /// durability: it may have been fully buffered but never reached storage.
+    async fn recover_to_durable_tail(shadow_dir: &Path, _page_size: u32) -> Result<(bool, bool)> {
+        let marker_path = shadow_dir.join(DURABLE_TAIL_FILE);
+        let marker = match fs::read(&marker_path).await {
+            Ok(bytes) => {
+                let marker: DurableShadowTail = serde_json::from_slice(&bytes)?;
+                if marker.version != DURABLE_TAIL_VERSION {
+                    return Err(anyhow!(
+                        "unsupported shadow durable-tail version {}",
+                        marker.version
+                    ));
+                }
+                marker
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                // A pre-marker shadow directory has no durable proof for even
+                // a frame-aligned tail. Never bless those bytes by fsyncing
+                // them during upgrade: remove the entire unproven segment set,
+                // install an empty marker, and force the caller through a full
+                // native snapshot boundary. Any already-admitted HADBP object
+                // remains authoritative in the spool journal.
+                let mut discarded = false;
+                let mut entries = fs::read_dir(shadow_dir).await?;
+                while let Some(entry) = entries.next_entry().await? {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if !name.ends_with(".wal") {
+                        continue;
+                    }
+                    fs::remove_file(entry.path()).await?;
+                    discarded = true;
+                }
+                Self::fsync_dir(shadow_dir).await?;
+                let marker = DurableShadowTail {
+                    version: DURABLE_TAIL_VERSION,
+                    segments: BTreeMap::new(),
+                };
+                Self::persist_durable_tail(shadow_dir, &marker).await?;
+                return Ok((discarded, discarded));
+            }
+            Err(error) => return Err(error.into()),
+        };
 
+        let mut discarded = false;
+        let mut reset_generation = false;
         let mut entries = fs::read_dir(shadow_dir).await?;
+        let mut seen = BTreeMap::new();
         while let Some(entry) = entries.next_entry().await? {
-            let name = entry.file_name();
-            if !name.to_string_lossy().ends_with(".wal") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.ends_with(".wal") {
                 continue;
             }
-            let path = entry.path();
-            let size = match fs::metadata(&path).await {
-                Ok(meta) => meta.len(),
-                Err(_) => continue,
+            let Some(durable) = marker.segments.get(&name).copied() else {
+                // Either append crashed before publishing the durable marker,
+                // or cleanup committed its marker before unlinking the old
+                // segment. In both cases the marker is authoritative.
+                fs::remove_file(entry.path()).await?;
+                discarded = true;
+                reset_generation = true;
+                continue;
             };
-            let aligned = (size / frame_size) * frame_size;
-            if aligned != size {
-                tracing::warn!(
-                    "Shadow WAL: healing torn segment {} ({} -> {} bytes, dropped {} partial-frame byte(s))",
-                    path.display(),
-                    size,
-                    aligned,
-                    size - aligned
-                );
-                let file = OpenOptions::new().write(true).open(&path).await?;
-                file.set_len(aligned).await?;
+            let actual = entry.metadata().await?.len();
+            if actual < durable {
+                return Err(anyhow!(
+                    "shadow segment {} is shorter than durable marker ({} < {})",
+                    entry.path().display(),
+                    actual,
+                    durable
+                ));
+            }
+            if actual > durable {
+                let file = OpenOptions::new().write(true).open(entry.path()).await?;
+                file.set_len(durable).await?;
                 file.sync_all().await?;
+                discarded = true;
+            }
+            seen.insert(name, durable);
+        }
+        for (name, durable) in &marker.segments {
+            if *durable > 0 && !seen.contains_key(name) {
+                return Err(anyhow!(
+                    "shadow durable marker references missing segment {}",
+                    shadow_dir.join(name).display()
+                ));
             }
         }
         Self::fsync_dir(shadow_dir).await?;
-        Ok(())
+        Ok((discarded, reset_generation))
+    }
+
+    async fn read_durable_tail(shadow_dir: &Path) -> Result<DurableShadowTail> {
+        let bytes = fs::read(shadow_dir.join(DURABLE_TAIL_FILE)).await?;
+        let marker: DurableShadowTail = serde_json::from_slice(&bytes)?;
+        if marker.version != DURABLE_TAIL_VERSION {
+            return Err(anyhow!("unsupported shadow durable-tail version"));
+        }
+        Ok(marker)
+    }
+
+    async fn persist_durable_tail(shadow_dir: &Path, marker: &DurableShadowTail) -> Result<()> {
+        let path = shadow_dir.join(DURABLE_TAIL_FILE);
+        let tmp = shadow_dir.join(format!(".durable-tail-v1-{}.tmp", std::process::id()));
+        let bytes = serde_json::to_vec_pretty(marker)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)
+            .await?;
+        file.write_all(&bytes).await?;
+        file.flush().await?;
+        file.sync_all().await?;
+        drop(file);
+        fs::rename(&tmp, &path).await?;
+        Self::fsync_dir(shadow_dir).await
     }
 
     /// Copy new WAL frames to the shadow WAL
@@ -287,7 +514,9 @@ impl ShadowWal {
 
         // Check if WAL exists
         if !wal_path.exists() {
-            Self::ensure_database_in_wal_mode(&self.db_path).await?;
+            if self.probe_wal_mode_on_lifecycle_state {
+                Self::ensure_database_in_wal_mode(&self.db_path).await?;
+            }
             return Ok((Vec::new(), offset));
         }
 
@@ -295,10 +524,21 @@ impl ShadowWal {
         let header = match wal::read_header(&wal_path).await? {
             Some(h) => h,
             None => {
-                Self::ensure_database_in_wal_mode(&self.db_path).await?;
+                if self.probe_wal_mode_on_lifecycle_state {
+                    Self::ensure_database_in_wal_mode(&self.db_path).await?;
+                }
                 return Ok((Vec::new(), offset));
             }
         };
+        let cursor_before = (
+            self.generation,
+            self.segment_index,
+            self.segment_offset,
+            self.page_size,
+            self.wal_salt,
+            self.wal_chain,
+            self.header_seeded,
+        );
 
         // Detect checkpoint by salt change
         let current_salt = (header.salt1, header.salt2);
@@ -316,11 +556,15 @@ impl ShadowWal {
             self.wal_chain = None;
         } else if current_salt != self.wal_salt {
             // Checkpoint occurred - start new generation
+            let next_generation = self
+                .generation
+                .checked_add(1)
+                .ok_or_else(|| anyhow!("shadow generation exhausted during checkpoint rollover"))?;
             tracing::info!(
                 "Shadow WAL: checkpoint detected (salt changed), starting generation {}",
-                self.generation + 1
+                next_generation
             );
-            self.generation += 1;
+            self.generation = next_generation;
             self.segment_index = 0;
             self.segment_offset = 0;
             self.wal_salt = current_salt;
@@ -342,15 +586,29 @@ impl ShadowWal {
             self.wal_chain,
         )
         .await?;
-        self.wal_chain = out_chain;
 
         if frames.is_empty() {
+            self.wal_chain = out_chain;
             return Ok((Vec::new(), new_offset));
         }
 
         // Write frames to current shadow segment
-        self.write_frames_to_segment(&frames, header.page_size)
-            .await?;
+        if let Err(error) = self
+            .write_frames_to_segment(&frames, header.page_size)
+            .await
+        {
+            (
+                self.generation,
+                self.segment_index,
+                self.segment_offset,
+                self.page_size,
+                self.wal_salt,
+                self.wal_chain,
+                self.header_seeded,
+            ) = cursor_before;
+            return Err(error);
+        }
+        self.wal_chain = out_chain;
 
         tracing::debug!(
             "Shadow WAL: copied {} frames to gen {} segment {} (offset {} -> {})",
@@ -370,33 +628,93 @@ impl ShadowWal {
         frames: &[ParsedFrame],
         page_size: u32,
     ) -> Result<()> {
-        let segment_path = self.current_segment_path();
-
-        // Open or create segment file
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&segment_path)
-            .await?;
-
-        // Write each frame (header + page data)
-        for frame in frames {
-            // Write frame header (24 bytes)
-            let mut header = [0u8; 24];
-            header[0..4].copy_from_slice(&frame.page_number.to_be_bytes());
-            header[4..8].copy_from_slice(&frame.db_size.to_be_bytes());
-            // Salt and checksum can be zeros for shadow (we verify on read)
-            file.write_all(&header).await?;
-
-            // Write page data
-            file.write_all(&frame.data).await?;
-
-            self.segment_offset += FRAME_HEADER_SIZE + page_size as u64;
+        if let Some(error) = &self.append_poisoned {
+            return Err(anyhow!(
+                "shadow append is fail-closed after rollback failure; restart required: {error}"
+            ));
         }
+        let segment_path = self.current_segment_path();
+        let marker_before = Self::read_durable_tail(&self.shadow_dir).await?;
+        let segment_name = segment_path
+            .file_name()
+            .expect("shadow segment has a filename")
+            .to_string_lossy()
+            .into_owned();
+        let durable_len = marker_before
+            .segments
+            .get(&segment_name)
+            .copied()
+            .unwrap_or(0);
+        let offset_before = self.segment_offset;
 
-        file.flush().await?;
-        file.sync_all().await?;
-        Self::fsync_dir(&self.shadow_dir).await?;
+        let write_result = async {
+            let mut file = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&segment_path)
+                .await?;
+            for frame in frames {
+                let mut header = [0u8; 24];
+                header[0..4].copy_from_slice(&frame.page_number.to_be_bytes());
+                header[4..8].copy_from_slice(&frame.db_size.to_be_bytes());
+                file.write_all(&header).await?;
+                #[cfg(test)]
+                if matches!(self.append_failure, Some(TestAppendFailure::Write)) {
+                    return Err(anyhow!("injected shadow write failure"));
+                }
+                file.write_all(&frame.data).await?;
+                self.segment_offset += FRAME_HEADER_SIZE + page_size as u64;
+            }
+            file.flush().await?;
+            crate::native_spool::durability_failpoint("shadow_before_fsync");
+            #[cfg(test)]
+            if matches!(self.append_failure, Some(TestAppendFailure::Sync)) {
+                return Err(anyhow!("injected shadow sync failure"));
+            }
+            file.sync_all().await?;
+            Self::fsync_dir(&self.shadow_dir).await?;
+            let mut marker = marker_before.clone();
+            marker
+                .segments
+                .insert(segment_name.clone(), file.metadata().await?.len());
+            Self::persist_durable_tail(&self.shadow_dir, &marker).await?;
+            #[cfg(test)]
+            if matches!(self.append_failure, Some(TestAppendFailure::Marker)) {
+                return Err(anyhow!("injected shadow marker failure"));
+            }
+            crate::native_spool::durability_failpoint("shadow_fsync_complete");
+            Ok(())
+        }
+        .await;
+
+        if let Err(error) = write_result {
+            self.segment_offset = offset_before;
+            // Restore the old marker first. A crash during rollback then leaves
+            // an authoritative shorter marker and an overlong file, which
+            // normal startup recovery safely truncates.
+            let rollback = async {
+                Self::persist_durable_tail(&self.shadow_dir, &marker_before).await?;
+                match OpenOptions::new().write(true).open(&segment_path).await {
+                    Ok(file) => {
+                        file.set_len(durable_len).await?;
+                        file.sync_all().await?;
+                    }
+                    Err(open_error)
+                        if open_error.kind() == std::io::ErrorKind::NotFound
+                            && durable_len == 0 => {}
+                    Err(open_error) => return Err(open_error.into()),
+                }
+                Self::fsync_dir(&self.shadow_dir).await
+            }
+            .await;
+            if let Err(rollback_error) = rollback {
+                let message =
+                    format!("append error: {error:#}; rollback error: {rollback_error:#}");
+                self.append_poisoned = Some(message.clone());
+                return Err(anyhow!(message));
+            }
+            return Err(error);
+        }
         Ok(())
     }
 
@@ -508,10 +826,23 @@ impl ShadowWal {
         Ok((frames, new_offset))
     }
 
-    /// Trigger a manual checkpoint and rotate shadow WAL
+    /// Trigger a manual PASSIVE checkpoint and rotate shadow WAL.
     ///
-    /// This releases the read transaction, runs checkpoint, then re-establishes the blocker
+    /// This releases the read transaction, runs checkpoint, then re-establishes the blocker.
     pub async fn checkpoint(&mut self) -> Result<()> {
+        self.checkpoint_with_mode("PASSIVE").await
+    }
+
+    /// Trigger a manual TRUNCATE checkpoint and rotate shadow WAL.
+    ///
+    /// Used as the emergency WAL-growth safety brake after every shadow frame
+    /// has been durably synced. The blocker is released only for the controlled
+    /// checkpoint and is re-established before this returns.
+    pub async fn checkpoint_truncate(&mut self) -> Result<()> {
+        self.checkpoint_with_mode("TRUNCATE").await
+    }
+
+    async fn checkpoint_with_mode(&mut self, mode: &'static str) -> Result<()> {
         // Release checkpoint blocker
         if let Some(blocker) = self.checkpoint_blocker.take() {
             let conn = blocker.lock().await;
@@ -519,25 +850,7 @@ impl ShadowWal {
             drop(conn);
         }
 
-        let checkpoint_result = {
-            let conn = Connection::open(&self.db_path)?;
-            conn.busy_timeout(Duration::from_secs(5))?;
-            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
-                conn.query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?;
-            if busy != 0 || checkpointed_frames < log_frames {
-                Err(anyhow!(
-                    "{}: shadow checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
-                    self.db_path.display(),
-                    busy,
-                    log_frames,
-                    checkpointed_frames
-                ))
-            } else {
-                Ok(())
-            }
-        };
+        let checkpoint_result = self.execute_checkpoint(mode);
 
         // Re-establish checkpoint blocker
         let reopen_result = Self::open_checkpoint_blocker(&self.db_path);
@@ -560,16 +873,38 @@ impl ShadowWal {
         }
 
         tracing::debug!(
-            "Shadow WAL: checkpoint complete for {}",
+            "Shadow WAL: {} checkpoint complete for {}",
+            mode,
             self.db_path.display()
         );
 
         Ok(())
     }
 
+    fn execute_checkpoint(&self, mode: &'static str) -> Result<()> {
+        let conn = Connection::open(&self.db_path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
+            conn.query_row(&format!("PRAGMA wal_checkpoint({mode});"), [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })?;
+        if busy != 0 || checkpointed_frames < log_frames {
+            Err(anyhow!(
+                "{}: shadow {} checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
+                self.db_path.display(),
+                mode,
+                busy,
+                log_frames,
+                checkpointed_frames
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Clean up old shadow segments after successful upload
     pub async fn cleanup_segments(&self, up_to_generation: u64) -> Result<usize> {
-        let mut deleted = 0;
+        let mut victims = Vec::new();
 
         let mut entries = fs::read_dir(&self.shadow_dir).await?;
         while let Some(entry) = entries.next_entry().await? {
@@ -580,23 +915,36 @@ impl ShadowWal {
                 if let Some(gen_str) = name_str.split('-').next() {
                     if let Ok(gen) = u64::from_str_radix(gen_str, 16) {
                         if gen < up_to_generation {
-                            fs::remove_file(entry.path()).await?;
-                            deleted += 1;
+                            victims.push((name_str.into_owned(), entry.path()));
                         }
                     }
                 }
             }
         }
 
-        if deleted > 0 {
+        if !victims.is_empty() {
+            // Commit the ownership change before unlinking. A crash before
+            // unlink leaves harmless unmarked files that startup removes; a
+            // crash after unlink can never leave the marker naming a missing
+            // segment.
+            let mut marker = Self::read_durable_tail(&self.shadow_dir).await?;
+            for (name, _) in &victims {
+                marker.segments.remove(name.as_str());
+            }
+            Self::persist_durable_tail(&self.shadow_dir, &marker).await?;
+            crate::native_spool::durability_failpoint("shadow_cleanup_marker_committed");
+            for (_, path) in &victims {
+                fs::remove_file(path).await?;
+            }
+            Self::fsync_dir(&self.shadow_dir).await?;
             tracing::debug!(
                 "Shadow WAL: cleaned up {} old segments (generations < {})",
-                deleted,
+                victims.len(),
                 up_to_generation
             );
         }
 
-        Ok(deleted)
+        Ok(victims.len())
     }
 
     /// Get current generation
@@ -617,6 +965,10 @@ impl ShadowWal {
     /// Get shadow directory path
     pub fn shadow_dir(&self) -> &Path {
         &self.shadow_dir
+    }
+
+    pub fn discarded_unproven_tail(&self) -> bool {
+        self.discarded_unproven_tail
     }
 
     /// The WAL header salt of the generation the live-WAL read cursor indexes
@@ -672,6 +1024,48 @@ impl Drop for ShadowWal {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn persist_wal_setting(conn: &Connection) -> std::os::raw::c_int {
+        let mut value: std::os::raw::c_int = -1;
+        let rc = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                conn.handle(),
+                b"main\0".as_ptr().cast(),
+                rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+                (&mut value as *mut std::os::raw::c_int).cast(),
+            )
+        };
+        assert_eq!(rc, rusqlite::ffi::SQLITE_OK);
+        value
+    }
+
+    #[test]
+    fn owned_blocker_does_not_inherit_cli_persistent_wal_semantics() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("blocker-file-lifecycle.db");
+        let app = Connection::open(&db_path).unwrap();
+        app.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE app_data (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+
+        let owned = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+        assert_eq!(
+            persist_wal_setting(&owned),
+            0,
+            "the shared owned/library primitive must preserve its pre-CLI file lifecycle"
+        );
+        drop(owned);
+
+        let cli = ShadowWal::open_persistent_checkpoint_blocker(&db_path).unwrap();
+        assert_eq!(
+            persist_wal_setting(&cli),
+            1,
+            "CLI watch explicitly opts into persistent WAL"
+        );
+    }
 
     #[test]
     fn test_checkpoint_blocker_prevents_concurrent_truncate_across_supported_wal_configs() {
@@ -770,6 +1164,187 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_checkpoint_blocker_preserves_wal_across_short_lived_writer_sessions() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("ephemeral-writers.db");
+        let setup = Connection::open(&db_path).unwrap();
+        setup
+            .execute_batch(
+                "
+                PRAGMA journal_mode=WAL;
+                PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE app_data (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+                ",
+            )
+            .unwrap();
+        drop(setup);
+
+        let blocker = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+        for snapshot_index in 0..2 {
+            {
+                let snapshot_checkpoint = Connection::open(&db_path).unwrap();
+                let _: (i64, i64, i64) = snapshot_checkpoint
+                    .query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap();
+            }
+            let snapshot_path = dir.path().join(format!("snapshot-{snapshot_index}.db"));
+            let snapshot_reader = Connection::open(&db_path).unwrap();
+            snapshot_reader
+                .execute("VACUUM INTO ?1", [snapshot_path.to_str().unwrap()])
+                .unwrap();
+        }
+        {
+            let first_writer = Connection::open(&db_path).unwrap();
+            first_writer
+                .execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=0;")
+                .unwrap();
+            first_writer
+                .execute(
+                    "INSERT INTO app_data (id, value) VALUES (1, 'ephemeral-1')",
+                    [],
+                )
+                .unwrap();
+            let busy: i64 = first_writer
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(busy, 1, "the pinned blocker must reject the first TRUNCATE");
+        }
+        for id in 2..=10i64 {
+            let writer = Connection::open(&db_path).unwrap();
+            writer.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+            writer
+                .execute(
+                    "INSERT INTO app_data (id, value) VALUES (?1, ?2)",
+                    rusqlite::params![id, format!("ephemeral-{id}")],
+                )
+                .unwrap();
+        }
+
+        let wal_path = db_path.with_extension("db-wal");
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > 32,
+            "short-lived writer closes must leave their frames in the pinned WAL"
+        );
+        let checkpoint = Connection::open(&db_path).unwrap();
+        checkpoint.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        let busy: i64 = checkpoint
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            busy, 1,
+            "the blocker must remain pinned across writer closes"
+        );
+
+        blocker.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_reused_checkpoint_blocker_preserves_wal_across_writer_close() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("reopened-ephemeral-writer.db");
+        let setup = Connection::open(&db_path).unwrap();
+        setup
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 PRAGMA wal_autocheckpoint=0;
+                 CREATE TABLE app_data (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+        drop(setup);
+
+        let monitor = Connection::open(&db_path).unwrap();
+        let blocker = ShadowWal::open_checkpoint_blocker(&db_path).unwrap();
+        blocker.execute_batch("ROLLBACK;").unwrap();
+        let _: (i64, i64, i64) = monitor
+            .query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+            })
+            .unwrap();
+        // This is the CLI controlled-checkpoint handoff: retain both handles,
+        // commit the replacement heartbeat on the monitor, then reuse the
+        // already-last-opened blocker connection to pin it. No source handle
+        // is closed or opened across the handoff.
+        ShadowWal::write_checkpoint_heartbeat(&monitor, &db_path).unwrap();
+        ShadowWal::pin_checkpoint_heartbeat(&blocker).unwrap();
+        {
+            let writer = Connection::open(&db_path).unwrap();
+            writer
+                .execute("INSERT INTO app_data (value) VALUES ('after-rearm')", [])
+                .unwrap();
+        }
+
+        let wal_path = db_path.with_extension("db-wal");
+        assert!(
+            std::fs::metadata(&wal_path).unwrap().len() > 32,
+            "a short-lived writer close reset the WAL after blocker reacquisition"
+        );
+        let checkpoint = Connection::open(&db_path).unwrap();
+        checkpoint.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        let busy: i64 = checkpoint
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(busy, 1, "reused blocker did not refuse TRUNCATE");
+        blocker.execute_batch("ROLLBACK;").unwrap();
+    }
+
+    #[test]
+    fn test_blocker_data_version_detects_only_other_connection_commits() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("data-version.db");
+        let setup = Connection::open(&db_path).unwrap();
+        setup
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE app_data (id INTEGER PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+        drop(setup);
+
+        let monitor = Connection::open(&db_path).unwrap();
+        let before: i64 = monitor
+            .query_row("PRAGMA data_version;", [], |row| row.get(0))
+            .unwrap();
+        monitor
+            .execute("INSERT INTO app_data (id, value) VALUES (1, 'monitor')", [])
+            .unwrap();
+        let after_own_commit: i64 = monitor
+            .query_row("PRAGMA data_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after_own_commit, before,
+            "a connection's own commit must not dirty its connection-local data_version"
+        );
+
+        let app = Connection::open(&db_path).unwrap();
+        app.execute(
+            "INSERT INTO app_data (id, value) VALUES (2, 'external')",
+            [],
+        )
+        .unwrap();
+        drop(app);
+        let after_app_commit: i64 = monitor
+            .query_row("PRAGMA data_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_ne!(
+            after_app_commit, after_own_commit,
+            "another connection's commit must dirty the checkpoint-window detector"
+        );
+
+        monitor
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |_| Ok(()))
+            .unwrap();
+        let after_own_checkpoint: i64 = monitor
+            .query_row("PRAGMA data_version;", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            after_own_checkpoint, after_app_commit,
+            "a checkpoint on the monitored connection must not dirty its own data_version"
+        );
+    }
+
     #[tokio::test]
     async fn test_shadow_dir_path() {
         let db_path = PathBuf::from("/data/myapp.db");
@@ -791,6 +1366,10 @@ mod tests {
                 wal_salt: (0, 0),
                 wal_chain: None,
                 header_seeded: false,
+                probe_wal_mode_on_lifecycle_state: false,
+                discarded_unproven_tail: false,
+                append_poisoned: None,
+                append_failure: None,
             };
             shadow
                 .current_segment_path()
@@ -883,14 +1462,11 @@ mod tests {
         );
     }
 
-    /// Fix gate: `ShadowWal::new` heals a torn segment tail on restart, so the
-    /// next append stays frame-aligned and the reader decodes the real pages
-    /// instead of a bogus page 0. With the healing disabled this fails because
-    /// the torn tail persists and `encode_shadow_to_ltx` errors.
+    /// Upgrade gate: a markerless aligned tail is not proof of fsync. It may be
+    /// a complete corrupt frame from a power-loss image, so startup must remove
+    /// it and force the watch layer through a full snapshot before any delta.
     #[tokio::test]
-    async fn e1_shadow_new_heals_torn_tail_so_sync_resumes() {
-        use crate::legacy_shadow::{encode_shadow_to_ltx, ShadowSyncInput};
-
+    async fn markerless_aligned_tail_is_discarded_and_requires_snapshot() {
         let dir = tempdir().unwrap();
         let db_path = dir.path().join("app.db");
         let conn = Connection::open(&db_path).unwrap();
@@ -902,48 +1478,191 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let frame_size = FRAME_HEADER_SIZE + E1_PAGE_SIZE as u64;
         let shadow_dir = ShadowWal::shadow_dir_for(&db_path);
         std::fs::create_dir_all(&shadow_dir).unwrap();
         let seg = shadow_dir.join(format_segment_name(0, 0));
+        std::fs::write(&seg, e1_frame(999, 999, 0xDE)).unwrap();
 
-        // One committed frame plus a 30-byte torn tail (crash mid-write).
-        let mut bytes = e1_frame(1, 1, 0xAB);
-        bytes.extend_from_slice(&[0u8; 30]);
-        std::fs::write(&seg, &bytes).unwrap();
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        assert!(shadow.discarded_unproven_tail());
+        assert_eq!(shadow.generation(), 1, "upgrade must rotate cursor domain");
+        assert!(!seg.exists(), "markerless bytes must never enter a delta");
+        let marker = ShadowWal::read_durable_tail(&shadow_dir).await.unwrap();
+        assert!(marker.segments.is_empty());
+    }
 
-        // Restart discovery must heal the torn tail.
-        let _shadow = ShadowWal::new(&db_path).await.unwrap();
+    #[tokio::test]
+    async fn durable_tail_discards_aligned_prefsync_crash_image() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("durable-tail.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t(v) VALUES ('durable');",
+        )
+        .unwrap();
+
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        shadow.copy_frames(0).await.unwrap();
+        let segment = shadow.current_segment_path();
+        let durable_len = std::fs::metadata(&segment).unwrap().len();
+        let marker_before = ShadowWal::read_durable_tail(shadow.shadow_dir())
+            .await
+            .unwrap();
         assert_eq!(
-            std::fs::metadata(&seg).unwrap().len(),
-            frame_size,
-            "restart must truncate the torn tail to a whole-frame boundary"
+            marker_before.segments[segment.file_name().unwrap().to_str().unwrap()],
+            durable_len
+        );
+        drop(shadow);
+
+        // Construct the power-loss image SIGKILL cannot model: a complete,
+        // frame-aligned tail reached the file length but not the durable marker.
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&segment)
+            .unwrap();
+        file.write_all(&e1_frame(999, 999, 0xDE)).unwrap();
+        drop(file);
+        assert_eq!(
+            std::fs::metadata(&segment).unwrap().len(),
+            durable_len + FRAME_HEADER_SIZE + E1_PAGE_SIZE as u64
         );
 
-        // Simulate the post-restart append that copy_frames performs.
-        {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new().append(true).open(&seg).unwrap();
-            f.write_all(&e1_frame(2, 2, 0xCD)).unwrap();
-        }
-
-        let input = ShadowSyncInput {
-            db_path: db_path.clone(),
-            name: "app".into(),
-            current_txid: 10,
-            db_checksum: Some(123),
-            generation: 0,
-            shadow_sync_offset: 0,
-            page_size: E1_PAGE_SIZE,
-            shadow_dir: shadow_dir.clone(),
-        };
-
-        let (result, _offset) = encode_shadow_to_ltx(&input)
-            .expect("healed segment must encode cleanly")
-            .expect("committed frames must produce an LTX buffer");
+        let restarted = ShadowWal::new(&db_path).await.unwrap();
+        assert!(restarted.discarded_unproven_tail());
         assert_eq!(
-            result.unique_pages, 2,
-            "both real pages (1 and 2) must decode, with no bogus page 0"
+            std::fs::metadata(&segment).unwrap().len(),
+            durable_len,
+            "startup must trust the fsynced marker, not aligned file length"
+        );
+        assert_eq!(
+            restarted.segment_offset(),
+            durable_len,
+            "direct snapshots must freeze the full recovered generation, not only bytes appended after restart"
+        );
+    }
+
+    #[tokio::test]
+    async fn append_failures_rollback_before_retry_can_bless_bytes() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("append-rollback.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE t(id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let frame = |page, fill| ParsedFrame {
+            page_number: page,
+            db_size: page,
+            data: vec![fill; E1_PAGE_SIZE as usize],
+        };
+        shadow
+            .write_frames_to_segment(&[frame(1, 0x11)], E1_PAGE_SIZE)
+            .await
+            .unwrap();
+
+        for (index, failure) in [
+            TestAppendFailure::Write,
+            TestAppendFailure::Sync,
+            TestAppendFailure::Marker,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let segment = shadow.current_segment_path();
+            let durable_before = std::fs::metadata(&segment).unwrap().len();
+            let offset_before = shadow.segment_offset;
+            let marker_before = ShadowWal::read_durable_tail(shadow.shadow_dir())
+                .await
+                .unwrap();
+            shadow.append_failure = Some(failure);
+            let error = shadow
+                .write_frames_to_segment(
+                    &[frame(index as u32 + 2, 0x20 + index as u8)],
+                    E1_PAGE_SIZE,
+                )
+                .await
+                .unwrap_err();
+            assert!(format!("{error:#}").contains("injected shadow"));
+            assert_eq!(std::fs::metadata(&segment).unwrap().len(), durable_before);
+            assert_eq!(shadow.segment_offset, offset_before);
+            assert_eq!(
+                ShadowWal::read_durable_tail(shadow.shadow_dir())
+                    .await
+                    .unwrap()
+                    .segments,
+                marker_before.segments,
+                "{failure:?} must not leave a marker that blesses failed bytes"
+            );
+
+            shadow.append_failure = None;
+            shadow
+                .write_frames_to_segment(
+                    &[frame(index as u32 + 2, 0x20 + index as u8)],
+                    E1_PAGE_SIZE,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                std::fs::metadata(&segment).unwrap().len(),
+                durable_before + FRAME_HEADER_SIZE + E1_PAGE_SIZE as u64,
+                "retry after {failure:?} must append at the prior durable boundary"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_append_does_not_advance_wal_checksum_cursor() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("append-chain.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t(v) VALUES ('retry');",
+        )
+        .unwrap();
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+        let chain_before = shadow.wal_read_chain();
+        shadow.append_failure = Some(TestAppendFailure::Sync);
+        shadow.copy_frames(0).await.unwrap_err();
+        assert_eq!(shadow.wal_read_chain(), chain_before);
+        shadow.append_failure = None;
+        let (frames, offset) = shadow.copy_frames(0).await.unwrap();
+        assert!(!frames.is_empty());
+        assert!(offset > 0);
+        assert!(shadow.wal_read_chain().is_some());
+    }
+
+    #[tokio::test]
+    async fn durable_tail_finishes_marker_first_cleanup_after_crash() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("cleanup-tail.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t(v) VALUES ('durable');",
+        )
+        .unwrap();
+
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let orphan = shadow.shadow_dir().join(format_segment_name(7, 0));
+        std::fs::write(&orphan, e1_frame(1, 1, 0xAA)).unwrap();
+        drop(shadow);
+
+        let restarted = ShadowWal::new(&db_path).await.unwrap();
+        assert!(restarted.discarded_unproven_tail());
+        assert!(
+            !orphan.exists(),
+            "startup must finish a marker-first cleanup instead of adopting or retaining its orphan"
         );
     }
 

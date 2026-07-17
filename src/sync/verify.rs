@@ -14,6 +14,58 @@ use hadb_storage::StorageBackend;
 use hadb_storage_s3::S3Storage;
 use walrust_core::compaction::{list_merged_ranges, ranges_cover, RangeLayout, SeqRange};
 
+struct ClassifiedS3Storage(S3Storage);
+
+#[async_trait::async_trait]
+impl StorageBackend for ClassifiedS3Storage {
+    async fn get(&self, key: &str) -> Result<Option<Vec<u8>>> {
+        self.0
+            .get(key)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+
+    async fn put(&self, key: &str, data: &[u8]) -> Result<()> {
+        self.0
+            .put(key, data)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+
+    async fn delete(&self, key: &str) -> Result<()> {
+        self.0
+            .delete(key)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+
+    async fn list(&self, prefix: &str, after: Option<&str>) -> Result<Vec<String>> {
+        self.0
+            .list(prefix, after)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+
+    async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<hadb_storage::CasResult> {
+        self.0
+            .put_if_absent(key, data)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+
+    async fn put_if_match(
+        &self,
+        key: &str,
+        data: &[u8],
+        etag: &str,
+    ) -> Result<hadb_storage::CasResult> {
+        self.0
+            .put_if_match(key, data, etag)
+            .await
+            .map_err(|error| classify_or_else(error, WalrustError::s3))
+    }
+}
+
 /// Verification issue found during verify
 #[derive(Debug, Clone)]
 pub struct VerifyIssue {
@@ -179,16 +231,31 @@ pub(crate) async fn validate_backup_integrity(
     prefix: &str,
     db_name: &str,
 ) -> Result<ValidationResult> {
+    let native_storage = ClassifiedS3Storage(S3Storage::new(client.clone(), bucket.to_string()));
+    let native_stats =
+        walrust_core::native_restore::verify_native_v1(&native_storage, bucket, prefix, db_name)
+            .await?;
+    let native_verified = native_stats.map_or(0, |stats| stats.object_count);
+    let native_verified_bytes = native_stats.map_or(0, |stats| stats.payload_bytes);
     let discovered = discover_all_ltx_from_s3(client, bucket, prefix, db_name)
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
-    if discovered.is_empty() {
+    if discovered.is_empty() && native_verified == 0 {
         return Err(WalrustError::integrity(format!(
             "{}: no LTX files found during backup validation",
             db_name
         ))
         .into());
+    }
+    if discovered.is_empty() {
+        return Ok(ValidationResult {
+            verified_count: native_verified,
+            total_files: native_verified,
+            issues: Vec::new(),
+            verified_size_bytes: native_verified_bytes,
+            is_valid: true,
+        });
     }
 
     let mut issues: Vec<VerifyIssue> = Vec::new();
@@ -253,10 +320,10 @@ pub(crate) async fn validate_backup_integrity(
     issues.extend(verify_ltx_chain(&verified_files, &merged_ranges));
 
     Ok(ValidationResult {
-        verified_count,
-        total_files: discovered.len(),
+        verified_count: verified_count + native_verified,
+        total_files: discovered.len() + native_verified,
         issues: issues.clone(),
-        verified_size_bytes: total_size,
+        verified_size_bytes: total_size.saturating_add(native_verified_bytes),
         is_valid: issues.is_empty(),
     })
 }
@@ -516,12 +583,30 @@ pub async fn verify(
     );
     println!();
 
+    let native_storage = ClassifiedS3Storage(S3Storage::new(client.clone(), bucket_name.clone()));
+    let native_verified = walrust_core::native_restore::verify_native_v1(
+        &native_storage,
+        &bucket_name,
+        &prefix,
+        name,
+    )
+    .await
+    .map_err(|error| classify_or_else(error, WalrustError::integrity))?
+    .map_or(0, |stats| stats.object_count);
+    if native_verified > 0 {
+        println!(
+            "Native HADBP: verified {} contiguous published object(s)",
+            native_verified
+        );
+        println!();
+    }
+
     // Discover state from S3 (litestream format - no manifest)
     let (current_txid, max_gen, _) = discover_state_from_s3(&client, &bucket_name, &prefix, name)
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
-    if current_txid == 0 {
+    if current_txid == 0 && native_verified == 0 {
         println!("No LTX files found for database: {}", name);
         println!("Exit code: 5 (integrity issues found)");
         return Err(WalrustError::integrity(format!(
@@ -529,6 +614,12 @@ pub async fn verify(
             name
         ))
         .into());
+    }
+    if current_txid == 0 {
+        println!("All checks passed - native HADBP backup integrity verified");
+        println!();
+        println!("Exit code: 0 (success)");
+        return Ok(());
     }
 
     // Collect all files from all generations

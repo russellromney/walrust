@@ -4,8 +4,10 @@ use crate::errors::WalrustError;
 use crate::legacy_cache::LocalCache;
 use crate::legacy_shadow::{ShadowSyncInput, ShadowSyncOutput};
 use crate::shadow::ShadowWal;
-use crate::wal::FRAME_HEADER_SIZE;
-use anyhow::{Context, Result};
+use crate::wal::{
+    validate_header_checksum, verify_frame_checksum, FRAME_HEADER_SIZE, WAL_MAGIC_BE, WAL_MAGIC_LE,
+};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -51,9 +53,287 @@ pub struct ShadowWatchState {
     pub last_snapshot: Option<chrono::DateTime<Utc>>,
     pub db_checksum: Option<u64>,
     pub shadow: ShadowWal,
+    /// CLI shadow watch's explicitly owned checkpoint blocker. This connection
+    /// lives with the per-database watch state rather than the file tailer.
+    pub checkpoint_blocker: Option<rusqlite::Connection>,
+    /// Long-lived connection used for `PRAGMA data_version` and for committing
+    /// the blocker's heartbeat. Its own heartbeat does not advance its
+    /// connection-local version, so it detects app commits across controlled
+    /// release/reacquire windows without closing after blocker acquisition.
+    pub data_version_monitor: Option<rusqlite::Connection>,
+    /// Long-lived source database descriptor used by direct native snapshots.
+    /// It is opened before the checkpoint blocker and must not be closed until
+    /// every SQLite handle above has released its locks. Reusing this exact
+    /// descriptor avoids the classic POSIX close-releases-process-locks trap on
+    /// systems without open-file-description locks.
+    pub source_db_file: Option<std::sync::Arc<std::sync::Mutex<std::fs::File>>>,
     pub shadow_sync_generation: u64,
     pub shadow_sync_offset: u64,
     pub wal_copy_offset: u64,
+}
+
+/// Replace CLI shadow watch's checkpoint blocker after all one-shot SQLite
+/// connections for a controlled operation have closed.
+///
+/// POSIX advisory locks are process-scoped. The old read transaction must end
+/// before the retained data-version monitor writes a fresh heartbeat, then the
+/// same blocker connection pins it again. Reusing the already-last-opened
+/// blocker avoids a close/open POSIX lock gap. The data-version observer never
+/// participates in this write path.
+pub fn rearm_checkpoint_blocker(state: &mut ShadowWatchState) -> Result<()> {
+    let blocker = state
+        .checkpoint_blocker
+        .as_ref()
+        .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
+    if !blocker.is_autocommit() {
+        blocker.execute_batch("ROLLBACK;")?;
+    }
+    let mut last_open_error = None;
+    for attempt in 1..=3 {
+        if let Err(error) = ShadowWal::write_checkpoint_heartbeat(blocker, &state.db_path) {
+            tracing::error!(
+                "{}: checkpoint heartbeat write failed (attempt {}/3): {}",
+                state.name,
+                attempt,
+                error
+            );
+            last_open_error = Some(error);
+            continue;
+        }
+        if let Err(error) = ShadowWal::pin_checkpoint_heartbeat(blocker) {
+            tracing::error!(
+                "{}: checkpoint blocker pin failed (attempt {}/3): {}",
+                state.name,
+                attempt,
+                error
+            );
+            if !blocker.is_autocommit() {
+                blocker.execute_batch("ROLLBACK;")?;
+            }
+            last_open_error = Some(error);
+            continue;
+        }
+        if checkpoint_blocker_heartbeat_is_live(state)? {
+            tracing::info!("{}: CLI checkpoint blocker rearmed", state.name);
+            return Ok(());
+        }
+        tracing::error!(
+            "{}: checkpoint blocker heartbeat was reset in the release/reacquire window (attempt {}/3)",
+            state.name,
+            attempt
+        );
+        if !blocker.is_autocommit() {
+            blocker.execute_batch("ROLLBACK;")?;
+        }
+    }
+    Err(anyhow!(
+        "{}: checkpoint blocker heartbeat was reset during all rearm attempts{}",
+        state.name,
+        last_open_error
+            .as_ref()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
+    ))
+}
+
+/// Rearm after a controlled checkpoint without allowing the heartbeat write to
+/// erase dirty-window evidence.
+///
+/// The blocker first takes `BEGIN IMMEDIATE`, excluding application writers.
+/// Only then does the dedicated read-only observer sample `data_version`.
+/// Therefore every application commit from `data_version_before` through
+/// writer-lock acquisition is detected. The staged heartbeat is then committed
+/// and immediately pinned. A checkpoint/reset in that final commit-to-pin gap
+/// invalidates the heartbeat and is retried rather than accepted.
+pub fn rearm_checkpoint_blocker_after_checkpoint(
+    state: &mut ShadowWatchState,
+    data_version_before: i64,
+) -> Result<bool> {
+    if cfg!(debug_assertions)
+        && std::env::var_os("WALRUST_TEST_NATIVE_REARM_FAIL_FILE")
+            .is_some_and(|path| std::path::Path::new(&path).exists())
+        && std::env::var_os("WALRUST_TEST_NATIVE_REARM_FAIL_DB")
+            .is_none_or(|selected| std::path::Path::new(&selected) == state.db_path)
+    {
+        return Err(anyhow!(
+            "{}: test-injected checkpoint blocker rearm failure",
+            state.name
+        ));
+    }
+    let blocker = state
+        .checkpoint_blocker
+        .as_ref()
+        .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
+    if !blocker.is_autocommit() {
+        blocker.execute_batch("ROLLBACK;")?;
+    }
+
+    let mut dirty = false;
+    let mut last_error = None;
+    for attempt in 1..=3 {
+        if let Err(error) = ShadowWal::begin_checkpoint_heartbeat_transaction(blocker) {
+            tracing::error!(
+                "{}: checkpoint heartbeat writer lock failed (attempt {}/3): {}",
+                state.name,
+                attempt,
+                error
+            );
+            last_error = Some(error);
+            continue;
+        }
+
+        let observed = match checkpoint_data_version(state) {
+            Ok(observed) => observed,
+            Err(error) => {
+                let _ = blocker.execute_batch("ROLLBACK;");
+                return Err(error);
+            }
+        };
+        dirty |= observed != data_version_before;
+
+        if let Err(error) = blocker.execute_batch("COMMIT;") {
+            let _ = blocker.execute_batch("ROLLBACK;");
+            tracing::error!(
+                "{}: checkpoint heartbeat commit failed (attempt {}/3): {}",
+                state.name,
+                attempt,
+                error
+            );
+            last_error = Some(error.into());
+            continue;
+        }
+        if let Err(error) = ShadowWal::pin_checkpoint_heartbeat(blocker) {
+            if !blocker.is_autocommit() {
+                let _ = blocker.execute_batch("ROLLBACK;");
+            }
+            tracing::error!(
+                "{}: checkpoint blocker pin failed (attempt {}/3): {}",
+                state.name,
+                attempt,
+                error
+            );
+            last_error = Some(error);
+            continue;
+        }
+        if checkpoint_blocker_heartbeat_is_live(state)? {
+            tracing::info!("{}: CLI checkpoint blocker rearmed", state.name);
+            return Ok(dirty);
+        }
+        tracing::error!(
+            "{}: checkpoint blocker heartbeat was reset in the release/reacquire window (attempt {}/3)",
+            state.name,
+            attempt
+        );
+        dirty = true;
+        if !blocker.is_autocommit() {
+            blocker.execute_batch("ROLLBACK;")?;
+        }
+    }
+    Err(anyhow!(
+        "{}: checkpoint blocker heartbeat was reset during all rearm attempts{}",
+        state.name,
+        last_error
+            .as_ref()
+            .map(|error| format!(": {error}"))
+            .unwrap_or_default()
+    ))
+}
+
+pub fn checkpoint_data_version(state: &ShadowWatchState) -> Result<i64> {
+    let monitor = state
+        .data_version_monitor
+        .as_ref()
+        .ok_or_else(|| anyhow!("{}: CLI data_version monitor was not held", state.name))?;
+    Ok(monitor.query_row("PRAGMA data_version;", [], |row| row.get(0))?)
+}
+
+/// Verify that the reacquired blocker's heartbeat is still a live frame in
+/// the current WAL generation. Once this returns true, the active read mark
+/// prevents a later reset. A checkpoint that slipped between heartbeat COMMIT
+/// and BEGIN removes that frame (or changes the WAL salt), so callers must
+/// retry/re-anchor rather than trust the gap.
+pub fn checkpoint_blocker_heartbeat_is_live(state: &ShadowWatchState) -> Result<bool> {
+    let blocker = state
+        .checkpoint_blocker
+        .as_ref()
+        .ok_or_else(|| anyhow!("{}: CLI checkpoint blocker was not held", state.name))?;
+    let root_page: u32 = blocker.query_row(
+        "SELECT rootpage FROM sqlite_schema WHERE name = '_walrust_seq' AND type = 'table'",
+        [],
+        |row| row.get(0),
+    )?;
+
+    let wal = match std::fs::read(&state.wal_path) {
+        Ok(wal) => wal,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if wal.len() < 32 {
+        return Ok(false);
+    }
+    let header: [u8; 32] = wal[0..32].try_into().expect("32-byte WAL header");
+    let magic = u32::from_be_bytes(header[0..4].try_into().expect("four-byte WAL magic"));
+    if magic != WAL_MAGIC_LE && magic != WAL_MAGIC_BE {
+        return Err(anyhow!(
+            "{}: invalid WAL magic while verifying checkpoint blocker: {magic:#x}",
+            state.name
+        ));
+    }
+    let page_size = u32::from_be_bytes(header[8..12].try_into().expect("four-byte page size"));
+    if page_size < 512 || page_size > 65_536 || !page_size.is_power_of_two() {
+        return Err(anyhow!(
+            "{}: invalid WAL page size while verifying checkpoint blocker: {}",
+            state.name,
+            page_size
+        ));
+    }
+    let big_endian = magic == WAL_MAGIC_BE;
+    let mut checksum = validate_header_checksum(&header, big_endian)?;
+    let salt1 = &header[16..20];
+    let salt2 = &header[20..24];
+    let frame_size = 24usize + page_size as usize;
+    let mut root_frame_pending_commit = false;
+    for frame in wal[32..].chunks_exact(frame_size) {
+        let frame_header: [u8; 24] = frame[0..24].try_into().expect("24-byte frame header");
+        if &frame_header[8..12] != salt1 || &frame_header[12..16] != salt2 {
+            return Err(anyhow!(
+                "{}: WAL frame salt changed while verifying checkpoint blocker",
+                state.name
+            ));
+        }
+        checksum = verify_frame_checksum(
+            checksum,
+            &frame_header,
+            &frame[24..24 + page_size as usize],
+            big_endian,
+        )
+        .ok_or_else(|| {
+            anyhow!(
+                "{}: WAL frame checksum failed while verifying checkpoint blocker",
+                state.name
+            )
+        })?;
+        if u32::from_be_bytes(
+            frame_header[0..4]
+                .try_into()
+                .expect("four-byte page number"),
+        ) == root_page
+        {
+            root_frame_pending_commit = true;
+        }
+        let db_size = u32::from_be_bytes(
+            frame_header[4..8]
+                .try_into()
+                .expect("four-byte commit size"),
+        );
+        if db_size != 0 {
+            if root_frame_pending_commit {
+                return Ok(true);
+            }
+            root_frame_pending_commit = false;
+        }
+    }
+    Ok(false)
 }
 
 pub fn shadow_progress_path(shadow_dir: &Path) -> PathBuf {
@@ -440,11 +720,49 @@ mod tests {
 
         // Generation 0 ends with the requested tail frame.
         let gen0_segment = write_shadow_frame(1, tail_db_size, page_size);
-        tokio::fs::write(&gen0_path, &gen0_segment).await.unwrap();
+        let mut gen0 = std::fs::File::create(&gen0_path).unwrap();
+        gen0.write_all(&gen0_segment).unwrap();
+        gen0.sync_all().unwrap();
 
         // A later generation exists so the drain cursor tries to advance past gen 0.
         let gen1_segment = write_shadow_frame(1, 1, page_size);
-        tokio::fs::write(&gen1_path, &gen1_segment).await.unwrap();
+        let mut gen1 = std::fs::File::create(&gen1_path).unwrap();
+        gen1.write_all(&gen1_segment).unwrap();
+        gen1.sync_all().unwrap();
+        std::fs::File::open(&shadow_dir)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+
+        // These tests exercise cursor semantics, not crash recovery. Bind both
+        // hand-built segments to the same fsynced durable-tail protocol the
+        // production writer uses so reopen must retain (and validate) them.
+        let segments = std::collections::BTreeMap::from([
+            (
+                gen0_path.file_name().unwrap().to_str().unwrap(),
+                gen0_segment.len(),
+            ),
+            (
+                gen1_path.file_name().unwrap().to_str().unwrap(),
+                gen1_segment.len(),
+            ),
+        ]);
+        let marker = serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "segments": segments,
+        }))
+        .unwrap();
+        let marker_tmp = shadow_dir.join("durable-tail-v1.json.tmp");
+        let marker_path = shadow_dir.join("durable-tail-v1.json");
+        let mut marker_file = std::fs::File::create(&marker_tmp).unwrap();
+        marker_file.write_all(&marker).unwrap();
+        marker_file.sync_all().unwrap();
+        drop(marker_file);
+        std::fs::rename(marker_tmp, marker_path).unwrap();
+        std::fs::File::open(&shadow_dir)
+            .unwrap()
+            .sync_all()
+            .unwrap();
 
         let shadow = ShadowWal::new(&db_path).await.unwrap();
         ShadowWatchState {
@@ -455,6 +773,9 @@ mod tests {
             last_snapshot: None,
             db_checksum: None,
             shadow,
+            checkpoint_blocker: None,
+            data_version_monitor: None,
+            source_db_file: None,
             shadow_sync_generation: 0,
             shadow_sync_offset: gen0_segment.len() as u64,
             wal_copy_offset: 0,

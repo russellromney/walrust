@@ -1,11 +1,11 @@
 use crate::cache::LocalCache;
 use crate::errors::{classify_or_else, WalrustError};
 use crate::s3::{self, create_client, parse_bucket};
-use anyhow::Result;
+use anyhow::{bail, Result};
 use async_trait::async_trait;
 use hadb_storage::{CasResult, StorageBackend};
 use hadb_storage_s3::S3Storage;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walrust_core::legacy_restore;
 
 use super::manifest::{
@@ -16,6 +16,48 @@ use walrust_core::legacy_manifest::{parse_legacy_flat_ltx_filename, parse_ltx_fi
 struct CachedLegacyStorage {
     s3: S3Storage,
     cache: Option<LocalCache>,
+}
+
+fn unique_local_native_spool(
+    dir: &Path,
+    bucket: &str,
+    prefix: &str,
+    database: &str,
+) -> Result<Option<(PathBuf, walrust_core::native_spool::SpoolIdentity)>> {
+    let mut roots = Vec::new();
+    if dir.join("journal.json").exists() {
+        roots.push(dir.to_path_buf());
+    }
+    let native_root = dir.join("native-v1");
+    if let Ok(entries) = std::fs::read_dir(&native_root) {
+        roots.extend(entries.filter_map(|entry| entry.ok().map(|entry| entry.path())));
+    }
+    roots.sort();
+    roots.dedup();
+    let mut matches = Vec::new();
+    for root in roots {
+        let Some(identity) = walrust_core::native_spool::NativeSpool::read_identity(&root)? else {
+            continue;
+        };
+        if identity.bucket == bucket && identity.prefix == prefix && identity.database == database {
+            matches.push((root, identity));
+        }
+    }
+    if matches.len() > 1 {
+        let candidates = matches
+            .iter()
+            .map(|(root, identity)| format!("{} (lineage {})", root.display(), identity.lineage_id))
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "multiple local native spools match s3://{}/{}{}; refusing ambiguous restore: {}",
+            bucket,
+            prefix,
+            database,
+            candidates
+        );
+    }
+    Ok(matches.pop())
 }
 
 /// True if `key` addresses a compaction **level** object (`.../levels/L{n}/…`).
@@ -185,9 +227,6 @@ pub async fn restore(
     webhook: Option<std::sync::Arc<crate::webhook::WebhookSender>>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
-    let client = create_client(endpoint)
-        .await
-        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
     // Try to open local cache if provided
     let cache = if let Some(dir) = cache_dir {
@@ -217,10 +256,75 @@ pub async fn restore(
         None
     };
 
+    if let Some(dir) = cache_dir {
+        if let Some((root, identity)) = unique_local_native_spool(dir, &bucket_name, &prefix, name)?
+        {
+            let spool = walrust_core::native_spool::NativeSpool::create_or_open(
+                &root,
+                identity,
+                walrust_core::native_spool::CapacityPolicy {
+                    warning_bytes: u64::MAX - 1,
+                    hard_bytes: u64::MAX,
+                    minimum_free_bytes: 0,
+                },
+            )?;
+            if let Some(seq) = walrust_core::native_restore::restore_local_spool(
+                &spool,
+                output,
+                parsed_point_in_time,
+            )? {
+                println!(
+                    "Restored {} to {} from local native HADBP spool (sequence: {})",
+                    name,
+                    output.display(),
+                    seq
+                );
+                return Ok(());
+            }
+        }
+    }
+
+    // A complete local native spool is a self-contained recovery source. Do
+    // not initialize an S3 client until local restore has been exhausted.
+    let client = create_client(endpoint)
+        .await
+        .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+
     let storage = CachedLegacyStorage {
         s3: S3Storage::new(client.clone(), bucket_name.clone()),
         cache,
     };
+    match walrust_core::native_restore::restore_native_v1(
+        &storage,
+        &bucket_name,
+        &prefix,
+        name,
+        output,
+        parsed_point_in_time,
+    )
+    .await
+    {
+        Ok(walrust_core::native_restore::NativeRestoreAvailability::Restored { seq }) => {
+            println!(
+                "Restored {} to {} (native HADBP sequence: {})",
+                name,
+                output.display(),
+                seq
+            );
+            return Ok(());
+        }
+        Ok(
+            walrust_core::native_restore::NativeRestoreAvailability::LegacyOnly
+            | walrust_core::native_restore::NativeRestoreAvailability::LegacyPoint { .. },
+        ) => {}
+        Err(error) => {
+            if let Some(webhook) = webhook {
+                let error_msg = format!("native HADBP restore failed: {error:#}");
+                webhook.notify_corruption(name, &error_msg).await;
+            }
+            return Err(classify_or_else(error, WalrustError::restore));
+        }
+    }
     let result =
         legacy_restore::restore_legacy_ltx(&storage, &prefix, name, output, parsed_point_in_time)
             .await;
@@ -283,6 +387,25 @@ pub async fn list(bucket: &str, endpoint: Option<&str>) -> Result<()> {
     } else {
         println!("Databases in s3://{}/{}:", bucket_name, prefix);
         for db in &dbs {
+            let storage = S3Storage::new(client.clone(), bucket_name.clone());
+            if let Some(native) =
+                walrust_core::native_restore::inspect_native_v1(&storage, &bucket_name, &prefix, db)
+                    .await
+                    .map_err(|e| classify_or_else(e, WalrustError::s3))?
+            {
+                println!(
+                    "  {} (native HADBP TXID: {}, {} objects, snapshot TXID {}{})",
+                    db,
+                    native.head_seq,
+                    native.object_count,
+                    native.latest_snapshot_seq,
+                    native
+                        .legacy_boundary_txid
+                        .map(|seq| format!(", legacy PITR through TXID {seq}"))
+                        .unwrap_or_default()
+                );
+                continue;
+            }
             // Discover state from S3 (litestream format)
             let (current_txid, _max_gen, _) =
                 discover_state_from_s3(&client, &bucket_name, &prefix, db)
@@ -439,6 +562,82 @@ mod tests {
             cache_substitute_for_key(&cache, "").is_none(),
             "empty key must fall back to S3"
         );
+    }
+
+    #[test]
+    fn local_native_restore_rejects_multiple_matching_lineages() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_a = dir.path().join("a.sqlite");
+        let db_b = dir.path().join("b.sqlite");
+        std::fs::File::create(&db_a).unwrap();
+        std::fs::File::create(&db_b).unwrap();
+        let capacity = walrust_core::native_spool::CapacityPolicy {
+            warning_bytes: u64::MAX - 1,
+            hard_bytes: u64::MAX,
+            minimum_free_bytes: 0,
+        };
+        for (db, lineage) in [(&db_a, "lineage-a"), (&db_b, "lineage-b")] {
+            let identity = walrust_core::native_spool::SpoolIdentity::new(
+                db, "bucket", "p/", "db", lineage, 1, None, true,
+            )
+            .unwrap();
+            let root = walrust_core::native_spool::NativeSpool::path_for(dir.path(), &identity);
+            walrust_core::native_spool::NativeSpool::create_or_open(&root, identity, capacity)
+                .unwrap();
+        }
+
+        let error = unique_local_native_spool(dir.path(), "bucket", "p/", "db").unwrap_err();
+        assert!(error.to_string().contains("refusing ambiguous restore"));
+        assert!(error.to_string().contains("lineage-a"));
+        assert!(error.to_string().contains("lineage-b"));
+    }
+
+    #[tokio::test]
+    async fn local_native_restore_refuses_active_spool_owner_without_cloud_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("active.sqlite");
+        std::fs::File::create(&db).unwrap();
+        let identity = walrust_core::native_spool::SpoolIdentity::new(
+            &db,
+            "bucket",
+            "p/",
+            "db",
+            "lineage-active",
+            1,
+            None,
+            true,
+        )
+        .unwrap();
+        let root = walrust_core::native_spool::NativeSpool::path_for(dir.path(), &identity);
+        let _owner = walrust_core::native_spool::NativeSpool::create_or_open(
+            &root,
+            identity,
+            walrust_core::native_spool::CapacityPolicy {
+                warning_bytes: u64::MAX - 1,
+                hard_bytes: u64::MAX,
+                minimum_free_bytes: 0,
+            },
+        )
+        .unwrap();
+        let output = dir.path().join("restore.sqlite");
+        let error = restore(
+            "db",
+            &output,
+            "bucket/p/",
+            None,
+            None,
+            Some(dir.path()),
+            None,
+        )
+        .await
+        .unwrap_err();
+        let message = format!("{error:#}");
+        assert!(message.contains("active watcher"), "{message}");
+        assert!(
+            message.contains("stop watch before local restore"),
+            "{message}"
+        );
+        assert!(!output.exists());
     }
 
     #[test]

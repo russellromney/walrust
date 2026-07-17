@@ -22,6 +22,113 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Startup SIGTERM durability window:** shadow watch now installs its Unix
+  shutdown handlers before remote discovery or initial native snapshot work.
+  A SIGTERM arriving after durable startup admission but before the main loop
+  can no longer take the process default and bypass final local spool
+  admission; it is queued and handled by the bounded graceful-shutdown path.
+  Replacement CI exposed the race in the existing live shutdown-SIGKILL E2E;
+  the unchanged test passes against live Tigris after the production fix.
+- **Independent-mode scope isolation:** removed the obsolete shadow-watch
+  source-close hook that had extended the legacy LTX snapshot writer and
+  changed independent-mode snapshot ordering/implementation even though the
+  native watcher no longer called it. The shared legacy snapshot source and
+  its integration tests are byte-for-byte restored to the PR #42 baseline;
+  default shadow watch continues exclusively through the native HADBP spool.
+- **Checkpoint rearm gap and local PIT fallback:** the controlled checkpoint
+  heartbeat is now committed by the retained pre-blocker `data_version`
+  monitor, then pinned again by the already-last-opened blocker connection.
+  No source handle is closed or opened in the handoff. The monitor's own
+  heartbeat cannot hide an application commit, so a commit plus TRUNCATE in
+  the former final-sample-to-rearm gap durably marks the window dirty and
+  forces a native snapshot re-anchor. Candidate release also requires a
+  bounded 500ms stable `data_version` interval; a commit in that interval is
+  copied and admitted as another native delta, while sustained writers defer
+  checkpointing with the blocker held. Local restore
+  now falls through to remote native history for a PIT below a cleaned local
+  snapshot base, and failed legacy-migration verification removes and fsyncs
+  its live scratch path.
+- **Local-first native HADBP shadow watch:** default CLI watch now stages every
+  initial, periodic, threshold, idle, downtime, and dirty-window snapshot or
+  delta as fsynced native HADBP plus a durable local journal before opening a
+  controlled SQLite checkpoint window. `checkpoint_release = "local"` never
+  waits for cloud I/O; the opt-in `"remote"` policy waits for a contiguous,
+  exact remote publish cursor. The asynchronous disk-scanning uploader uses a
+  versioned `native/v1` namespace, immutable conditional publication, exact
+  payload/header/chain validation, bounded retry, split-brain refusal, and
+  remote visibility records that never expose a delta without its snapshot
+  base. Restart reconciles snapshot/install intents, adopts only proven
+  orphans, re-anchors every dirty checkpoint window, preserves pending work
+  through shutdown and capacity pressure, and supports complete local restore
+  while S3 is unavailable. Native retention advances only through verified
+  snapshot-floor records; legacy 0.7 LTX history remains readable and migrates
+  through a full native snapshot boundary. Independent review additionally
+  closed fail-open monitor-refresh rearm, corrupt remote cursor, pre-validation
+  cleanup unlink, missing predecessor/base publication, and retained-floor base
+  selection gaps.
+- **Adversarial local-first startup and filesystem hardening:** CLI watch now
+  pins every SQLite WAL before S3 client construction or remote discovery, so
+  application TRUNCATE cannot erase startup-window frames. Shadow segments use
+  an atomic, fsynced durable-tail marker and discard even frame-aligned bytes
+  beyond that proof after a crash. Snapshot capacity is computed from the exact
+  fsynced shadow commit boundary and reserves the direct HADBP
+  temporary/installed payload, full journal rewrite, intents, source footprint,
+  and filesystem reserve before encoding. Object admission likewise
+  reserves install-intent and journal rewrite peaks. SIGTERM retries local
+  admission indefinitely with the blocker held when capacity or local I/O is
+  unhealthy; SIGKILL remains the explicit forced-stop route.
+- **Shadow proof-boundary follow-up:** markerless pre-upgrade shadow segments
+  are no longer fsynced and adopted during startup; they are discarded, the
+  source-cursor generation is rotated, and a full native snapshot is required
+  before later deltas. Live append write/sync/marker failures restore the prior
+  durable marker, truncate and fsync the prior length, and roll back all
+  in-memory WAL cursor state before retry; rollback failure poisons admission
+  until restart. Native watcher snapshots now apply Litestream's physical
+  page-selection rule directly: the latest page at the frozen fsynced shadow
+  commit wins, otherwise the pinned main database supplies the page, and the
+  result streams straight into native HADBP. There is no SQLite online-backup
+  or VACUUM handoff, stable `.db` copy, or destination rollback-journal
+  transient.
+- **Native spool ownership and collision safety:** an advisory ownership lock
+  prevents local restore or a second mutating recovery opener from racing the
+  watcher's payload-before-journal and cleanup windows. Active local restore
+  fails with an actionable message; after watch stops, the same spool restores
+  without S3. New spool paths length-prefix and domain-separate all identity
+  components. Existing v1 paths remain discoverable, while an adversarial v1
+  tuple collision belonging to another identity routes safely to v2.
+- **Native migration prune gate:** legacy pruning now requires the same
+  descriptor-selected contiguous native snapshot base used by restore. A stray
+  publish record beyond a gap cannot unlock deletion of the legacy recovery
+  base. Scheduled shadow-watch retention now uses this same native-aware path
+  instead of its former legacy-only helper. Before `stream.json` exists, the
+  watcher additionally consults its durable migration journal and preserves the
+  legacy base until a retained native snapshot is published through the
+  contiguous remote cursor; safe local cleanup of the original first snapshot
+  does not disable later retention. Negative live-storage proofs cover both the
+  pending-local/pre-descriptor and descriptor-without-visible-base windows. A
+  live watcher proof advances the verified native floor across repeated
+  snapshots and preserves row-exact latest restore with a clean integrity
+  check.
+- **Native spool crash recovery:** restart now validates and completes a
+  fsynced HADBP payload temporary when its durable install intent exists,
+  instead of deleting the intent and leaving a temp that blocks every retry.
+  Direct snapshots also fsync the temporary's directory entry before their
+  crash boundary and adopt a complete temp from the durable frozen-source
+  intent even when the generic install intent was not yet written. Incomplete
+  pre-admission encodes are validated and removed without cursor advancement;
+  cleanup refuses to remove a temp once durable object installation has begun.
+- **Lossless default CLI watch:** shadow watch retains the same pinned-frame
+  `_walrust_seq` checkpoint blocker used by owned/library replication for each
+  database, so application autocheckpoints, explicit TRUNCATE checkpoints, and
+  short-lived writer sessions cannot erase unread WAL frames. Walrust's own
+  checkpoint path durably drains shadow data before the blocker is released and
+  reacquires it immediately afterward. A lifetime `PRAGMA data_version` monitor
+  plus live-heartbeat-frame verification detects an app commit/reset in the
+  controlled release window and conditionally re-anchors instead of losing it.
+  The blocker makes walrust responsible for WAL growth: crossing
+  `wal_truncate_threshold_pages` now emits an ERROR and
+  a `wal_size_exceeded` webhook, durably drains, then runs a controlled TRUNCATE
+  instead of letting the WAL bloat silently.
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
   owns each planned candidate instead of retaining borrowed plan entries across
   the async stream, fixing the non-general `Send` future seen by embedders using
@@ -45,10 +152,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- Added a deterministic post-sample checkpoint handoff test that commits and
+  TRUNCATEs through the unblocked gap; disabling the after-rearm
+  `data_version` comparison makes it fail. A separate test pins the retained
+  monitor handle across rearm, and local cleanup coverage now proves an older
+  PIT returns “not local” so the CLI can continue to remote restore.
+- Added live-S3 call-site proofs for local checkpoint independence from paused
+  uploads, opt-in remote release, exact staged bytes, all snapshot triggers,
+  every shadow/snapshot/journal/checkpoint/PUT/publish/cleanup/shutdown SIGKILL
+  boundary, offline restart/reconnect conflict, custom multi-database spool
+  paths, capacity watermarks, graceful bounded drain, PASSIVE contention,
+  native latest/PITR/prune/compaction, and legacy migration. Load-bearing gates
+  were neutered to observe failure before restored green runs. The preserved
+  DF1/DF2, application checkpoint, WAL backpressure, racing checkpoint,
+  two-writer, fenced follower, core SIGKILL, and frozen 0.7 format-stability
+  gates remain green.
+- Added live-S3 user-path proofs for blocker attachment before delayed startup
+  discovery, SIGTERM at hard spool capacity, WAL-visible snapshot growth under
+  a tight custom spool limit, and active-owner local restore refusal followed
+  by exact offline restore. Added unit crash images for aligned but unproven
+  shadow tails, journal/intent rewrite peaks, ownership contention, and
+  adversarial path-component collisions. Each new production gate was disabled
+  at its call site and observed failing before its restored green run.
+- Added live-S3 proofs that markerless upgrade re-anchors before emitting a
+  new-generation delta and that an application TRUNCATE remains blocked at the
+  native frozen-shadow snapshot handoff. The test commits after the exact cursor
+  is frozen, proves the local snapshot excludes that commit without any
+  intermediate `.db`, then proves the following native delta and remote latest
+  restore include it exactly.
+  Injected unit failures cover partial write, pre-fsync, post-marker, and WAL
+  checksum-cursor rollback paths. CI fixture hardening now constructs legacy
+  cursor generations and their durable-tail marker explicitly, and the
+  snapshot-handoff E2E uses a bounded durable-delta observation so exact remote
+  restore cannot race the watcher log assertion.
+- Added direct-snapshot fail-on-revert proofs for shadow-page precedence, exact
+  prewritten HADBP temp installation, durable frozen-source intent admission,
+  complete pre-install-intent orphan adoption, and divergent-valid-temp
+  retention. The live frozen-cursor path additionally caught and fixed Tokio's
+  immediate first periodic-snapshot tick, which otherwise emitted a redundant
+  second snapshot instead of the required next native delta.
+- Markerless shadow upgrade now resets the live-WAL copy offset when durable-tail
+  recovery discards the bytes described by old progress. This recopies the
+  pinned WAL from zero before the direct native snapshot re-anchor instead of
+  incorrectly asking the shorter main DB for a WAL-only page. The marker-file
+  SIGKILL harness also waits for non-empty fsynced marker contents, eliminating
+  a create-before-write observation race without weakening any crash boundary.
 - Pinned the checkpoint-blocker contract against real SQLite databases across
   every supported page size and synchronous level: a concurrent
   `wal_checkpoint(TRUNCATE)` reports busy and preserves the WAL until walrust
   releases its pinned read transaction.
+- Added live-S3 CLI proofs for DF1/DF2 short-lived writers with zero safety
+  re-anchors and no snapshot storm, application TRUNCATE checkpoints underneath
+  a running watcher, and the WAL-growth ERROR + webhook + durable-drain path.
 - Added public-API integration coverage for flat and lineaged owned histories,
   leveled-compaction restore/resume, mixed DDL/INSERT/UPDATE/DELETE/blob loads,
   PITR refusal with no storage writes, competing-writer refusal with byte-exact

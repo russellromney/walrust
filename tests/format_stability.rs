@@ -453,6 +453,187 @@ async fn format_stability_cli_v0_7_0_bucket_restores_row_exact() -> Result<()> {
     result
 }
 
+/// A published 0.7 CLI LTX stream remains the immutable historical prefix
+/// when default watch crosses to its versioned native HADBP snapshot boundary.
+#[tokio::test]
+async fn format_stability_cli_v0_7_0_migrates_to_native_hadbp_boundary() -> Result<()> {
+    require_s3!("format_stability_cli_v0_7_0_migrates_to_native_hadbp_boundary");
+    let fixture = "cli-v0.7.0";
+    let manifest = load_manifest(fixture)?;
+    let scratch = unique_scratch_prefix("cli-native-migration");
+    let bucket = test_bucket();
+    let endpoint = test_endpoint();
+    let storage = walrust::s3_backend_from_env(bucket.clone(), endpoint.as_deref()).await?;
+    upload_fixture(&storage, fixture, &manifest, &scratch).await?;
+
+    let result = async {
+        let temp = tempfile::TempDir::new()?;
+        let bucket_arg = format!("{bucket}/{scratch}");
+        let db = temp.path().join(format!("{}.db", manifest.db_name));
+        let watch_log_path = temp.path().join("migration-watch.log");
+        run_cli_restore(
+            &manifest.db_name,
+            &bucket_arg,
+            endpoint.as_deref(),
+            &db,
+            None,
+        )?;
+        assert_restored_matches(
+            "legacy head before native migration",
+            &db,
+            manifest.latest.row_count,
+            &manifest.latest.rows_sha256,
+        )?;
+
+        let watch_log = std::fs::File::create(&watch_log_path)?;
+        let mut watch = Command::new(env!("CARGO_BIN_EXE_walrust"));
+        watch
+            .env(
+                "RUST_LOG",
+                "walrust_core::shadow=debug,walrust::sync::watch_shadow=debug,walrust_core::native_publish=info",
+            )
+            .arg("watch")
+            .arg(&db)
+            .arg("--bucket")
+            .arg(&bucket_arg)
+            .arg("--snapshot-interval")
+            .arg("3600")
+            .arg("--wal-sync-interval")
+            .arg("1")
+            .arg("--checkpoint-interval")
+            .arg("1")
+            .arg("--min-checkpoint-pages")
+            .arg("1")
+            .arg("--wal-truncate-threshold")
+            .arg("100000")
+            .arg("--no-metrics")
+            .stdout(watch_log.try_clone()?)
+            .stderr(watch_log);
+        if let Some(endpoint) = endpoint.as_deref() {
+            watch.arg("--endpoint").arg(endpoint);
+        }
+        let mut child = watch.spawn().context("start native migration watcher")?;
+        let migration_result = async {
+            let startup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait()? {
+                    anyhow::bail!("native migration watcher exited during startup: {status}");
+                }
+                let descriptor_key =
+                    format!("{scratch}/{}/native/v1/stream.json", manifest.db_name);
+                if let Some(bytes) = storage.get(&descriptor_key).await? {
+                    let descriptor: walrust::walrust_core::native_publish::StreamDescriptor =
+                        serde_json::from_slice(&bytes)?;
+                    let published_base = format!(
+                        "{scratch}/{}/native/v1/lineages/{}/published/{:016x}.json",
+                        manifest.db_name, descriptor.lineage_id, descriptor.first_native_seq
+                    );
+                    if storage.get(&published_base).await?.is_some() {
+                        break;
+                    }
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < startup_deadline,
+                    "timed out waiting for the first published native migration snapshot"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+
+            let writer = Connection::open(&db)?;
+            writer.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0;")?;
+            writer.execute(
+                "INSERT INTO items(value) VALUES ('post-native-migration')",
+                [],
+            )?;
+            let journal_mode: String = writer.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
+            let live_rows: u64 = writer.query_row("SELECT count(*) FROM items", [], |row| row.get(0))?;
+            let wal_path = db.with_extension("db-wal");
+            let wal_before_close = std::fs::metadata(&wal_path).map(|metadata| metadata.len()).unwrap_or(0);
+            anyhow::ensure!(
+                journal_mode.eq_ignore_ascii_case("wal")
+                    && live_rows == manifest.latest.row_count + 1
+                    && wal_before_close > 0,
+                "post-migration commit was not live in WAL mode: mode={journal_mode} rows={live_rows} wal_bytes={wal_before_close}"
+            );
+            drop(writer);
+
+            let latest = temp.path().join("native-latest.db");
+            let publish_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let mut last_restore_error: String;
+            loop {
+                let restored = run_cli_restore(
+                    &manifest.db_name,
+                    &bucket_arg,
+                    endpoint.as_deref(),
+                    &latest,
+                    None,
+                )
+                .and_then(|_| read_rows(&latest));
+                match restored {
+                    Ok(rows) => {
+                        last_restore_error = format!(
+                            "restore contained {} rows; last={:?}",
+                            rows.len(),
+                            rows.last()
+                        );
+                        if rows.len() as u64 == manifest.latest.row_count + 1
+                            && rows.last().map(|(_, value)| value.as_str())
+                                == Some("post-native-migration")
+                        {
+                            assert_integrity_ok(&latest)?;
+                            break;
+                        }
+                    }
+                    Err(error) => last_restore_error = format!("{error:#}"),
+                }
+                if let Some(status) = child.try_wait()? {
+                    anyhow::bail!("native migration watcher exited before publish: {status}");
+                }
+                anyhow::ensure!(
+                    std::time::Instant::now() < publish_deadline,
+                    "timed out waiting for native migration latest restore; last restore: {}; watcher:\n{}",
+                    last_restore_error,
+                    std::fs::read_to_string(&watch_log_path).unwrap_or_default()
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+
+            let old_pitr = temp.path().join("legacy-pitr-after-migration.db");
+            run_cli_restore(
+                &manifest.db_name,
+                &bucket_arg,
+                endpoint.as_deref(),
+                &old_pitr,
+                Some(manifest.pitr.txid),
+            )?;
+            assert_restored_matches(
+                "legacy PITR after native migration",
+                &old_pitr,
+                manifest.pitr.row_count,
+                &manifest.pitr.rows_sha256,
+            )?;
+
+            let keys = storage
+                .list(&format!("{scratch}/{}/native/v1/", manifest.db_name), None)
+                .await?;
+            anyhow::ensure!(keys.iter().any(|key| key.ends_with(".hadbp")));
+            anyhow::ensure!(
+                keys.iter().all(|key| !key.ends_with(".ltx")),
+                "native layout must never classify HADBP bytes as legacy LTX"
+            );
+            Ok(())
+        }
+        .await;
+        let _ = child.kill();
+        let _ = child.wait();
+        migration_result
+    }
+    .await;
+
+    delete_scratch(&storage, &scratch).await;
+    result
+}
+
 /// A bucket written by REGISTRY walrust-core 0.7.0 in owned mode
 /// (`add_without_snapshot` + autonomous snapshots + compaction) restores
 /// row-exact through the current library restore path: `Replicator::restore`

@@ -30,6 +30,10 @@ pub struct Config {
     #[serde(default)]
     pub cache: CacheConfig,
 
+    /// Mandatory native-HADBP local spool used by default shadow watch.
+    #[serde(default)]
+    pub spool: SpoolConfig,
+
     /// Retry configuration for transient failures
     #[serde(default)]
     pub retry: crate::retry::RetryConfig,
@@ -119,6 +123,64 @@ pub struct SyncConfig {
     /// Recommended: 86400 (daily) for production. Warning: downloads metadata from S3.
     #[serde(default)]
     pub validation_interval: u64,
+
+    /// Boundary required before walrust releases its checkpoint blocker.
+    #[serde(default)]
+    pub checkpoint_release: CheckpointRelease,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CheckpointRelease {
+    /// Fsynced native HADBP payload plus matching local journal record.
+    #[default]
+    Local,
+    /// Local admission plus contiguous remote publish confirmation.
+    Remote,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SpoolConfig {
+    /// Root directory. A collision-safe per-stream directory is created below it.
+    pub path: Option<PathBuf>,
+    /// Warning watermark in bytes.
+    #[serde(default = "default_spool_warning_size")]
+    pub warning_size: u64,
+    /// Hard spool capacity in bytes. Pending objects are never evicted.
+    #[serde(default = "default_spool_max_size")]
+    pub max_size: u64,
+    /// Required free bytes on the actual spool filesystem.
+    #[serde(default = "default_spool_min_free_space")]
+    pub min_free_space: u64,
+    /// Optional bounded cloud drain on graceful shutdown.
+    #[serde(default = "default_spool_shutdown_drain")]
+    pub shutdown_drain_seconds: u64,
+}
+
+impl Default for SpoolConfig {
+    fn default() -> Self {
+        Self {
+            path: None,
+            warning_size: default_spool_warning_size(),
+            max_size: default_spool_max_size(),
+            min_free_space: default_spool_min_free_space(),
+            shutdown_drain_seconds: default_spool_shutdown_drain(),
+        }
+    }
+}
+
+fn default_spool_warning_size() -> u64 {
+    4 * 1024 * 1024 * 1024
+}
+fn default_spool_max_size() -> u64 {
+    5 * 1024 * 1024 * 1024
+}
+fn default_spool_min_free_space() -> u64 {
+    1024 * 1024 * 1024
+}
+fn default_spool_shutdown_drain() -> u64 {
+    10
 }
 
 impl Default for SyncConfig {
@@ -136,6 +198,7 @@ impl Default for SyncConfig {
             min_checkpoint_page_count: 1000,
             wal_truncate_threshold_pages: 121359,
             validation_interval: 0,
+            checkpoint_release: CheckpointRelease::Local,
         }
     }
 }

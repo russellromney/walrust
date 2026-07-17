@@ -1,5 +1,6 @@
 use anyhow::{anyhow, Result};
 use chrono::Utc;
+use hadb_storage_s3::S3Storage;
 use std::fs::{self, File};
 use std::path::Path;
 use std::time::Duration;
@@ -138,6 +139,33 @@ async fn replicate_poll(
     local: &Path,
     current_txid: &mut u64,
 ) -> Result<usize> {
+    let native_tmp = local.with_extension("db-native-replica.tmp");
+    let native_storage = S3Storage::new(client.clone(), bucket.to_string());
+    match walrust_core::native_restore::restore_native_v1(
+        &native_storage,
+        bucket,
+        prefix,
+        db_name,
+        &native_tmp,
+        None,
+    )
+    .await?
+    {
+        walrust_core::native_restore::NativeRestoreAvailability::Restored { seq } => {
+            if seq <= *current_txid && local.exists() {
+                let _ = fs::remove_file(&native_tmp);
+                return Ok(0);
+            }
+            fs::rename(&native_tmp, local)?;
+            fsync_parent_dir(local)?;
+            *current_txid = seq;
+            save_replica_state(local, seq)?;
+            return Ok(1);
+        }
+        walrust_core::native_restore::NativeRestoreAvailability::LegacyOnly
+        | walrust_core::native_restore::NativeRestoreAvailability::LegacyPoint { .. } => {}
+    }
+
     // Discover LTX files from the S3 listing. The production watch path writes
     // litestream-format objects and never a manifest.json, so reading a
     // manifest made replicate fail with "No LTX files found" (F6).

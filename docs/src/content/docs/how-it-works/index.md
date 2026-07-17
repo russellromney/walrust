@@ -23,8 +23,8 @@ app.db-shm  ← shared memory (ignore this)
 
 ```
 ┌─────────────┐    ┌─────────────┐    ┌─────────────┐    ┌─────────────┐
-│  Your App   │───▶│   WAL File  │───▶│ Shadow WAL  │───▶│   Walrust   │───▶ S3
-│  (writes)   │    │  (changes)  │    │   (copy)    │    │  (uploads)  │
+│  Your App   │───▶│   WAL File  │───▶│ Shadow WAL  │───▶│ HADBP Spool │───▶ S3
+│  (writes)   │    │  (changes)  │    │   (fsync)   │    │ (journaled) │
 └─────────────┘    └─────────────┘    └─────────────┘    └─────────────┘
 ```
 
@@ -32,10 +32,10 @@ app.db-shm  ← shared memory (ignore this)
 2. SQLite appends to the WAL file
 3. Walrust detects the change (via polling at `wal_sync_interval`)
 4. Walrust copies frames to a shadow WAL file (decouples from SQLite)
-5. Walrust packages changed pages into an LTX file
-6. LTX file uploads to S3
+5. Walrust fsyncs a native HADBP snapshot or delta and its local journal
+6. SQLite may checkpoint; the exact immutable HADBP bytes upload asynchronously
 
-The shadow WAL ensures that S3 upload latency doesn't block SQLite checkpoints or writes.
+The durable local spool keeps S3 latency out of SQLite checkpointing by default.
 
 ## LTX Format
 

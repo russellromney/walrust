@@ -95,7 +95,7 @@ hadb-io = { version = "0.5.0", default-features = false }
 aws-sdk-s3 = { version = "1", optional = true }
 
 # SQLite for checkpointing
-rusqlite = { version = "0.35", features = ["bundled"] }
+rusqlite = { version = "0.35", features = ["bundled", "backup"] }
 
 # Directory traversal (for shadow WAL size calculation)
 walkdir = "2"
@@ -110,12 +110,12 @@ prometheus = "0.13"
 
 # Compaction
 tempfile = "3"
+uuid = { version = "1", features = ["v4"] }
 
 # Memory allocator — returns freed memory to OS (macOS system allocator doesn't)
 mimalloc = { version = "0.1", default-features = false }
 
 [dev-dependencies]
-uuid = { version = "1", features = ["v4"] }
 brunch = "0.5"
 tower = "0.5"
 # Construct typed AWS SDK errors in unit tests (the not-found classifier in

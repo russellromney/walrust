@@ -14,6 +14,54 @@ use crate::s3::{self, create_client, parse_bucket};
 
 use super::manifest::discover_snapshots_from_s3;
 
+fn native_retention_floor(
+    snapshots: &[SnapshotEntry],
+    policy: &RetentionPolicy,
+    now: chrono::DateTime<Utc>,
+) -> Option<u64> {
+    // hadb-io's generic safety minimum fills from the oldest entry because
+    // some formats need their original base. Every native-v1 entry here is a
+    // complete HADBP snapshot, so retaining the oldest would pin the immutable
+    // floor forever. Preserve all GFS tier selections, then satisfy the same
+    // minimum with the newest complete snapshots.
+    let mut tier_policy = policy.clone();
+    tier_policy.minimum = 0;
+    let tier_plan = crate::retention::analyze_retention(snapshots, &tier_policy, now);
+    let mut keep = tier_plan
+        .keep
+        .iter()
+        .map(|entry| entry.sequence)
+        .collect::<std::collections::BTreeSet<_>>();
+    if keep.len() < policy.minimum {
+        let mut newest = snapshots.iter().collect::<Vec<_>>();
+        newest.sort_by_key(|entry| std::cmp::Reverse(entry.sequence));
+        for entry in newest {
+            keep.insert(entry.sequence);
+            if keep.len() >= policy.minimum {
+                break;
+            }
+        }
+    }
+    keep.into_iter().next()
+}
+
+fn native_publish_created_at(
+    record: &walrust_core::native_publish::PublishRecord,
+    last_modified: chrono::DateTime<Utc>,
+) -> chrono::DateTime<Utc> {
+    // Native records written before created_unix_ms was added deserialize the
+    // missing field as zero. Zero is a valid Unix timestamp, so attempting the
+    // conversion first would silently bucket every upgrade-era snapshot in
+    // January 1970 instead of using the object's historical S3 timestamp.
+    if record.created_unix_ms == 0 {
+        return last_modified;
+    }
+    i64::try_from(record.created_unix_ms)
+        .ok()
+        .and_then(chrono::DateTime::<Utc>::from_timestamp_millis)
+        .unwrap_or(last_modified)
+}
+
 pub async fn prune(
     name: &str,
     bucket: &str,
@@ -25,23 +73,136 @@ pub async fn prune(
     let client = create_client(endpoint)
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+    prune_with_client(&client, &bucket_name, &prefix, name, policy, force).await
+}
+
+/// Shared retention implementation for the interactive command and watcher.
+/// The watcher runs this only on its retention timer, never on the local WAL
+/// admission/checkpoint path.
+pub(crate) async fn prune_with_client(
+    client: &aws_sdk_s3::Client,
+    bucket_name: &str,
+    prefix: &str,
+    name: &str,
+    policy: &RetentionPolicy,
+    force: bool,
+) -> Result<()> {
+    // During legacy -> native migration the immutable descriptor can be
+    // published before its full native snapshot's visibility record. Until
+    // that record exists, the legacy base/history is the only remote recovery
+    // point and pruning it could strand unpublished local descendants.
+    let descriptor_key = format!("{}{}/native/v1/stream.json", prefix, name);
+    let (native_state, native_descriptor) = match s3::download_bytes(
+        client,
+        bucket_name,
+        &descriptor_key,
+    )
+    .await
+    {
+        Ok(descriptor_bytes) => {
+            let descriptor = serde_json::from_slice::<
+                walrust_core::native_publish::StreamDescriptor,
+            >(&descriptor_bytes)?;
+            let storage = S3Storage::new(client.clone(), bucket_name.to_string());
+            // A non-empty `published/` listing is not a visibility proof: the
+            // only record may be beyond a gap, malformed, or belong to an
+            // incompatible chain. Use the same contiguous descriptor-selected
+            // head calculation as restore/list before allowing destructive
+            // legacy retention.
+            let visible = walrust_core::native_restore::inspect_native_v1(
+                &storage,
+                bucket_name,
+                prefix,
+                name,
+            )
+            .await?;
+            if visible.is_none() {
+                println!(
+                    "Native migration for '{}' has no contiguous published snapshot base; refusing legacy prune",
+                    name
+                );
+                return Ok(());
+            }
+            (visible, Some(descriptor))
+        }
+        Err(error) if s3::download_error_is_not_found(&error) => (None, None),
+        Err(error) => return Err(classify_or_else(error, WalrustError::s3)),
+    };
+
+    if let Some(native) = &native_state {
+        let descriptor = native_descriptor
+            .as_ref()
+            .expect("native state and descriptor are created together");
+        let mut native_snapshots = Vec::with_capacity(native.snapshot_seqs.len());
+        for seq in &native.snapshot_seqs {
+            let key = format!(
+                "{}{}/native/v1/lineages/{}/published/{seq:016x}.json",
+                prefix, name, descriptor.lineage_id
+            );
+            let meta = s3::head_object_meta(client, bucket_name, &key)
+                .await
+                .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+            let record_bytes = s3::download_bytes(client, bucket_name, &key)
+                .await
+                .map_err(|e| classify_or_else(e, WalrustError::s3))?;
+            let record: walrust_core::native_publish::PublishRecord =
+                serde_json::from_slice(&record_bytes)?;
+            let created_at = native_publish_created_at(&record, meta.last_modified);
+            native_snapshots.push(SnapshotEntry {
+                key,
+                created_at,
+                sequence: *seq,
+                size: meta.size,
+            });
+        }
+        let floor = native_retention_floor(&native_snapshots, policy, Utc::now())
+            .unwrap_or(native.retention_floor_seq);
+        let delete_count = floor.saturating_sub(native.retention_floor_seq) as usize;
+        println!(
+            "Native HADBP retention: keep floor sequence {} through visible head {} ({} older object(s) eligible)",
+            floor,
+            native.head_seq,
+            delete_count
+        );
+        if force && floor > native.retention_floor_seq {
+            let storage = S3Storage::new(client.clone(), bucket_name.to_string());
+            let outcome = walrust_core::native_restore::prune_native_before_snapshot(
+                &storage,
+                bucket_name,
+                prefix,
+                name,
+                floor,
+            )
+            .await?;
+            println!(
+                "Native HADBP prune complete: deleted {} object/record pair(s); earliest native PIT is {}",
+                outcome.deleted_objects,
+                outcome.floor_seq
+            );
+        } else if !force && floor > native.retention_floor_seq {
+            println!("Native HADBP prune is a dry run; use --force to advance the floor.");
+        }
+    }
 
     // Discover snapshots from the S3 listing — the production watch path never
     // writes a manifest.json, so reading one made prune a silent no-op (F6).
     // The key here is the FULL S3 key (verify/restore use full keys too).
-    let discovered = discover_snapshots_from_s3(&client, &bucket_name, &prefix, name)
+    let discovered = discover_snapshots_from_s3(client, bucket_name, prefix, name)
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
-    if discovered.is_empty() {
+    if discovered.is_empty() && native_state.is_none() {
         println!("No snapshots found for database '{}'", name);
+        return Ok(());
+    }
+    if discovered.is_empty() {
         return Ok(());
     }
 
     // HEAD each snapshot for size + last-modified to build retention entries.
     let mut snapshot_entries: Vec<SnapshotEntry> = Vec::with_capacity(discovered.len());
     for (key, _gen, _min, max) in &discovered {
-        let meta = s3::head_object_meta(&client, &bucket_name, key)
+        let meta = s3::head_object_meta(client, bucket_name, key)
             .await
             .map_err(|e| classify_or_else(e, WalrustError::s3))?;
         snapshot_entries.push(SnapshotEntry {
@@ -58,10 +219,10 @@ pub async fn prune(
     }
 
     let now = Utc::now();
-    let storage = S3Storage::new(client.clone(), bucket_name.clone());
+    let storage = S3Storage::new(client.clone(), bucket_name.to_string());
     let plan_before_reachability =
         crate::retention::analyze_retention(&snapshot_entries, policy, now);
-    let plan = plan_legacy_prune(&storage, &prefix, name, &snapshot_entries, policy, now)
+    let plan = plan_legacy_prune(&storage, prefix, name, &snapshot_entries, policy, now)
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
     let before = plan.delete.len();
@@ -80,8 +241,8 @@ pub async fn prune(
     // level and never a watermark-straddling object a retained PITR still needs.
     let watermark = plan.keep.iter().map(|e| e.sequence).min().unwrap_or(0);
     let level_storage: Arc<dyn StorageBackend> =
-        Arc::new(S3Storage::new(client.clone(), bucket_name.clone()));
-    let level_layout = RangeLayout::new(level_storage, &prefix, name);
+        Arc::new(S3Storage::new(client.clone(), bucket_name.to_string()));
+    let level_layout = RangeLayout::new(level_storage, prefix, name);
     // E10 sibling (fail-loud, not fail-silent): this DELETION plan must come
     // from a complete levels listing. Swallowing a failed LIST with
     // `unwrap_or_default()` silently skipped the level prune and misreported
@@ -159,7 +320,7 @@ pub async fn prune(
     let mut keys_to_delete: Vec<String> = plan.delete.iter().map(|e| e.key.clone()).collect();
     keys_to_delete.extend(level_delete.iter().map(|f| f.key.clone()));
 
-    let deleted_count = s3::delete_objects(&client, &bucket_name, &keys_to_delete)
+    let deleted_count = s3::delete_objects(client, bucket_name, &keys_to_delete)
         .await
         .map_err(|e| classify_or_else(e, WalrustError::s3))?;
 
@@ -246,6 +407,76 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn native_minimum_selects_newest_complete_snapshot_bases() {
+        let now = Utc::now();
+        let snapshots = (1..=7)
+            .map(|sequence| SnapshotEntry {
+                key: format!("snapshot-{sequence}"),
+                created_at: now - chrono::Duration::minutes((7 - sequence) as i64),
+                sequence,
+                size: 1,
+            })
+            .collect::<Vec<_>>();
+        let policy = RetentionPolicy::new(1, 0, 0, 0);
+        assert_eq!(native_retention_floor(&snapshots, &policy, now), Some(6));
+    }
+
+    #[test]
+    fn missing_native_publish_timestamps_use_last_modified_for_gfs_buckets() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-07-17T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let months = ["2026-01-15", "2026-02-15", "2026-03-15", "2026-04-15"];
+        let snapshots = months
+            .into_iter()
+            .enumerate()
+            .map(|(index, day)| {
+                let sequence = index as u64 + 1;
+                let record: walrust_core::native_publish::PublishRecord =
+                    serde_json::from_value(serde_json::json!({
+                        "version": 1,
+                        "stream_digest": "stream",
+                        "lineage_id": "lineage",
+                        "seq": sequence,
+                        "kind": "snapshot",
+                        "previous_publish_sha256": null,
+                        "previous_chain_checksum": sequence - 1,
+                        "ending_chain_checksum": sequence,
+                        "end_page_count": 1,
+                        "object_key": format!("snapshot-{sequence}.hadbp"),
+                        "payload_length": 1,
+                        "payload_sha256": "00"
+                    }))
+                    .unwrap();
+                assert_eq!(record.created_unix_ms, 0);
+                let last_modified =
+                    chrono::DateTime::parse_from_rfc3339(&format!("{day}T12:00:00Z"))
+                        .unwrap()
+                        .with_timezone(&Utc);
+                SnapshotEntry {
+                    key: format!("snapshot-{sequence}"),
+                    created_at: native_publish_created_at(&record, last_modified),
+                    sequence,
+                    size: 1,
+                }
+            })
+            .collect::<Vec<_>>();
+        let policy = RetentionPolicy {
+            hourly: 0,
+            daily: 0,
+            weekly: 0,
+            monthly: 3,
+            minimum: 1,
+        };
+
+        assert_eq!(
+            native_retention_floor(&snapshots, &policy, now),
+            Some(2),
+            "three distinct historical monthly buckets must survive upgrade-era timestamp fallback"
+        );
+    }
 
     /// E6: when a watcher holds the single-writer lock, `snapshot` must return
     /// an actionable error naming the watcher — before it ever reaches the
