@@ -499,9 +499,9 @@ import sys
 max_txid = 0
 with open(sys.argv[1], encoding="utf-8") as handle:
   for key in handle:
-    m = re.search(r'/([0-9a-f]{16})-([0-9a-f]{16})\.ltx$', key.strip())
+    m = re.search(r'/published/([0-9a-f]{16})\.json$', key.strip())
     if m:
-        max_txid = max(max_txid, int(m.group(2), 16))
+        max_txid = max(max_txid, int(m.group(1), 16))
 print(max_txid)
 PY
 }
@@ -516,21 +516,20 @@ vals = set()
 with open(sys.argv[1], encoding="utf-8") as handle:
   for key in handle:
     key = key.strip()
-    m = re.search(r'/([0-9a-f]{4})/([0-9a-f]{16})-([0-9a-f]{16})\.ltx$', key)
+    m = re.search(r'/lineages/[^/]+/([0-9a-f]{4})/([0-9a-f]{16})\.hadbp$', key)
     if not m:
         continue
     generation = int(m.group(1), 16)
-    min_txid = int(m.group(2), 16)
-    max_txid = int(m.group(3), 16)
-    if generation != 0 and min_txid == 1:
-        vals.add(max_txid)
+    seq = int(m.group(2), 16)
+    if generation == 1:
+        vals.add(seq)
 for txid in sorted(vals):
     print(txid)
 PY
 }
 
 first_incremental_key() {
-  s3_list_prefix "$DRILL_RUN_PREFIX/" | awk '/\/0000\/.*\.ltx$/ { print; exit }'
+  s3_list_prefix "$DRILL_RUN_PREFIX/" | awk '/\/lineages\/[^/]+\/0000\/[0-9a-f]+\.hadbp$/ { print; exit }'
 }
 
 run_prune() {
