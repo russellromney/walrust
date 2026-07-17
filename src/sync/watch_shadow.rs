@@ -2109,8 +2109,25 @@ pub async fn watch_with_shadow(
     // changed while we were down, `copy_frames` bumps the shadow generation;
     // those databases need an eager snapshot instead of waiting for the periodic
     // timer (D3).
-    let eager_snapshot_paths =
-        initial_shadow_copy(&mut db_states, spool_config.min_free_space).await?;
+    let eager_snapshot_paths = loop {
+        match initial_shadow_copy(&mut db_states, spool_config.min_free_space).await {
+            Ok(paths) => break paths,
+            Err(error) if format!("{error:#}").contains("local_spool_full") => {
+                tracing::error!(
+                    event = "local_spool_full",
+                    error = %error,
+                    "initial WAL-to-shadow copy cannot preserve the source filesystem reserve; retaining checkpoint blockers and retrying"
+                );
+                for state in db_states.values() {
+                    webhook_sender
+                        .notify_upload_failed(&state.name, &error.to_string(), 1)
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            Err(error) => return Err(error),
+        }
+    };
 
     let mut startup_reanchored = HashSet::new();
     for db_path in required_native_reanchors.clone() {

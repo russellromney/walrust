@@ -270,12 +270,17 @@ of the compatibility `[cache]` for legacy LTX streams.
 | `path` | string | `.walrust-spool` beside the database | Root for collision-safe per-database spool directories |
 | `warning_size` | integer | 4294967296 | Warning watermark in bytes (4 GiB) |
 | `max_size` | integer | 5368709120 | Hard capacity in bytes (5 GiB); pending objects are never evicted |
-| `min_free_space` | integer | 1073741824 | Required reserve on the actual spool filesystem (1 GiB) |
+| `min_free_space` | integer | 1073741824 | Required reserve on both the actual spool filesystem and the source WAL/shadow filesystem (1 GiB) |
 | `shutdown_drain_seconds` | integer | 10 | Optional bounded cloud drain on graceful shutdown; pending work remains on disk |
 
 At the hard limit or free-space reserve, walrust retains the checkpoint blocker
 and pauses checkpointing. A cloud outage instead raises `remote_lag` while local
 ingestion continues until these local protections are reached.
+
+The source-filesystem check projects the unread live-WAL bytes that still need
+to be copied into the shadow. This prevents walrust from consuming the final
+reserve while preserving frames that SQLite is intentionally blocked from
+truncating.
 
 ---
 
