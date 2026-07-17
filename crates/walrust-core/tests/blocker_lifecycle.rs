@@ -386,21 +386,61 @@ async fn controlled_checkpoint_rearms_blocker() {
 
     let mut shadow = ShadowWal::new(&db_path).await.unwrap();
     run_child(&db_path, "commit", "before-dance");
-    let (frames, _off) = shadow.copy_frames(0).await.unwrap();
+    let (frames, off) = shadow.copy_frames(0).await.unwrap();
     assert!(
         !frames.is_empty(),
         "setup: shadow must copy the commit frames"
     );
 
     // Production controlled checkpoint (release blocker, PASSIVE, re-arm).
-    let commit_in_window = shadow.checkpoint().await.unwrap();
+    let outcome = shadow.checkpoint(off).await.unwrap();
     assert!(
-        !commit_in_window,
+        !outcome.commit_in_window,
         "a window with no application commits must report clean"
+    );
+    assert!(
+        !outcome.folded_uncopied_frames,
+        "folding exactly the copied prefix must not count as uncopied frames"
     );
 
     let outcome = run_child(&db_path, "commit_and_truncate", "after-dance");
     assert_external_truncate_blocked(&outcome, &db_path, "controlled checkpoint");
+}
+
+/// Folded-extent detection (the copy-to-dance gap): a commit that lands after
+/// the shadow's last copy but before the controlled checkpoint is folded by
+/// walrust's own PASSIVE and erased by the re-pin WAL restart — invisible to
+/// `data_version`, so the folded-extent check must catch it.
+#[tokio::test]
+async fn controlled_checkpoint_detects_folded_uncopied_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = fresh_db(dir.path(), "folded.db");
+
+    let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+    run_child(&db_path, "commit", "copied");
+    let (_frames, copied_offset) = shadow.copy_frames(0).await.unwrap();
+    assert!(copied_offset > 0, "setup: shadow must copy frames");
+
+    // This commit is NOT copied before the dance: it lands in the gap between
+    // the last copy and the checkpoint, exactly the hole the folded-extent
+    // check exists for.
+    run_child(&db_path, "commit", "uncopied");
+
+    let outcome = shadow.checkpoint(copied_offset).await.unwrap();
+    assert!(
+        outcome.folded_uncopied_frames,
+        "a commit folded past the shadow's copied cursor must be detected"
+    );
+    assert!(
+        !outcome.commit_in_window,
+        "the gap commit predates the data_version window and must not trip it"
+    );
+
+    // The dance is still safe: the uncopied commit was folded into the main
+    // DB, so a re-anchoring snapshot would cover it; and the blocker still
+    // blocks external TRUNCATE afterwards.
+    let outcome2 = run_child(&db_path, "commit_and_truncate", "after");
+    assert_external_truncate_blocked(&outcome2, &db_path, "folded-extent dance");
 }
 
 /// Window detection at the production dance entry: an application commit that
@@ -438,13 +478,13 @@ async fn controlled_checkpoint_detects_window_commit() {
     let mut saw_dirty = false;
     for _ in 0..100 {
         // Drain frames like the production checkpoint path does first.
-        let _ = shadow.copy_frames(0).await.unwrap();
-        match shadow.checkpoint().await {
-            Ok(true) => {
+        let (_frames, off) = shadow.copy_frames(0).await.unwrap();
+        match shadow.checkpoint(off).await {
+            Ok(outcome) if outcome.commit_in_window => {
                 saw_dirty = true;
                 break;
             }
-            Ok(false) => {}
+            Ok(_) => {}
             // A commit landing mid-checkpoint can make the fold incomplete;
             // that is the pre-existing racing-checkpoint error path, retry.
             Err(_) => {}
@@ -498,6 +538,10 @@ async fn lifecycle_truncate_dance_preserves_window_commit() {
 
     // Safe by construction: the in-window commit was folded by the TRUNCATE,
     // so it is part of the main-DB image any snapshot encodes after the dance.
+    // Opening this probe connection is safe for the blocker: SQLite's unix VFS
+    // parks a closing connection's fd while the inode has outstanding locks,
+    // so same-process connection churn cannot release the blocker's locks
+    // (only raw opens bypass the parking — that was the bug).
     let probe = Connection::open(&db_path).unwrap();
     let found: i64 = probe
         .query_row(

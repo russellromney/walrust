@@ -23,13 +23,17 @@
 //!
 //! Classic POSIX semantics are the hazard: closing ANY file descriptor a
 //! process holds for an inode releases ALL of the process's `fcntl` locks on
-//! that inode. So one stray `File::open(db)`/`Connection::open(db)` + close
-//! after arming — a page-size read, a change-counter read, a VACUUM INTO
-//! snapshot connection — destroys part 2 while the blocker object still
-//! appears alive (SQLite's bookkeeping still shows the lock; the kernel no
-//! longer has it). The next short-lived writer's close then unlinks the
-//! WAL (measured on macOS: external TRUNCATE still `busy=1`, and the WAL
-//! gone one close later).
+//! that inode. So one stray RAW `File::open(db)` + close after arming — a
+//! page-size read, a change-counter read, a direct snapshot encode —
+//! destroys part 2 while the blocker object still appears alive (SQLite's
+//! bookkeeping still shows the lock; the kernel no longer has it). The next
+//! short-lived writer's close then unlinks the WAL (measured on macOS:
+//! external TRUNCATE still `busy=1`, and the WAL gone one close later).
+//! SQLite-level connection churn is different: the unix VFS parks a closing
+//! connection's fd while the inode has outstanding locks, so same-process
+//! `Connection::open`/close cycles do not release the blocker's locks. The
+//! lifecycle still routes every main-DB access through retained handles —
+//! there is no reason to reopen what is already open.
 //!
 //! The lifecycle contract (D2 hardening):
 //!
@@ -77,6 +81,22 @@ pub struct BlockerLifecycle {
     /// encoding, checksum, change counter). Opened before the blocker arms
     /// and never closed while armed.
     source_fd: std::fs::File,
+}
+
+/// Outcome of a [`BlockerLifecycle::controlled_checkpoint`] dance.
+#[derive(Debug, Clone, Copy)]
+pub struct ControlledCheckpoint {
+    /// `PRAGMA data_version` proved an application commit landed in the
+    /// release window (PASSIVE dance only; always false for TRUNCATE — see
+    /// [`BlockerLifecycle::controlled_checkpoint`]).
+    pub commit_in_window: bool,
+    /// Frames the checkpoint folded (third `PRAGMA wal_checkpoint` column).
+    /// Callers holding a copied WAL prefix compare this against their copied
+    /// extent to catch commits folded **before** the window sample: a commit
+    /// that lands between the last shadow copy and the window is folded by
+    /// this checkpoint and then erased by the re-pin WAL restart, but it is
+    /// invisible to `data_version` (v0 already includes it).
+    pub checkpointed_frames: u64,
 }
 
 impl BlockerLifecycle {
@@ -183,11 +203,10 @@ impl BlockerLifecycle {
     /// the fresh WAL into the next incremental).
     ///
     /// On a checkpoint error the blocker is still re-pinned before the error
-    /// returns (the old code re-armed on failure too). The returned `bool`
-    /// is `true` when `PRAGMA data_version` proves another connection
-    /// committed between release and the checkpoint's end; the caller must
-    /// then follow the existing safe re-anchor behavior for its mode.
-    pub fn controlled_checkpoint(&self, truncate: bool) -> Result<bool> {
+    /// returns (the old code re-armed on failure too). The returned outcome
+    /// reports the window commit detection and the folded frame count (see
+    /// [`ControlledCheckpoint`]).
+    pub fn controlled_checkpoint(&self, truncate: bool) -> Result<ControlledCheckpoint> {
         let v0 = if truncate {
             None
         } else {
@@ -197,18 +216,21 @@ impl BlockerLifecycle {
 
         let checkpoint_result = self.run_checkpoint(truncate);
         let dirty = match (&checkpoint_result, v0) {
-            (Ok(()), Some(v0)) => Some(self.data_version().map(|v1| v1 != v0)),
+            (Ok(_), Some(v0)) => Some(self.data_version().map(|v1| v1 != v0)),
             _ => None,
         };
         // Always re-pin before returning, even when the checkpoint failed.
         let repin_result = self.repin();
         match (checkpoint_result, repin_result) {
-            (Ok(()), Ok(())) => Ok(match dirty {
-                Some(d) => d?,
-                None => false,
+            (Ok(checkpointed_frames), Ok(())) => Ok(ControlledCheckpoint {
+                commit_in_window: match dirty {
+                    Some(d) => d?,
+                    None => false,
+                },
+                checkpointed_frames,
             }),
             (Err(checkpoint_err), Ok(())) => Err(checkpoint_err),
-            (Ok(()), Err(repin_err)) => Err(repin_err),
+            (Ok(_), Err(repin_err)) => Err(repin_err),
             (Err(checkpoint_err), Err(repin_err)) => Err(anyhow!(
                 "{checkpoint_err}; additionally failed to re-pin checkpoint blocker: {repin_err}"
             )),
@@ -218,8 +240,8 @@ impl BlockerLifecycle {
     /// The controlled checkpoint runs on the BLOCKER connection: after
     /// ROLLBACK it is in autocommit, and running it anywhere else (notably
     /// the observer) would either mask window commits from `data_version` or
-    /// require a third connection.
-    fn run_checkpoint(&self, truncate: bool) -> Result<()> {
+    /// require a third connection. Returns the folded frame count.
+    fn run_checkpoint(&self, truncate: bool) -> Result<u64> {
         let pragma = if truncate {
             "PRAGMA wal_checkpoint(TRUNCATE);"
         } else {
@@ -237,7 +259,7 @@ impl BlockerLifecycle {
                 checkpointed_frames
             ));
         }
-        Ok(())
+        Ok(checkpointed_frames as u64)
     }
 }
 

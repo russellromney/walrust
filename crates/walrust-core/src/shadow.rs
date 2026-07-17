@@ -102,6 +102,18 @@ pub struct ShadowWal {
     header_seeded: bool,
 }
 
+/// Outcome of a [`ShadowWal::checkpoint`] dance: which commit detections
+/// fired. Either one requires the caller's safe re-anchor behavior.
+#[derive(Debug, Clone, Copy)]
+pub struct ShadowCheckpoint {
+    /// `PRAGMA data_version` proved an application commit landed in the
+    /// pin-release window.
+    pub commit_in_window: bool,
+    /// The checkpoint folded frames past the shadow's copied WAL cursor (a
+    /// commit that landed between the last copy and the dance).
+    pub folded_uncopied_frames: bool,
+}
+
 /// A segment file in the shadow WAL
 #[derive(Debug, Clone)]
 pub struct ShadowSegment {
@@ -490,11 +502,20 @@ impl ShadowWal {
     /// in autocommit, and is re-pinned — never dropped and reopened (see the
     /// `blocker` module docs for why).
     ///
-    /// Returns `true` when `PRAGMA data_version` proves an application commit
-    /// landed in the release window; the caller must then follow the existing
-    /// safe re-anchor behavior (snapshot) instead of trusting the incremental
-    /// stream across the checkpoint.
-    pub async fn checkpoint(&mut self) -> Result<bool> {
+    /// `copied_wal_offset` is the shadow's live-WAL copy cursor (a file
+    /// offset including the 32-byte WAL header). The outcome reports two
+    /// commit detections:
+    /// - `commit_in_window`: `PRAGMA data_version` proved an application
+    ///   commit landed between the pin release and the checkpoint's end.
+    /// - `folded_uncopied_frames`: the checkpoint folded frames past
+    ///   `copied_wal_offset` — a commit that landed between the last shadow
+    ///   copy and the dance. It is folded into the main DB, erased by the
+    ///   re-pin WAL restart, and invisible to `data_version` (v0 already
+    ///   includes it), so it needs its own check.
+    /// Either one means the incremental stream cannot be trusted across the
+    /// checkpoint; the caller must follow the existing safe re-anchor
+    /// behavior (snapshot).
+    pub async fn checkpoint(&mut self, copied_wal_offset: u64) -> Result<ShadowCheckpoint> {
         let lifecycle = self
             .lifecycle
             .as_ref()
@@ -505,22 +526,32 @@ impl ShadowWal {
                 )
             })?
             .clone();
-        let commit_in_window = {
-            let guard = lifecycle.lock().await;
-            guard.controlled_checkpoint(false).with_context(|| {
-                format!(
-                    "{}: shadow checkpoint incomplete or re-pin failed",
-                    self.db_path.display()
-                )
-            })?
-        };
+        let outcome = tokio::task::spawn_blocking(move || {
+            let guard = lifecycle.blocking_lock();
+            guard.controlled_checkpoint(false)
+        })
+        .await?
+        .with_context(|| {
+            format!(
+                "{}: shadow checkpoint incomplete or re-pin failed",
+                self.db_path.display()
+            )
+        })?;
+
+        let folded_end = crate::wal::WAL_HEADER_SIZE
+            + outcome.checkpointed_frames * (FRAME_HEADER_SIZE + self.page_size as u64);
+        let folded_uncopied_frames =
+            outcome.checkpointed_frames > 0 && folded_end > copied_wal_offset;
 
         tracing::debug!(
             "Shadow WAL: checkpoint complete for {}",
             self.db_path.display()
         );
 
-        Ok(commit_in_window)
+        Ok(ShadowCheckpoint {
+            commit_in_window: outcome.commit_in_window,
+            folded_uncopied_frames,
+        })
     }
 
     /// The retained blocker lifecycle handles, for snapshot paths that must

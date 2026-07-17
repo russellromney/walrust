@@ -42,10 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   checkpoint-blocker connection (armed last; reused and re-pinned across the
   controlled checkpoint, never dropped/reopened), and a read-only source
   descriptor for raw reads. Snapshot encoding borrows the retained handles;
-  the CLI shadow controlled checkpoint detects application commits in the
-  release window via `PRAGMA data_version` and re-anchors with the existing
-  snapshot path (the owned TRUNCATE dance is safe by construction: folded
-  commits land in the post-dance snapshot, later commits ride the fresh WAL).
+  the CLI shadow controlled checkpoint detects application commits two ways:
+  `PRAGMA data_version` for the release window, and a folded-extent check
+  (`checkpointed_frames` vs the shadow's copied WAL cursor) for a commit that
+  landed between the last shadow copy and the dance — both re-anchor through
+  the existing snapshot path (the owned TRUNCATE dance is safe by
+  construction: folded commits land in the post-dance snapshot, later commits
+  ride the fresh WAL).
   Regression tests use real SQLite plus an external child process
   (`crates/walrust-core/tests/blocker_lifecycle.rs`); neutering the retained
   handles at either production call site makes them fail with the exact

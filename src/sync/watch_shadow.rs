@@ -175,22 +175,27 @@ async fn checkpoint_shadow_after_durable_sync(
 
     apply_shadow_sync_result_to_state(state, &output).await?;
 
-    let commit_in_window = state
+    let checkpoint_outcome = state
         .shadow
-        .checkpoint()
+        .checkpoint(state.wal_copy_offset)
         .await
         .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
 
-    if commit_in_window {
-        // An application commit landed in the checkpoint release window. Its
-        // frames may already be folded into the main DB with the WAL reset
-        // before the shadow could copy them, so the incremental stream cannot
-        // be trusted across the checkpoint. Follow the existing safe re-anchor
-        // behavior (the D3 downtime-checkpoint shape): publish a full snapshot
-        // now and resume incrementals from the fresh WAL.
+    if checkpoint_outcome.commit_in_window || checkpoint_outcome.folded_uncopied_frames {
+        // An application commit landed where walrust's own checkpoint folds it
+        // before the shadow could copy it: inside the pin-release window
+        // (`commit_in_window`, caught by PRAGMA data_version) or between the
+        // last shadow copy and the dance (`folded_uncopied_frames`, caught by
+        // the folded-extent check). Its frames are erased by the re-pin WAL
+        // restart, so the incremental stream cannot be trusted across the
+        // checkpoint. Follow the existing safe re-anchor behavior (the D3
+        // downtime-checkpoint shape): publish a full snapshot now and resume
+        // incrementals from the fresh WAL.
         tracing::warn!(
-            "{}: application commit detected during walrust's controlled checkpoint window; re-anchoring with a snapshot",
-            state.name
+            "{}: application commit detected across walrust's controlled checkpoint (in_window={}, folded_uncopied={}); re-anchoring with a snapshot",
+            state.name,
+            checkpoint_outcome.commit_in_window,
+            checkpoint_outcome.folded_uncopied_frames
         );
         let target = direct_target.ok_or_else(|| {
             anyhow!(

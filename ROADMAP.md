@@ -207,17 +207,24 @@ Classic POSIX semantics: closing **any** descriptor the process holds for an
 inode releases **all** of the process's fcntl locks on that inode. One stray
 raw `File::open(db)` + close (page-size read, change counter, checksum,
 snapshot encode) destroyed lock (2) while the blocker object still appeared
-alive. Measured at the production call sites: external `TRUNCATE` still
-reported `busy=1` (read mark intact), and the WAL was unlinked one close
-later (`cli.db`/`owned.db` repro; DF2 shape: short-lived writer's WAL gone
-right after the snapshot lifecycle). The fix is a retained-handles lifecycle:
+alive. (Same-process SQLite connection churn is safe — the unix VFS parks a
+closing connection's fd while the inode has outstanding locks — but the fix
+routes everything through retained handles anyway.) Measured at the
+production call sites: external `TRUNCATE` still reported `busy=1` (read
+mark intact), and the WAL was unlinked one close later (`cli.db`/`owned.db`
+repro; DF2 shape: short-lived writer's WAL gone right after the snapshot
+lifecycle). The fix is a retained-handles lifecycle:
 open monitor connection + source descriptor before arming, arm last, never
 open/close another main-DB descriptor while armed, reuse and re-pin the
 blocker connection across the controlled checkpoint, and detect window
-commits with `PRAGMA data_version` (PASSIVE dance; a TRUNCATE restarts the
-wal-index header, which itself bumps data_version, so the owned dance is
+commits two ways: `PRAGMA data_version` catches commits inside the
+release/re-pin window (PASSIVE dance; a TRUNCATE restarts the wal-index
+header, which itself bumps data_version, so the owned dance is
 safe-by-construction instead: folded commits land in the post-dance snapshot,
-later commits ride the fresh WAL).
+later commits ride the fresh WAL), and a folded-extent check
+(`checkpointed_frames` vs the shadow's copied WAL cursor) catches a commit
+that landed between the last shadow copy and the dance — folded by walrust's
+own PASSIVE and erased by the re-pin WAL restart, invisible to data_version.
 
 ### What must not change
 
