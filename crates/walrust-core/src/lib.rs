@@ -10,6 +10,7 @@
 //! This crate is designed to be embedded as a library (not run as a sidecar).
 //! The caller controls scheduling and lifecycle.
 
+pub mod blocker;
 pub mod compaction;
 pub mod errors;
 pub mod external_delta;

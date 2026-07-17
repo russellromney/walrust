@@ -230,6 +230,7 @@ async fn legacy_wal_sync_periodic_snapshot_is_owned_by_core() -> Result<()> {
             wal_salt: None,
             wal_checksum_chain: Some((1, 2)),
         },
+        None,
     )
     .await?;
 
@@ -265,7 +266,7 @@ async fn legacy_manual_snapshot_is_owned_by_core() -> Result<()> {
         .await?;
 
     let output =
-        snapshot_database_to_storage(&storage, "backups", "manual-source", &db_path).await?;
+        snapshot_database_to_storage(&storage, "backups", "manual-source", &db_path, None).await?;
 
     let key = build_ltx_key("backups", "manual-source", 2, 1, 5);
     assert!(storage.get(&key).await?.is_some());
@@ -309,7 +310,8 @@ async fn legacy_manual_snapshot_folds_wal_resident_rows() -> Result<()> {
     }
 
     let storage = MemoryStorage::default();
-    let output = snapshot_database_to_storage(&storage, "backups", "fold-source", &db_path).await?;
+    let output =
+        snapshot_database_to_storage(&storage, "backups", "fold-source", &db_path, None).await?;
 
     let bytes = storage
         .get(&output.key)

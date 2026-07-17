@@ -17,7 +17,6 @@ use tokio::sync::Mutex;
 
 use crate::errors::WalrustError;
 use crate::ltx;
-use crate::shadow;
 use crate::wal;
 use hadb_io::RetryPolicy;
 use hadb_storage::StorageBackend;
@@ -266,10 +265,11 @@ pub struct SyncState {
     /// Runtime-only sink for loud rollover events. Not persisted; the embedder
     /// installs it (e.g. wired to the CLI's webhook sender).
     pub rollover_observer: RolloverObserver,
-    /// Optional long-running read transaction that pins the live WAL so an
-    /// external checkpoint cannot restart it. Only set in walrust-owned mode
-    /// (D2). Not persisted; rebuilt on add()/reopen.
-    pub checkpoint_blocker: Option<Arc<Mutex<rusqlite::Connection>>>,
+    /// Optional retained blocker lifecycle (pinned read transaction, monitor
+    /// connection, source descriptor) that keeps the live WAL safe from
+    /// external checkpoints and close-time WAL unlinks. Only set in
+    /// walrust-owned mode (D2). Not persisted; rebuilt on add()/reopen.
+    pub checkpoint_blocker: Option<Arc<Mutex<crate::blocker::BlockerLifecycle>>>,
 }
 
 impl std::fmt::Debug for SyncState {
@@ -601,27 +601,48 @@ async fn reset_wal_cursor_after_snapshot(state: &mut SyncState) {
     state.wal_checksum_chain = None;
 }
 
-/// Release the walrust-owned checkpoint blocker so walrust can run its own
-/// checkpoint. The read transaction must be rolled back before another
-/// connection can checkpoint the WAL (D2).
-async fn release_checkpoint_blocker(state: &mut SyncState) -> Result<()> {
-    if let Some(blocker) = state.checkpoint_blocker.take() {
-        let guard = blocker.lock().await;
-        guard.execute_batch("ROLLBACK;")?;
+/// Run walrust's own controlled checkpoint around the retained blocker
+/// lifecycle. When a lifecycle is armed, this is the release/re-acquire dance
+/// on the retained handles (the blocker connection is never dropped). The
+/// owned TRUNCATE dance has no data_version window detection — a TRUNCATE
+/// restarts the wal-index header, which itself bumps data_version — and it is
+/// safe by construction: a commit folded by the checkpoint lands in the
+/// snapshot taken right after, and a later commit rides the fresh WAL into
+/// the next incremental. With no lifecycle armed (external-base mode, or the
+/// resume path before re-arming) this is the legacy one-shot TRUNCATE on a
+/// fresh connection.
+async fn controlled_checkpoint(state: &mut SyncState) -> Result<()> {
+    if let Some(lifecycle) = state.checkpoint_blocker.as_ref() {
+        let lifecycle = lifecycle.clone();
+        let guard = lifecycle.lock().await;
+        guard.controlled_checkpoint(true).map(|_| ())
+    } else {
+        checkpoint_wal(&state.db_path).await
     }
-    Ok(())
 }
 
-/// Re-establish the walrust-owned checkpoint blocker after a walrust-controlled
-/// checkpoint. Writing to `_walrust_seq` and opening a read transaction pins a
-/// real frame in the fresh WAL immediately (D2).
-async fn reacquire_checkpoint_blocker(state: &mut SyncState) -> Result<()> {
+/// Re-establish the walrust-owned checkpoint blocker lifecycle after a
+/// walrust-controlled checkpoint when none is armed (the resume path; D2).
+/// Arming opens the retained handles and pins a real frame in the fresh WAL.
+async fn ensure_checkpoint_blocker(state: &mut SyncState) -> Result<()> {
     if state.checkpoint_blocker.is_some() {
         return Ok(());
     }
-    let conn = shadow::ShadowWal::open_checkpoint_blocker(&state.db_path)?;
-    state.checkpoint_blocker = Some(Arc::new(Mutex::new(conn)));
+    let lifecycle = crate::blocker::BlockerLifecycle::open(&state.db_path)?;
+    state.checkpoint_blocker = Some(Arc::new(Mutex::new(lifecycle)));
     Ok(())
+}
+
+/// Read the SQLite file change counter (db header offset 24) through the
+/// retained source descriptor instead of a fresh open/close of the main DB
+/// (see the `blocker` module docs).
+fn change_counter_from_fd(file: &std::fs::File) -> Result<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    file.seek(SeekFrom::Start(0))?;
+    let mut header = [0u8; 28];
+    file.read_exact(&mut header)?;
+    Ok(u32::from_be_bytes([header[24], header[25], header[26], header[27]]) as u64)
 }
 
 // ============================================================================
@@ -2084,15 +2105,22 @@ pub async fn take_snapshot(
     state: &mut SyncState,
 ) -> Result<()> {
     let timestamp = Utc::now();
-    // Walrust-owned mode holds a read transaction to pin the WAL. Release it
-    // around our own checkpoint, then re-pin the fresh WAL immediately (D2).
-    release_checkpoint_blocker(state).await?;
-    checkpoint_wal(&state.db_path).await?;
-    reacquire_checkpoint_blocker(state).await?;
-    let page_size = get_page_size(&state.db_path).await?;
+    // Walrust-owned mode holds the blocker lifecycle to pin the WAL. The
+    // controlled checkpoint releases and re-pins it on the retained handles
+    // (never a fresh descriptor); the legacy one-shot path covers states with
+    // no lifecycle armed (external-base, resume pre-arm) (D2).
+    controlled_checkpoint(state).await?;
+    ensure_checkpoint_blocker(state).await?;
+    let page_size = match state.checkpoint_blocker.as_ref() {
+        Some(lifecycle) => lifecycle.lock().await.page_size()?,
+        None => get_page_size(&state.db_path).await?,
+    };
 
     // Use the file change counter as a txid source when available.
-    let cc = change_counter_from_file(&state.db_path).unwrap_or(0);
+    let cc = match state.checkpoint_blocker.as_ref() {
+        Some(lifecycle) => change_counter_from_fd(lifecycle.lock().await.source_fd()).unwrap_or(0),
+        None => change_counter_from_file(&state.db_path).unwrap_or(0),
+    };
     let wal_commits = wal::count_wal_commits(&state.wal_path, page_size).await?;
     let new_txid = if cc + wal_commits > state.current_txid {
         cc + wal_commits
@@ -2105,11 +2133,24 @@ pub async fn take_snapshot(
 
     let prev_checksum = state.db_checksum.unwrap_or(0);
     // The checkpoint blocker pins the main database file while writers append
-    // only to WAL. Encode that exact page layout. VACUUM INTO is not valid here:
-    // it may reorder b-tree/overflow pages, so later WAL pages from the live
-    // database would be applied to a different physical layout on restore.
-    let snapshot =
-        ltx::encode_snapshot_with_checksum(&state.db_path, page_size, new_seq, prev_checksum)?;
+    // only to WAL. Encode that exact page layout through the retained source
+    // descriptor. VACUUM INTO is not valid here: it may reorder b-tree/overflow
+    // pages, so later WAL pages from the live database would be applied to a
+    // different physical layout on restore.
+    let snapshot = match state.checkpoint_blocker.as_ref() {
+        Some(lifecycle) => {
+            let guard = lifecycle.lock().await;
+            ltx::encode_snapshot_with_checksum_fd(
+                guard.source_fd(),
+                page_size,
+                new_seq,
+                prev_checksum,
+            )?
+        }
+        None => {
+            ltx::encode_snapshot_with_checksum(&state.db_path, page_size, new_seq, prev_checksum)?
+        }
+    };
     let db_checksum = snapshot.checksum;
     let changeset_bytes = snapshot.bytes;
 
@@ -2644,12 +2685,19 @@ async fn take_snapshot_with_retry_guarded(
     lease: Option<&dyn OwnedResumeLease>,
 ) -> Result<()> {
     let timestamp = Utc::now();
-    release_checkpoint_blocker(state).await?;
-    checkpoint_wal(&state.db_path).await?;
-    reacquire_checkpoint_blocker(state).await?;
-    let page_size = get_page_size(&state.db_path).await?;
+    // Same controlled-checkpoint dance as `take_snapshot` (D2); see it for the
+    // lifecycle contract.
+    controlled_checkpoint(state).await?;
+    ensure_checkpoint_blocker(state).await?;
+    let page_size = match state.checkpoint_blocker.as_ref() {
+        Some(lifecycle) => lifecycle.lock().await.page_size()?,
+        None => get_page_size(&state.db_path).await?,
+    };
 
-    let cc = change_counter_from_file(&state.db_path).unwrap_or(0);
+    let cc = match state.checkpoint_blocker.as_ref() {
+        Some(lifecycle) => change_counter_from_fd(lifecycle.lock().await.source_fd()).unwrap_or(0),
+        None => change_counter_from_file(&state.db_path).unwrap_or(0),
+    };
     let wal_commits = wal::count_wal_commits(&state.wal_path, page_size).await?;
     let new_txid = if cc + wal_commits > state.current_txid {
         cc + wal_commits
@@ -2659,8 +2707,20 @@ async fn take_snapshot_with_retry_guarded(
 
     let new_seq = state.current_seq + 1;
     let prev_checksum = state.db_checksum.unwrap_or(0);
-    let snapshot =
-        ltx::encode_snapshot_with_checksum(&state.db_path, page_size, new_seq, prev_checksum)?;
+    let snapshot = match state.checkpoint_blocker.as_ref() {
+        Some(lifecycle) => {
+            let guard = lifecycle.lock().await;
+            ltx::encode_snapshot_with_checksum_fd(
+                guard.source_fd(),
+                page_size,
+                new_seq,
+                prev_checksum,
+            )?
+        }
+        None => {
+            ltx::encode_snapshot_with_checksum(&state.db_path, page_size, new_seq, prev_checksum)?
+        }
+    };
     let db_checksum = snapshot.checksum;
     let changeset_bytes = snapshot.bytes;
 

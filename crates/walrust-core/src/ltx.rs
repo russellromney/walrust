@@ -80,12 +80,27 @@ pub fn encode_snapshot_with_checksum(
     seq: u64,
     prev_checksum: u64,
 ) -> Result<EncodedSnapshot> {
-    use sha2::{Digest, Sha256};
-    use std::io::BufReader;
-
-    let page_size_usize = validate_sqlite_page_size(page_size)?;
     let file = std::fs::File::open(db_path)
         .map_err(|e| anyhow!("Failed to open database for snapshot: {}", e))?;
+    encode_snapshot_with_checksum_fd(&file, page_size, seq, prev_checksum)
+}
+
+/// [`encode_snapshot_with_checksum`] through an already-open descriptor.
+///
+/// Snapshot encoding while the checkpoint blocker is armed MUST borrow the
+/// retained source descriptor this way: opening and closing a fresh
+/// descriptor for the main DB would release the process's POSIX locks on the
+/// inode (see the `blocker` module docs).
+pub fn encode_snapshot_with_checksum_fd(
+    file: &std::fs::File,
+    page_size: u32,
+    seq: u64,
+    prev_checksum: u64,
+) -> Result<EncodedSnapshot> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    let page_size_usize = validate_sqlite_page_size(page_size)?;
     let file_size = file.metadata()?.len() as usize;
     if !file_size.is_multiple_of(page_size_usize) {
         return Err(anyhow!(
@@ -102,7 +117,9 @@ pub fn encode_snapshot_with_checksum(
         ));
     }
 
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    let mut file_ref = file;
+    file_ref.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file_ref);
     let mut pages = Vec::with_capacity(num_pages);
     let mut hasher = Sha256::new();
 

@@ -9,15 +9,15 @@
 //! 3. Preserved history - shadow keeps frames even after checkpoint
 //! 4. Decoupled I/O - upload doesn't block write path
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::fs::{self, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
 use tokio::sync::Mutex;
 
+use crate::blocker::BlockerLifecycle;
 use crate::wal::{self, ParsedFrame, FRAME_HEADER_SIZE};
 
 /// Hex width for both the generation and index components of a shadow segment
@@ -41,9 +41,14 @@ fn format_segment_name(generation: u64, index: u64) -> String {
 /// where the special value `1` means 65536. Returns `None` if the file is
 /// missing or is not a SQLite database (e.g. before the first write), in which
 /// case callers fall back to the WAL-header-derived page size.
-fn db_header_page_size(db_path: &Path) -> Option<u32> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(db_path).ok()?;
+///
+/// Reads through the retained source descriptor: opening a fresh descriptor
+/// for the main DB and closing it again would release the process's POSIX
+/// locks on the inode (see `blocker` module docs).
+fn db_header_page_size(file: &std::fs::File) -> Option<u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = file;
+    file.seek(SeekFrom::Start(0)).ok()?;
     let mut header = [0u8; 18];
     file.read_exact(&mut header).ok()?;
     if &header[0..16] != b"SQLite format 3\0" {
@@ -80,9 +85,10 @@ pub struct ShadowWal {
     segment_offset: u64,
     /// Page size from WAL header
     page_size: u32,
-    /// Read connection that prevents auto-checkpoint
-    /// Wrapped in Option<Arc<Mutex>> so we can close it for checkpoint
-    checkpoint_blocker: Option<Arc<Mutex<Connection>>>,
+    /// Retained checkpoint-blocker lifecycle handles (blocker, monitor
+    /// connection, source descriptor). Held for the watch lifetime; wrapped
+    /// in Option so Drop can take it.
+    lifecycle: Option<Arc<Mutex<BlockerLifecycle>>>,
     /// Salt values from current WAL header (used to detect checkpoint)
     wal_salt: (u32, u32),
     /// Running WAL checksum chain of the last frame copied into the shadow. Used
@@ -129,6 +135,12 @@ impl ShadowWal {
             .await?
             .unwrap_or(0);
 
+        // Open the retained lifecycle handles (source descriptor, monitor
+        // connection) and arm the checkpoint blocker LAST. After this point
+        // no other descriptor for the main DB may be opened or closed by
+        // this process (see the `blocker` module docs).
+        let lifecycle = BlockerLifecycle::open(db_path)?;
+
         // E1: heal any torn shadow-segment tail left by a crash mid-write.
         //
         // Shadow segments are a stream of fixed-size frames (24-byte header +
@@ -142,11 +154,8 @@ impl ShadowWal {
         // non-zero" — sync then fails forever. Truncating every segment down to
         // a whole-frame boundary before the first append removes the torn tail;
         // the durable `wal_copy_offset` re-copies any dropped frames cleanly.
-        let frame_page_size = db_header_page_size(db_path).unwrap_or(page_size);
+        let frame_page_size = db_header_page_size(lifecycle.source_fd()).unwrap_or(page_size);
         Self::align_truncate_segments(&shadow_dir, frame_page_size).await?;
-
-        // Open read connection to prevent auto-checkpoint
-        let checkpoint_blocker = Self::open_checkpoint_blocker(db_path)?;
 
         Ok(Self {
             db_path: db_path.to_path_buf(),
@@ -155,7 +164,7 @@ impl ShadowWal {
             segment_index: 0,
             segment_offset: 0,
             page_size,
-            checkpoint_blocker: Some(Arc::new(Mutex::new(checkpoint_blocker))),
+            lifecycle: Some(Arc::new(Mutex::new(lifecycle))),
             wal_salt: (salt1, salt2),
             wal_chain: None,
             header_seeded,
@@ -167,40 +176,6 @@ impl ShadowWal {
         let parent = db_path.parent().unwrap_or(Path::new("."));
         let db_name = db_path.file_stem().unwrap_or_default();
         parent.join(format!(".walrust-{}", db_name.to_string_lossy()))
-    }
-
-    /// Open a read connection that prevents SQLite from auto-checkpointing.
-    /// Also used by walrust-owned replication to pin the live WAL (D2).
-    pub(crate) fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
-        let conn = Connection::open(db_path)?;
-
-        ensure_connection_in_wal_mode(&conn, db_path)?;
-
-        // Disable auto-checkpoint on this connection without changing journal_mode.
-        conn.execute_batch(
-            "
-            PRAGMA busy_timeout=5000;
-            PRAGMA wal_autocheckpoint=0;
-            CREATE TABLE IF NOT EXISTS _walrust_seq (
-                id INTEGER PRIMARY KEY CHECK (id = 1),
-                value INTEGER NOT NULL
-            );
-            INSERT INTO _walrust_seq (id, value)
-            VALUES (1, 1)
-            ON CONFLICT(id) DO UPDATE SET value = value + 1;
-            ",
-        )?;
-
-        // Pin a real WAL frame. Reading sqlite_master can leave the blocker at
-        // read-mark 0, which does not prevent walRestartLog on later frames.
-        conn.execute_batch("BEGIN DEFERRED;")?;
-        let _: i64 = conn.query_row("SELECT value FROM _walrust_seq WHERE id = 1", [], |row| {
-            row.get(0)
-        })?;
-
-        tracing::debug!("Opened checkpoint blocker for {}", db_path.display());
-
-        Ok(conn)
     }
 
     async fn ensure_database_in_wal_mode(db_path: &Path) -> Result<()> {
@@ -510,61 +485,48 @@ impl ShadowWal {
 
     /// Trigger a manual checkpoint and rotate shadow WAL
     ///
-    /// This releases the read transaction, runs checkpoint, then re-establishes the blocker
-    pub async fn checkpoint(&mut self) -> Result<()> {
-        // Release checkpoint blocker
-        if let Some(blocker) = self.checkpoint_blocker.take() {
-            let conn = blocker.lock().await;
-            conn.execute_batch("ROLLBACK;")?;
-            drop(conn);
-        }
-
-        let checkpoint_result = {
-            let conn = Connection::open(&self.db_path)?;
-            conn.busy_timeout(Duration::from_secs(5))?;
-            let (busy, log_frames, checkpointed_frames): (i64, i64, i64) =
-                conn.query_row("PRAGMA wal_checkpoint(PASSIVE);", [], |row| {
-                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                })?;
-            if busy != 0 || checkpointed_frames < log_frames {
-                Err(anyhow!(
-                    "{}: shadow checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
-                    self.db_path.display(),
-                    busy,
-                    log_frames,
-                    checkpointed_frames
-                ))
-            } else {
-                Ok(())
-            }
+    /// Runs the controlled release/re-acquire dance on the retained handles:
+    /// the blocker connection is ROLLBACKed, runs the checkpoint itself while
+    /// in autocommit, and is re-pinned — never dropped and reopened (see the
+    /// `blocker` module docs for why).
+    ///
+    /// Returns `true` when `PRAGMA data_version` proves an application commit
+    /// landed in the release window; the caller must then follow the existing
+    /// safe re-anchor behavior (snapshot) instead of trusting the incremental
+    /// stream across the checkpoint.
+    pub async fn checkpoint(&mut self) -> Result<bool> {
+        let lifecycle = self
+            .lifecycle
+            .as_ref()
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}: checkpoint blocker lifecycle is closed",
+                    self.db_path.display()
+                )
+            })?
+            .clone();
+        let commit_in_window = {
+            let guard = lifecycle.lock().await;
+            guard.controlled_checkpoint(false).with_context(|| {
+                format!(
+                    "{}: shadow checkpoint incomplete or re-pin failed",
+                    self.db_path.display()
+                )
+            })?
         };
-
-        // Re-establish checkpoint blocker
-        let reopen_result = Self::open_checkpoint_blocker(&self.db_path);
-        match (checkpoint_result, reopen_result) {
-            (Ok(()), Ok(new_blocker)) => {
-                self.checkpoint_blocker = Some(Arc::new(Mutex::new(new_blocker)));
-            }
-            (Err(checkpoint_err), Ok(new_blocker)) => {
-                self.checkpoint_blocker = Some(Arc::new(Mutex::new(new_blocker)));
-                return Err(checkpoint_err);
-            }
-            (Ok(()), Err(reopen_err)) => return Err(reopen_err),
-            (Err(checkpoint_err), Err(reopen_err)) => {
-                return Err(anyhow!(
-                    "{}; additionally failed to re-open shadow checkpoint blocker: {}",
-                    checkpoint_err,
-                    reopen_err
-                ));
-            }
-        }
 
         tracing::debug!(
             "Shadow WAL: checkpoint complete for {}",
             self.db_path.display()
         );
 
-        Ok(())
+        Ok(commit_in_window)
+    }
+
+    /// The retained blocker lifecycle handles, for snapshot paths that must
+    /// borrow them instead of opening fresh descriptors for the main DB.
+    pub fn lifecycle(&self) -> Option<Arc<Mutex<BlockerLifecycle>>> {
+        self.lifecycle.clone()
     }
 
     /// Clean up old shadow segments after successful upload
@@ -658,11 +620,14 @@ impl ShadowWal {
 
 impl Drop for ShadowWal {
     fn drop(&mut self) {
-        // Clean up checkpoint blocker connection
-        if let Some(blocker) = self.checkpoint_blocker.take() {
-            if let Ok(mutex) = Arc::try_unwrap(blocker) {
-                let conn = mutex.into_inner();
-                let _ = conn.execute_batch("ROLLBACK;");
+        // Close the lifecycle handles: blocker first, then monitor, then the
+        // source descriptor (BlockerLifecycle's field order). Roll back the
+        // pinned read transaction first so the blocker's own close does not
+        // attempt its last-connection checkpoint against a live read mark.
+        if let Some(lifecycle) = self.lifecycle.take() {
+            if let Ok(mutex) = Arc::try_unwrap(lifecycle) {
+                let lifecycle = mutex.into_inner();
+                lifecycle.rollback_blocker();
             }
         }
     }
@@ -690,7 +655,7 @@ mod tests {
                 segment_index: 0,
                 segment_offset: 0,
                 page_size: 4096,
-                checkpoint_blocker: None,
+                lifecycle: None,
                 wal_salt: (0, 0),
                 wal_chain: None,
                 header_seeded: false,

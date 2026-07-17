@@ -22,6 +22,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Checkpoint-blocker lifecycle repair (lossless watch regression).** The
+  checkpoint blocker's protection is two locks: the pinned WAL read mark
+  (`-shm` inode) and a SHARED POSIX lock on the main-DB inode held by the
+  blocker connection for its whole lifetime. The SHARED lock is the only
+  thing stopping another process's last-connection close from taking the
+  EXCLUSIVE main-db lock its close-time checkpoint needs before it unlinks
+  `-wal`/`-shm` with unread frames inside. Both CLI shadow watch
+  (`ShadowWal::new` arms the blocker) and owned `Replicator` snapshots then
+  opened and closed other main-DB descriptors — raw page-size/change-counter/
+  snapshot-encode reads, one-shot checkpoint and `VACUUM INTO` connections —
+  and POSIX releases **all** of the process's fcntl locks on an inode when
+  any descriptor for it closes. The blocker object looked alive while its
+  locks were gone; the next short-lived writer's close unlinked the WAL
+  (external `TRUNCATE` still reported `busy=1`; the WAL vanished one close
+  later — the DF2 shape). New `blocker::BlockerLifecycle` retains the three
+  handles per database for the watch lifetime: monitor connection
+  (data-version observer + snapshot `VACUUM INTO`/page-size borrows),
+  checkpoint-blocker connection (armed last; reused and re-pinned across the
+  controlled checkpoint, never dropped/reopened), and a read-only source
+  descriptor for raw reads. Snapshot encoding borrows the retained handles;
+  the CLI shadow controlled checkpoint detects application commits in the
+  release window via `PRAGMA data_version` and re-anchors with the existing
+  snapshot path (the owned TRUNCATE dance is safe by construction: folded
+  commits land in the post-dance snapshot, later commits ride the fresh WAL).
+  Regression tests use real SQLite plus an external child process
+  (`crates/walrust-core/tests/blocker_lifecycle.rs`); neutering the retained
+  handles at either production call site makes them fail with the exact
+  reproduction signature.
+
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
   owns each planned candidate instead of retaining borrowed plan entries across
   the async stream, fixing the non-general `Send` future seen by embedders using

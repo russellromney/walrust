@@ -628,6 +628,7 @@ async fn run_db_task(
                     &mut state.db_state,
                     &retry_policy,
                     &webhook_sender,
+                    None,
                 )
                 .await
                 {

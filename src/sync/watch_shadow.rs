@@ -147,11 +147,11 @@ async fn checkpoint_shadow_after_durable_sync(
             Arc::clone(&webhook_sender),
         )
         .await?
-    } else if let Some(target) = direct_target {
+    } else if let Some(target) = direct_target.as_ref() {
         sync_shadow_concurrent_with_retry(
             Arc::clone(&target.client),
-            target.bucket_name,
-            target.prefix,
+            target.bucket_name.clone(),
+            target.prefix.clone(),
             input,
             retry_policy.clone(),
             Arc::clone(&webhook_sender),
@@ -175,11 +175,59 @@ async fn checkpoint_shadow_after_durable_sync(
 
     apply_shadow_sync_result_to_state(state, &output).await?;
 
-    state
+    let commit_in_window = state
         .shadow
         .checkpoint()
         .await
         .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
+
+    if commit_in_window {
+        // An application commit landed in the checkpoint release window. Its
+        // frames may already be folded into the main DB with the WAL reset
+        // before the shadow could copy them, so the incremental stream cannot
+        // be trusted across the checkpoint. Follow the existing safe re-anchor
+        // behavior (the D3 downtime-checkpoint shape): publish a full snapshot
+        // now and resume incrementals from the fresh WAL.
+        tracing::warn!(
+            "{}: application commit detected during walrust's controlled checkpoint window; re-anchoring with a snapshot",
+            state.name
+        );
+        let target = direct_target.ok_or_else(|| {
+            anyhow!(
+                "{}: commit-in-window re-anchor requires the direct upload target",
+                state.name
+            )
+        })?;
+        let mut db_state = DbState {
+            name: state.name.clone(),
+            db_path: state.db_path.clone(),
+            wal_path: state.wal_path.clone(),
+            wal_offset: 0,
+            wal_generation: state.shadow.generation(),
+            current_txid: state.current_txid,
+            last_snapshot: state.last_snapshot,
+            db_checksum: state.db_checksum,
+            wal_salt: None,
+            wal_checksum_chain: None,
+        };
+        take_snapshot_with_retry(
+            &target.client,
+            &target.bucket_name,
+            &target.prefix,
+            &mut db_state,
+            retry_policy,
+            &webhook_sender,
+            state.shadow.lifecycle(),
+        )
+        .await?;
+        state.current_txid = db_state.current_txid;
+        state.last_snapshot = db_state.last_snapshot;
+        state.db_checksum = db_state.db_checksum;
+        state.shadow_sync_generation = state.shadow.generation();
+        state.shadow_sync_offset = state.shadow.segment_offset();
+        state.wal_copy_offset = 0;
+        save_shadow_progress(state)?;
+    }
 
     let cleanup_before_gen = state.shadow_sync_generation;
     if cleanup_before_gen > 0 {
@@ -570,6 +618,7 @@ pub async fn watch_with_shadow(
                 &mut db_state,
                 &retry_policy,
                 &webhook_sender,
+                state.shadow.lifecycle(),
             )
             .await
             {
@@ -617,6 +666,7 @@ pub async fn watch_with_shadow(
             &mut db_state,
             &retry_policy,
             &webhook_sender,
+            state.shadow.lifecycle(),
         )
         .await
         {
@@ -835,7 +885,7 @@ pub async fn watch_with_shadow(
                                             wal_salt: None,
                                             wal_checksum_chain: None,
                                         };
-                                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender, state.shadow.lifecycle()).await {
                                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
                                             metrics_state.record_error(&state.name);
                                         } else {
@@ -919,7 +969,7 @@ pub async fn watch_with_shadow(
                             wal_checksum_chain: None,
                         };
 
-                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender, state.shadow.lifecycle()).await {
                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
                             metrics_state.record_error(&state.name);
                         } else {
@@ -951,7 +1001,7 @@ pub async fn watch_with_shadow(
                         wal_checksum_chain: None,
                     };
 
-                    if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                    if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender, state.shadow.lifecycle()).await {
                         tracing::error!("Failed to snapshot {}: {}", state.name, e);
                         metrics_state.record_error(&state.name);
                     } else {

@@ -593,7 +593,7 @@ impl Harness {
                 wal_salt: self.state.wal_salt,
                 wal_checksum_chain: self.state.wal_checksum_chain,
             };
-            match take_snapshot_to_storage(&self.storage, &self.prefix, input).await {
+            match take_snapshot_to_storage(&self.storage, &self.prefix, input, None).await {
                 Ok(o) => break o,
                 Err(e) => {
                     if self.faults.has_transient()

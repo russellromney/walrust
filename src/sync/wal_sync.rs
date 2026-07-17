@@ -256,6 +256,11 @@ pub(crate) async fn do_sync(
 // ============================================================================
 
 /// Take snapshot with retry and webhook notifications
+///
+/// `handles` is the armed blocker lifecycle (CLI shadow watch): the snapshot
+/// then borrows the retained monitor connection for its passive fold and
+/// VACUUM INTO instead of opening fresh descriptors for the main DB. Modes
+/// with no armed blocker (independent watch) pass `None`.
 pub(crate) async fn take_snapshot_with_retry(
     client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -263,6 +268,7 @@ pub(crate) async fn take_snapshot_with_retry(
     state: &mut DbState,
     retry_policy: &RetryPolicy,
     webhook_sender: &Arc<WebhookSender>,
+    handles: Option<Arc<tokio::sync::Mutex<walrust_core::blocker::BlockerLifecycle>>>,
 ) -> Result<()> {
     let db_name = state.name.clone();
     let mut attempts = 0u32;
@@ -270,7 +276,7 @@ pub(crate) async fn take_snapshot_with_retry(
     // Try the snapshot operation with retries
     loop {
         attempts += 1;
-        match take_snapshot(client, bucket, prefix, state).await {
+        match take_snapshot(client, bucket, prefix, state, handles.clone()).await {
             Ok(()) => return Ok(()),
             Err(e) => {
                 let error_kind = classify_error(&e);
@@ -321,6 +327,7 @@ pub(crate) async fn take_snapshot(
     bucket: &str,
     prefix: &str,
     state: &mut DbState,
+    handles: Option<Arc<tokio::sync::Mutex<walrust_core::blocker::BlockerLifecycle>>>,
 ) -> Result<()> {
     let timestamp = Utc::now();
     let storage = S3Storage::new(client.clone(), bucket.to_string());
@@ -328,6 +335,7 @@ pub(crate) async fn take_snapshot(
         &storage,
         prefix,
         SyncInput::from(&*state),
+        handles,
     )
     .await?;
 
