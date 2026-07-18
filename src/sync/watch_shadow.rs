@@ -1211,20 +1211,54 @@ pub async fn watch_with_shadow(
     // Graceful shutdown - sync remaining shadow data
     tracing::info!("Shadow mode shutdown: syncing remaining data...");
 
-    copy_final_shadow_frames(&mut db_states).await?;
-    let final_results = run_shadow_syncs(
-        &db_states,
-        &cache_states,
-        Some(DirectShadowSyncTarget {
-            client: Arc::clone(&client),
-            bucket_name: bucket_name.clone(),
-            prefix: prefix.clone(),
-        }),
-        &retry_policy,
-        Arc::clone(&webhook_sender),
-    )
-    .await;
-    apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
+    // A WAL reset just before shutdown bumps the shadow generation: one sync
+    // round then only advances the cursor past the drained old generation
+    // (the D3 cursor-reset shape) and ships nothing of the new one. Drain
+    // until a round moves nothing — bounded, then fail loudly rather than
+    // exit with frames left unshipped in the shadow dir.
+    const SHUTDOWN_DRAIN_MAX_ROUNDS: usize = 5;
+    for round in 0..SHUTDOWN_DRAIN_MAX_ROUNDS {
+        copy_final_shadow_frames(&mut db_states).await?;
+        let before: HashMap<PathBuf, (u64, u64, u64)> = db_states
+            .iter()
+            .map(|(p, s)| {
+                (
+                    p.clone(),
+                    (
+                        s.shadow_sync_generation,
+                        s.shadow_sync_offset,
+                        s.current_txid,
+                    ),
+                )
+            })
+            .collect();
+        let final_results = run_shadow_syncs(
+            &db_states,
+            &cache_states,
+            Some(DirectShadowSyncTarget {
+                client: Arc::clone(&client),
+                bucket_name: bucket_name.clone(),
+                prefix: prefix.clone(),
+            }),
+            &retry_policy,
+            Arc::clone(&webhook_sender),
+        )
+        .await;
+        apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
+        let drained = db_states.iter().all(|(p, s)| {
+            let b = &before[p];
+            b.0 == s.shadow_sync_generation && b.1 == s.shadow_sync_offset && b.2 == s.current_txid
+        });
+        if drained {
+            break;
+        }
+        if round + 1 == SHUTDOWN_DRAIN_MAX_ROUNDS {
+            return Err(anyhow!(
+                "shadow shutdown drain did not quiesce after {} rounds",
+                SHUTDOWN_DRAIN_MAX_ROUNDS
+            ));
+        }
+    }
 
     shutdown_shadow_uploaders(&cache_states, &db_states, uploader_handles).await?;
 
