@@ -160,8 +160,18 @@ impl BlockerLifecycle {
     /// lock survives the ROLLBACK (verified empirically), so another
     /// process's last-connection close still cannot unlink the WAL in the
     /// release window.
+    ///
+    /// Idempotent: after a failed re-pin (e.g. the heartbeat upsert timed out
+    /// behind an application writer) the blocker connection is already in
+    /// autocommit, and an unconditional ROLLBACK would error with "cannot
+    /// rollback - no transaction is active" on every later dance — wedging
+    /// the watch until restart. The old drop-and-reopen dance self-healed
+    /// here; skipping the ROLLBACK when there is no transaction restores that
+    /// recovery without giving up the retained connection.
     fn release_pin(&self) -> Result<()> {
-        self.blocker_conn.execute_batch("ROLLBACK;")?;
+        if !self.blocker_conn.is_autocommit() {
+            self.blocker_conn.execute_batch("ROLLBACK;")?;
+        }
         Ok(())
     }
 

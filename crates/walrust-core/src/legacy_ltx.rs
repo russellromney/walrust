@@ -154,8 +154,13 @@ impl StableSqliteSnapshot {
         let dest = path
             .to_str()
             .ok_or_else(|| anyhow!("snapshot path is not valid UTF-8: {}", path.display()))?;
-        conn.execute("VACUUM INTO ?1", [dest])
-            .map_err(|e| anyhow!("Failed to create stable SQLite snapshot: {}", e))?;
+        // Match the old one-shot connection's 30s busy_timeout for the
+        // VACUUM, restoring the borrowed connection's timeout afterwards.
+        let prev_timeout: i64 = conn.query_row("PRAGMA busy_timeout;", [], |row| row.get(0))?;
+        conn.execute_batch("PRAGMA busy_timeout=30000;")?;
+        let vacuum_result = conn.execute("VACUUM INTO ?1", [dest]);
+        conn.execute_batch(&format!("PRAGMA busy_timeout={prev_timeout};"))?;
+        vacuum_result.map_err(|e| anyhow!("Failed to create stable SQLite snapshot: {}", e))?;
 
         Ok(Self { path })
     }
@@ -415,12 +420,24 @@ fn apply_ltx_to_db_inner<R: Read>(
 
 /// Compute checksum from database file (streaming, no full-DB read).
 pub fn compute_checksum_from_file(db_path: &Path) -> Result<Checksum> {
-    use sha2::{Digest, Sha256};
-    use std::io::BufReader;
-
     let file = std::fs::File::open(db_path)
         .map_err(|e| anyhow!("Failed to open database for checksum: {}", e))?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    compute_checksum_from_fd(&file)
+}
+
+/// [`compute_checksum_from_file`] through an already-open descriptor.
+///
+/// Checksum computation while the checkpoint blocker is armed MUST borrow the
+/// retained source descriptor this way: opening and closing a fresh
+/// descriptor for the main DB would release the process's POSIX locks on the
+/// inode (see the `blocker` module docs).
+pub fn compute_checksum_from_fd(file: &std::fs::File) -> Result<Checksum> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    let mut file_ref = file;
+    file_ref.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file_ref);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536]; // 64KB read chunks (BufReader handles 1MB read-ahead)
 

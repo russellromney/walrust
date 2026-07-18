@@ -373,6 +373,19 @@ impl Replicator {
         let prefix = self.prefix.clone();
         sync::ensure_no_saved_state(self.storage.as_ref(), &prefix, name).await?;
 
+        // Replacing a registration would drop the old lifecycle's raw source
+        // descriptor AFTER the new one is armed — and POSIX releases all of
+        // the process's locks on the inode when any descriptor for it closes,
+        // killing the new blocker's SHARED lock. Reject the double-add; the
+        // caller must remove() first (which drops the old handles before any
+        // re-arm).
+        if self.databases.read().await.contains_key(name) {
+            anyhow::bail!(
+                "Replicator: '{}' is already registered; call remove() before re-adding it",
+                name
+            );
+        }
+
         // Build state and take initial snapshot OUTSIDE the map lock
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
@@ -464,6 +477,15 @@ impl Replicator {
         }
 
         let prefix = self.prefix.clone();
+
+        // Same double-registration hazard as add(): the replaced lifecycle's
+        // raw source descriptor must never close after the new one arms.
+        if self.databases.read().await.contains_key(name) {
+            anyhow::bail!(
+                "Replicator: '{}' is already registered; call remove() before re-adding it",
+                name
+            );
+        }
 
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();

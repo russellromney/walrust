@@ -120,7 +120,7 @@ async fn checkpoint_shadow_after_durable_sync(
     retry_policy: &RetryPolicy,
     webhook_sender: Arc<WebhookSender>,
     drain_timeout: Duration,
-) -> Result<()> {
+) -> Result<bool> {
     let (frames, new_offset) = state
         .shadow
         .copy_frames(state.wal_copy_offset)
@@ -181,7 +181,9 @@ async fn checkpoint_shadow_after_durable_sync(
         .await
         .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
 
-    if checkpoint_outcome.commit_in_window || checkpoint_outcome.folded_uncopied_frames {
+    let reanchored =
+        checkpoint_outcome.commit_in_window || checkpoint_outcome.folded_uncopied_frames;
+    if reanchored {
         // An application commit landed where walrust's own checkpoint folds it
         // before the shadow could copy it: inside the pin-release window
         // (`commit_in_window`, caught by PRAGMA data_version) or between the
@@ -243,7 +245,7 @@ async fn checkpoint_shadow_after_durable_sync(
             .with_context(|| format!("{}: shadow cleanup failed", state.name))?;
     }
 
-    Ok(())
+    Ok(reanchored)
 }
 
 async fn shutdown_shadow_uploaders(
@@ -522,6 +524,31 @@ pub async fn watch_with_shadow(
             // re-append the whole live WAL from offset 0).
             restored_wal_copy_offset = progress.wal_copy_offset;
             shadow.restore_read_cursor(progress.wal_salt, progress.wal_checksum_chain);
+        }
+
+        // If no checksum came from the manifest, durable progress, or the
+        // pre-arm computation, compute it now through the retained source
+        // descriptor. The armed shadow-sync encoder's None-checksum fallback
+        // reads the database file, which must never happen through a fresh
+        // open while the blocker holds its locks (see the `blocker` module
+        // docs in walrust-core).
+        if db_checksum.is_none() {
+            if let Some(lifecycle) = shadow.lifecycle() {
+                let guard = lifecycle.lock().await;
+                match ltx::compute_checksum_from_fd(guard.source_fd()) {
+                    Ok(cs) => {
+                        tracing::debug!(
+                            "{}: Computed initial checksum via retained descriptor: {:#x}",
+                            name,
+                            cs.into_inner()
+                        );
+                        db_checksum = Some(cs.into_inner());
+                    }
+                    Err(e) => {
+                        tracing::warn!("{}: Could not compute initial checksum: {}", name, e);
+                    }
+                }
+            }
         }
 
         tracing::info!(
@@ -1069,7 +1096,7 @@ pub async fn watch_with_shadow(
                             estimated_frames
                         );
 
-                        if let Err(e) = checkpoint_shadow_after_durable_sync(
+                        match checkpoint_shadow_after_durable_sync(
                             state,
                             cache_states.get(db_path),
                             Some(DirectShadowSyncTarget {
@@ -1081,14 +1108,25 @@ pub async fn watch_with_shadow(
                             Arc::clone(&webhook_sender),
                             CHECKPOINT_UPLOAD_DRAIN_TIMEOUT,
                         ).await {
-                            tracing::error!("{}: Shadow checkpoint failed: {}", state.name, e);
-                            webhook_sender
-                                .notify_upload_failed(&state.name, &e.to_string(), 1)
-                                .await;
-                            return Err(e.context(format!(
-                                "{}: shadow checkpoint failed",
-                                state.name
-                            )));
+                            Ok(reanchored) => {
+                                if reanchored {
+                                    metrics_state.record_snapshot(&state.name);
+                                    if let Some(trigger) = trigger_states.get_mut(db_path) {
+                                        trigger.frames_since_snapshot = 0;
+                                        trigger.first_change_time = None;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("{}: Shadow checkpoint failed: {}", state.name, e);
+                                webhook_sender
+                                    .notify_upload_failed(&state.name, &e.to_string(), 1)
+                                    .await;
+                                return Err(e.context(format!(
+                                    "{}: shadow checkpoint failed",
+                                    state.name
+                                )));
+                            }
                         }
 
                         tracing::debug!("{}: Shadow checkpoint completed", state.name);
@@ -1632,7 +1670,7 @@ mod tests {
         });
         let cache_state = (Arc::clone(&cache), upload_tx);
 
-        checkpoint_shadow_after_durable_sync(
+        let reanchored = checkpoint_shadow_after_durable_sync(
             &mut state,
             Some(&cache_state),
             None,
@@ -1642,8 +1680,11 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            !reanchored,
+            "a checkpoint with no window commit must not re-anchor"
+        );
         ack_handle.await.unwrap();
-
         assert!(
             state.wal_copy_offset > 0,
             "checkpoint path must copy real active WAL frames before checkpointing"
@@ -1814,5 +1855,296 @@ mod tests {
             generation_before,
             "shadow generation must not advance without a downtime checkpoint"
         );
+    }
+
+    fn s3_e2e_enabled() -> bool {
+        std::env::var("AWS_ENDPOINT_URL_S3").is_ok()
+            || std::env::var("AWS_ENDPOINT_URL").is_ok()
+            || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+    }
+
+    /// Live-S3 end-to-end for the commit-in-window re-anchor: a racing writer
+    /// lands commits between the shadow copy and the controlled checkpoint
+    /// (the window is the network round-trip wide), the folded-extent/data
+    /// version checks must fire, the function must re-anchor through the
+    /// existing snapshot path, and a full restore from the bucket must carry
+    /// every committed row. Skips when no S3 is configured (same gate as
+    /// `tests/production_e2e.rs`).
+    #[tokio::test]
+    async fn e2e_shadow_checkpoint_reanchors_window_commit_live_s3() {
+        if !s3_e2e_enabled() {
+            eprintln!(
+                "SKIP e2e_shadow_checkpoint_reanchors_window_commit_live_s3: no S3 endpoint/credentials configured"
+            );
+            return;
+        }
+
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        let bucket = std::env::var("TIERED_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026".to_string());
+        let client = Arc::new(create_client(endpoint.as_deref()).await.unwrap());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (bucket_name, _) = parse_bucket(&bucket);
+        let prefix = format!("e2e-reanchor-{nanos}/");
+        let name = "reanchor".to_string();
+
+        let (_temp, db_path, app_conn) = create_real_wal_db();
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let wal_path = db_path.with_extension("db-wal");
+        let mut state = ShadowDbState {
+            name: name.clone(),
+            db_path: db_path.clone(),
+            wal_path,
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let retry_policy = RetryPolicy::new(RetryConfig::default());
+        let webhook_sender = Arc::new(WebhookSender::new(vec![]));
+
+        // The CLI startup-snapshot wiring, verbatim from watch_with_shadow.
+        let mut db_state = DbState {
+            name: state.name.clone(),
+            db_path: state.db_path.clone(),
+            wal_path: state.wal_path.clone(),
+            wal_offset: 0,
+            wal_generation: state.shadow.generation(),
+            current_txid: state.current_txid,
+            last_snapshot: state.last_snapshot,
+            db_checksum: state.db_checksum,
+            wal_salt: None,
+            wal_checksum_chain: None,
+        };
+        take_snapshot_with_retry(
+            &client,
+            &bucket_name,
+            &prefix,
+            &mut db_state,
+            &retry_policy,
+            &webhook_sender,
+            state.shadow.lifecycle(),
+        )
+        .await
+        .unwrap();
+        state.current_txid = db_state.current_txid;
+        state.last_snapshot = db_state.last_snapshot;
+        state.db_checksum = db_state.db_checksum;
+        state.shadow_sync_generation = state.shadow.generation();
+        state.shadow_sync_offset = state.shadow.segment_offset();
+        state.wal_copy_offset = 0;
+
+        // Racing writer: lands commits inside the copy-to-checkpoint window,
+        // which spans the S3 round trip.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = {
+            let db_path = db_path.clone();
+            let stop = Arc::clone(&stop);
+            let writer_count = Arc::clone(&writer_count);
+            std::thread::spawn(move || {
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA synchronous=OFF;")
+                    .unwrap();
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    conn.execute("INSERT INTO items (value) VALUES (?1)", [format!("w{i}")])
+                        .unwrap();
+                    i += 1;
+                    writer_count.store(i, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+
+        let mut reanchored = false;
+        for _ in 0..30 {
+            match checkpoint_shadow_after_durable_sync(
+                &mut state,
+                None,
+                Some(DirectShadowSyncTarget {
+                    client: Arc::clone(&client),
+                    bucket_name: bucket_name.clone(),
+                    prefix: prefix.clone(),
+                }),
+                &retry_policy,
+                Arc::clone(&webhook_sender),
+                Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok(true) => {
+                    reanchored = true;
+                    break;
+                }
+                Ok(false) => {}
+                // A commit landing mid-checkpoint makes the fold incomplete;
+                // that is the pre-existing racing-checkpoint error path.
+                Err(_) => {}
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            reanchored,
+            "a racing writer must trip the window detection within 30 checkpoint rounds"
+        );
+
+        // The re-anchor published a new-generation snapshot (startup was gen 1).
+        let keys = client
+            .list_objects_v2()
+            .bucket(&bucket_name)
+            .prefix(&format!("{prefix}{name}/"))
+            .send()
+            .await
+            .unwrap();
+        let gen2 = keys
+            .contents()
+            .iter()
+            .filter_map(|o| o.key())
+            .filter(|k| k.contains("/0002/"))
+            .count();
+        assert!(
+            gen2 > 0,
+            "re-anchor must publish a generation-2 snapshot; keys: {:?}",
+            keys.contents()
+                .iter()
+                .filter_map(|o| o.key())
+                .collect::<Vec<_>>()
+        );
+
+        // A post-reanchor commit still ships through the normal sync. The
+        // re-anchor resets the WAL, so the next copy lands in a new shadow
+        // generation: the first sync round only drains the old generation at
+        // EOF (the D3 cursor-reset shape), and a later round ships the new
+        // one. Sync until the incremental covering the post-reanchor frames
+        // (txid >= 6) is durable.
+        app_conn
+            .execute("INSERT INTO items (value) VALUES ('post-reanchor')", [])
+            .unwrap();
+        let incremental_txid = state.current_txid + 1;
+        let mut last_err = None;
+        let mut shipped = false;
+        for _ in 0..15 {
+            match checkpoint_shadow_after_durable_sync(
+                &mut state,
+                None,
+                Some(DirectShadowSyncTarget {
+                    client: Arc::clone(&client),
+                    bucket_name: bucket_name.clone(),
+                    prefix: prefix.clone(),
+                }),
+                &retry_policy,
+                Arc::clone(&webhook_sender),
+                Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok(_) => {
+                    let keys = client
+                        .list_objects_v2()
+                        .bucket(&bucket_name)
+                        .prefix(&format!("{prefix}{name}/0000/"))
+                        .send()
+                        .await
+                        .unwrap();
+                    shipped = keys.contents().iter().filter_map(|o| o.key()).any(|k| {
+                        let filename = k.rsplit('/').next().unwrap_or(k);
+                        walrust_core::legacy_manifest::parse_ltx_filename(filename)
+                            .is_some_and(|(min, _)| min >= incremental_txid)
+                    });
+                    if shipped {
+                        break;
+                    }
+                }
+                Err(e) => last_err = Some(format!("{e:#}")),
+            }
+        }
+        assert!(
+            shipped,
+            "post-reanchor commit must ship as an incremental (txid >= {incremental_txid}); last error: {last_err:?}"
+        );
+
+        // Handled safely: a full restore carries every committed row.
+        let restored_path = db_path.with_file_name("restored.db");
+        crate::sync::restore::restore(
+            &name,
+            &restored_path,
+            &format!("{bucket_name}/{prefix}"),
+            endpoint.as_deref(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let verify = Connection::open(&restored_path).unwrap();
+        let writer_rows: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value LIKE 'w%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            writer_rows,
+            writer_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            "every racing-writer row must survive the re-anchor"
+        );
+        let post: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value = 'post-reanchor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            post, 1,
+            "post-reanchor commit must ship after the re-anchor"
+        );
+        let seed_rows: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value IN ('alpha', 'beta', 'gamma')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seed_rows, 3, "seed rows must survive");
+        drop(verify);
+
+        // Cleanup: delete only this test's unique prefix.
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(&bucket_name)
+                .prefix(&prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.unwrap();
+            for obj in page.contents() {
+                if let Some(key) = obj.key() {
+                    let _ = client
+                        .delete_object()
+                        .bucket(&bucket_name)
+                        .key(key)
+                        .send()
+                        .await;
+                }
+            }
+            match page.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
     }
 }
