@@ -10,7 +10,7 @@ use tokio::signal;
 use tokio::sync::mpsc;
 
 use crate::cache::LocalCache;
-use crate::config::{CacheConfig, ResolvedDbConfig, SyncConfig, WebhookConfig};
+use crate::config::{CacheConfig, ResolvedDbConfig, RetentionConfig, SyncConfig, WebhookConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::errors::WalrustError;
 use crate::ltx;
@@ -200,6 +200,9 @@ async fn checkpoint_shadow_after_durable_sync(
             checkpoint_outcome.folded_uncopied_frames
         );
         let target = direct_target.ok_or_else(|| {
+            // Hard requirement, not an option: without an upload target a
+            // window commit can only fail loudly. The production checkpoint
+            // timer always passes Some; None is test-only.
             anyhow!(
                 "{}: commit-in-window re-anchor requires the direct upload target",
                 state.name
@@ -2113,6 +2116,237 @@ mod tests {
         let seed_rows: i64 = verify
             .query_row(
                 "SELECT count(*) FROM items WHERE value IN ('alpha', 'beta', 'gamma')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seed_rows, 3, "seed rows must survive");
+        drop(verify);
+
+        // Cleanup: delete only this test's unique prefix.
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(&bucket_name)
+                .prefix(&prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.unwrap();
+            for obj in page.contents() {
+                if let Some(key) = obj.key() {
+                    let _ = client
+                        .delete_object()
+                        .bucket(&bucket_name)
+                        .key(key)
+                        .send()
+                        .await;
+                }
+            }
+            match page.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
+    }
+
+    /// Whole-watch end-to-end against the real DF2 shape: the full
+    /// `watch_with_shadow` loop (snapshot + checkpoint timers, startup
+    /// snapshot, controlled checkpoint dances) drives a database while an
+    /// ephemeral writer opens and closes one connection per commit — the
+    /// last-connection close-time unlink attempt this bug class lives on —
+    /// and the app periodically attempts `wal_checkpoint(TRUNCATE)`. Asserts
+    /// the watch stays alive (DF1), a restore is row-exact (DF2), the WAL is
+    /// never unlinked, and snapshot production stays bounded (no storm).
+    /// Skips when no S3 is configured (same gate as `tests/production_e2e.rs`).
+    #[tokio::test]
+    async fn e2e_cli_shadow_watch_survives_ephemeral_writer_live_s3() {
+        if !s3_e2e_enabled() {
+            eprintln!(
+                "SKIP e2e_cli_shadow_watch_survives_ephemeral_writer_live_s3: no S3 endpoint/credentials configured"
+            );
+            return;
+        }
+
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        let bucket = std::env::var("TIERED_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026".to_string());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = "watchdf2".to_string();
+        let prefix = format!("e2e-watchdf2-{nanos}/");
+        let bucket_with_prefix = format!("{bucket}/{prefix}");
+
+        let (_temp, db_path, _app) = create_real_wal_db();
+        let fast_sync = SyncConfig {
+            snapshot_interval: 2,
+            wal_sync_interval: 1,
+            checkpoint_interval: 3,
+            min_checkpoint_page_count: 1,
+            on_startup: true,
+            ..SyncConfig::default()
+        };
+        let db_config = ResolvedDbConfig {
+            path: db_path.clone(),
+            prefix: name.clone(),
+            sync: fast_sync.clone(),
+            retention: RetentionConfig::default(),
+            compaction: walrust_core::compaction::CompactionSettings::default(),
+        };
+
+        let bucket_for_watch = bucket_with_prefix.clone();
+        let endpoint_for_watch = endpoint.clone();
+        let watch = tokio::spawn(async move {
+            watch_with_shadow(
+                vec![db_config],
+                &bucket_for_watch,
+                endpoint_for_watch.as_deref(),
+                fast_sync,
+                None,
+                0,
+                true,
+                RetryConfig::default(),
+                vec![],
+                CacheConfig::default(),
+            )
+            .await
+        });
+
+        // Ephemeral writer: one open+insert+close connection per commit. The
+        // last-connection close-time EXCLUSIVE attempt is what unlinks the WAL
+        // when walrust's SHARED main-db lock is gone — the exact DF2 shape.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let truncate_violations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = {
+            let db_path = db_path.clone();
+            let stop = Arc::clone(&stop);
+            let writer_count = Arc::clone(&writer_count);
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let conn = Connection::open(&db_path).unwrap();
+                    conn.execute("INSERT INTO items (value) VALUES (?1)", [format!("w{i}")])
+                        .unwrap();
+                    drop(conn);
+                    i += 1;
+                    writer_count.store(i, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                }
+            })
+        };
+        let truncater = {
+            let db_path = db_path.clone();
+            let stop = Arc::clone(&stop);
+            let truncate_violations = Arc::clone(&truncate_violations);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let conn = Connection::open(&db_path).unwrap();
+                    conn.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+                    let (busy, _, _): (i64, i64, i64) = conn
+                        .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                        })
+                        .unwrap();
+                    if busy == 0 {
+                        truncate_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    drop(conn);
+                }
+            })
+        };
+
+        // Let the watch run through several snapshot and checkpoint intervals.
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        truncater.join().unwrap();
+
+        assert!(
+            !watch.is_finished(),
+            "watch must still be running after 10s of ephemeral writes (DF1: it must not die)"
+        );
+
+        // Graceful shutdown with the final drain, exactly like a SIGTERM in production.
+        unsafe {
+            libc::kill(libc::getpid(), libc::SIGTERM);
+        }
+        tokio::time::timeout(Duration::from_secs(30), watch)
+            .await
+            .expect("watch must shut down gracefully within 30s")
+            .expect("watch task must not panic")
+            .expect("watch must exit cleanly on SIGTERM");
+
+        assert_eq!(
+            truncate_violations.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "every app-side wal_checkpoint(TRUNCATE) must have been refused while armed"
+        );
+        let wal_len = std::fs::metadata(db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(wal_len > 0, "the live WAL must never be unlinked");
+
+        // Bounded snapshot production (no re-anchor storm): startup + one per
+        // snapshot interval + at most one per checkpoint interval.
+        let client = create_client(endpoint.as_deref()).await.unwrap();
+        let (bucket_name, _) = parse_bucket(&bucket);
+        let keys = client
+            .list_objects_v2()
+            .bucket(&bucket_name)
+            .prefix(&format!("{prefix}{name}/"))
+            .send()
+            .await
+            .unwrap();
+        let snapshot_count = keys
+            .contents()
+            .iter()
+            .filter_map(|o| o.key())
+            .filter(|k| {
+                let parts: Vec<&str> = k.rsplit('/').collect();
+                parts.len() == 3 && parts[1] != "0000" && parts[1] != "levels"
+            })
+            .count();
+        assert!(
+            snapshot_count <= 11,
+            "snapshot production must stay bounded (got {snapshot_count} in 10s)"
+        );
+
+        // DF2: restore must be row-exact.
+        let restored_path = db_path.with_file_name("restored-watch.db");
+        crate::sync::restore::restore(
+            &name,
+            &restored_path,
+            &bucket_with_prefix,
+            endpoint.as_deref(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let verify = Connection::open(&restored_path).unwrap();
+        let writer_rows: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value LIKE \'w%\'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            writer_rows,
+            writer_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            "every ephemeral-writer row must be replicated (DF2)"
+        );
+        let seed_rows: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value IN (\'alpha\', \'beta\', \'gamma\')",
                 [],
                 |row| row.get(0),
             )

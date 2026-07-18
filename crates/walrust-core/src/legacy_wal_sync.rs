@@ -584,7 +584,7 @@ pub async fn take_snapshot_to_storage(
     storage: &dyn StorageBackend,
     prefix: &str,
     input: SyncInput,
-    handles: Option<std::sync::Arc<tokio::sync::Mutex<crate::blocker::BlockerLifecycle>>>,
+    handles: Option<crate::blocker::SharedLifecycle>,
 ) -> Result<SyncOutput> {
     let snapshot =
         snapshot_database_to_storage(storage, prefix, &input.name, &input.db_path, handles).await?;
@@ -621,7 +621,7 @@ pub async fn snapshot_database_to_storage(
     prefix: &str,
     name: &str,
     database: &Path,
-    handles: Option<std::sync::Arc<tokio::sync::Mutex<crate::blocker::BlockerLifecycle>>>,
+    handles: Option<crate::blocker::SharedLifecycle>,
 ) -> Result<SnapshotUploadOutput> {
     // Best-effort PASSIVE checkpoint before encoding. This path is shared by the
     // shadow watch loop, whose checkpoint blocker deliberately pins a live WAL

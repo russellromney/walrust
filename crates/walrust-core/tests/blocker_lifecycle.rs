@@ -318,9 +318,99 @@ async fn cli_startup_snapshot_does_not_invalidate_blocker() {
     .await
     .unwrap();
 
-    // 4. External app commits more, then issues wal_checkpoint(TRUNCATE).
+    // The borrowed-handle snapshot must carry the right CONTENT, not just
+    // succeed: decode it and require the seed and post-blocker rows.
+    let decode_snapshot = |storage: &MemStorage, key: &str, expect: &[&str]| {
+        let bytes = storage.map.lock().unwrap().get(key).cloned().unwrap();
+        let out = dir
+            .path()
+            .join(format!("decoded-{}.db", key.replace('/', "_")));
+        walrust_core::legacy_ltx::decode_to_db(std::io::Cursor::new(bytes), &out).unwrap();
+        let conn = Connection::open(&out).unwrap();
+        for value in expect {
+            let n: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM app_data WHERE value = ?1",
+                    [value],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 1, "snapshot at {key} must contain row {value}");
+        }
+    };
+    decode_snapshot(
+        &storage,
+        "app/0001/0000000000000001-0000000000000001.ltx",
+        &["seed", "after-blocker"],
+    );
+
+    // 4. A second snapshot on the same borrowed connection (its busy_timeout
+    // save/restore must behave across calls) also contains both commits.
+    run_child(&db_path, "commit", "second-round");
+    take_snapshot_to_storage(
+        &storage,
+        "",
+        cli_snapshot_input(&db_path),
+        _shadow.lifecycle(),
+    )
+    .await
+    .unwrap();
+    decode_snapshot(
+        &storage,
+        "app/0002/0000000000000001-0000000000000002.ltx",
+        &["seed", "after-blocker", "second-round"],
+    );
+
+    // 5. External app commits more, then issues wal_checkpoint(TRUNCATE).
     let outcome = run_child(&db_path, "commit_and_truncate", "after-snapshot");
     assert_external_truncate_blocked(&outcome, &db_path, "cli startup snapshot");
+}
+
+/// Double-registration is rejected before arming (a replaced lifecycle's raw
+/// descriptor must never close after the new one arms); `remove()` clears the
+/// way for a re-add, and the re-armed blocker still blocks.
+#[tokio::test]
+async fn replicator_rejects_double_add_until_remove() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = fresh_db(dir.path(), "dbl.db");
+
+    let storage: Arc<dyn StorageBackend> = Arc::new(MemStorage::default());
+    let config = ReplicationConfig {
+        sync_interval: std::time::Duration::from_secs(3600),
+        snapshot_interval: std::time::Duration::from_secs(3600),
+        ..ReplicationConfig::default()
+    };
+    let replicator = Replicator::new(storage, "dbl/", config);
+
+    replicator.add("dbl", &db_path).await.unwrap();
+
+    // add() again is rejected (the remote-state guard fires first here — the
+    // point is rejection before any arming, by either guard).
+    replicator
+        .add("dbl", &db_path)
+        .await
+        .expect_err("second add() without remove() must be rejected");
+
+    // add_without_snapshot has no remote-state guard: THIS is where the
+    // registration guard is load-bearing.
+    let err = replicator
+        .add_without_snapshot("dbl", &db_path)
+        .await
+        .expect_err("second add_without_snapshot must be rejected by the registration guard");
+    assert!(
+        err.to_string().contains("already registered"),
+        "error must name the double registration, got: {err}"
+    );
+
+    replicator.remove("dbl").await.unwrap();
+    // add() again would trip the remote-state guard; the reopen path must work.
+    replicator
+        .add_without_snapshot("dbl", &db_path)
+        .await
+        .unwrap();
+
+    let outcome = run_child(&db_path, "commit_and_truncate", "after-readd");
+    assert_external_truncate_blocked(&outcome, &db_path, "re-add after remove");
 }
 
 /// Owned mode: `Replicator::add()` arms the blocker and runs the owned
@@ -695,18 +785,6 @@ async fn bisect_which_step_invalidates_blocker() {
         Some(0),
         "the zombified blocker must no longer block external TRUNCATE"
     );
-
-    // Step 4: the full production chain in one go, for comparison.
-    let storage = MemStorage::default();
-    take_snapshot_to_storage(
-        &storage,
-        "",
-        cli_snapshot_input(&db_path),
-        _shadow.lifecycle(),
-    )
-    .await
-    .unwrap();
-    probe("full-production-chain");
 }
 
 /// Busy-failure negative path: an external reader pinning the WAL makes the
@@ -867,7 +945,7 @@ async fn cli_startup_snapshot_keeps_blocker_at_extreme_page_sizes() {
         .unwrap();
         drop(conn);
 
-        let _shadow = ShadowWal::new(&db_path).await.unwrap();
+        let mut shadow = ShadowWal::new(&db_path).await.unwrap();
         run_child(&db_path, "commit", "past-mark");
 
         let storage = MemStorage::default();
@@ -875,13 +953,24 @@ async fn cli_startup_snapshot_keeps_blocker_at_extreme_page_sizes() {
             &storage,
             "",
             cli_snapshot_input(&db_path),
-            _shadow.lifecycle(),
+            shadow.lifecycle(),
         )
         .await
         .unwrap();
 
         let outcome = run_child(&db_path, "commit_and_truncate", "after-snapshot");
         assert_external_truncate_blocked(&outcome, &db_path, "extreme page size");
+
+        // The folded-extent math is the only page-size-dependent logic: a
+        // commit folded past the copied cursor must be detected at this page
+        // size too.
+        let (_frames, copied_offset) = shadow.copy_frames(0).await.unwrap();
+        run_child(&db_path, "commit", "uncopied");
+        let dance = shadow.checkpoint(copied_offset).await.unwrap();
+        assert!(
+            dance.folded_uncopied_frames,
+            "folded-extent detection must hold at page_size={page_size}"
+        );
     }
 }
 

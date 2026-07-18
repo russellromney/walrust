@@ -75,6 +75,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles; the startup checksum and startup re-anchor run before arming and
   are unaffected. Double-registration guard is TOCTOU-safe (re-checked under
   the write lock at insert).
+- **Design review hardening:** registration is now reserved by name across
+  build+insert AND remove, so no two lifecycles can ever arm on the same
+  name concurrently (a concurrent same-name add would have zombified the
+  winner when the loser's handles dropped). New whole-watch end-to-end
+  (`e2e_cli_shadow_watch_survives_ephemeral_writer_live_s3`): the real
+  `watch_with_shadow` loop drives snapshot+checkpoint timers against an
+  ephemeral one-connection-per-commit writer plus app-side
+  `wal_checkpoint(TRUNCATE)` attempts — the watch stays alive (DF1), every
+  app TRUNCATE is refused, the WAL is never unlinked, snapshots stay
+  bounded, and a restore after graceful SIGTERM is row-exact (DF2). New API
+  surface narrowed (`SharedLifecycle` alias; three `pub(crate)` helpers; the
+  armer is private). Coverage additions: double-registration
+  rejection/re-add, borrowed-snapshot content decode + repeat-snapshot
+  busy-timeout behavior, folded-extent detection at 512-byte and 64KiB page
+  sizes.
 
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
   owns each planned candidate instead of retaining borrowed plan entries across

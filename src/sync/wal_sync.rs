@@ -268,7 +268,7 @@ pub(crate) async fn take_snapshot_with_retry(
     state: &mut DbState,
     retry_policy: &RetryPolicy,
     webhook_sender: &Arc<WebhookSender>,
-    handles: Option<Arc<tokio::sync::Mutex<walrust_core::blocker::BlockerLifecycle>>>,
+    handles: Option<walrust_core::blocker::SharedLifecycle>,
 ) -> Result<()> {
     let db_name = state.name.clone();
     let mut attempts = 0u32;
@@ -327,7 +327,7 @@ pub(crate) async fn take_snapshot(
     bucket: &str,
     prefix: &str,
     state: &mut DbState,
-    handles: Option<Arc<tokio::sync::Mutex<walrust_core::blocker::BlockerLifecycle>>>,
+    handles: Option<walrust_core::blocker::SharedLifecycle>,
 ) -> Result<()> {
     let timestamp = Utc::now();
     let storage = S3Storage::new(client.clone(), bucket.to_string());

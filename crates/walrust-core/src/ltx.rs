@@ -91,7 +91,7 @@ pub fn encode_snapshot_with_checksum(
 /// retained source descriptor this way: opening and closing a fresh
 /// descriptor for the main DB would release the process's POSIX locks on the
 /// inode (see the `blocker` module docs).
-pub fn encode_snapshot_with_checksum_fd(
+pub(crate) fn encode_snapshot_with_checksum_fd(
     file: &std::fs::File,
     page_size: u32,
     seq: u64,

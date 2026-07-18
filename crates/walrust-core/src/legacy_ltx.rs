@@ -43,7 +43,7 @@ pub fn encode_sqlite_snapshot_to_vec(
 /// retained handle: opening and closing another connection for the same DB
 /// releases the process's POSIX locks on the inode (see the `blocker` module
 /// docs).
-pub fn encode_sqlite_snapshot_to_vec_with_conn(
+pub(crate) fn encode_sqlite_snapshot_to_vec_with_conn(
     conn: &rusqlite::Connection,
     db_path: &Path,
     page_size: u32,

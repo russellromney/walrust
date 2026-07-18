@@ -503,7 +503,8 @@ impl ShadowWal {
     /// `blocker` module docs for why).
     ///
     /// `copied_wal_offset` is the shadow's live-WAL copy cursor (a file
-    /// offset including the 32-byte WAL header). The outcome reports two
+    /// offset including the 32-byte WAL header) — pass the cursor returned by
+    /// your most recent `copy_frames`. The outcome reports two
     /// commit detections:
     /// - `commit_in_window`: `PRAGMA data_version` proved an application
     ///   commit landed between the pin release and the checkpoint's end.
@@ -556,7 +557,7 @@ impl ShadowWal {
 
     /// The retained blocker lifecycle handles, for snapshot paths that must
     /// borrow them instead of opening fresh descriptors for the main DB.
-    pub fn lifecycle(&self) -> Option<Arc<Mutex<BlockerLifecycle>>> {
+    pub fn lifecycle(&self) -> Option<crate::blocker::SharedLifecycle> {
         self.lifecycle.clone()
     }
 
@@ -655,6 +656,11 @@ impl Drop for ShadowWal {
         // source descriptor (BlockerLifecycle's field order). Roll back the
         // pinned read transaction first so the blocker's own close does not
         // attempt its last-connection checkpoint against a live read mark.
+        // If a borrowed handle is still held elsewhere (a snapshot in flight),
+        // try_unwrap fails and the rollback is skipped: the watch loop
+        // serializes snapshot and checkpoint work per database, so that does
+        // not happen in production, and the connection's own close still
+        // cleans up the transaction when the last Arc drops.
         if let Some(lifecycle) = self.lifecycle.take() {
             if let Ok(mutex) = Arc::try_unwrap(lifecycle) {
                 let lifecycle = mutex.into_inner();

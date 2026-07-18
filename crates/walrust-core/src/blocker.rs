@@ -59,6 +59,10 @@ use rusqlite::Connection;
 
 use crate::shadow::ensure_connection_in_wal_mode;
 
+/// The shared-handle form of the lifecycle passed between the CLI watch and
+/// the snapshot paths that must borrow it (see the module docs).
+pub type SharedLifecycle = std::sync::Arc<tokio::sync::Mutex<BlockerLifecycle>>;
+
 /// The retained per-database handles for the checkpoint-blocker lifecycle.
 /// See the module docs for the contract.
 pub struct BlockerLifecycle {
@@ -189,7 +193,7 @@ impl BlockerLifecycle {
     }
 
     /// Roll the blocker's read transaction back (best-effort, for drop).
-    pub fn rollback_blocker(&self) {
+    pub(crate) fn rollback_blocker(&self) {
         let _ = self.blocker_conn.execute_batch("ROLLBACK;");
     }
 
@@ -275,11 +279,9 @@ impl BlockerLifecycle {
 
 /// Open and arm a checkpoint-blocker connection for `db_path`: a read
 /// transaction pinning a real WAL frame so external checkpoints cannot
-/// truncate past the mark (D2).
-///
-/// Standalone primitive for callers that only need the blocker; the
-/// production watch lifetime goes through [`BlockerLifecycle`].
-pub fn open_checkpoint_blocker_conn(db_path: &Path) -> Result<Connection> {
+/// truncate past the mark (D2). Used by [`BlockerLifecycle::open`], which
+/// retains the full handle set around it — never arm one without them.
+fn open_checkpoint_blocker_conn(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
 
     ensure_connection_in_wal_mode(&conn, db_path)?;
