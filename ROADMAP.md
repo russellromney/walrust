@@ -162,8 +162,8 @@ detecting a WAL reset (salt mismatch) and re-anchoring with a full snapshot —
 
 Per-mode reality (verified in code):
 - **Owned / library mode (`Replicator`) holds the blocker but invalidated it
-  after arming.** It holds
-  `crate::shadow::ShadowWal::open_checkpoint_blocker` for the DB's lifetime:
+  after arming.** It holds a checkpoint-blocker connection for the DB's
+  lifetime:
   `wal_autocheckpoint=0`, a `_walrust_seq` heartbeat row, and a `BEGIN DEFERRED`
   read transaction pinning a real WAL frame — exactly litestream's
   `_litestream_seq`. The held read-mark is what makes it lossless: another
@@ -187,7 +187,7 @@ Per-mode reality (verified in code):
   it holds no persistent read-mark either, and by opening/closing may itself
   trigger last-close checkpoints.
 
-#### Measured diagnosis (2026-07-17, macOS, bundled SQLite 3.46)
+#### Measured diagnosis (2026-07-17, macOS, bundled SQLite 3.49.1)
 
 The blocker's protection is two locks, not one:
 

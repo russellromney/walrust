@@ -53,6 +53,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`crates/walrust-core/tests/blocker_lifecycle.rs`); neutering the retained
   handles at either production call site makes them fail with the exact
   reproduction signature.
+- **Adversarial-review remediations (same lifecycle):** the pin release is
+  idempotent, so a heartbeat re-pin that times out behind an application
+  writer errors loudly and the next dance heals (an unconditional ROLLBACK
+  would have wedged every later dance); `Replicator::add*` rejects
+  double-registration before arming (replacing a registration would close the
+  old lifecycle's raw source descriptor after the new one arms, releasing the
+  new blocker's locks); a `None` startup checksum is computed through the
+  retained source descriptor so the armed shadow encoder never falls back to
+  a raw open; the folded-extent check catches commits between the last shadow
+  copy and the dance (invisible to `data_version`); snapshot `VACUUM INTO`
+  keeps its 30s busy timeout on the borrowed connection; the re-anchor branch
+  resets the snapshot trigger and records the metric. The live-S3 end-to-end
+  (`e2e_shadow_checkpoint_reanchors_window_commit_live_s3`) proves a racing
+  writer trips the detection, the re-anchor publishes a new-generation
+  snapshot, and a full restore carries every committed row.
 
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
   owns each planned candidate instead of retaining borrowed plan entries across

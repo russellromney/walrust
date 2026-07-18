@@ -140,6 +140,20 @@ fn child_worker() {
                 Err(e) => println!("CHILD_RESULT error={e}"),
             }
         }
+        "burst" => {
+            // One large transaction pushing the WAL past the default 1000-page
+            // autocheckpoint threshold, so SQLite auto-checkpoints mid-write on
+            // THIS connection (the realistic app-burst shape). ~300B/row puts
+            // ~12 rows per 4KiB page: 15000 rows ≈ 1250 pages.
+            conn.execute_batch("BEGIN;").expect("burst begin");
+            let payload = "x".repeat(300);
+            for _ in 0..15000 {
+                conn.execute("INSERT INTO app_data (value) VALUES (?1)", [&payload])
+                    .expect("burst insert");
+            }
+            conn.execute_batch("COMMIT;").expect("burst commit");
+            println!("CHILD_RESULT burst-committed");
+        }
         other => panic!("unknown child mode {other}"),
     }
 }
@@ -461,7 +475,10 @@ async fn controlled_checkpoint_detects_window_commit() {
         let stop = Arc::clone(&stop);
         std::thread::spawn(move || {
             let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("PRAGMA busy_timeout=5000;").unwrap();
+            // synchronous=OFF keeps the commit cadence high on slow disks so
+            // the bounded loop below reliably intersects the dance window.
+            conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA synchronous=OFF;")
+                .unwrap();
             let mut i = 0u64;
             while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                 conn.execute(
@@ -470,12 +487,13 @@ async fn controlled_checkpoint_detects_window_commit() {
                 )
                 .unwrap();
                 i += 1;
-                std::thread::sleep(std::time::Duration::from_millis(2));
+                std::thread::sleep(std::time::Duration::from_millis(1));
             }
         })
     };
 
     let mut saw_dirty = false;
+    let mut dance_errors = 0u32;
     for _ in 0..100 {
         // Drain frames like the production checkpoint path does first.
         let (_frames, off) = shadow.copy_frames(0).await.unwrap();
@@ -487,7 +505,7 @@ async fn controlled_checkpoint_detects_window_commit() {
             Ok(_) => {}
             // A commit landing mid-checkpoint can make the fold incomplete;
             // that is the pre-existing racing-checkpoint error path, retry.
-            Err(_) => {}
+            Err(_) => dance_errors += 1,
         }
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -495,8 +513,17 @@ async fn controlled_checkpoint_detects_window_commit() {
 
     assert!(
         saw_dirty,
-        "a commit in the release window must be detected by PRAGMA data_version"
+        "a commit in the release window must be detected by PRAGMA data_version \
+         (no detection in 100 dances, {dance_errors} swallowed dance errors)"
     );
+    assert!(
+        dance_errors < 100,
+        "every dance errored — the error arm hid a systemic dance failure"
+    );
+
+    // The blocker survived the whole loop.
+    let outcome = run_child(&db_path, "commit_and_truncate", "after-loop");
+    assert_external_truncate_blocked(&outcome, &db_path, "post-loop probe");
 }
 
 /// The owned-mode dance (TRUNCATE) on the lifecycle directly: a clean window
@@ -516,10 +543,11 @@ async fn lifecycle_truncate_dance_preserves_window_commit() {
     let outcome = run_child(&db_path, "commit_and_truncate", "after-dance");
     assert_external_truncate_blocked(&outcome, &db_path, "owned TRUNCATE dance");
 
-    // Deterministic window commit: a writer holds its write transaction open
-    // across the checkpoint's writer-lock wait, so its commit provably lands
-    // between release and re-pin (the checkpoint blocks on the writer lock
-    // until the writer commits).
+    // Deterministic window commit: the writer holds its write transaction
+    // open and signals once the INSERT is in flight; only then does the dance
+    // begin, so the checkpoint provably blocks on the writer lock until the
+    // writer commits — the commit lands between release and re-pin, always.
+    let (inserted_tx, inserted_rx) = std::sync::mpsc::channel::<()>();
     let writer = {
         let db_path = db_path.clone();
         std::thread::spawn(move || {
@@ -528,11 +556,15 @@ async fn lifecycle_truncate_dance_preserves_window_commit() {
             conn.execute_batch("BEGIN;").unwrap();
             conn.execute("INSERT INTO app_data (value) VALUES ('in-window')", [])
                 .unwrap();
-            // Give the dance time to release the pin and block on the writer lock.
+            inserted_tx.send(()).unwrap();
+            // Hold the write transaction open so the checkpoint must wait.
             std::thread::sleep(std::time::Duration::from_millis(200));
             conn.execute_batch("COMMIT;").unwrap();
         })
     };
+    inserted_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("writer must signal its INSERT");
     lifecycle.controlled_checkpoint(true).unwrap();
     writer.join().unwrap();
 
@@ -587,7 +619,9 @@ async fn control_without_blocker_truncate_succeeds() {
 // Arms the blocker, then runs each individual step of the CLI snapshot
 /// lifecycle (same SQL/file ops the production chain performs), probing after
 /// each step with an external child commit + TRUNCATE and recording the
-/// WAL/-shm state (length + inode) before and after. Evidence output only.
+/// WAL/-shm state (length + inode) before and after. Asserts the exact zombie
+/// signature: one raw main-DB open+close lets the child's close unlink
+/// WAL/SHM while the read mark still refuses explicit TRUNCATE.
 #[tokio::test]
 async fn bisect_which_step_invalidates_blocker() {
     let dir = tempfile::tempdir().unwrap();
@@ -628,6 +662,21 @@ async fn bisect_which_step_invalidates_blocker() {
     }
     probe("raw-page-size-read");
 
+    // Hard assertion on the exact zombie signature (this is the bug, pinned as
+    // deterministic evidence): after ONE raw open+close of the main DB, the
+    // child's TRUNCATE was still refused (read mark intact on the old shm
+    // inode) and yet its close-time checkpoint unlinked the WAL and SHM.
+    let wal = wal_state(&db_path);
+    let shm = shm_state(&db_path);
+    assert!(
+        !wal.exists && !shm.exists,
+        "one raw main-DB open+close must let the child's close unlink WAL/SHM: \
+         wal(exists={}, len={}) shm(exists={})",
+        wal.exists,
+        wal.len,
+        shm.exists
+    );
+
     // Step 3: VACUUM INTO on a fresh connection (StableSqliteSnapshot::create).
     {
         let dest = dir.path().join("bisect-vacuum-tmp.db");
@@ -639,7 +688,13 @@ async fn bisect_which_step_invalidates_blocker() {
         drop(conn);
         let _ = std::fs::remove_file(&dest);
     }
+    let vacuum_probe = run_child(&db_path, "commit_and_truncate", "probe");
     probe("vacuum-into-conn");
+    assert_eq!(
+        vacuum_probe.busy(),
+        Some(0),
+        "the zombified blocker must no longer block external TRUNCATE"
+    );
 
     // Step 4: the full production chain in one go, for comparison.
     let storage = MemStorage::default();
@@ -652,4 +707,209 @@ async fn bisect_which_step_invalidates_blocker() {
     .await
     .unwrap();
     probe("full-production-chain");
+}
+
+/// Busy-failure negative path: an external reader pinning the WAL makes the
+/// controlled checkpoint incomplete, so the dance errors — but the blocker
+/// must be re-pinned before the error returns, and an external TRUNCATE
+/// afterwards must still be blocked.
+#[tokio::test]
+async fn checkpoint_busy_failure_still_repins_blocker() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = fresh_db(dir.path(), "busy.db");
+
+    let lifecycle = BlockerLifecycle::open(&db_path).unwrap();
+
+    // An external reader pinning the WAL at its current end; further commits
+    // then land past its read mark, so the PASSIVE checkpoint cannot fold the
+    // whole log and the completeness check fails.
+    let external = Connection::open(&db_path).unwrap();
+    external.execute_batch("BEGIN DEFERRED;").unwrap();
+    let _: i64 = external
+        .query_row("SELECT count(*) FROM app_data", [], |row| row.get(0))
+        .unwrap();
+    run_child(&db_path, "commit", "past-the-mark");
+
+    let err = lifecycle
+        .controlled_checkpoint(false)
+        .expect_err("checkpoint must fail while the external reader pins the WAL");
+    assert!(
+        err.to_string().contains("incomplete"),
+        "expected the completeness failure, got: {err}"
+    );
+
+    drop(external);
+
+    // The dance re-pinned the blocker before returning the error.
+    let outcome = run_child(&db_path, "commit_and_truncate", "after-busy");
+    assert_external_truncate_blocked(&outcome, &db_path, "busy-failure re-pin");
+
+    // And the next clean dance succeeds.
+    lifecycle.controlled_checkpoint(false).unwrap();
+}
+
+/// Re-pin failure recovery: if the heartbeat upsert times out behind an
+/// application writer, the dance errors loudly — and the NEXT dance must
+/// succeed (the release is idempotent; an unconditional ROLLBACK would wedge
+/// every later dance with "no transaction is active").
+#[tokio::test]
+async fn repin_failure_heals_next_dance() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = fresh_db(dir.path(), "repin.db");
+
+    let lifecycle = BlockerLifecycle::open(&db_path).unwrap();
+
+    // A writer holding WAL_WRITE_LOCK past the lifecycle's 5s busy timeout:
+    // the dance's PASSIVE fold succeeds (it needs no writer lock), but the
+    // heartbeat upsert cannot write and the re-pin fails.
+    let (inserted_tx, inserted_rx) = std::sync::mpsc::channel::<()>();
+    let writer = {
+        let db_path = db_path.clone();
+        std::thread::spawn(move || {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+            conn.execute_batch("BEGIN;").unwrap();
+            conn.execute("INSERT INTO app_data (value) VALUES ('held')", [])
+                .unwrap();
+            inserted_tx.send(()).unwrap();
+            // Hold past the heartbeat's 5s busy timeout.
+            std::thread::sleep(std::time::Duration::from_millis(6500));
+            conn.execute_batch("COMMIT;").unwrap();
+        })
+    };
+    inserted_rx
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("writer must signal its INSERT");
+
+    let err = lifecycle
+        .controlled_checkpoint(false)
+        .expect_err("re-pin must fail while the writer holds the write lock");
+    writer.join().unwrap();
+    drop(err);
+
+    // The next dance heals: release is idempotent, checkpoint, heartbeat and
+    // re-pin all succeed.
+    lifecycle.controlled_checkpoint(false).unwrap();
+
+    let outcome = run_child(&db_path, "commit_and_truncate", "after-heal");
+    assert_external_truncate_blocked(&outcome, &db_path, "healed dance");
+}
+
+/// Shutdown ordering: dropping the ShadowWal closes blocker, then monitor,
+/// then the source descriptor — and an external TRUNCATE afterwards must
+/// succeed (locks really released; no pinned-forever WAL).
+#[tokio::test]
+async fn shutdown_releases_locks() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = fresh_db(dir.path(), "shutdown.db");
+
+    let shadow = ShadowWal::new(&db_path).await.unwrap();
+    drop(shadow);
+
+    let outcome = run_child(&db_path, "commit_and_truncate", "post-shutdown");
+    assert_eq!(
+        outcome.busy(),
+        Some(0),
+        "TRUNCATE must succeed after the lifecycle drops; child said: {}",
+        outcome.raw
+    );
+    assert!(
+        wal_len(&db_path).unwrap_or(0) == 0,
+        "the WAL must be empty/removed after a successful TRUNCATE"
+    );
+}
+
+/// Per-database isolation: arming two lifecycles and snapshotting one must
+/// not disturb the other's blocker.
+#[tokio::test]
+async fn multi_db_lifecycles_do_not_interfere() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_a = fresh_db(dir.path(), "a.db");
+    let db_b = fresh_db(dir.path(), "b.db");
+
+    let shadow_a = ShadowWal::new(&db_a).await.unwrap();
+    let _shadow_b = ShadowWal::new(&db_b).await.unwrap();
+
+    // Run the full CLI snapshot lifecycle against db A.
+    let storage = MemStorage::default();
+    take_snapshot_to_storage(
+        &storage,
+        "",
+        cli_snapshot_input(&db_a),
+        shadow_a.lifecycle(),
+    )
+    .await
+    .unwrap();
+
+    // db B's blocker is untouched.
+    let outcome = run_child(&db_b, "commit_and_truncate", "probe-b");
+    assert_external_truncate_blocked(&outcome, &db_b, "multi-DB isolation");
+
+    // And db A is still protected too.
+    let outcome = run_child(&db_a, "commit_and_truncate", "probe-a");
+    assert_external_truncate_blocked(&outcome, &db_a, "multi-DB post-snapshot");
+}
+
+/// The contract holds at non-default page sizes: 512-byte and 64KiB pages.
+#[tokio::test]
+async fn cli_startup_snapshot_keeps_blocker_at_extreme_page_sizes() {
+    for page_size in [512u32, 65536] {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join(format!("ps{page_size}.db"));
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(&format!(
+            "PRAGMA page_size={page_size};
+             PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE app_data (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO app_data (value) VALUES ('seed');"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let _shadow = ShadowWal::new(&db_path).await.unwrap();
+        run_child(&db_path, "commit", "past-mark");
+
+        let storage = MemStorage::default();
+        take_snapshot_to_storage(
+            &storage,
+            "",
+            cli_snapshot_input(&db_path),
+            _shadow.lifecycle(),
+        )
+        .await
+        .unwrap();
+
+        let outcome = run_child(&db_path, "commit_and_truncate", "after-snapshot");
+        assert_external_truncate_blocked(&outcome, &db_path, "extreme page size");
+    }
+}
+
+/// App auto-checkpoint burst (default 1000-page threshold, one big
+/// transaction): the app's own checkpoint cannot erase unread WAL frames
+/// while the blocker is armed.
+#[tokio::test]
+async fn app_autocheckpoint_burst_cannot_reset_unread_wal() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = fresh_db(dir.path(), "burst.db");
+
+    let mut shadow = ShadowWal::new(&db_path).await.unwrap();
+
+    run_child(&db_path, "burst", "");
+    let len = wal_len(&db_path).unwrap_or(0);
+    assert!(
+        len > 0,
+        "WAL must survive the app-side autocheckpoint burst and close"
+    );
+
+    // The shadow must be able to copy every burst frame.
+    let (frames, _off) = shadow.copy_frames(0).await.unwrap();
+    assert!(
+        frames.len() > 1000,
+        "shadow must copy the whole burst ({} frames)",
+        frames.len()
+    );
+
+    let outcome = run_child(&db_path, "commit_and_truncate", "after-burst");
+    assert_external_truncate_blocked(&outcome, &db_path, "autocheckpoint burst");
 }
