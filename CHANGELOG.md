@@ -68,6 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`e2e_shadow_checkpoint_reanchors_window_commit_live_s3`) proves a racing
   writer trips the detection, the re-anchor publishes a new-generation
   snapshot, and a full restore carries every committed row.
+- **Independent+cache mode closed too (audit finding):** that mode arms the
+  same blocker via its cache `ShadowWal`, and its periodic snapshot then
+  reopened the main DB raw (`get_page_size`) — the same measured
+  invalidation. The snapshot timer now borrows the cache shadow's retained
+  handles; the startup checksum and startup re-anchor run before arming and
+  are unaffected. Double-registration guard is TOCTOU-safe (re-checked under
+  the write lock at insert).
 
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
   owns each planned candidate instead of retaining borrowed plan entries across

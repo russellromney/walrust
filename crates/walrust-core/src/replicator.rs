@@ -430,10 +430,19 @@ impl Replicator {
             compaction_triggers: None,
         }));
 
-        self.databases
-            .write()
-            .await
-            .insert(name.to_string(), db_state);
+        // Re-check under the write lock: the hazardous drop of a replaced
+        // lifecycle happens exactly here, so this is where the guard must hold
+        // even against a concurrent same-name add (TOCTOU).
+        {
+            let mut databases = self.databases.write().await;
+            if databases.contains_key(name) {
+                anyhow::bail!(
+                    "Replicator: '{}' is already registered; call remove() before re-adding it",
+                    name
+                );
+            }
+            databases.insert(name.to_string(), db_state);
+        }
 
         tracing::info!("Replicator: added '{}' ({})", name, db_path.display());
         Ok(())
@@ -566,10 +575,18 @@ impl Replicator {
             compaction_triggers: None,
         }));
 
-        self.databases
-            .write()
-            .await
-            .insert(name.to_string(), db_state);
+        // Re-check under the write lock (TOCTOU): the hazardous drop of a
+        // replaced lifecycle happens exactly here.
+        {
+            let mut databases = self.databases.write().await;
+            if databases.contains_key(name) {
+                anyhow::bail!(
+                    "Replicator: '{}' is already registered; call remove() before re-adding it",
+                    name
+                );
+            }
+            databases.insert(name.to_string(), db_state);
+        }
 
         tracing::info!(
             "Replicator: added '{}' without snapshot ({})",

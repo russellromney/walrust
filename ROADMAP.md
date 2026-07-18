@@ -184,8 +184,13 @@ Per-mode reality (verified in code):
 
 - **CLI independent mode (`crates/walrust-core/src/legacy_wal_sync.rs`)** runs
   `wal_checkpoint(PASSIVE/TRUNCATE)` through **one-shot** `Connection::open`s, so
-  it holds no persistent read-mark either, and by opening/closing may itself
-  trigger last-close checkpoints.
+  it holds no persistent read-mark in no-cache mode, and by opening/closing may
+  itself trigger last-close checkpoints. **Cache mode is different:** it creates
+  a `ShadowWal` (`src/sync/watch_independent.rs:292`), which arms the blocker —
+  and its periodic snapshot then reopened the main DB raw (`get_page_size`),
+  the same measured invalidation. The lifecycle fix makes the snapshot borrow
+  the cache shadow's retained handles (startup checksum/anchor run pre-arm and
+  are unaffected).
 
 #### Measured diagnosis (2026-07-17, macOS, bundled SQLite 3.49.1)
 

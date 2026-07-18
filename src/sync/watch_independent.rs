@@ -621,6 +621,15 @@ async fn run_db_task(
             // Periodic full-snapshot timer
             _ = snapshot_timer.tick(), if snapshot_interval_secs > 0 => {
                 tracing::debug!("{}: Taking periodic snapshot", db_name);
+                // Cache mode arms a checkpoint blocker via the cache's
+                // ShadowWal; the snapshot must borrow its retained handles
+                // instead of opening fresh descriptors for the main DB (see
+                // the `blocker` module docs in walrust-core). No-cache mode
+                // holds no blocker and keeps the one-shot path.
+                let snapshot_handles = match cache_state.as_ref() {
+                    Some(cache) => cache.shadow.lock().await.lifecycle(),
+                    None => None,
+                };
                 if let Err(e) = take_snapshot_with_retry(
                     &client,
                     &bucket,
@@ -628,7 +637,7 @@ async fn run_db_task(
                     &mut state.db_state,
                     &retry_policy,
                     &webhook_sender,
-                    None,
+                    snapshot_handles,
                 )
                 .await
                 {
