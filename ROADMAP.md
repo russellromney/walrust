@@ -314,6 +314,16 @@ litestream does — call it out plainly for operators).
 
 ### Disposition of the open PRs
 
+- **PR #44 is Phase 1 (this repair).** It lands the checkpoint-blocker
+  lifecycle — retained handles, the controlled release/re-pin dance with
+  `data_version` + folded-extent detection, defer-not-die on reader
+  contention, and the WAL-growth alarm — with the proofs above. One boundary
+  it deliberately does NOT move: walrust's own checkpoint still waits for
+  durable remote upload before releasing the read mark (the pre-existing
+  remote-ack order), so S3 latency/outage still grows the live WAL — bounded
+  and alarmed, not eliminated. Making the fsynced local shadow/LTX the
+  checkpoint boundary, with cloud upload fully asynchronous, is the next PR
+  (the local-first refinement), through its own adversarial gate.
 - **PR #41 stays open, unmerged**, until Phase 1/3 land and cherry-pick the parts
   that survive (`read_header_classified`, degraded-mode re-anchor). Do not merge
   it as the primary fix; do not close it and lose the machinery.

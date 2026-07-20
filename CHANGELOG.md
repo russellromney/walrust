@@ -109,6 +109,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   runs in `spawn_blocking`; PASSIVE window-commit detection has a
   deterministic dance-hook test alongside the race-stress test; shutdown in
   tests is an injected oneshot rather than a process-global signal.
+- **Second blocking-review remediations (proofs and operator contract):** the
+  WAL-growth alarm now fires from the real wal-sync tick (call-site
+  revert-proof: deleting the tick call makes the live webhook assertion time
+  out), is throttled to one firing per 60s per database instead of every
+  tick, and reports exact bytes with approximate pages; the config and CLI
+  text no longer claim a nonexistent "emergency blocking TRUNCATE". The DF
+  whole-watch e2e's snapshot counter was vacuous — an absolute `rsplit`
+  depth check matched nothing once the object prefix was non-empty, so every
+  rate assertion silently saw zero objects; fixed, and the scenario is now
+  proven two ways: a deterministic zero-re-anchor run
+  (`e2e_cli_shadow_watch_armed_no_windows_no_loss_live_s3` — no periodic
+  ticks and no checkpoint dances inside the measured window, so exactly zero
+  new snapshot objects may appear, every external `wal_checkpoint(TRUNCATE)`
+  is refused, and the restore is row-exact) and per-phase bounds in the
+  dance-driving run (periodic cadence plus at most one window-commit
+  re-anchor per completed dance, never a commit-correlated storm).
+  Owned-mode `None`-checksum pre-image hashes while armed now go through the
+  retained source descriptor (`ltx::compute_checksum_from_fd`, three delta
+  call sites); a child-process regression proves the old raw-open fallback
+  zombied the blocker (`busy=1` on the TRUNCATE probe, WAL unlinked on the
+  close). Independent+cache mode's periodic snapshot tick is pinned at the
+  call site by a live e2e driving the real `run_db_task` loop (neutering the
+  borrowed handles to `None` lets the external close unlink the WAL).
+  Operator documentation (README) now states the retained-connections
+  contract, the WAL-growth tradeoff and alarm semantics, local vs cloud
+  durability, and remote-outage behavior.
 
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
   owns each planned candidate instead of retaining borrowed plan entries across

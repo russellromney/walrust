@@ -101,8 +101,8 @@ enum Commands {
         #[arg(long)]
         min_checkpoint_pages: Option<u64>,
 
-        /// Emergency WAL truncate threshold in pages (default: 121359, ~500MB)
-        /// Set to 0 to disable emergency checkpoints
+        /// WAL-growth alarm threshold in pages (default: 121359, ~500MB)
+        /// Alarms (error log + webhook) when the WAL exceeds it; 0 disables
         #[arg(long)]
         wal_truncate_threshold: Option<u64>,
 

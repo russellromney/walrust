@@ -837,6 +837,11 @@ pub(crate) async fn watch_with_shadow_and_shutdown(
     };
     tokio::pin!(shutdown_signal);
 
+    // Throttle state for the WAL-growth alarm: the last time each database
+    // fired, so a stuck WAL re-alarms every WAL_ALARM_INTERVAL instead of
+    // hammering the webhook endpoint on every sync tick.
+    let mut wal_alarm_last: HashMap<PathBuf, std::time::Instant> = HashMap::new();
+
     loop {
         tokio::select! {
             // Handle shutdown signals
@@ -874,13 +879,23 @@ pub(crate) async fn watch_with_shadow_and_shutdown(
                     // WAL-growth alarm (the litestream tradeoff): while walrust
                     // holds the read mark, walrust is the only thing that can
                     // let the WAL truncate — a WAL that keeps growing means
-                    // walrust is behind or wedged. Alarm loudly, every tick.
+                    // walrust is behind or wedged. Alarm loudly (throttled).
                     let threshold = sync_configs
                         .get(&state.db_path)
                         .unwrap_or(&global_sync)
                         .wal_truncate_threshold_pages;
-                    alarm_if_wal_oversized(state, threshold, &webhook_sender, &metrics_state)
-                        .await;
+                    let last_fired = wal_alarm_last.get(&state.db_path).copied();
+                    if alarm_if_wal_oversized(
+                        state,
+                        threshold,
+                        &webhook_sender,
+                        &metrics_state,
+                        last_fired,
+                    )
+                    .await
+                    {
+                        wal_alarm_last.insert(state.db_path.clone(), std::time::Instant::now());
+                    }
                 }
 
                 let results = run_shadow_syncs(
@@ -1306,35 +1321,53 @@ pub(crate) async fn watch_with_shadow_and_shutdown(
     Ok(())
 }
 
+/// Minimum interval between repeated WAL-growth alarms for one database while
+/// its WAL stays over the threshold.
+const WAL_ALARM_INTERVAL: Duration = Duration::from_secs(60);
+
 /// WAL-growth alarm (the litestream tradeoff): once walrust holds the read
 /// mark, walrust is the only thing that can let the WAL truncate, so a WAL
 /// that keeps growing means walrust is behind or wedged. Alarm loudly —
-/// error log + webhook with the exact size, every tick while over the
-/// threshold — never silently. `threshold_pages == 0` disables the alarm.
+/// error log + webhook — never silently. `threshold_pages == 0` disables the
+/// alarm. The alarm fires at most once per [`WAL_ALARM_INTERVAL`] per
+/// database while the WAL stays over the threshold: a stuck WAL must keep
+/// reminding, but a 1s sync tick must not hammer the webhook endpoint.
+///
+/// The byte count is exact; the page count is approximate (the WAL carries a
+/// 32-byte header plus a 24-byte frame header per page, so raw bytes do not
+/// divide evenly into database pages).
 async fn alarm_if_wal_oversized(
     state: &ShadowDbState,
     threshold_pages: u64,
     webhook_sender: &WebhookSender,
     metrics_state: &MetricsState,
-) {
+    last_fired: Option<std::time::Instant>,
+) -> bool {
     if threshold_pages == 0 {
-        return;
+        return false;
+    }
+    if let Some(last) = last_fired {
+        if last.elapsed() < WAL_ALARM_INTERVAL {
+            return false;
+        }
     }
     let wal_bytes = std::fs::metadata(&state.wal_path)
         .map(|m| m.len())
         .unwrap_or(0);
-    let page_size = state.shadow.page_size() as u64;
-    let wal_pages = if page_size > 0 {
-        wal_bytes / page_size
+    // Frame size = page + 24-byte frame header; the result stays approximate
+    // (the 32-byte WAL header is not accounted for), hence "≈" in the message.
+    let frame_size = state.shadow.page_size() as u64 + 24;
+    let approx_pages = if frame_size > 0 {
+        wal_bytes / frame_size
     } else {
         0
     };
-    if wal_pages > threshold_pages {
+    if approx_pages > threshold_pages {
         tracing::error!(
-            "{}: WAL growth alarm: live WAL is {} pages ({} bytes), over the {}-page threshold; walrust is behind or wedged",
+            "{}: WAL growth alarm: live WAL is {} bytes (\u{2248}{} pages incl. WAL framing), over the {}-page threshold; walrust is behind or wedged",
             state.name,
-            wal_pages,
             wal_bytes,
+            approx_pages,
             threshold_pages
         );
         metrics_state.record_error(&state.name);
@@ -1342,12 +1375,14 @@ async fn alarm_if_wal_oversized(
             .notify_upload_failed(
                 &state.name,
                 &format!(
-                    "WAL growth alarm: {wal_pages} pages ({wal_bytes} bytes) over {threshold_pages}-page threshold"
+                    "WAL growth alarm: {wal_bytes} bytes (\u{2248}{approx_pages} pages incl. framing) over {threshold_pages}-page threshold"
                 ),
                 1,
             )
             .await;
+        return true;
     }
+    false
 }
 
 /// How startup state is seeded from the remote `manifest.json`.
@@ -1400,13 +1435,17 @@ mod tests {
     use crate::shadow::format_segment_name;
     use rusqlite::Connection;
     use std::io::{Read, Write};
+    use std::path::Path;
     use tempfile::TempDir;
 
-    // ── WAL-growth alarm (revert-proof) ─────────────────────────────────────
+    // ── WAL-growth alarm ────────────────────────────────────────────────────
 
-    /// The alarm must fire loudly (webhook with the exact size + error count)
-    /// when the WAL exceeds the threshold, and stay silent under it. Neutering
-    /// the call site makes the webhook assertion fail.
+    /// The alarm must fire loudly (webhook with the exact byte size + error
+    /// count) when the WAL exceeds the threshold, stay silent under it, and
+    /// throttle repeats. This pins the function's contract; the tick → alarm
+    /// call-site wiring is pinned by
+    /// `e2e_cli_shadow_watch_wal_growth_alarm_live_s3` (deleting the call in
+    /// the wal-sync tick fails that test).
     #[tokio::test]
     async fn wal_growth_alarm_fires_over_threshold_and_stays_silent_under() {
         let (_temp, db_path, conn) = create_real_wal_db();
@@ -1438,22 +1477,27 @@ mod tests {
         };
         let metrics = MetricsState::new();
 
-        // Over threshold: the webhook fires with the exact size and the error
-        // counter increments.
+        // Over threshold: the webhook fires with the exact byte size and the
+        // error counter increments.
         let (url, body) = capture_one_webhook().await;
         let webhook = WebhookSender::new(vec![WebhookConfig {
             url,
             events: vec!["upload_failed".to_string()],
             secret: None,
         }]);
-        alarm_if_wal_oversized(&state, 1, &webhook, &metrics).await;
+        assert!(
+            alarm_if_wal_oversized(&state, 1, &webhook, &metrics, None).await,
+            "first crossing must fire"
+        );
         let alarm_body = tokio::time::timeout(Duration::from_secs(5), body)
             .await
             .expect("alarm must reach the webhook")
             .expect("capture task must not panic");
         assert!(
-            alarm_body.contains("WAL growth alarm") && alarm_body.contains("pages"),
-            "alarm must carry the exact size, got: {alarm_body}"
+            alarm_body.contains("WAL growth alarm")
+                && alarm_body.contains("bytes")
+                && alarm_body.contains("pages"),
+            "alarm must carry the exact byte size and approximate pages, got: {alarm_body}"
         );
         assert_eq!(
             metrics.error_count.with_label_values(&["alarm-db"]).get(),
@@ -1461,13 +1505,52 @@ mod tests {
             "the error counter must record the alarm"
         );
 
-        // Under threshold and disabled: silent, no error recorded.
-        alarm_if_wal_oversized(&state, 121359, &webhook, &metrics).await;
-        alarm_if_wal_oversized(&state, 0, &webhook, &metrics).await;
+        // Throttled: a tick immediately after firing must stay silent (no
+        // webhook hammering on a 1s sync interval), even over threshold.
+        assert!(
+            !alarm_if_wal_oversized(
+                &state,
+                1,
+                &webhook,
+                &metrics,
+                Some(std::time::Instant::now())
+            )
+            .await,
+            "an immediate re-crossing must be throttled"
+        );
         assert_eq!(
             metrics.error_count.with_label_values(&["alarm-db"]).get(),
             1,
-            "no further alarm under the threshold or when disabled"
+            "a throttled tick must not record another error"
+        );
+
+        // After the throttle interval the alarm fires again (a stuck WAL must
+        // keep reminding).
+        assert!(
+            alarm_if_wal_oversized(
+                &state,
+                1,
+                &webhook,
+                &metrics,
+                Some(std::time::Instant::now() - WAL_ALARM_INTERVAL - Duration::from_secs(1))
+            )
+            .await,
+            "the alarm must re-fire after the throttle interval"
+        );
+
+        // Under threshold and disabled: silent, no error recorded.
+        assert!(
+            !alarm_if_wal_oversized(&state, 121359, &webhook, &metrics, None).await,
+            "under the threshold must stay silent"
+        );
+        assert!(
+            !alarm_if_wal_oversized(&state, 0, &webhook, &metrics, None).await,
+            "threshold 0 must disable the alarm"
+        );
+        assert_eq!(
+            metrics.error_count.with_label_values(&["alarm-db"]).get(),
+            2,
+            "only the two real firings are recorded"
         );
         drop(conn);
         state.wal_copy_offset = 0;
@@ -2340,16 +2423,510 @@ mod tests {
         }
     }
 
+    /// Watch-level wiring for the WAL-growth alarm: the real
+    /// `watch_with_shadow` loop, driven by its wal-sync tick, must fire the
+    /// alarm webhook when the live WAL exceeds `wal_truncate_threshold_pages`
+    /// — and must keep running (the alarm is a report, not a failure).
+    /// Deleting the `alarm_if_wal_oversized` call in the wal-sync tick makes
+    /// this test time out waiting for the webhook. Skips without S3.
+    #[tokio::test]
+    async fn e2e_cli_shadow_watch_wal_growth_alarm_live_s3() {
+        if !s3_e2e_enabled() {
+            eprintln!(
+                "SKIP e2e_cli_shadow_watch_wal_growth_alarm_live_s3: no S3 endpoint/credentials configured"
+            );
+            return;
+        }
+
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        let bucket = std::env::var("TIERED_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026".to_string());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = "walarm".to_string();
+        let prefix = format!("e2e-walarm-{nanos}/");
+        let bucket_with_prefix = format!("{bucket}/{prefix}");
+
+        let (_temp, db_path, app) = create_real_wal_db();
+        // Grow the WAL well past one page so the 1-page threshold trips.
+        for i in 0..50 {
+            app.execute(
+                "INSERT INTO items (value) VALUES (?1)",
+                [format!("row-{i}")],
+            )
+            .unwrap();
+        }
+        let sync = SyncConfig {
+            snapshot_interval: 3600,
+            wal_sync_interval: 1,
+            checkpoint_interval: 3600,
+            min_checkpoint_page_count: u64::MAX,
+            on_startup: false,
+            wal_truncate_threshold_pages: 1,
+            ..SyncConfig::default()
+        };
+        let db_config = ResolvedDbConfig {
+            path: db_path.clone(),
+            prefix: name.clone(),
+            sync: sync.clone(),
+            retention: RetentionConfig::default(),
+            compaction: walrust_core::compaction::CompactionSettings::default(),
+        };
+
+        let (webhook_url, webhook_body) = capture_one_webhook().await;
+        let webhooks = vec![WebhookConfig {
+            url: webhook_url,
+            events: vec!["upload_failed".to_string()],
+            secret: None,
+        }];
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let endpoint_for_watch = endpoint.clone();
+        let watch = tokio::spawn(async move {
+            watch_with_shadow_and_shutdown(
+                vec![db_config],
+                &bucket_with_prefix,
+                endpoint_for_watch.as_deref(),
+                sync,
+                None,
+                0,
+                true,
+                RetryConfig::default(),
+                webhooks,
+                CacheConfig::default(),
+                Some(shutdown_rx),
+            )
+            .await
+        });
+
+        // The wal-sync tick must raise the alarm (threshold: 1 page).
+        let alarm_body = tokio::time::timeout(Duration::from_secs(20), webhook_body)
+            .await
+            .expect("WAL-growth alarm must reach the webhook within 20s of the first tick")
+            .expect("webhook capture task must not panic");
+        assert!(
+            alarm_body.contains("WAL growth alarm"),
+            "alarm must identify itself, got: {alarm_body}"
+        );
+        assert!(
+            alarm_body.contains("bytes"),
+            "alarm must carry the exact WAL byte size, got: {alarm_body}"
+        );
+        assert!(
+            alarm_body.contains(&name),
+            "alarm must name the database, got: {alarm_body}"
+        );
+
+        // The alarm is a report, not a failure: the watch keeps running.
+        assert!(
+            !watch.is_finished(),
+            "watch must stay alive after firing the WAL-growth alarm"
+        );
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(30), watch)
+            .await
+            .expect("watch must shut down gracefully within 30s")
+            .expect("watch task must not panic")
+            .expect("watch must exit cleanly on shutdown");
+
+        // Cleanup: delete only this test's unique prefix.
+        let client = create_client(endpoint.as_deref()).await.unwrap();
+        let (bucket_name, _) = parse_bucket(&bucket);
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(&bucket_name)
+                .prefix(&prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.unwrap();
+            for obj in page.contents() {
+                if let Some(key) = obj.key() {
+                    let _ = client
+                        .delete_object()
+                        .bucket(&bucket_name)
+                        .key(key)
+                        .send()
+                        .await;
+                }
+            }
+            match page.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
+    }
+
+    /// The DF2 workload as a background thread pair: an ephemeral writer
+    /// (one open+insert+close connection per commit — the last-connection
+    /// close-time EXCLUSIVE attempt is what unlinks the WAL when walrust's
+    /// SHARED main-db lock is gone) and a truncater (non-blocking
+    /// `wal_checkpoint(TRUNCATE)` probes; a `busy == 0` result means the
+    /// blocker failed to protect the WAL).
+    struct DfThreads {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        writer_count: Arc<std::sync::atomic::AtomicU64>,
+        truncate_violations: Arc<std::sync::atomic::AtomicU64>,
+        writer: std::thread::JoinHandle<()>,
+        truncater: std::thread::JoinHandle<()>,
+    }
+
+    fn spawn_df_threads(db_path: &Path) -> DfThreads {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let truncate_violations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = {
+            let db_path = db_path.to_path_buf();
+            let stop = Arc::clone(&stop);
+            let writer_count = Arc::clone(&writer_count);
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // A real application retries transient SQLITE_BUSY (the
+                    // checkpoint dance holds the writer lock briefly); a
+                    // panicking workload generator would silently stop the
+                    // commit stream and invalidate the phase assertions.
+                    if let Ok(conn) = Connection::open(&db_path) {
+                        if conn
+                            .execute("INSERT INTO items (value) VALUES (?1)", [format!("w{i}")])
+                            .is_ok()
+                        {
+                            drop(conn);
+                            i += 1;
+                            writer_count.store(i, std::sync::atomic::Ordering::Relaxed);
+                            std::thread::sleep(std::time::Duration::from_millis(400));
+                            continue;
+                        }
+                        drop(conn);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
+        let truncater = {
+            let db_path = db_path.to_path_buf();
+            let stop = Arc::clone(&stop);
+            let truncate_violations = Arc::clone(&truncate_violations);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let conn = match Connection::open(&db_path) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    conn.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+                    // Only a SUCCESSFUL truncation is a blocker violation; a
+                    // lock-contention error is a refusal, same as busy=1.
+                    if let Ok(0) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                        row.get::<_, i64>(0)
+                    }) {
+                        truncate_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    drop(conn);
+                }
+            })
+        };
+        DfThreads {
+            stop,
+            writer_count,
+            truncate_violations,
+            writer,
+            truncater,
+        }
+    }
+
+    impl DfThreads {
+        /// Stop both threads and return (commits, truncate violations).
+        fn stop_and_join(self) -> (u64, u64) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.writer.join().unwrap();
+            self.truncater.join().unwrap();
+            (
+                self.writer_count.load(std::sync::atomic::Ordering::Relaxed),
+                self.truncate_violations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+    }
+
+    /// Poll S3 until at least `minimum` snapshot objects exist (or `timeout`
+    /// elapses) and return the count then visible.
+    async fn wait_for_snapshot_count(
+        client: &aws_sdk_s3::Client,
+        bucket_name: &str,
+        prefix: &str,
+        name: &str,
+        minimum: usize,
+        timeout: Duration,
+    ) -> usize {
+        let start = std::time::Instant::now();
+        loop {
+            let n = count_snapshot_objects(client, bucket_name, prefix, name).await;
+            if n >= minimum {
+                return n;
+            }
+            if start.elapsed() > timeout {
+                let all = client
+                    .list_objects_v2()
+                    .bucket(bucket_name)
+                    .prefix(prefix)
+                    .send()
+                    .await
+                    .unwrap();
+                eprintln!(
+                    "wait_for_snapshot_count timed out at {n}; keys under {prefix}: {:?}",
+                    all.contents()
+                        .iter()
+                        .filter_map(|o| o.key())
+                        .collect::<Vec<_>>()
+                );
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Delete every object under this test's unique prefix (and nothing else).
+    async fn cleanup_prefix(client: &aws_sdk_s3::Client, bucket_name: &str, prefix: &str) {
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = client.list_objects_v2().bucket(bucket_name).prefix(prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.unwrap();
+            for obj in page.contents() {
+                if let Some(key) = obj.key() {
+                    let _ = client
+                        .delete_object()
+                        .bucket(bucket_name)
+                        .key(key)
+                        .send()
+                        .await;
+                }
+            }
+            match page.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
+    }
+
+    /// Restore into `restored_path` and require exactly `expected_writer_rows`
+    /// ephemeral-writer rows plus the three seed rows.
+    async fn assert_row_exact_restore(
+        restored_path: &Path,
+        name: &str,
+        bucket_with_prefix: &str,
+        endpoint: Option<&str>,
+        expected_writer_rows: u64,
+    ) {
+        crate::sync::restore::restore(
+            name,
+            restored_path,
+            bucket_with_prefix,
+            endpoint,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let verify = Connection::open(restored_path).unwrap();
+        let writer_rows: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value LIKE 'w%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            writer_rows, expected_writer_rows as i64,
+            "every ephemeral-writer row must be replicated (DF2)"
+        );
+        let seed_rows: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value IN ('alpha', 'beta', 'gamma')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seed_rows, 3, "seed rows must survive");
+    }
+
+    /// The zero-re-anchor / zero-storm proof, made exact: with the periodic
+    /// snapshot timer and the checkpoint dance both moved out of the measured
+    /// window (intervals of one hour, `min_checkpoint_page_count` unreachable)
+    /// there is NO legitimate snapshot source while the DF2 workload runs —
+    /// every re-anchor path (window-commit, downtime, trigger) is either
+    /// disabled or would itself be the bug. Any WAL loss underneath the armed
+    /// blocker would also surface as a successful external TRUNCATE probe or
+    /// as missing rows on restore. So the measured window must produce
+    /// EXACTLY ZERO new snapshot objects, zero successful truncations, and a
+    /// row-exact restore. Skips when no S3 is configured.
+    #[tokio::test]
+    async fn e2e_cli_shadow_watch_armed_no_windows_no_loss_live_s3() {
+        if !s3_e2e_enabled() {
+            eprintln!(
+                "SKIP e2e_cli_shadow_watch_armed_no_windows_no_loss_live_s3: no S3 endpoint/credentials configured"
+            );
+            return;
+        }
+
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        let bucket = std::env::var("TIERED_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026".to_string());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = "armedzero".to_string();
+        let prefix = format!("e2e-armedzero-{nanos}/");
+        let bucket_with_prefix = format!("{bucket}/{prefix}");
+
+        let (_temp, db_path, _app) = create_real_wal_db();
+        let sync = SyncConfig {
+            // No periodic snapshots and no checkpoint dances inside the
+            // measured window (the immediate t=0 timer tick still fires; the
+            // baseline below absorbs it).
+            snapshot_interval: 3600,
+            wal_sync_interval: 1,
+            checkpoint_interval: 3600,
+            min_checkpoint_page_count: u64::MAX,
+            on_startup: true,
+            ..SyncConfig::default()
+        };
+        let db_config = ResolvedDbConfig {
+            path: db_path.clone(),
+            prefix: name.clone(),
+            sync: sync.clone(),
+            retention: RetentionConfig::default(),
+            compaction: walrust_core::compaction::CompactionSettings::default(),
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let bucket_for_watch = bucket_with_prefix.clone();
+        let endpoint_for_watch = endpoint.clone();
+        let watch = tokio::spawn(async move {
+            watch_with_shadow_and_shutdown(
+                vec![db_config],
+                &bucket_for_watch,
+                endpoint_for_watch.as_deref(),
+                sync,
+                None,
+                0,
+                true,
+                RetryConfig::default(),
+                Vec::new(),
+                CacheConfig::default(),
+                Some(shutdown_rx),
+            )
+            .await
+        });
+
+        let client = create_client(endpoint.as_deref()).await.unwrap();
+        let (bucket_name, _) = parse_bucket(&bucket);
+
+        // Baseline: the startup snapshot and the immediate t=0 timer-tick
+        // snapshot are the only legitimate objects. The next periodic tick is
+        // an hour out, so nothing else may appear during the measured window.
+        let baseline = wait_for_snapshot_count(
+            &client,
+            &bucket_name,
+            &prefix,
+            &name,
+            2,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(
+            baseline >= 2,
+            "startup + initial timer-tick snapshots must be published (got {baseline})"
+        );
+
+        let df = spawn_df_threads(&db_path);
+        let wal_at_start = std::fs::metadata(db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        // Measured window: ~8s of ephemeral commits and TRUNCATE probes.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        let (commits, violations) = df.stop_and_join();
+        assert!(
+            commits >= 10,
+            "the measured window must contain a real workload (got {commits} commits)"
+        );
+        assert_eq!(
+            violations, 0,
+            "every external wal_checkpoint(TRUNCATE) must be refused: with no \
+             controlled-checkpoint windows in this run, a success can only mean \
+             the blocker died"
+        );
+        assert!(
+            !watch.is_finished(),
+            "watch must be alive through the measured window"
+        );
+
+        let snapshots_after = count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
+        assert_eq!(
+            snapshots_after, baseline,
+            "EXACTLY ZERO re-anchors and zero storm: no snapshot may appear \
+             while the blocker is armed and no timer/dance can fire ({baseline} \
+             -> {snapshots_after})"
+        );
+
+        let wal_at_end = std::fs::metadata(db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            wal_at_end > wal_at_start,
+            "the WAL must accumulate, never reset ({wal_at_start} -> {wal_at_end})"
+        );
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(30), watch)
+            .await
+            .expect("watch must shut down gracefully within 30s")
+            .expect("watch task must not panic")
+            .expect("watch must exit cleanly on shutdown");
+
+        // DF2: restore must be row-exact.
+        let restored_path = db_path.with_file_name("restored-armed.db");
+        assert_row_exact_restore(
+            &restored_path,
+            &name,
+            &bucket_with_prefix,
+            endpoint.as_deref(),
+            commits,
+        )
+        .await;
+
+        cleanup_prefix(&client, &bucket_name, &prefix).await;
+    }
+
     /// Whole-watch end-to-end against the real DF2 shape: the full
     /// `watch_with_shadow` loop (snapshot + checkpoint timers, startup
-    /// snapshot, controlled checkpoint dances) drives a database through five
-    /// phases: an ephemeral one-connection-per-commit writer (the real DF2
-    /// shape), app-side `wal_checkpoint(TRUNCATE)` attempts, a long
-    /// application reader that must defer the checkpoint with a loud alarm
-    /// (never kill the watch), and a quiet phase proving zero re-anchors and
-    /// zero snapshot storm. Restore after graceful shutdown must be
-    /// row-exact. Skips when no S3 is configured (same gate as
-    /// `tests/production_e2e.rs`).
+    /// snapshot, controlled checkpoint dances) drives a database through an
+    /// ephemeral one-connection-per-commit writer (the real DF2 shape),
+    /// app-side `wal_checkpoint(TRUNCATE)` attempts, a long application
+    /// reader that must defer the checkpoint with a loud alarm (never kill
+    /// the watch), and a quiet phase pinned to exactly the periodic cadence.
+    /// Snapshot production is accounted per phase: periodic ticks plus at
+    /// most one window-commit re-anchor per completed dance — never a
+    /// commit-correlated storm. Restore after graceful shutdown must be
+    /// row-exact. The deterministic zero-re-anchor proof (no windows at all)
+    /// is `e2e_cli_shadow_watch_armed_no_windows_no_loss_live_s3`. Skips when
+    /// no S3 is configured (same gate as `tests/production_e2e.rs`).
     #[tokio::test]
     async fn e2e_cli_shadow_watch_survives_ephemeral_writer_live_s3() {
         if !s3_e2e_enabled() {
@@ -2417,54 +2994,28 @@ mod tests {
             .await
         });
 
-        // Ephemeral writer: one open+insert+close connection per commit. The
-        // last-connection close-time EXCLUSIVE attempt is what unlinks the WAL
-        // when walrust's SHARED main-db lock is gone — the exact DF2 shape.
-        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let writer_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let truncate_violations = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let writer = {
-            let db_path = db_path.clone();
-            let stop = Arc::clone(&stop);
-            let writer_count = Arc::clone(&writer_count);
-            std::thread::spawn(move || {
-                let mut i = 0u64;
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    let conn = Connection::open(&db_path).unwrap();
-                    conn.execute("INSERT INTO items (value) VALUES (?1)", [format!("w{i}")])
-                        .unwrap();
-                    drop(conn);
-                    i += 1;
-                    writer_count.store(i, std::sync::atomic::Ordering::Relaxed);
-                    std::thread::sleep(std::time::Duration::from_millis(400));
-                }
-            })
-        };
-        let truncater = {
-            let db_path = db_path.clone();
-            let stop = Arc::clone(&stop);
-            let truncate_violations = Arc::clone(&truncate_violations);
-            std::thread::spawn(move || {
-                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                    std::thread::sleep(std::time::Duration::from_millis(1500));
-                    let conn = Connection::open(&db_path).unwrap();
-                    conn.execute_batch("PRAGMA busy_timeout=0;").unwrap();
-                    let (busy, _, _): (i64, i64, i64) = conn
-                        .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
-                            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
-                        })
-                        .unwrap();
-                    if busy == 0 {
-                        truncate_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    drop(conn);
-                }
-            })
-        };
-
-        // Phase 1: normal operation under the ephemeral writer.
         let client = create_client(endpoint.as_deref()).await.unwrap();
         let (bucket_name, _) = parse_bucket(&bucket);
+
+        // Baseline: the startup snapshot and the first periodic timer tick.
+        // Snapshot deltas below are measured from here.
+        let baseline = wait_for_snapshot_count(
+            &client,
+            &bucket_name,
+            &prefix,
+            &name,
+            2,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(
+            baseline >= 2,
+            "startup + first periodic snapshots must be published (got {baseline})"
+        );
+
+        let df = spawn_df_threads(&db_path);
+
+        // Phase 1 (3s): normal operation under the ephemeral writer.
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         // Phase 2: a long application reader pins part of the WAL across a
@@ -2507,23 +3058,37 @@ mod tests {
             "alarm must carry the WAL size, got: {alarm_body}"
         );
 
+        // Active-phase snapshot accounting (phases 1+2, ~7s of commits and
+        // probes): legitimate sources are the 2s periodic timer (≤ 4 ticks
+        // including boundary straddle) and window-commit re-anchors from the
+        // completed checkpoint dances (≤ 2: the ~t=3s dance and the ~t=6s
+        // dance the reader usually defers). One extra slot covers S3-latency
+        // boundary effects. A loss-driven storm would be commit-correlated —
+        // ~2.5 commits/s would mean ~17 extra snapshots.
+        let active_snapshots = count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
+        assert!(
+            active_snapshots - baseline <= 7,
+            "active phases: only periodic ticks and ≤ 1 re-anchor per dance, \
+             never a commit-correlated storm ({baseline} -> {active_snapshots})"
+        );
+
         // Phase 3 (quiet): stop the writer and the truncater. With no
-        // application commits, the window detections cannot fire — snapshots
-        // must appear only at the periodic cadence (2s), proving zero
-        // re-anchors and zero snapshot storm.
-        stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        writer.join().unwrap();
-        truncater.join().unwrap();
+        // application commits, window detection cannot fire, so the ONLY
+        // remaining snapshot source is the 2s periodic timer: over a 4s
+        // window that is 2 ticks (1–3 with boundary straddle). Zero would
+        // mean the periodic timer died; more means an extra snapshot source.
+        let (commits, violations) = df.stop_and_join();
+        eprintln!("DF workload: {commits} commits, {violations} window-won truncations");
         let snapshots_before_quiet =
             count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
         tokio::time::sleep(Duration::from_secs(4)).await;
         let snapshots_after_quiet =
             count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
+        let quiet_delta = snapshots_after_quiet - snapshots_before_quiet;
         assert!(
-            snapshots_after_quiet - snapshots_before_quiet <= 3,
-            "quiet phase must produce only periodic snapshots, no re-anchor storm ({} -> {})",
-            snapshots_before_quiet,
-            snapshots_after_quiet
+            (1..=3).contains(&quiet_delta),
+            "quiet phase must produce exactly the periodic cadence, no more, \
+             no less ({snapshots_before_quiet} -> {snapshots_after_quiet})"
         );
 
         // Graceful shutdown with the final drain via the injected shutdown.
@@ -2538,87 +3103,31 @@ mod tests {
             .expect("watch task must not panic")
             .expect("watch must exit cleanly on shutdown");
 
-        assert_eq!(
-            truncate_violations.load(std::sync::atomic::Ordering::Relaxed),
-            0,
-            "every app-side wal_checkpoint(TRUNCATE) must have been refused while armed"
-        );
+        // A probe CAN legitimately win a truncation inside walrust's released
+        // checkpoint window (milliseconds every 3s); the data_version /
+        // folded-extent detection then re-anchors safely and nothing is lost
+        // — the row-exact restore below is the proof. The strict "always
+        // refused" guarantee is pinned deterministically by
+        // `e2e_cli_shadow_watch_armed_no_windows_no_loss_live_s3`, which runs
+        // with no windows at all.
         let wal_len = std::fs::metadata(db_path.with_extension("db-wal"))
             .map(|m| m.len())
             .unwrap_or(0);
         assert!(wal_len > 0, "the live WAL must never be unlinked");
 
-        // Bounded snapshot production across the whole run (no storm):
-        // startup + one per snapshot interval + at most one per checkpoint
-        // interval + quiet-phase periodic.
-        let snapshot_count = count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
-        assert!(
-            snapshot_count <= 11,
-            "snapshot production must stay bounded (got {snapshot_count})"
-        );
-
-        // DF2: restore must be row-exact.
+        // DF2: restore must be row-exact, including across any window-won
+        // truncation (violations) that forced a re-anchor.
         let restored_path = db_path.with_file_name("restored-watch.db");
-        crate::sync::restore::restore(
-            &name,
+        assert_row_exact_restore(
             &restored_path,
+            &name,
             &bucket_with_prefix,
             endpoint.as_deref(),
-            None,
-            None,
-            None,
+            commits,
         )
-        .await
-        .unwrap();
-        let verify = Connection::open(&restored_path).unwrap();
-        let writer_rows: i64 = verify
-            .query_row(
-                "SELECT count(*) FROM items WHERE value LIKE 'w%'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            writer_rows,
-            writer_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
-            "every ephemeral-writer row must be replicated (DF2)"
-        );
-        let seed_rows: i64 = verify
-            .query_row(
-                "SELECT count(*) FROM items WHERE value IN ('alpha', 'beta', 'gamma')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(seed_rows, 3, "seed rows must survive");
-        drop(verify);
+        .await;
 
-        // Cleanup: delete only this test's unique prefix.
-        let mut token: Option<String> = None;
-        loop {
-            let mut req = client
-                .list_objects_v2()
-                .bucket(&bucket_name)
-                .prefix(&prefix);
-            if let Some(t) = token.take() {
-                req = req.continuation_token(t);
-            }
-            let page = req.send().await.unwrap();
-            for obj in page.contents() {
-                if let Some(key) = obj.key() {
-                    let _ = client
-                        .delete_object()
-                        .bucket(&bucket_name)
-                        .key(key)
-                        .send()
-                        .await;
-                }
-            }
-            match page.next_continuation_token() {
-                Some(t) => token = Some(t.to_string()),
-                None => break,
-            }
-        }
+        cleanup_prefix(&client, &bucket_name, &prefix).await;
     }
 
     /// A never-used upload target for cache-mode checkpoint tests: the
@@ -2676,17 +3185,22 @@ mod tests {
     }
 
     /// Count full-snapshot objects (generation folders other than the live
-    /// incremental folder) under this test's prefix.
+    /// incremental folder) under this test's prefix. Keys are
+    /// `{prefix}{name}/{generation}/{file}` — the prefix itself contains a
+    /// '/', so the shape check must run on the key relative to
+    /// `{prefix}{name}/` (an absolute `rsplit` depth check silently matches
+    /// nothing and makes every assertion on this counter vacuous).
     async fn count_snapshot_objects(
         client: &aws_sdk_s3::Client,
         bucket_name: &str,
         prefix: &str,
         name: &str,
     ) -> usize {
+        let list_prefix = format!("{prefix}{name}/");
         let keys = client
             .list_objects_v2()
             .bucket(bucket_name)
-            .prefix(&format!("{prefix}{name}/"))
+            .prefix(&list_prefix)
             .send()
             .await
             .unwrap();
@@ -2694,8 +3208,11 @@ mod tests {
             .iter()
             .filter_map(|o| o.key())
             .filter(|k| {
-                let parts: Vec<&str> = k.rsplit('/').collect();
-                parts.len() == 3 && parts[1] != "0000" && parts[1] != "levels"
+                // Keys are `{prefix}{name}/{generation}/{file}`; relative to
+                // the list prefix that is `{generation}/{file}`.
+                let rel = k.strip_prefix(&list_prefix).unwrap_or(k);
+                let parts: Vec<&str> = rel.split('/').collect();
+                parts.len() == 2 && parts[0] != "0000" && parts[0] != "levels"
             })
             .count()
     }
