@@ -129,11 +129,15 @@ pub async fn watch_with_independent_tasks(
         let wal_offset = 0u64;
         let wal_generation = 0u64;
 
-        // Compute checksum from database file
-        let db_checksum = match ltx::compute_checksum_from_file(db_path) {
-            Ok(cs) => Some(cs.into_inner()),
-            Err(_) => None,
-        };
+        // Compute checksum from database file. Fail closed: a None checksum
+        // would fall through to the armed cache sync's raw compute-from-file
+        // fallback (a POSIX-lock-releasing raw open while the blocker is
+        // armed; see the `blocker` module docs in walrust-core).
+        let db_checksum = Some(
+            ltx::compute_checksum_from_file(db_path)
+                .with_context(|| format!("{name}: failed to compute initial checksum"))?
+                .into_inner(),
+        );
 
         tracing::info!(
             "Spawning independent task for {} (TXID: {}, checksum: {})",
