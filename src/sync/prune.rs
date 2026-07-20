@@ -233,7 +233,7 @@ pub async fn snapshot(database: &Path, bucket: &str, endpoint: Option<&str>) -> 
     // watcher) pins the WAL — correct fail-closed behavior for a manual snapshot,
     // rather than silently producing a base missing recent commits (B10).
     checkpoint_wal_truncate(database).await?;
-    let output = snapshot_database_to_storage(&storage, &prefix, name, database).await?;
+    let output = snapshot_database_to_storage(&storage, &prefix, name, database, None).await?;
 
     println!(
         "Snapshot uploaded: s3://{}/{} (gen {}, TXID 1-{})",

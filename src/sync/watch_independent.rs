@@ -129,11 +129,15 @@ pub async fn watch_with_independent_tasks(
         let wal_offset = 0u64;
         let wal_generation = 0u64;
 
-        // Compute checksum from database file
-        let db_checksum = match ltx::compute_checksum_from_file(db_path) {
-            Ok(cs) => Some(cs.into_inner()),
-            Err(_) => None,
-        };
+        // Compute checksum from database file. Fail closed: a None checksum
+        // would fall through to the armed cache sync's raw compute-from-file
+        // fallback (a POSIX-lock-releasing raw open while the blocker is
+        // armed; see the `blocker` module docs in walrust-core).
+        let db_checksum = Some(
+            ltx::compute_checksum_from_file(db_path)
+                .with_context(|| format!("{name}: failed to compute initial checksum"))?
+                .into_inner(),
+        );
 
         tracing::info!(
             "Spawning independent task for {} (TXID: {}, checksum: {})",
@@ -621,6 +625,7 @@ async fn run_db_task(
             // Periodic full-snapshot timer
             _ = snapshot_timer.tick(), if snapshot_interval_secs > 0 => {
                 tracing::debug!("{}: Taking periodic snapshot", db_name);
+                let snapshot_handles = snapshot_handles_for(cache_state.as_ref()).await;
                 if let Err(e) = take_snapshot_with_retry(
                     &client,
                     &bucket,
@@ -628,6 +633,7 @@ async fn run_db_task(
                     &mut state.db_state,
                     &retry_policy,
                     &webhook_sender,
+                    snapshot_handles,
                 )
                 .await
                 {
@@ -695,4 +701,291 @@ async fn run_db_task(
 
     tracing::debug!("{}: Task exiting", db_name);
     Ok(())
+}
+
+/// Cache mode arms a checkpoint blocker via the cache's `ShadowWal`; its
+/// periodic snapshot must borrow the retained lifecycle handles instead of
+/// opening fresh descriptors for the main DB (see the `blocker` module docs
+/// in walrust-core). No-cache mode holds no blocker and keeps the one-shot
+/// path (`None`).
+async fn snapshot_handles_for(
+    cache_state: Option<&CacheState>,
+) -> Option<walrust_core::blocker::SharedLifecycle> {
+    match cache_state {
+        Some(cache) => cache.shadow.lock().await.lifecycle(),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use tokio::sync::mpsc;
+
+    /// The wiring pin: cache mode hands the snapshot the cache shadow's own
+    /// lifecycle handles (so the snapshot borrows instead of reopening), and
+    /// no-cache mode hands None (the one-shot path).
+    #[tokio::test]
+    async fn snapshot_handles_borrows_cache_shadow_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("indep.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t (id INTEGER PRIMARY KEY);
+             INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let shadow = Arc::new(tokio::sync::Mutex::new(
+            ShadowWal::new(&db_path).await.unwrap(),
+        ));
+        let expected = shadow.lock().await.lifecycle().unwrap();
+        let (upload_tx, _rx) = mpsc::channel(1);
+        let cache_state = CacheState {
+            cache: Arc::new(LocalCache::new(&db_path).unwrap()),
+            shadow,
+            upload_tx,
+            upload_handle: None,
+            retention_duration: chrono::Duration::hours(1),
+            max_cache_size: 1 << 20,
+        };
+
+        let handles = snapshot_handles_for(Some(&cache_state))
+            .await
+            .expect("cache mode must borrow the cache shadow's lifecycle");
+        assert!(
+            Arc::ptr_eq(&expected, &handles),
+            "the snapshot must borrow the cache shadow's exact lifecycle handles"
+        );
+        assert!(
+            snapshot_handles_for(None).await.is_none(),
+            "no-cache mode must keep the one-shot path"
+        );
+    }
+
+    // ── Call-site pin: the periodic snapshot tick must borrow the blocker ───
+
+    /// Re-exec'd child process: commit one row and attempt
+    /// `wal_checkpoint(TRUNCATE)`, printing the raw busy flag. POSIX advisory
+    /// locks are process-scoped, so the cross-process blocker contract can
+    /// only be probed from a separate OS process.
+    #[test]
+    #[ignore]
+    fn independent_child_probe() {
+        let db = std::env::var("INDEP_PROBE_DB").expect("INDEP_PROBE_DB");
+        let conn = Connection::open(&db).expect("child open");
+        conn.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+        conn.execute("INSERT INTO items (value) VALUES ('probe')", [])
+            .expect("child commit");
+        let busy: i64 = conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| row.get(0))
+            .unwrap();
+        println!("PROBE_RESULT busy={busy}");
+    }
+
+    fn run_independent_probe(db_path: &Path) -> i64 {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("sync::watch_independent::tests::independent_child_probe")
+            .arg("--ignored")
+            .arg("--exact")
+            .arg("--nocapture")
+            .env("INDEP_PROBE_DB", db_path)
+            .output()
+            .expect("spawn probe");
+        assert!(
+            out.status.success(),
+            "probe failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        stdout
+            .split_whitespace()
+            .find_map(|tok| tok.strip_prefix("busy=")?.parse().ok())
+            .unwrap_or_else(|| panic!("probe produced no PROBE_RESULT: {stdout}"))
+    }
+
+    /// Call-site pin for `snapshot_handles_for` in the periodic snapshot tick:
+    /// run the REAL `run_db_task` loop in cache mode through at least one
+    /// snapshot tick; the cache shadow's checkpoint blocker must still be
+    /// alive afterwards — an external TRUNCATE stays busy and the WAL
+    /// survives. Replacing the `snapshot_handles_for(cache_state.as_ref())`
+    /// call with `None` at the tick (the old raw-reopen snapshot path) closes
+    /// fresh connections for the main DB, drops the process's POSIX locks,
+    /// and the probe below truncates. Skips when no S3 is configured.
+    #[tokio::test]
+    async fn e2e_independent_cache_snapshot_tick_preserves_blocker_live_s3() {
+        let s3_enabled = std::env::var("AWS_ENDPOINT_URL_S3").is_ok()
+            || std::env::var("AWS_ENDPOINT_URL").is_ok()
+            || std::env::var("AWS_ACCESS_KEY_ID").is_ok();
+        if !s3_enabled {
+            eprintln!(
+                "SKIP e2e_independent_cache_snapshot_tick_preserves_blocker_live_s3: no S3 endpoint/credentials configured"
+            );
+            return;
+        }
+
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        let bucket = std::env::var("TIERED_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026".to_string());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = "indepcache".to_string();
+        let prefix = format!("e2e-indepcache-{nanos}/");
+        let (bucket_name, _) = parse_bucket(&bucket);
+
+        // Real WAL database.
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("indepcache.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE items (id INTEGER PRIMARY KEY, value TEXT NOT NULL);
+             INSERT INTO items (value) VALUES ('seed');",
+        )
+        .unwrap();
+        drop(conn);
+
+        // Cache mode: the ShadowWal arms the checkpoint blocker.
+        let shadow = Arc::new(tokio::sync::Mutex::new(
+            ShadowWal::new(&db_path).await.unwrap(),
+        ));
+        let (upload_tx, upload_rx) = mpsc::channel(64);
+        let _keep_upload_rx_alive = upload_rx; // sync notifications must never fail
+        let cache_state = CacheState {
+            cache: Arc::new(LocalCache::new(&db_path).unwrap()),
+            shadow,
+            upload_tx,
+            upload_handle: None,
+            retention_duration: chrono::Duration::hours(1),
+            max_cache_size: 1 << 20,
+        };
+
+        let state = DbTaskState {
+            db_state: DbState {
+                name: name.clone(),
+                db_path: db_path.clone(),
+                wal_path: db_path.with_extension("db-wal"),
+                wal_offset: 0,
+                wal_generation: 0,
+                current_txid: 0,
+                last_snapshot: None,
+                db_checksum: None,
+                wal_salt: None,
+                wal_checksum_chain: None,
+            },
+            trigger_state: TriggerState::default(),
+            sync_config: SyncConfig {
+                snapshot_interval: 2,
+                wal_sync_interval: 1,
+                checkpoint_interval: 3600,
+                min_checkpoint_page_count: u64::MAX,
+                on_startup: false,
+                ..SyncConfig::default()
+            },
+            compaction: walrust_core::compaction::CompactionSettings::default(),
+        };
+
+        let client = Arc::new(create_client(endpoint.as_deref()).await.unwrap());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
+        let task = tokio::spawn(run_db_task(
+            state,
+            Arc::clone(&client),
+            bucket_name.clone(),
+            prefix.clone(),
+            RetryPolicy::new(RetryConfig::default()),
+            Arc::new(WebhookSender::new(vec![])),
+            Arc::new(MetricsState::new()),
+            shutdown_rx,
+            Some(cache_state),
+        ));
+
+        // Wait for the periodic snapshot tick (2s) to publish a snapshot.
+        let list_prefix = format!("{prefix}{name}/");
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let snapshot_seen = loop {
+            let keys = client
+                .list_objects_v2()
+                .bucket(bucket_name.as_str())
+                .prefix(&list_prefix)
+                .send()
+                .await
+                .unwrap();
+            let found = keys.contents().iter().filter_map(|o| o.key()).any(|k| {
+                let rel = k.strip_prefix(&list_prefix).unwrap_or(k);
+                let mut parts = rel.split('/');
+                matches!(parts.next(), Some(gen) if gen != "0000" && gen != "levels")
+                    && parts.next().is_some()
+                    && parts.next().is_none()
+            });
+            if found {
+                break true;
+            }
+            if std::time::Instant::now() > deadline || task.is_finished() {
+                break false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        };
+        assert!(
+            snapshot_seen,
+            "the periodic snapshot tick must publish a snapshot object (task alive: {})",
+            !task.is_finished()
+        );
+        assert!(!task.is_finished(), "the db task must stay alive");
+
+        // The snapshot tick borrowed the retained handles: the blocker still
+        // refuses external checkpoints and the WAL survives.
+        let busy = run_independent_probe(&db_path);
+        assert_eq!(
+            busy, 1,
+            "external wal_checkpoint(TRUNCATE) must stay busy after the snapshot tick"
+        );
+        let wal_len = std::fs::metadata(db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(wal_len > 0, "the WAL must survive the snapshot tick");
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(15), task)
+            .await
+            .expect("db task must shut down within 15s")
+            .expect("db task must not panic")
+            .expect("db task must exit cleanly");
+
+        // Cleanup: delete only this test's unique prefix.
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(bucket_name.as_str())
+                .prefix(&prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.unwrap();
+            for obj in page.contents() {
+                if let Some(key) = obj.key() {
+                    let _ = client
+                        .delete_object()
+                        .bucket(bucket_name.as_str())
+                        .key(key)
+                        .send()
+                        .await;
+                }
+            }
+            match page.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
+    }
 }

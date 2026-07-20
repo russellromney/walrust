@@ -161,25 +161,75 @@ detecting a WAL reset (salt mismatch) and re-anchoring with a full snapshot —
 **lossy-but-recovered**. DF2 is the case the recovery missed.
 
 Per-mode reality (verified in code):
-- **Owned / library mode (`Replicator`) already does it right.** It holds
-  `crate::shadow::ShadowWal::open_checkpoint_blocker` for the DB's lifetime:
+- **Owned / library mode (`Replicator`) holds the blocker but invalidated it
+  after arming.** It holds a checkpoint-blocker connection for the DB's
+  lifetime:
   `wal_autocheckpoint=0`, a `_walrust_seq` heartbeat row, and a `BEGIN DEFERRED`
   read transaction pinning a real WAL frame — exactly litestream's
   `_litestream_seq`. The held read-mark is what makes it lossless: another
   connection's checkpoint cannot truncate past walrust's mark. `sync.rs` already
   has the controlled `release_checkpoint_blocker` / `reacquire_checkpoint_blocker`
-  dance around walrust's own checkpoints (D2).
-- **CLI shadow mode (`src/sync/watch_shadow.rs`) holds no connection at all.**
-  `ShadowWal::new()` opens no SQLite connection; it tails the `-wal` file on
-  disk. Its "checkpoint" (`checkpoint_shadow_after_durable_sync`) only flushes
-  the shadow segment to S3 — it never checkpoints the real DB. So WAL truncation
-  is entirely at the app's mercy. `git log -S open_checkpoint_blocker` confirms
-  this path has **never** held the blocker (despite an old ledger note claiming
-  "shadow mode uses" it — the note was aspirational).
+  dance around walrust's own checkpoints (D2). **But** its snapshot lifecycle
+  then reopened/closed other main-DB descriptors (one-shot checkpoint
+  connections, raw `get_page_size` / change-counter / snapshot-encode reads),
+  which silently released the blocker's process-wide POSIX locks — see the
+  measured diagnosis below.
+- **CLI shadow mode (`src/sync/watch_shadow.rs`) arms the same blocker in
+  `ShadowWal::new()`** (the old claim here that it "holds no connection at all"
+  was wrong: `ShadowWal::new()` has opened `open_checkpoint_blocker()` since it
+  landed). Its snapshot path (`take_snapshot_to_storage`: one-shot PASSIVE
+  connection, raw page-size read, fresh `VACUUM INTO` connection) invalidated
+  the blocker the same way, and its `ShadowWal::checkpoint` dropped and
+  re-opened the blocker connection every dance.
+
 - **CLI independent mode (`crates/walrust-core/src/legacy_wal_sync.rs`)** runs
   `wal_checkpoint(PASSIVE/TRUNCATE)` through **one-shot** `Connection::open`s, so
-  it holds no persistent read-mark either, and by opening/closing may itself
-  trigger last-close checkpoints.
+  it holds no persistent read-mark in no-cache mode, and by opening/closing may
+  itself trigger last-close checkpoints. **Cache mode is different:** it creates
+  a `ShadowWal` (`src/sync/watch_independent.rs:292`), which arms the blocker —
+  and its periodic snapshot then reopened the main DB raw (`get_page_size`),
+  the same measured invalidation. The lifecycle fix makes the snapshot borrow
+  the cache shadow's retained handles (startup checksum/anchor run pre-arm and
+  are unaffected).
+
+#### Measured diagnosis (2026-07-17, macOS, bundled SQLite 3.49.1)
+
+The blocker's protection is two locks, not one:
+
+1. The pinned **read mark** (POSIX lock on the `-shm` inode) — blocks
+   `wal_checkpoint(TRUNCATE/RESTART)` from other processes. Robust: nothing in
+   the process ever opens the `-shm` file outside SQLite's VFS.
+2. A **SHARED POSIX lock on the main-DB inode**, taken by the blocker
+   connection at its first write and held for the connection's lifetime
+   (measured `F_GETLK`: `F_RDLCK` at `PENDING_BYTE+2..+510`, persisting across
+   ROLLBACK/re-BEGIN/COMMIT). This is the only thing stopping another
+   process's last-connection close from taking the EXCLUSIVE main-db lock its
+   close-time checkpoint needs before it **unlinks `-wal` and `-shm`** —
+   PASSIVE close-checkpoint returns OK on a partial fold, so the delete
+   proceeds with unread frames still in the WAL.
+
+Classic POSIX semantics: closing **any** descriptor the process holds for an
+inode releases **all** of the process's fcntl locks on that inode. One stray
+raw `File::open(db)` + close (page-size read, change counter, checksum,
+snapshot encode) destroyed lock (2) while the blocker object still appeared
+alive. (Same-process SQLite connection churn is safe — the unix VFS parks a
+closing connection's fd while the inode has outstanding locks — but the fix
+routes everything through retained handles anyway.) Measured at the
+production call sites: external `TRUNCATE` still reported `busy=1` (read
+mark intact), and the WAL was unlinked one close later (`cli.db`/`owned.db`
+repro; DF2 shape: short-lived writer's WAL gone right after the snapshot
+lifecycle). The fix is a retained-handles lifecycle:
+open monitor connection + source descriptor before arming, arm last, never
+open/close another main-DB descriptor while armed, reuse and re-pin the
+blocker connection across the controlled checkpoint, and detect window
+commits two ways: `PRAGMA data_version` catches commits inside the
+release/re-pin window (PASSIVE dance; a TRUNCATE restarts the wal-index
+header, which itself bumps data_version, so the owned dance is
+safe-by-construction instead: folded commits land in the post-dance snapshot,
+later commits ride the fresh WAL), and a folded-extent check
+(`checkpointed_frames` vs the shadow's copied WAL cursor) catches a commit
+that landed between the last shadow copy and the dance — folded by walrust's
+own PASSIVE and erased by the re-pin WAL restart, invisible to data_version.
 
 ### What must not change
 
@@ -264,6 +314,16 @@ litestream does — call it out plainly for operators).
 
 ### Disposition of the open PRs
 
+- **PR #44 is Phase 1 (this repair).** It lands the checkpoint-blocker
+  lifecycle — retained handles, the controlled release/re-pin dance with
+  `data_version` + folded-extent detection, defer-not-die on reader
+  contention, and the WAL-growth alarm — with the proofs above. One boundary
+  it deliberately does NOT move: walrust's own checkpoint still waits for
+  durable remote upload before releasing the read mark (the pre-existing
+  remote-ack order), so S3 latency/outage still grows the live WAL — bounded
+  and alarmed, not eliminated. Making the fsynced local shadow/LTX the
+  checkpoint boundary, with cloud upload fully asynchronous, is the next PR
+  (the local-first refinement), through its own adversarial gate.
 - **PR #41 stays open, unmerged**, until Phase 1/3 land and cherry-pick the parts
   that survive (`read_header_classified`, degraded-mode re-anchor). Do not merge
   it as the primary fix; do not close it and lose the machinery.

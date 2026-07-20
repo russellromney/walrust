@@ -1008,14 +1008,14 @@ async fn test_controlled_checkpoint_with_shadow() {
     let mut shadow = ShadowWal::new(&db_path).await.unwrap();
 
     // Copy initial frames - frames should exist from the inserts above
-    let (initial_frames, _offset) = shadow.copy_frames(0).await.unwrap();
+    let (initial_frames, initial_offset) = shadow.copy_frames(0).await.unwrap();
 
     // If no initial frames, the WAL might have been checkpointed already
     // Just verify the shadow WAL was created successfully
     let initial_generation = shadow.generation();
 
     // Trigger controlled checkpoint through shadow
-    shadow.checkpoint().await.unwrap();
+    shadow.checkpoint(initial_offset).await.unwrap();
 
     // Write more data after checkpoint
     {

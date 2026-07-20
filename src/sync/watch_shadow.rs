@@ -10,7 +10,7 @@ use tokio::signal;
 use tokio::sync::mpsc;
 
 use crate::cache::LocalCache;
-use crate::config::{CacheConfig, ResolvedDbConfig, SyncConfig, WebhookConfig};
+use crate::config::{CacheConfig, ResolvedDbConfig, RetentionConfig, SyncConfig, WebhookConfig};
 use crate::dashboard::{self, DbStatus, MetricsState};
 use crate::errors::WalrustError;
 use crate::ltx;
@@ -113,14 +113,44 @@ async fn copy_final_shadow_frames(db_states: &mut HashMap<PathBuf, ShadowDbState
     Ok(())
 }
 
+/// Build the throwaway `DbState` a snapshot call needs from a shadow state.
+fn snapshot_db_state(state: &ShadowDbState) -> DbState {
+    DbState {
+        name: state.name.clone(),
+        db_path: state.db_path.clone(),
+        wal_path: state.wal_path.clone(),
+        wal_offset: 0,
+        wal_generation: state.shadow.generation(),
+        current_txid: state.current_txid,
+        last_snapshot: state.last_snapshot,
+        db_checksum: state.db_checksum,
+        wal_salt: None,
+        wal_checksum_chain: None,
+    }
+}
+
+/// Anchor the shadow state to a snapshot just taken: adopt its metadata and
+/// reset the shadow/live-WAL cursors so the next sync resumes from the fresh
+/// WAL, then persist the progress record. Used by every eager-snapshot path
+/// (startup, downtime-checkpoint D3, window-commit re-anchor).
+async fn apply_shadow_snapshot_anchor(state: &mut ShadowDbState, db_state: &DbState) -> Result<()> {
+    state.current_txid = db_state.current_txid;
+    state.last_snapshot = db_state.last_snapshot;
+    state.db_checksum = db_state.db_checksum;
+    state.shadow_sync_generation = state.shadow.generation();
+    state.shadow_sync_offset = state.shadow.segment_offset();
+    state.wal_copy_offset = 0;
+    save_shadow_progress(state)
+}
+
 async fn checkpoint_shadow_after_durable_sync(
     state: &mut ShadowDbState,
     cache_state: Option<&(Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
-    direct_target: Option<DirectShadowSyncTarget>,
+    direct_target: DirectShadowSyncTarget,
     retry_policy: &RetryPolicy,
     webhook_sender: Arc<WebhookSender>,
     drain_timeout: Duration,
-) -> Result<()> {
+) -> Result<bool> {
     let (frames, new_offset) = state
         .shadow
         .copy_frames(state.wal_copy_offset)
@@ -147,21 +177,16 @@ async fn checkpoint_shadow_after_durable_sync(
             Arc::clone(&webhook_sender),
         )
         .await?
-    } else if let Some(target) = direct_target {
+    } else {
         sync_shadow_concurrent_with_retry(
-            Arc::clone(&target.client),
-            target.bucket_name,
-            target.prefix,
+            Arc::clone(&direct_target.client),
+            direct_target.bucket_name.clone(),
+            direct_target.prefix.clone(),
             input,
             retry_policy.clone(),
             Arc::clone(&webhook_sender),
         )
         .await?
-    } else {
-        anyhow::bail!(
-            "{}: no cache uploader or direct upload target configured for checkpoint drain",
-            state.name
-        );
     };
     if let Some((cache, _)) = cache_state {
         wait_for_cache_checkpoint_durability(
@@ -175,11 +200,70 @@ async fn checkpoint_shadow_after_durable_sync(
 
     apply_shadow_sync_result_to_state(state, &output).await?;
 
-    state
+    let checkpoint_outcome = state
         .shadow
-        .checkpoint()
+        .checkpoint(state.wal_copy_offset)
         .await
         .with_context(|| format!("{}: shadow checkpoint failed", state.name))?;
+
+    if checkpoint_outcome.deferred {
+        // The fold could not complete because application readers pin the
+        // WAL — ordinary SQLite contention, not an error. The shadow is fully
+        // copied and durable, and no WAL reset is possible while readers pin,
+        // so nothing is at risk: alarm loudly with the current WAL size and
+        // let the next tick retry. The watch MUST NOT die here — exiting
+        // would drop the blocker and leave the WAL unprotected.
+        let wal_size = std::fs::metadata(&state.wal_path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        tracing::error!(
+            "{}: controlled checkpoint deferred (application readers pin the WAL); WAL size {} bytes; will retry on the next checkpoint tick",
+            state.name,
+            wal_size
+        );
+        webhook_sender
+            .notify_upload_failed(
+                &state.name,
+                &format!(
+                    "controlled checkpoint deferred (readers pin the WAL); WAL size {wal_size} bytes"
+                ),
+                1,
+            )
+            .await;
+        return Ok(false);
+    }
+
+    let reanchored =
+        checkpoint_outcome.commit_in_window || checkpoint_outcome.folded_uncopied_frames;
+    if reanchored {
+        // An application commit landed where walrust's own checkpoint folds it
+        // before the shadow could copy it: inside the pin-release window
+        // (`commit_in_window`, caught by PRAGMA data_version) or between the
+        // last shadow copy and the dance (`folded_uncopied_frames`, caught by
+        // the folded-extent check). Its frames are erased by the re-pin WAL
+        // restart, so the incremental stream cannot be trusted across the
+        // checkpoint. Follow the existing safe re-anchor behavior (the D3
+        // downtime-checkpoint shape): publish a full snapshot now and resume
+        // incrementals from the fresh WAL.
+        tracing::warn!(
+            "{}: application commit detected across walrust's controlled checkpoint (in_window={}, folded_uncopied={}); re-anchoring with a snapshot",
+            state.name,
+            checkpoint_outcome.commit_in_window,
+            checkpoint_outcome.folded_uncopied_frames
+        );
+        let mut db_state = snapshot_db_state(state);
+        take_snapshot_with_retry(
+            &direct_target.client,
+            &direct_target.bucket_name,
+            &direct_target.prefix,
+            &mut db_state,
+            retry_policy,
+            &webhook_sender,
+            state.shadow.lifecycle(),
+        )
+        .await?;
+        apply_shadow_snapshot_anchor(state, &db_state).await?;
+    }
 
     let cleanup_before_gen = state.shadow_sync_generation;
     if cleanup_before_gen > 0 {
@@ -190,7 +274,7 @@ async fn checkpoint_shadow_after_durable_sync(
             .with_context(|| format!("{}: shadow cleanup failed", state.name))?;
     }
 
-    Ok(())
+    Ok(reanchored)
 }
 
 async fn shutdown_shadow_uploaders(
@@ -317,6 +401,40 @@ pub async fn watch_with_shadow(
     retry_config: RetryConfig,
     webhooks: Vec<WebhookConfig>,
     cache_config: CacheConfig,
+) -> Result<()> {
+    watch_with_shadow_and_shutdown(
+        databases,
+        bucket,
+        endpoint,
+        global_sync,
+        compact_policy,
+        metrics_port,
+        no_metrics,
+        retry_config,
+        webhooks,
+        cache_config,
+        None,
+    )
+    .await
+}
+
+/// [`watch_with_shadow`] with an injectable shutdown trigger: when `shutdown`
+/// resolves, the watch runs its graceful final drain and returns. Tests
+/// use this instead of process-global signals, which are not test-safe
+/// (they can land on the wrong thread or affect concurrently running
+/// tests).
+pub(crate) async fn watch_with_shadow_and_shutdown(
+    databases: Vec<ResolvedDbConfig>,
+    bucket: &str,
+    endpoint: Option<&str>,
+    global_sync: SyncConfig,
+    compact_policy: Option<RetentionPolicy>,
+    metrics_port: u16,
+    no_metrics: bool,
+    retry_config: RetryConfig,
+    webhooks: Vec<WebhookConfig>,
+    cache_config: CacheConfig,
+    shutdown: Option<tokio::sync::oneshot::Receiver<()>>,
 ) -> Result<()> {
     let (bucket_name, prefix) = parse_bucket(bucket);
     let client = Arc::new(
@@ -471,6 +589,27 @@ pub async fn watch_with_shadow(
             shadow.restore_read_cursor(progress.wal_salt, progress.wal_checksum_chain);
         }
 
+        // If no checksum came from the manifest, durable progress, or the
+        // pre-arm computation, compute it now through the retained source
+        // descriptor. The armed shadow-sync encoder's None-checksum fallback
+        // reads the database file, which must never happen through a fresh
+        // open while the blocker holds its locks (see the `blocker` module
+        // docs in walrust-core) — so this FAILS CLOSED: a startup that cannot
+        // hash the database dies loudly instead of reaching that fallback.
+        if db_checksum.is_none() {
+            if let Some(lifecycle) = shadow.lifecycle() {
+                let guard = lifecycle.lock().await;
+                let cs = ltx::compute_checksum_from_fd(guard.source_fd())
+                    .with_context(|| format!("{name}: failed to compute initial checksum"))?;
+                tracing::debug!(
+                    "{}: Computed initial checksum via retained descriptor: {:#x}",
+                    name,
+                    cs.into_inner()
+                );
+                db_checksum = Some(cs.into_inner());
+            }
+        }
+
         tracing::info!(
             "Shadow WAL: Watching {} as '{}' (TXID: {}, generation: {}, shadow dir: {})",
             db_path.display(),
@@ -550,19 +689,7 @@ pub async fn watch_with_shadow(
     for (db_path, state) in db_states.iter_mut() {
         let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
         if sync_config.on_startup && !eager_snapshot_paths.contains(db_path) {
-            // Convert to DbState temporarily for snapshot
-            let mut db_state = DbState {
-                name: state.name.clone(),
-                db_path: state.db_path.clone(),
-                wal_path: state.wal_path.clone(),
-                wal_offset: 0,
-                wal_generation: state.shadow.generation(),
-                current_txid: state.current_txid,
-                last_snapshot: state.last_snapshot,
-                db_checksum: state.db_checksum,
-                wal_salt: None,
-                wal_checksum_chain: None,
-            };
+            let mut db_state = snapshot_db_state(state);
             if let Err(e) = take_snapshot_with_retry(
                 &client,
                 &bucket_name,
@@ -570,18 +697,13 @@ pub async fn watch_with_shadow(
                 &mut db_state,
                 &retry_policy,
                 &webhook_sender,
+                state.shadow.lifecycle(),
             )
             .await
             {
                 tracing::error!("{}: Initial snapshot failed: {}", state.name, e);
             } else {
-                state.current_txid = db_state.current_txid;
-                state.last_snapshot = db_state.last_snapshot;
-                state.db_checksum = db_state.db_checksum;
-                state.shadow_sync_generation = state.shadow.generation();
-                state.shadow_sync_offset = state.shadow.segment_offset();
-                state.wal_copy_offset = 0;
-                save_shadow_progress(state)?;
+                apply_shadow_snapshot_anchor(state, &db_state).await?;
 
                 if let Some(trigger) = trigger_states.get_mut(db_path) {
                     trigger.frames_since_snapshot = 0;
@@ -598,18 +720,7 @@ pub async fn watch_with_shadow(
         let state = db_states
             .get_mut(db_path)
             .expect("eager snapshot path must exist in db_states");
-        let mut db_state = DbState {
-            name: state.name.clone(),
-            db_path: state.db_path.clone(),
-            wal_path: state.wal_path.clone(),
-            wal_offset: 0,
-            wal_generation: state.shadow.generation(),
-            current_txid: state.current_txid,
-            last_snapshot: state.last_snapshot,
-            db_checksum: state.db_checksum,
-            wal_salt: None,
-            wal_checksum_chain: None,
-        };
+        let mut db_state = snapshot_db_state(state);
         if let Err(e) = take_snapshot_with_retry(
             &client,
             &bucket_name,
@@ -617,6 +728,7 @@ pub async fn watch_with_shadow(
             &mut db_state,
             &retry_policy,
             &webhook_sender,
+            state.shadow.lifecycle(),
         )
         .await
         {
@@ -627,13 +739,7 @@ pub async fn watch_with_shadow(
             );
             metrics_state.record_error(&state.name);
         } else {
-            state.current_txid = db_state.current_txid;
-            state.last_snapshot = db_state.last_snapshot;
-            state.db_checksum = db_state.db_checksum;
-            state.shadow_sync_generation = state.shadow.generation();
-            state.shadow_sync_offset = state.shadow.segment_offset();
-            state.wal_copy_offset = 0;
-            save_shadow_progress(state)?;
+            apply_shadow_snapshot_anchor(state, &db_state).await?;
             metrics_state.record_snapshot(&state.name);
 
             if let Some(trigger) = trigger_states.get_mut(db_path) {
@@ -699,29 +805,42 @@ pub async fn watch_with_shadow(
         global_sync.checkpoint_interval
     );
 
-    // Set up shutdown signal
-    let shutdown_signal = async {
-        #[cfg(unix)]
-        {
-            use signal::unix::{signal, SignalKind};
-            let mut sigterm =
-                signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
-            let mut sigint =
-                signal(SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
-            tokio::select! {
-                _ = sigterm.recv() => "SIGTERM",
-                _ = sigint.recv() => "SIGINT",
+    // Set up shutdown signal: the injectable oneshot for tests, otherwise the
+    // process signal handlers.
+    let shutdown_signal = async move {
+        if let Some(rx) = shutdown {
+            match rx.await {
+                Ok(()) => "injected shutdown",
+                Err(_) => "shutdown sender dropped",
             }
-        }
-        #[cfg(not(unix))]
-        {
-            signal::ctrl_c()
-                .await
-                .expect("Failed to set up Ctrl+C handler");
-            "Ctrl+C"
+        } else {
+            #[cfg(unix)]
+            {
+                use signal::unix::{signal, SignalKind};
+                let mut sigterm =
+                    signal(SignalKind::terminate()).expect("Failed to set up SIGTERM handler");
+                let mut sigint =
+                    signal(SignalKind::interrupt()).expect("Failed to set up SIGINT handler");
+                tokio::select! {
+                    _ = sigterm.recv() => "SIGTERM",
+                    _ = sigint.recv() => "SIGINT",
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                signal::ctrl_c()
+                    .await
+                    .expect("Failed to set up Ctrl+C handler");
+                "Ctrl+C"
+            }
         }
     };
     tokio::pin!(shutdown_signal);
+
+    // Throttle state for the WAL-growth alarm: the last time each database
+    // fired, so a stuck WAL re-alarms every WAL_ALARM_INTERVAL instead of
+    // hammering the webhook endpoint on every sync tick.
+    let mut wal_alarm_last: HashMap<PathBuf, std::time::Instant> = HashMap::new();
 
     loop {
         tokio::select! {
@@ -755,6 +874,27 @@ pub async fn watch_with_shadow(
                                 .await;
                             return Err(e.context(format!("{}: shadow copy failed", state.name)));
                         }
+                    }
+
+                    // WAL-growth alarm (the litestream tradeoff): while walrust
+                    // holds the read mark, walrust is the only thing that can
+                    // let the WAL truncate — a WAL that keeps growing means
+                    // walrust is behind or wedged. Alarm loudly (throttled).
+                    let threshold = sync_configs
+                        .get(&state.db_path)
+                        .unwrap_or(&global_sync)
+                        .wal_truncate_threshold_pages;
+                    let last_fired = wal_alarm_last.get(&state.db_path).copied();
+                    if alarm_if_wal_oversized(
+                        state,
+                        threshold,
+                        &webhook_sender,
+                        &metrics_state,
+                        last_fired,
+                    )
+                    .await
+                    {
+                        wal_alarm_last.insert(state.db_path.clone(), std::time::Instant::now());
                     }
                 }
 
@@ -835,7 +975,7 @@ pub async fn watch_with_shadow(
                                             wal_salt: None,
                                             wal_checksum_chain: None,
                                         };
-                                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender, state.shadow.lifecycle()).await {
                                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
                                             metrics_state.record_error(&state.name);
                                         } else {
@@ -919,7 +1059,7 @@ pub async fn watch_with_shadow(
                             wal_checksum_chain: None,
                         };
 
-                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                        if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender, state.shadow.lifecycle()).await {
                             tracing::error!("Failed to snapshot {}: {}", state.name, e);
                             metrics_state.record_error(&state.name);
                         } else {
@@ -951,7 +1091,7 @@ pub async fn watch_with_shadow(
                         wal_checksum_chain: None,
                     };
 
-                    if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender).await {
+                    if let Err(e) = take_snapshot_with_retry(&client, &bucket_name, &prefix, &mut db_state, &retry_policy, &webhook_sender, state.shadow.lifecycle()).await {
                         tracing::error!("Failed to snapshot {}: {}", state.name, e);
                         metrics_state.record_error(&state.name);
                     } else {
@@ -1014,26 +1154,37 @@ pub async fn watch_with_shadow(
                             estimated_frames
                         );
 
-                        if let Err(e) = checkpoint_shadow_after_durable_sync(
+                        match checkpoint_shadow_after_durable_sync(
                             state,
                             cache_states.get(db_path),
-                            Some(DirectShadowSyncTarget {
+                            DirectShadowSyncTarget {
                                 client: Arc::clone(&client),
                                 bucket_name: bucket_name.clone(),
                                 prefix: prefix.clone(),
-                            }),
+                            },
                             &retry_policy,
                             Arc::clone(&webhook_sender),
                             CHECKPOINT_UPLOAD_DRAIN_TIMEOUT,
                         ).await {
-                            tracing::error!("{}: Shadow checkpoint failed: {}", state.name, e);
-                            webhook_sender
-                                .notify_upload_failed(&state.name, &e.to_string(), 1)
-                                .await;
-                            return Err(e.context(format!(
-                                "{}: shadow checkpoint failed",
-                                state.name
-                            )));
+                            Ok(reanchored) => {
+                                if reanchored {
+                                    metrics_state.record_snapshot(&state.name);
+                                    if let Some(trigger) = trigger_states.get_mut(db_path) {
+                                        trigger.frames_since_snapshot = 0;
+                                        trigger.first_change_time = None;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!("{}: Shadow checkpoint failed: {}", state.name, e);
+                                webhook_sender
+                                    .notify_upload_failed(&state.name, &e.to_string(), 1)
+                                    .await;
+                                return Err(e.context(format!(
+                                    "{}: shadow checkpoint failed",
+                                    state.name
+                                )));
+                            }
                         }
 
                         tracing::debug!("{}: Shadow checkpoint completed", state.name);
@@ -1115,25 +1266,123 @@ pub async fn watch_with_shadow(
     // Graceful shutdown - sync remaining shadow data
     tracing::info!("Shadow mode shutdown: syncing remaining data...");
 
-    copy_final_shadow_frames(&mut db_states).await?;
-    let final_results = run_shadow_syncs(
-        &db_states,
-        &cache_states,
-        Some(DirectShadowSyncTarget {
-            client: Arc::clone(&client),
-            bucket_name: bucket_name.clone(),
-            prefix: prefix.clone(),
-        }),
-        &retry_policy,
-        Arc::clone(&webhook_sender),
-    )
-    .await;
-    apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
+    // A WAL reset just before shutdown bumps the shadow generation: one sync
+    // round then only advances the cursor past the drained old generation
+    // (the D3 cursor-reset shape) and ships nothing of the new one. Drain
+    // until a round moves nothing — bounded, then fail loudly rather than
+    // exit with frames left unshipped in the shadow dir.
+    const SHUTDOWN_DRAIN_MAX_ROUNDS: usize = 5;
+    for round in 0..SHUTDOWN_DRAIN_MAX_ROUNDS {
+        copy_final_shadow_frames(&mut db_states).await?;
+        let before: HashMap<PathBuf, (u64, u64, u64)> = db_states
+            .iter()
+            .map(|(p, s)| {
+                (
+                    p.clone(),
+                    (
+                        s.shadow_sync_generation,
+                        s.shadow_sync_offset,
+                        s.current_txid,
+                    ),
+                )
+            })
+            .collect();
+        let final_results = run_shadow_syncs(
+            &db_states,
+            &cache_states,
+            Some(DirectShadowSyncTarget {
+                client: Arc::clone(&client),
+                bucket_name: bucket_name.clone(),
+                prefix: prefix.clone(),
+            }),
+            &retry_policy,
+            Arc::clone(&webhook_sender),
+        )
+        .await;
+        apply_shadow_sync_results_strict(&mut db_states, final_results).await?;
+        let drained = db_states.iter().all(|(p, s)| {
+            let b = &before[p];
+            b.0 == s.shadow_sync_generation && b.1 == s.shadow_sync_offset && b.2 == s.current_txid
+        });
+        if drained {
+            break;
+        }
+        if round + 1 == SHUTDOWN_DRAIN_MAX_ROUNDS {
+            return Err(anyhow!(
+                "shadow shutdown drain did not quiesce after {} rounds",
+                SHUTDOWN_DRAIN_MAX_ROUNDS
+            ));
+        }
+    }
 
     shutdown_shadow_uploaders(&cache_states, &db_states, uploader_handles).await?;
 
     tracing::info!("walrust shadow mode shutdown complete");
     Ok(())
+}
+
+/// Minimum interval between repeated WAL-growth alarms for one database while
+/// its WAL stays over the threshold.
+const WAL_ALARM_INTERVAL: Duration = Duration::from_secs(60);
+
+/// WAL-growth alarm (the litestream tradeoff): once walrust holds the read
+/// mark, walrust is the only thing that can let the WAL truncate, so a WAL
+/// that keeps growing means walrust is behind or wedged. Alarm loudly —
+/// error log + webhook — never silently. `threshold_pages == 0` disables the
+/// alarm. The alarm fires at most once per [`WAL_ALARM_INTERVAL`] per
+/// database while the WAL stays over the threshold: a stuck WAL must keep
+/// reminding, but a 1s sync tick must not hammer the webhook endpoint.
+///
+/// The byte count is exact; the page count is approximate (the WAL carries a
+/// 32-byte header plus a 24-byte frame header per page, so raw bytes do not
+/// divide evenly into database pages).
+async fn alarm_if_wal_oversized(
+    state: &ShadowDbState,
+    threshold_pages: u64,
+    webhook_sender: &WebhookSender,
+    metrics_state: &MetricsState,
+    last_fired: Option<std::time::Instant>,
+) -> bool {
+    if threshold_pages == 0 {
+        return false;
+    }
+    if let Some(last) = last_fired {
+        if last.elapsed() < WAL_ALARM_INTERVAL {
+            return false;
+        }
+    }
+    let wal_bytes = std::fs::metadata(&state.wal_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    // Frame size = page + 24-byte frame header; the result stays approximate
+    // (the 32-byte WAL header is not accounted for), hence "≈" in the message.
+    let frame_size = state.shadow.page_size() as u64 + 24;
+    let approx_pages = if frame_size > 0 {
+        wal_bytes / frame_size
+    } else {
+        0
+    };
+    if approx_pages > threshold_pages {
+        tracing::error!(
+            "{}: WAL growth alarm: live WAL is {} bytes (\u{2248}{} pages incl. WAL framing), over the {}-page threshold; walrust is behind or wedged",
+            state.name,
+            wal_bytes,
+            approx_pages,
+            threshold_pages
+        );
+        metrics_state.record_error(&state.name);
+        webhook_sender
+            .notify_upload_failed(
+                &state.name,
+                &format!(
+                    "WAL growth alarm: {wal_bytes} bytes (\u{2248}{approx_pages} pages incl. framing) over {threshold_pages}-page threshold"
+                ),
+                1,
+            )
+            .await;
+        return true;
+    }
+    false
 }
 
 /// How startup state is seeded from the remote `manifest.json`.
@@ -1186,7 +1435,126 @@ mod tests {
     use crate::shadow::format_segment_name;
     use rusqlite::Connection;
     use std::io::{Read, Write};
+    use std::path::Path;
     use tempfile::TempDir;
+
+    // ── WAL-growth alarm ────────────────────────────────────────────────────
+
+    /// The alarm must fire loudly (webhook with the exact byte size + error
+    /// count) when the WAL exceeds the threshold, stay silent under it, and
+    /// throttle repeats. This pins the function's contract; the tick → alarm
+    /// call-site wiring is pinned by
+    /// `e2e_cli_shadow_watch_wal_growth_alarm_live_s3` (deleting the call in
+    /// the wal-sync tick fails that test).
+    #[tokio::test]
+    async fn wal_growth_alarm_fires_over_threshold_and_stays_silent_under() {
+        let (_temp, db_path, conn) = create_real_wal_db();
+        // Enough rows to exceed one page of WAL.
+        for i in 0..50 {
+            conn.execute(
+                "INSERT INTO items (value) VALUES (?1)",
+                [format!("row-{i}")],
+            )
+            .unwrap();
+        }
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let wal_bytes = std::fs::metadata(db_path.with_extension("db-wal"))
+            .unwrap()
+            .len();
+        assert!(wal_bytes > shadow.page_size() as u64);
+
+        let mut state = ShadowDbState {
+            name: "alarm-db".to_string(),
+            db_path: db_path.clone(),
+            wal_path: db_path.with_extension("db-wal"),
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let metrics = MetricsState::new();
+
+        // Over threshold: the webhook fires with the exact byte size and the
+        // error counter increments.
+        let (url, body) = capture_one_webhook().await;
+        let webhook = WebhookSender::new(vec![WebhookConfig {
+            url,
+            events: vec!["upload_failed".to_string()],
+            secret: None,
+        }]);
+        assert!(
+            alarm_if_wal_oversized(&state, 1, &webhook, &metrics, None).await,
+            "first crossing must fire"
+        );
+        let alarm_body = tokio::time::timeout(Duration::from_secs(5), body)
+            .await
+            .expect("alarm must reach the webhook")
+            .expect("capture task must not panic");
+        assert!(
+            alarm_body.contains("WAL growth alarm")
+                && alarm_body.contains("bytes")
+                && alarm_body.contains("pages"),
+            "alarm must carry the exact byte size and approximate pages, got: {alarm_body}"
+        );
+        assert_eq!(
+            metrics.error_count.with_label_values(&["alarm-db"]).get(),
+            1,
+            "the error counter must record the alarm"
+        );
+
+        // Throttled: a tick immediately after firing must stay silent (no
+        // webhook hammering on a 1s sync interval), even over threshold.
+        assert!(
+            !alarm_if_wal_oversized(
+                &state,
+                1,
+                &webhook,
+                &metrics,
+                Some(std::time::Instant::now())
+            )
+            .await,
+            "an immediate re-crossing must be throttled"
+        );
+        assert_eq!(
+            metrics.error_count.with_label_values(&["alarm-db"]).get(),
+            1,
+            "a throttled tick must not record another error"
+        );
+
+        // After the throttle interval the alarm fires again (a stuck WAL must
+        // keep reminding).
+        assert!(
+            alarm_if_wal_oversized(
+                &state,
+                1,
+                &webhook,
+                &metrics,
+                Some(std::time::Instant::now() - WAL_ALARM_INTERVAL - Duration::from_secs(1))
+            )
+            .await,
+            "the alarm must re-fire after the throttle interval"
+        );
+
+        // Under threshold and disabled: silent, no error recorded.
+        assert!(
+            !alarm_if_wal_oversized(&state, 121359, &webhook, &metrics, None).await,
+            "under the threshold must stay silent"
+        );
+        assert!(
+            !alarm_if_wal_oversized(&state, 0, &webhook, &metrics, None).await,
+            "threshold 0 must disable the alarm"
+        );
+        assert_eq!(
+            metrics.error_count.with_label_values(&["alarm-db"]).get(),
+            2,
+            "only the two real firings are recorded"
+        );
+        drop(conn);
+        state.wal_copy_offset = 0;
+    }
 
     // ── H8 cousin: manifest-fetch seeding never silently starts fresh ────────
 
@@ -1577,18 +1945,21 @@ mod tests {
         });
         let cache_state = (Arc::clone(&cache), upload_tx);
 
-        checkpoint_shadow_after_durable_sync(
+        let reanchored = checkpoint_shadow_after_durable_sync(
             &mut state,
             Some(&cache_state),
-            None,
+            dummy_direct_target().await,
             &RetryPolicy::new(RetryConfig::default()),
             Arc::new(WebhookSender::new(vec![])),
             Duration::from_secs(2),
         )
         .await
         .unwrap();
+        assert!(
+            !reanchored,
+            "a checkpoint with no window commit must not re-anchor"
+        );
         ack_handle.await.unwrap();
-
         assert!(
             state.wal_copy_offset > 0,
             "checkpoint path must copy real active WAL frames before checkpointing"
@@ -1632,7 +2003,7 @@ mod tests {
         let err = checkpoint_shadow_after_durable_sync(
             &mut state,
             Some(&cache_state),
-            None,
+            dummy_direct_target().await,
             &RetryPolicy::new(RetryConfig::default()),
             Arc::new(WebhookSender::new(vec![])),
             Duration::from_millis(100),
@@ -1759,5 +2130,1097 @@ mod tests {
             generation_before,
             "shadow generation must not advance without a downtime checkpoint"
         );
+    }
+
+    fn s3_e2e_enabled() -> bool {
+        std::env::var("AWS_ENDPOINT_URL_S3").is_ok()
+            || std::env::var("AWS_ENDPOINT_URL").is_ok()
+            || std::env::var("AWS_ACCESS_KEY_ID").is_ok()
+    }
+
+    /// Live-S3 end-to-end for the commit-in-window re-anchor: a racing writer
+    /// lands commits between the shadow copy and the controlled checkpoint
+    /// (the window is the network round-trip wide), the folded-extent/data
+    /// version checks must fire, the function must re-anchor through the
+    /// existing snapshot path, and a full restore from the bucket must carry
+    /// every committed row. Skips when no S3 is configured (same gate as
+    /// `tests/production_e2e.rs`).
+    #[tokio::test]
+    async fn e2e_shadow_checkpoint_reanchors_window_commit_live_s3() {
+        if !s3_e2e_enabled() {
+            eprintln!(
+                "SKIP e2e_shadow_checkpoint_reanchors_window_commit_live_s3: no S3 endpoint/credentials configured"
+            );
+            return;
+        }
+
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        let bucket = std::env::var("TIERED_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026".to_string());
+        let client = Arc::new(create_client(endpoint.as_deref()).await.unwrap());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let (bucket_name, _) = parse_bucket(&bucket);
+        let prefix = format!("e2e-reanchor-{nanos}/");
+        let name = "reanchor".to_string();
+
+        let (_temp, db_path, app_conn) = create_real_wal_db();
+        let shadow = ShadowWal::new(&db_path).await.unwrap();
+        let wal_path = db_path.with_extension("db-wal");
+        let mut state = ShadowDbState {
+            name: name.clone(),
+            db_path: db_path.clone(),
+            wal_path,
+            current_txid: 0,
+            last_snapshot: None,
+            db_checksum: None,
+            shadow,
+            shadow_sync_generation: 0,
+            shadow_sync_offset: 0,
+            wal_copy_offset: 0,
+        };
+        let retry_policy = RetryPolicy::new(RetryConfig::default());
+        let webhook_sender = Arc::new(WebhookSender::new(vec![]));
+
+        // The CLI startup-snapshot wiring, verbatim from watch_with_shadow.
+        let mut db_state = DbState {
+            name: state.name.clone(),
+            db_path: state.db_path.clone(),
+            wal_path: state.wal_path.clone(),
+            wal_offset: 0,
+            wal_generation: state.shadow.generation(),
+            current_txid: state.current_txid,
+            last_snapshot: state.last_snapshot,
+            db_checksum: state.db_checksum,
+            wal_salt: None,
+            wal_checksum_chain: None,
+        };
+        take_snapshot_with_retry(
+            &client,
+            &bucket_name,
+            &prefix,
+            &mut db_state,
+            &retry_policy,
+            &webhook_sender,
+            state.shadow.lifecycle(),
+        )
+        .await
+        .unwrap();
+        state.current_txid = db_state.current_txid;
+        state.last_snapshot = db_state.last_snapshot;
+        state.db_checksum = db_state.db_checksum;
+        state.shadow_sync_generation = state.shadow.generation();
+        state.shadow_sync_offset = state.shadow.segment_offset();
+        state.wal_copy_offset = 0;
+
+        // Racing writer: lands commits inside the copy-to-checkpoint window,
+        // which spans the S3 round trip.
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = {
+            let db_path = db_path.clone();
+            let stop = Arc::clone(&stop);
+            let writer_count = Arc::clone(&writer_count);
+            std::thread::spawn(move || {
+                let conn = Connection::open(&db_path).unwrap();
+                conn.execute_batch("PRAGMA busy_timeout=5000; PRAGMA synchronous=OFF;")
+                    .unwrap();
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    conn.execute("INSERT INTO items (value) VALUES (?1)", [format!("w{i}")])
+                        .unwrap();
+                    i += 1;
+                    writer_count.store(i, std::sync::atomic::Ordering::Relaxed);
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+            })
+        };
+
+        let mut reanchored = false;
+        for _ in 0..30 {
+            match checkpoint_shadow_after_durable_sync(
+                &mut state,
+                None,
+                DirectShadowSyncTarget {
+                    client: Arc::clone(&client),
+                    bucket_name: bucket_name.clone(),
+                    prefix: prefix.clone(),
+                },
+                &retry_policy,
+                Arc::clone(&webhook_sender),
+                Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok(true) => {
+                    reanchored = true;
+                    break;
+                }
+                Ok(false) => {}
+                // A commit landing mid-checkpoint makes the fold incomplete;
+                // that is the pre-existing racing-checkpoint error path.
+                Err(_) => {}
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(
+            reanchored,
+            "a racing writer must trip the window detection within 30 checkpoint rounds"
+        );
+
+        // The re-anchor published a new-generation snapshot (startup was gen 1).
+        let keys = client
+            .list_objects_v2()
+            .bucket(&bucket_name)
+            .prefix(&format!("{prefix}{name}/"))
+            .send()
+            .await
+            .unwrap();
+        let gen2 = keys
+            .contents()
+            .iter()
+            .filter_map(|o| o.key())
+            .filter(|k| k.contains("/0002/"))
+            .count();
+        assert!(
+            gen2 > 0,
+            "re-anchor must publish a generation-2 snapshot; keys: {:?}",
+            keys.contents()
+                .iter()
+                .filter_map(|o| o.key())
+                .collect::<Vec<_>>()
+        );
+
+        // A post-reanchor commit still ships through the normal sync. The
+        // re-anchor resets the WAL, so the next copy lands in a new shadow
+        // generation: the first sync round only drains the old generation at
+        // EOF (the D3 cursor-reset shape), and a later round ships the new
+        // one. Sync until the incremental covering the post-reanchor frames
+        // (txid >= 6) is durable.
+        app_conn
+            .execute("INSERT INTO items (value) VALUES ('post-reanchor')", [])
+            .unwrap();
+        let incremental_txid = state.current_txid + 1;
+        let mut last_err = None;
+        let mut shipped = false;
+        for _ in 0..15 {
+            match checkpoint_shadow_after_durable_sync(
+                &mut state,
+                None,
+                DirectShadowSyncTarget {
+                    client: Arc::clone(&client),
+                    bucket_name: bucket_name.clone(),
+                    prefix: prefix.clone(),
+                },
+                &retry_policy,
+                Arc::clone(&webhook_sender),
+                Duration::from_secs(30),
+            )
+            .await
+            {
+                Ok(_) => {
+                    let keys = client
+                        .list_objects_v2()
+                        .bucket(&bucket_name)
+                        .prefix(&format!("{prefix}{name}/0000/"))
+                        .send()
+                        .await
+                        .unwrap();
+                    shipped = keys.contents().iter().filter_map(|o| o.key()).any(|k| {
+                        let filename = k.rsplit('/').next().unwrap_or(k);
+                        walrust_core::legacy_manifest::parse_ltx_filename(filename)
+                            .is_some_and(|(min, _)| min >= incremental_txid)
+                    });
+                    if shipped {
+                        break;
+                    }
+                }
+                Err(e) => last_err = Some(format!("{e:#}")),
+            }
+        }
+        assert!(
+            shipped,
+            "post-reanchor commit must ship as an incremental (txid >= {incremental_txid}); last error: {last_err:?}"
+        );
+
+        // Handled safely: a full restore carries every committed row.
+        let restored_path = db_path.with_file_name("restored.db");
+        crate::sync::restore::restore(
+            &name,
+            &restored_path,
+            &format!("{bucket_name}/{prefix}"),
+            endpoint.as_deref(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let verify = Connection::open(&restored_path).unwrap();
+        let writer_rows: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value LIKE 'w%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            writer_rows,
+            writer_count.load(std::sync::atomic::Ordering::Relaxed) as i64,
+            "every racing-writer row must survive the re-anchor"
+        );
+        let post: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value = 'post-reanchor'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            post, 1,
+            "post-reanchor commit must ship after the re-anchor"
+        );
+        let seed_rows: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value IN ('alpha', 'beta', 'gamma')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seed_rows, 3, "seed rows must survive");
+        drop(verify);
+
+        // Cleanup: delete only this test's unique prefix.
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(&bucket_name)
+                .prefix(&prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.unwrap();
+            for obj in page.contents() {
+                if let Some(key) = obj.key() {
+                    let _ = client
+                        .delete_object()
+                        .bucket(&bucket_name)
+                        .key(key)
+                        .send()
+                        .await;
+                }
+            }
+            match page.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
+    }
+
+    /// Watch-level wiring for the WAL-growth alarm: the real
+    /// `watch_with_shadow` loop, driven by its wal-sync tick, must fire the
+    /// alarm webhook when the live WAL exceeds `wal_truncate_threshold_pages`
+    /// — and must keep running (the alarm is a report, not a failure).
+    /// Deleting the `alarm_if_wal_oversized` call in the wal-sync tick makes
+    /// this test time out waiting for the webhook. Skips without S3.
+    #[tokio::test]
+    async fn e2e_cli_shadow_watch_wal_growth_alarm_live_s3() {
+        if !s3_e2e_enabled() {
+            eprintln!(
+                "SKIP e2e_cli_shadow_watch_wal_growth_alarm_live_s3: no S3 endpoint/credentials configured"
+            );
+            return;
+        }
+
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        let bucket = std::env::var("TIERED_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026".to_string());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = "walarm".to_string();
+        let prefix = format!("e2e-walarm-{nanos}/");
+        let bucket_with_prefix = format!("{bucket}/{prefix}");
+
+        let (_temp, db_path, app) = create_real_wal_db();
+        // Grow the WAL well past one page so the 1-page threshold trips.
+        for i in 0..50 {
+            app.execute(
+                "INSERT INTO items (value) VALUES (?1)",
+                [format!("row-{i}")],
+            )
+            .unwrap();
+        }
+        let sync = SyncConfig {
+            snapshot_interval: 3600,
+            wal_sync_interval: 1,
+            checkpoint_interval: 3600,
+            min_checkpoint_page_count: u64::MAX,
+            on_startup: false,
+            wal_truncate_threshold_pages: 1,
+            ..SyncConfig::default()
+        };
+        let db_config = ResolvedDbConfig {
+            path: db_path.clone(),
+            prefix: name.clone(),
+            sync: sync.clone(),
+            retention: RetentionConfig::default(),
+            compaction: walrust_core::compaction::CompactionSettings::default(),
+        };
+
+        let (webhook_url, webhook_body) = capture_one_webhook().await;
+        let webhooks = vec![WebhookConfig {
+            url: webhook_url,
+            events: vec!["upload_failed".to_string()],
+            secret: None,
+        }];
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let endpoint_for_watch = endpoint.clone();
+        let watch = tokio::spawn(async move {
+            watch_with_shadow_and_shutdown(
+                vec![db_config],
+                &bucket_with_prefix,
+                endpoint_for_watch.as_deref(),
+                sync,
+                None,
+                0,
+                true,
+                RetryConfig::default(),
+                webhooks,
+                CacheConfig::default(),
+                Some(shutdown_rx),
+            )
+            .await
+        });
+
+        // The wal-sync tick must raise the alarm (threshold: 1 page).
+        let alarm_body = tokio::time::timeout(Duration::from_secs(20), webhook_body)
+            .await
+            .expect("WAL-growth alarm must reach the webhook within 20s of the first tick")
+            .expect("webhook capture task must not panic");
+        assert!(
+            alarm_body.contains("WAL growth alarm"),
+            "alarm must identify itself, got: {alarm_body}"
+        );
+        assert!(
+            alarm_body.contains("bytes"),
+            "alarm must carry the exact WAL byte size, got: {alarm_body}"
+        );
+        assert!(
+            alarm_body.contains(&name),
+            "alarm must name the database, got: {alarm_body}"
+        );
+
+        // The alarm is a report, not a failure: the watch keeps running.
+        assert!(
+            !watch.is_finished(),
+            "watch must stay alive after firing the WAL-growth alarm"
+        );
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(30), watch)
+            .await
+            .expect("watch must shut down gracefully within 30s")
+            .expect("watch task must not panic")
+            .expect("watch must exit cleanly on shutdown");
+
+        // Cleanup: delete only this test's unique prefix.
+        let client = create_client(endpoint.as_deref()).await.unwrap();
+        let (bucket_name, _) = parse_bucket(&bucket);
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = client
+                .list_objects_v2()
+                .bucket(&bucket_name)
+                .prefix(&prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.unwrap();
+            for obj in page.contents() {
+                if let Some(key) = obj.key() {
+                    let _ = client
+                        .delete_object()
+                        .bucket(&bucket_name)
+                        .key(key)
+                        .send()
+                        .await;
+                }
+            }
+            match page.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
+    }
+
+    /// The DF2 workload as a background thread pair: an ephemeral writer
+    /// (one open+insert+close connection per commit — the last-connection
+    /// close-time EXCLUSIVE attempt is what unlinks the WAL when walrust's
+    /// SHARED main-db lock is gone) and a truncater (non-blocking
+    /// `wal_checkpoint(TRUNCATE)` probes; a `busy == 0` result means the
+    /// blocker failed to protect the WAL).
+    struct DfThreads {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        writer_count: Arc<std::sync::atomic::AtomicU64>,
+        truncate_violations: Arc<std::sync::atomic::AtomicU64>,
+        writer: std::thread::JoinHandle<()>,
+        truncater: std::thread::JoinHandle<()>,
+    }
+
+    fn spawn_df_threads(db_path: &Path) -> DfThreads {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer_count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let truncate_violations = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer = {
+            let db_path = db_path.to_path_buf();
+            let stop = Arc::clone(&stop);
+            let writer_count = Arc::clone(&writer_count);
+            std::thread::spawn(move || {
+                let mut i = 0u64;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    // A real application retries transient SQLITE_BUSY (the
+                    // checkpoint dance holds the writer lock briefly); a
+                    // panicking workload generator would silently stop the
+                    // commit stream and invalidate the phase assertions.
+                    if let Ok(conn) = Connection::open(&db_path) {
+                        if conn
+                            .execute("INSERT INTO items (value) VALUES (?1)", [format!("w{i}")])
+                            .is_ok()
+                        {
+                            drop(conn);
+                            i += 1;
+                            writer_count.store(i, std::sync::atomic::Ordering::Relaxed);
+                            std::thread::sleep(std::time::Duration::from_millis(400));
+                            continue;
+                        }
+                        drop(conn);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(100));
+                }
+            })
+        };
+        let truncater = {
+            let db_path = db_path.to_path_buf();
+            let stop = Arc::clone(&stop);
+            let truncate_violations = Arc::clone(&truncate_violations);
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    std::thread::sleep(std::time::Duration::from_millis(1500));
+                    let conn = match Connection::open(&db_path) {
+                        Ok(c) => c,
+                        Err(_) => continue,
+                    };
+                    conn.execute_batch("PRAGMA busy_timeout=0;").unwrap();
+                    // Only a SUCCESSFUL truncation is a blocker violation; a
+                    // lock-contention error is a refusal, same as busy=1.
+                    if let Ok(0) = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE);", [], |row| {
+                        row.get::<_, i64>(0)
+                    }) {
+                        truncate_violations.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    drop(conn);
+                }
+            })
+        };
+        DfThreads {
+            stop,
+            writer_count,
+            truncate_violations,
+            writer,
+            truncater,
+        }
+    }
+
+    impl DfThreads {
+        /// Stop both threads and return (commits, truncate violations).
+        fn stop_and_join(self) -> (u64, u64) {
+            self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+            self.writer.join().unwrap();
+            self.truncater.join().unwrap();
+            (
+                self.writer_count.load(std::sync::atomic::Ordering::Relaxed),
+                self.truncate_violations
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            )
+        }
+    }
+
+    /// Poll S3 until at least `minimum` snapshot objects exist (or `timeout`
+    /// elapses) and return the count then visible.
+    async fn wait_for_snapshot_count(
+        client: &aws_sdk_s3::Client,
+        bucket_name: &str,
+        prefix: &str,
+        name: &str,
+        minimum: usize,
+        timeout: Duration,
+    ) -> usize {
+        let start = std::time::Instant::now();
+        loop {
+            let n = count_snapshot_objects(client, bucket_name, prefix, name).await;
+            if n >= minimum {
+                return n;
+            }
+            if start.elapsed() > timeout {
+                let all = client
+                    .list_objects_v2()
+                    .bucket(bucket_name)
+                    .prefix(prefix)
+                    .send()
+                    .await
+                    .unwrap();
+                eprintln!(
+                    "wait_for_snapshot_count timed out at {n}; keys under {prefix}: {:?}",
+                    all.contents()
+                        .iter()
+                        .filter_map(|o| o.key())
+                        .collect::<Vec<_>>()
+                );
+                return n;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+    }
+
+    /// Delete every object under this test's unique prefix (and nothing else).
+    async fn cleanup_prefix(client: &aws_sdk_s3::Client, bucket_name: &str, prefix: &str) {
+        let mut token: Option<String> = None;
+        loop {
+            let mut req = client.list_objects_v2().bucket(bucket_name).prefix(prefix);
+            if let Some(t) = token.take() {
+                req = req.continuation_token(t);
+            }
+            let page = req.send().await.unwrap();
+            for obj in page.contents() {
+                if let Some(key) = obj.key() {
+                    let _ = client
+                        .delete_object()
+                        .bucket(bucket_name)
+                        .key(key)
+                        .send()
+                        .await;
+                }
+            }
+            match page.next_continuation_token() {
+                Some(t) => token = Some(t.to_string()),
+                None => break,
+            }
+        }
+    }
+
+    /// Restore into `restored_path` and require exactly `expected_writer_rows`
+    /// ephemeral-writer rows plus the three seed rows.
+    async fn assert_row_exact_restore(
+        restored_path: &Path,
+        name: &str,
+        bucket_with_prefix: &str,
+        endpoint: Option<&str>,
+        expected_writer_rows: u64,
+    ) {
+        crate::sync::restore::restore(
+            name,
+            restored_path,
+            bucket_with_prefix,
+            endpoint,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let verify = Connection::open(restored_path).unwrap();
+        let writer_rows: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value LIKE 'w%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            writer_rows, expected_writer_rows as i64,
+            "every ephemeral-writer row must be replicated (DF2)"
+        );
+        let seed_rows: i64 = verify
+            .query_row(
+                "SELECT count(*) FROM items WHERE value IN ('alpha', 'beta', 'gamma')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(seed_rows, 3, "seed rows must survive");
+    }
+
+    /// The zero-re-anchor / zero-storm proof, made exact: with the periodic
+    /// snapshot timer and the checkpoint dance both moved out of the measured
+    /// window (intervals of one hour, `min_checkpoint_page_count` unreachable)
+    /// there is NO legitimate snapshot source while the DF2 workload runs —
+    /// every re-anchor path (window-commit, downtime, trigger) is either
+    /// disabled or would itself be the bug. Any WAL loss underneath the armed
+    /// blocker would also surface as a successful external TRUNCATE probe or
+    /// as missing rows on restore. So the measured window must produce
+    /// EXACTLY ZERO new snapshot objects, zero successful truncations, and a
+    /// row-exact restore. Skips when no S3 is configured.
+    #[tokio::test]
+    async fn e2e_cli_shadow_watch_armed_no_windows_no_loss_live_s3() {
+        if !s3_e2e_enabled() {
+            eprintln!(
+                "SKIP e2e_cli_shadow_watch_armed_no_windows_no_loss_live_s3: no S3 endpoint/credentials configured"
+            );
+            return;
+        }
+
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        let bucket = std::env::var("TIERED_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026".to_string());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = "armedzero".to_string();
+        let prefix = format!("e2e-armedzero-{nanos}/");
+        let bucket_with_prefix = format!("{bucket}/{prefix}");
+
+        let (_temp, db_path, _app) = create_real_wal_db();
+        let sync = SyncConfig {
+            // No periodic snapshots and no checkpoint dances inside the
+            // measured window (the immediate t=0 timer tick still fires; the
+            // baseline below absorbs it).
+            snapshot_interval: 3600,
+            wal_sync_interval: 1,
+            checkpoint_interval: 3600,
+            min_checkpoint_page_count: u64::MAX,
+            on_startup: true,
+            ..SyncConfig::default()
+        };
+        let db_config = ResolvedDbConfig {
+            path: db_path.clone(),
+            prefix: name.clone(),
+            sync: sync.clone(),
+            retention: RetentionConfig::default(),
+            compaction: walrust_core::compaction::CompactionSettings::default(),
+        };
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let bucket_for_watch = bucket_with_prefix.clone();
+        let endpoint_for_watch = endpoint.clone();
+        let watch = tokio::spawn(async move {
+            watch_with_shadow_and_shutdown(
+                vec![db_config],
+                &bucket_for_watch,
+                endpoint_for_watch.as_deref(),
+                sync,
+                None,
+                0,
+                true,
+                RetryConfig::default(),
+                Vec::new(),
+                CacheConfig::default(),
+                Some(shutdown_rx),
+            )
+            .await
+        });
+
+        let client = create_client(endpoint.as_deref()).await.unwrap();
+        let (bucket_name, _) = parse_bucket(&bucket);
+
+        // Baseline: the startup snapshot and the immediate t=0 timer-tick
+        // snapshot are the only legitimate objects. The next periodic tick is
+        // an hour out, so nothing else may appear during the measured window.
+        let baseline = wait_for_snapshot_count(
+            &client,
+            &bucket_name,
+            &prefix,
+            &name,
+            2,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(
+            baseline >= 2,
+            "startup + initial timer-tick snapshots must be published (got {baseline})"
+        );
+
+        let df = spawn_df_threads(&db_path);
+        let wal_at_start = std::fs::metadata(db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+
+        // Measured window: ~8s of ephemeral commits and TRUNCATE probes.
+        tokio::time::sleep(Duration::from_secs(8)).await;
+
+        let (commits, violations) = df.stop_and_join();
+        assert!(
+            commits >= 10,
+            "the measured window must contain a real workload (got {commits} commits)"
+        );
+        assert_eq!(
+            violations, 0,
+            "every external wal_checkpoint(TRUNCATE) must be refused: with no \
+             controlled-checkpoint windows in this run, a success can only mean \
+             the blocker died"
+        );
+        assert!(
+            !watch.is_finished(),
+            "watch must be alive through the measured window"
+        );
+
+        let snapshots_after = count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
+        assert_eq!(
+            snapshots_after, baseline,
+            "EXACTLY ZERO re-anchors and zero storm: no snapshot may appear \
+             while the blocker is armed and no timer/dance can fire ({baseline} \
+             -> {snapshots_after})"
+        );
+
+        let wal_at_end = std::fs::metadata(db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            wal_at_end > wal_at_start,
+            "the WAL must accumulate, never reset ({wal_at_start} -> {wal_at_end})"
+        );
+
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(30), watch)
+            .await
+            .expect("watch must shut down gracefully within 30s")
+            .expect("watch task must not panic")
+            .expect("watch must exit cleanly on shutdown");
+
+        // DF2: restore must be row-exact.
+        let restored_path = db_path.with_file_name("restored-armed.db");
+        assert_row_exact_restore(
+            &restored_path,
+            &name,
+            &bucket_with_prefix,
+            endpoint.as_deref(),
+            commits,
+        )
+        .await;
+
+        cleanup_prefix(&client, &bucket_name, &prefix).await;
+    }
+
+    /// Whole-watch end-to-end against the real DF2 shape: the full
+    /// `watch_with_shadow` loop (snapshot + checkpoint timers, startup
+    /// snapshot, controlled checkpoint dances) drives a database through an
+    /// ephemeral one-connection-per-commit writer (the real DF2 shape),
+    /// app-side `wal_checkpoint(TRUNCATE)` attempts, a long application
+    /// reader that must defer the checkpoint with a loud alarm (never kill
+    /// the watch), and a quiet phase pinned to exactly the periodic cadence.
+    /// Snapshot production is accounted per phase: periodic ticks plus at
+    /// most one window-commit re-anchor per completed dance — never a
+    /// commit-correlated storm. Restore after graceful shutdown must be
+    /// row-exact. The deterministic zero-re-anchor proof (no windows at all)
+    /// is `e2e_cli_shadow_watch_armed_no_windows_no_loss_live_s3`. Skips when
+    /// no S3 is configured (same gate as `tests/production_e2e.rs`).
+    #[tokio::test]
+    async fn e2e_cli_shadow_watch_survives_ephemeral_writer_live_s3() {
+        if !s3_e2e_enabled() {
+            eprintln!(
+                "SKIP e2e_cli_shadow_watch_survives_ephemeral_writer_live_s3: no S3 endpoint/credentials configured"
+            );
+            return;
+        }
+
+        let endpoint = std::env::var("AWS_ENDPOINT_URL_S3")
+            .or_else(|_| std::env::var("AWS_ENDPOINT_URL"))
+            .ok();
+        let bucket = std::env::var("TIERED_TEST_BUCKET")
+            .unwrap_or_else(|_| "walrust-test-rr-2026".to_string());
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let name = "watchdf2".to_string();
+        let prefix = format!("e2e-watchdf2-{nanos}/");
+        let bucket_with_prefix = format!("{bucket}/{prefix}");
+
+        let (_temp, db_path, _app) = create_real_wal_db();
+        let fast_sync = SyncConfig {
+            snapshot_interval: 2,
+            wal_sync_interval: 1,
+            checkpoint_interval: 3,
+            min_checkpoint_page_count: 1,
+            on_startup: true,
+            ..SyncConfig::default()
+        };
+        let db_config = ResolvedDbConfig {
+            path: db_path.clone(),
+            prefix: name.clone(),
+            sync: fast_sync.clone(),
+            retention: RetentionConfig::default(),
+            compaction: walrust_core::compaction::CompactionSettings::default(),
+        };
+
+        // Webhook capture: the deferred-checkpoint alarm must arrive here.
+        let (webhook_url, webhook_body) = capture_one_webhook().await;
+        let webhooks = vec![WebhookConfig {
+            url: webhook_url,
+            events: vec!["upload_failed".to_string()],
+            secret: None,
+        }];
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let bucket_for_watch = bucket_with_prefix.clone();
+        let endpoint_for_watch = endpoint.clone();
+        let watch = tokio::spawn(async move {
+            watch_with_shadow_and_shutdown(
+                vec![db_config],
+                &bucket_for_watch,
+                endpoint_for_watch.as_deref(),
+                fast_sync,
+                None,
+                0,
+                true,
+                RetryConfig::default(),
+                webhooks,
+                CacheConfig::default(),
+                Some(shutdown_rx),
+            )
+            .await
+        });
+
+        let client = create_client(endpoint.as_deref()).await.unwrap();
+        let (bucket_name, _) = parse_bucket(&bucket);
+
+        // Baseline: the startup snapshot and the first periodic timer tick.
+        // Snapshot deltas below are measured from here.
+        let baseline = wait_for_snapshot_count(
+            &client,
+            &bucket_name,
+            &prefix,
+            &name,
+            2,
+            Duration::from_secs(30),
+        )
+        .await;
+        assert!(
+            baseline >= 2,
+            "startup + first periodic snapshots must be published (got {baseline})"
+        );
+
+        let df = spawn_df_threads(&db_path);
+
+        // Phase 1 (3s): normal operation under the ephemeral writer.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        // Phase 2: a long application reader pins part of the WAL across a
+        // checkpoint tick. The dance must DEFER with a loud alarm — the watch
+        // must NOT die (dying would drop the blocker and leave the WAL
+        // unprotected) and the WAL must never be truncated underneath the
+        // reader.
+        let wal_before = std::fs::metadata(db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let holder = Connection::open(&db_path).unwrap();
+        holder.execute_batch("BEGIN DEFERRED;").unwrap();
+        let _: i64 = holder
+            .query_row("SELECT count(*) FROM items", [], |row| row.get(0))
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(
+            !watch.is_finished(),
+            "watch must survive a long application reader across its checkpoint tick"
+        );
+        // The fold must never truncate while the application reader pins the
+        // WAL. Growth is NOT asserted here: walrust's deferred checkpoint
+        // busy-waits behind the reader holding the writer lock, which can
+        // stall the ephemeral writer for the whole window on some platforms
+        // (Linux CI observed 53592 -> 53592); non-shrink is the invariant.
+        // The defer itself is proven by the loud alarm asserted just below.
+        let wal_during = std::fs::metadata(db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(
+            wal_during >= wal_before,
+            "WAL must never be truncated while the fold defers to the application reader ({wal_before} -> {wal_during})"
+        );
+        drop(holder);
+
+        // The deferred-checkpoint alarm must have fired with the WAL size.
+        let alarm_body = tokio::time::timeout(Duration::from_secs(10), webhook_body)
+            .await
+            .expect("deferred-checkpoint alarm must reach the webhook within 10s")
+            .expect("webhook capture task must not panic");
+        assert!(
+            alarm_body.contains("deferred"),
+            "alarm must name the deferred checkpoint, got: {alarm_body}"
+        );
+        assert!(
+            alarm_body.contains("WAL size"),
+            "alarm must carry the WAL size, got: {alarm_body}"
+        );
+
+        // Active-phase snapshot accounting (phases 1+2, ~7s of commits and
+        // probes): legitimate sources are the 2s periodic timer (≤ 4 ticks
+        // including boundary straddle) and window-commit re-anchors from the
+        // completed checkpoint dances (≤ 2: the ~t=3s dance and the ~t=6s
+        // dance the reader usually defers). One extra slot covers S3-latency
+        // boundary effects. A loss-driven storm would be commit-correlated —
+        // ~2.5 commits/s would mean ~17 extra snapshots.
+        let active_snapshots = count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
+        assert!(
+            active_snapshots - baseline <= 7,
+            "active phases: only periodic ticks and ≤ 1 re-anchor per dance, \
+             never a commit-correlated storm ({baseline} -> {active_snapshots})"
+        );
+
+        // Phase 3 (quiet): stop the writer and the truncater. With no
+        // application commits, window detection cannot fire, so the ONLY
+        // remaining snapshot source is the 2s periodic timer: over a 4s
+        // window that is 2 ticks (1–3 with boundary straddle). Zero would
+        // mean the periodic timer died; more means an extra snapshot source.
+        let (commits, violations) = df.stop_and_join();
+        eprintln!("DF workload: {commits} commits, {violations} window-won truncations");
+        let snapshots_before_quiet =
+            count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let snapshots_after_quiet =
+            count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
+        let quiet_delta = snapshots_after_quiet - snapshots_before_quiet;
+        assert!(
+            (1..=3).contains(&quiet_delta),
+            "quiet phase must produce exactly the periodic cadence, no more, \
+             no less ({snapshots_before_quiet} -> {snapshots_after_quiet})"
+        );
+
+        // Graceful shutdown with the final drain via the injected shutdown.
+        assert!(
+            !watch.is_finished(),
+            "watch must still be running (DF1: it must not die)"
+        );
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(Duration::from_secs(30), watch)
+            .await
+            .expect("watch must shut down gracefully within 30s")
+            .expect("watch task must not panic")
+            .expect("watch must exit cleanly on shutdown");
+
+        // A probe CAN legitimately win a truncation inside walrust's released
+        // checkpoint window (milliseconds every 3s); the data_version /
+        // folded-extent detection then re-anchors safely and nothing is lost
+        // — the row-exact restore below is the proof. The strict "always
+        // refused" guarantee is pinned deterministically by
+        // `e2e_cli_shadow_watch_armed_no_windows_no_loss_live_s3`, which runs
+        // with no windows at all.
+        let wal_len = std::fs::metadata(db_path.with_extension("db-wal"))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        assert!(wal_len > 0, "the live WAL must never be unlinked");
+
+        // DF2: restore must be row-exact, including across any window-won
+        // truncation (violations) that forced a re-anchor.
+        let restored_path = db_path.with_file_name("restored-watch.db");
+        assert_row_exact_restore(
+            &restored_path,
+            &name,
+            &bucket_with_prefix,
+            endpoint.as_deref(),
+            commits,
+        )
+        .await;
+
+        cleanup_prefix(&client, &bucket_name, &prefix).await;
+    }
+
+    /// A never-used upload target for cache-mode checkpoint tests: the
+    /// client is constructed but never PUTs (cache mode drains through the
+    /// LocalCache). The re-anchor path requires a target structurally.
+    async fn dummy_direct_target() -> DirectShadowSyncTarget {
+        DirectShadowSyncTarget {
+            client: Arc::new(create_client(None).await.unwrap()),
+            bucket_name: "unused".to_string(),
+            prefix: String::new(),
+        }
+    }
+
+    /// One-shot webhook capture: returns the server URL and a handle that
+    /// resolves with the first request body it receives.
+    async fn capture_one_webhook() -> (String, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let handle = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buffer = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = stream.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "webhook connection closed before request body");
+                buffer.extend_from_slice(&chunk[..n]);
+                if let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
+                {
+                    let headers = String::from_utf8_lossy(&buffer[..header_end]);
+                    let content_length: usize = headers
+                        .lines()
+                        .find_map(|line| {
+                            line.strip_prefix("Content-Length:")
+                                .or_else(|| line.strip_prefix("content-length:"))
+                                .and_then(|value| value.trim().parse().ok())
+                        })
+                        .unwrap_or(0);
+                    let body_start = header_end + 4;
+                    if buffer.len() >= body_start + content_length {
+                        let body = String::from_utf8(
+                            buffer[body_start..body_start + content_length].to_vec(),
+                        )
+                        .unwrap();
+                        stream
+                            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                            .await
+                            .unwrap();
+                        return body;
+                    }
+                }
+            }
+        });
+        (url, handle)
+    }
+
+    /// Count full-snapshot objects (generation folders other than the live
+    /// incremental folder) under this test's prefix. Keys are
+    /// `{prefix}{name}/{generation}/{file}` — the prefix itself contains a
+    /// '/', so the shape check must run on the key relative to
+    /// `{prefix}{name}/` (an absolute `rsplit` depth check silently matches
+    /// nothing and makes every assertion on this counter vacuous).
+    async fn count_snapshot_objects(
+        client: &aws_sdk_s3::Client,
+        bucket_name: &str,
+        prefix: &str,
+        name: &str,
+    ) -> usize {
+        let list_prefix = format!("{prefix}{name}/");
+        let keys = client
+            .list_objects_v2()
+            .bucket(bucket_name)
+            .prefix(&list_prefix)
+            .send()
+            .await
+            .unwrap();
+        keys.contents()
+            .iter()
+            .filter_map(|o| o.key())
+            .filter(|k| {
+                // Keys are `{prefix}{name}/{generation}/{file}`; relative to
+                // the list prefix that is `{generation}/{file}`.
+                let rel = k.strip_prefix(&list_prefix).unwrap_or(k);
+                let parts: Vec<&str> = rel.split('/').collect();
+                parts.len() == 2 && parts[0] != "0000" && parts[0] != "levels"
+            })
+            .count()
     }
 }

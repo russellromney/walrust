@@ -109,8 +109,12 @@ pub struct SyncConfig {
     #[serde(default = "default_min_checkpoint_pages")]
     pub min_checkpoint_page_count: u64,
 
-    /// Emergency WAL size threshold in pages (default: 121359 = ~500MB)
-    /// Triggers blocking TRUNCATE checkpoint. Set to 0 to disable.
+    /// WAL-growth alarm threshold in pages (default: 121359 ≈ ~500MB at 4KiB
+    /// pages; the page count is approximate, the alarm's byte count is exact).
+    /// While walrust holds the checkpoint blocker, only walrust can truncate
+    /// the WAL — a WAL over this size means walrust is behind or wedged, so it
+    /// emits a loud error log + webhook (throttled to one per 60s per
+    /// database). It never checkpoints or truncates by itself. 0 disables.
     #[serde(default = "default_truncate_threshold")]
     pub wal_truncate_threshold_pages: u64,
 

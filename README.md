@@ -145,6 +145,42 @@ behavior breaks:
   `wal_checkpoint` cannot reset the WAL mid-backup. If the database *was*
   checkpointed while walrust was stopped, those pages live only in the `.db`
   file (not the WAL), so restart re-anchors from the current `.db` — see below.
+- **Watching a database is not zero-touch.** For each watched database walrust
+  holds SQLite connections open for the watch's whole lifetime: the checkpoint
+  blocker (a pinned read transaction anchored on the small `_walrust_seq`
+  heartbeat table it creates), a monitor connection for change detection, and
+  a read-only descriptor snapshots are encoded from. External checkpoints —
+  an app's `wal_checkpoint(TRUNCATE)`, autocheckpoints, close-time checkpoints
+  — cannot truncate past walrust's read mark while the watch is alive; they
+  report busy instead. walrust runs its own passive checkpoint every
+  `checkpoint_interval` (default 60s, once `min_checkpoint_page_count` frames
+  accumulate), briefly releasing and re-pinning its read mark; a commit racing
+  that small window is detected via `PRAGMA data_version` and handled by
+  re-anchoring with a snapshot, so no committed frames are lost.
+- **The tradeoff: WAL growth is the alarm.** While walrust holds the read
+  mark, only walrust can let the WAL truncate. If walrust falls behind — slow
+  or unreachable S3, an application reader pinning the WAL — the WAL keeps
+  growing and the app's writes eventually slow. That is the deliberate
+  Litestream tradeoff: loud and observable ("backup is behind, WAL is
+  growing") instead of silent backup loss. When the live WAL exceeds
+  `wal_truncate_threshold_pages` (default 121359, ~500 MB at 4 KiB pages; 0
+  disables) walrust emits an error log plus an `upload_failed` webhook with
+  the exact byte size, throttled to one alarm per minute per database. The
+  alarm never checkpoints or truncates anything itself — it tells you to look.
+- **Local durability vs cloud durability.** A committed frame is safe from
+  WAL reset as soon as walrust's shadow has fsynced it locally (sub-second).
+  It survives machine or disk loss only once the upload to S3 completes. The
+  recovery-point bound above ("bounded by the sync interval") is the
+  cloud-durable statement.
+- **S3 outages.** While S3 is unreachable, walrust keeps capturing frames into
+  its local shadow and keeps the blocker armed; its own checkpoints defer
+  until the upload is durable, the WAL grows, and the WAL-growth alarm fires
+  past the threshold. A checkpoint blocked by an application reader is not
+  fatal: walrust re-pins, alarms with the current WAL size, and retries on the
+  next tick. Upload retries are bounded, though — if an outage outlasts the
+  retry policy the watch exits with an error (releasing the blocker so the
+  app can checkpoint again) and must be restarted; supervise it with your
+  service manager's restart policy.
 - **Restart re-anchors with a full snapshot (`--independent-tasks`).** On every
   restart against an existing stream, walrust re-anchors by uploading a fresh
   full snapshot of the current `.db`, not by resuming an incremental. This is a

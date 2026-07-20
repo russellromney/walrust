@@ -141,7 +141,8 @@ pub async fn anchor_stream_on_startup(
     state: &mut WatchedDbState,
 ) -> Result<SyncOutput> {
     if state.current_txid > 0 {
-        let output = take_snapshot_to_storage(storage, prefix, SyncInput::from(&*state)).await?;
+        let output =
+            take_snapshot_to_storage(storage, prefix, SyncInput::from(&*state), None).await?;
         apply_sync_output_to_watched_state(state, &output);
         Ok(output)
     } else {
@@ -583,9 +584,10 @@ pub async fn take_snapshot_to_storage(
     storage: &dyn StorageBackend,
     prefix: &str,
     input: SyncInput,
+    handles: Option<crate::blocker::SharedLifecycle>,
 ) -> Result<SyncOutput> {
     let snapshot =
-        snapshot_database_to_storage(storage, prefix, &input.name, &input.db_path).await?;
+        snapshot_database_to_storage(storage, prefix, &input.name, &input.db_path, handles).await?;
 
     let wal_salt = wal::read_header(&input.wal_path)
         .await
@@ -606,11 +608,20 @@ pub async fn take_snapshot_to_storage(
     })
 }
 
+/// Take a full-database snapshot and upload it.
+///
+/// `handles` is the armed blocker lifecycle when one exists (CLI shadow
+/// watch): the passive fold, page-size read, and `VACUUM INTO` then borrow
+/// the retained monitor connection instead of opening fresh descriptors for
+/// the main DB (see the `blocker` module docs). Paths with no armed blocker
+/// (independent watch, manual `walrust snapshot`) pass `None` and keep the
+/// one-shot behavior.
 pub async fn snapshot_database_to_storage(
     storage: &dyn StorageBackend,
     prefix: &str,
     name: &str,
     database: &Path,
+    handles: Option<crate::blocker::SharedLifecycle>,
 ) -> Result<SnapshotUploadOutput> {
     // Best-effort PASSIVE checkpoint before encoding. This path is shared by the
     // shadow watch loop, whose checkpoint blocker deliberately pins a live WAL
@@ -620,9 +631,27 @@ pub async fn snapshot_database_to_storage(
     // command (which has no shadow to carry incrementals) performs its own
     // completeness-checked TRUNCATE fold before calling this (see
     // `sync::prune::snapshot`).
-    checkpoint_wal_passive(database).await?;
+    match handles.as_ref() {
+        Some(lifecycle) => {
+            let lifecycle = lifecycle.clone();
+            tokio::task::spawn_blocking(move || {
+                let guard = lifecycle.blocking_lock();
+                guard
+                    .monitor_conn()
+                    .execute_batch("PRAGMA wal_checkpoint(PASSIVE);")
+            })
+            .await??;
+        }
+        None => checkpoint_wal_passive(database).await?,
+    }
 
-    let page_size = get_page_size(database).await?;
+    let page_size = match handles.as_ref() {
+        Some(lifecycle) => {
+            let guard = lifecycle.lock().await;
+            guard.page_size()?
+        }
+        None => get_page_size(database).await?,
+    };
     let (current_txid, current_gen) = discover_legacy_state(storage, prefix, name).await?;
     let new_txid = current_txid + 1;
     let snapshot_gen = current_gen + 1;
@@ -630,17 +659,48 @@ pub async fn snapshot_database_to_storage(
 
     let db_path_for_encode = database.to_path_buf();
     let db_name_for_error = name.to_string();
-    let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
-        ltx::encode_sqlite_snapshot_to_vec(&db_path_for_encode, page_size, new_txid).map_err(|e| {
-            anyhow::anyhow!(
-                "{}: Snapshot encode failed for {}: {}",
-                db_name_for_error,
-                db_path_for_encode.display(),
-                e
-            )
-        })
-    })
-    .await??;
+    let (ltx_buffer, db_checksum_new) = match handles {
+        Some(lifecycle) => {
+            let db_name = db_name_for_error.clone();
+            let db_path = db_path_for_encode.clone();
+            tokio::task::spawn_blocking(move || {
+                // tokio's blocking_lock is the documented way to hold an async
+                // mutex from blocking code; the watch loop serializes snapshot
+                // and checkpoint work per database, so this never contends.
+                let guard = lifecycle.blocking_lock();
+                ltx::encode_sqlite_snapshot_to_vec_with_conn(
+                    guard.monitor_conn(),
+                    &db_path,
+                    page_size,
+                    new_txid,
+                )
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "{}: Snapshot encode failed for {}: {}",
+                        db_name,
+                        db_path.display(),
+                        e
+                    )
+                })
+            })
+            .await??
+        }
+        None => {
+            let (ltx_buffer, db_checksum_new) = tokio::task::spawn_blocking(move || {
+                ltx::encode_sqlite_snapshot_to_vec(&db_path_for_encode, page_size, new_txid)
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "{}: Snapshot encode failed for {}: {}",
+                            db_name_for_error,
+                            db_path_for_encode.display(),
+                            e
+                        )
+                    })
+            })
+            .await??;
+            (ltx_buffer, db_checksum_new)
+        }
+    };
 
     let ltx_size = ltx_buffer.len() as u64;
     storage.put(&ltx_key, &ltx_buffer).await?;

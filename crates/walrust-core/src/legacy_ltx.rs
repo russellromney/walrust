@@ -36,6 +36,26 @@ pub fn encode_sqlite_snapshot_to_vec(
     Ok((buffer, checksum))
 }
 
+/// [`encode_sqlite_snapshot_to_vec`] borrowing a retained connection for the
+/// stable-copy `VACUUM INTO` instead of opening a fresh one.
+///
+/// Snapshot encoding while the checkpoint blocker is armed MUST borrow a
+/// retained handle: opening and closing another connection for the same DB
+/// releases the process's POSIX locks on the inode (see the `blocker` module
+/// docs).
+pub(crate) fn encode_sqlite_snapshot_to_vec_with_conn(
+    conn: &rusqlite::Connection,
+    db_path: &Path,
+    page_size: u32,
+    txid: u64,
+) -> Result<(Vec<u8>, Checksum)> {
+    let db_size = std::fs::metadata(db_path)?.len() as usize;
+    let mut buffer = Vec::with_capacity(db_size.saturating_mul(2));
+    let snapshot = StableSqliteSnapshot::create_with_conn(conn, db_path)?;
+    let checksum = encode_snapshot_with_checksum(&mut buffer, snapshot.path(), page_size, txid)?;
+    Ok((buffer, checksum))
+}
+
 /// Create an LTX snapshot from a stable SQLite backup copy and return the
 /// checksum of the database bytes that were actually encoded.
 pub fn encode_sqlite_snapshot<W: Write>(
@@ -104,6 +124,16 @@ struct StableSqliteSnapshot {
 
 impl StableSqliteSnapshot {
     fn create(source: &Path) -> Result<Self> {
+        let conn = rusqlite::Connection::open(source)
+            .map_err(|e| anyhow!("Failed to open database for stable snapshot: {}", e))?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
+        Self::create_with_conn(&conn, source)
+    }
+
+    /// VACUUM INTO through a borrowed connection. The caller retains the
+    /// connection for its own lifetime; no new descriptor for the source DB
+    /// is opened or closed here.
+    fn create_with_conn(conn: &rusqlite::Connection, source: &Path) -> Result<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(0);
 
         let parent = source.parent().unwrap_or_else(|| Path::new("."));
@@ -124,11 +154,13 @@ impl StableSqliteSnapshot {
         let dest = path
             .to_str()
             .ok_or_else(|| anyhow!("snapshot path is not valid UTF-8: {}", path.display()))?;
-        let conn = rusqlite::Connection::open(source)
-            .map_err(|e| anyhow!("Failed to open database for stable snapshot: {}", e))?;
-        conn.busy_timeout(std::time::Duration::from_secs(30))?;
-        conn.execute("VACUUM INTO ?1", [dest])
-            .map_err(|e| anyhow!("Failed to create stable SQLite snapshot: {}", e))?;
+        // Match the old one-shot connection's 30s busy_timeout for the
+        // VACUUM, restoring the borrowed connection's timeout afterwards.
+        let prev_timeout: i64 = conn.query_row("PRAGMA busy_timeout;", [], |row| row.get(0))?;
+        conn.execute_batch("PRAGMA busy_timeout=30000;")?;
+        let vacuum_result = conn.execute("VACUUM INTO ?1", [dest]);
+        conn.execute_batch(&format!("PRAGMA busy_timeout={prev_timeout};"))?;
+        vacuum_result.map_err(|e| anyhow!("Failed to create stable SQLite snapshot: {}", e))?;
 
         Ok(Self { path })
     }
@@ -388,12 +420,24 @@ fn apply_ltx_to_db_inner<R: Read>(
 
 /// Compute checksum from database file (streaming, no full-DB read).
 pub fn compute_checksum_from_file(db_path: &Path) -> Result<Checksum> {
-    use sha2::{Digest, Sha256};
-    use std::io::BufReader;
-
     let file = std::fs::File::open(db_path)
         .map_err(|e| anyhow!("Failed to open database for checksum: {}", e))?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    compute_checksum_from_fd(&file)
+}
+
+/// [`compute_checksum_from_file`] through an already-open descriptor.
+///
+/// Checksum computation while the checkpoint blocker is armed MUST borrow the
+/// retained source descriptor this way: opening and closing a fresh
+/// descriptor for the main DB would release the process's POSIX locks on the
+/// inode (see the `blocker` module docs).
+pub fn compute_checksum_from_fd(file: &std::fs::File) -> Result<Checksum> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    let mut file_ref = file;
+    file_ref.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file_ref);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536]; // 64KB read chunks (BufReader handles 1MB read-ahead)
 

@@ -22,6 +22,120 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Checkpoint-blocker lifecycle repair (lossless watch regression).** The
+  checkpoint blocker's protection is two locks: the pinned WAL read mark
+  (`-shm` inode) and a SHARED POSIX lock on the main-DB inode held by the
+  blocker connection for its whole lifetime. The SHARED lock is the only
+  thing stopping another process's last-connection close from taking the
+  EXCLUSIVE main-db lock its close-time checkpoint needs before it unlinks
+  `-wal`/`-shm` with unread frames inside. Both CLI shadow watch
+  (`ShadowWal::new` arms the blocker) and owned `Replicator` snapshots then
+  opened and closed other main-DB descriptors — raw page-size/change-counter/
+  snapshot-encode reads, one-shot checkpoint and `VACUUM INTO` connections —
+  and POSIX releases **all** of the process's fcntl locks on an inode when
+  any descriptor for it closes. The blocker object looked alive while its
+  locks were gone; the next short-lived writer's close unlinked the WAL
+  (external `TRUNCATE` still reported `busy=1`; the WAL vanished one close
+  later — the DF2 shape). New `blocker::BlockerLifecycle` retains the three
+  handles per database for the watch lifetime: monitor connection
+  (data-version observer + snapshot `VACUUM INTO`/page-size borrows),
+  checkpoint-blocker connection (armed last; reused and re-pinned across the
+  controlled checkpoint, never dropped/reopened), and a read-only source
+  descriptor for raw reads. Snapshot encoding borrows the retained handles;
+  the CLI shadow controlled checkpoint detects application commits two ways:
+  `PRAGMA data_version` for the release window, and a folded-extent check
+  (`checkpointed_frames` vs the shadow's copied WAL cursor) for a commit that
+  landed between the last shadow copy and the dance — both re-anchor through
+  the existing snapshot path (the owned TRUNCATE dance is safe by
+  construction: folded commits land in the post-dance snapshot, later commits
+  ride the fresh WAL).
+  Regression tests use real SQLite plus an external child process
+  (`crates/walrust-core/tests/blocker_lifecycle.rs`); neutering the retained
+  handles at either production call site makes them fail with the exact
+  reproduction signature.
+- **Adversarial-review remediations (same lifecycle):** the pin release is
+  idempotent, so a heartbeat re-pin that times out behind an application
+  writer errors loudly and the next dance heals (an unconditional ROLLBACK
+  would have wedged every later dance); `Replicator::add*` rejects
+  double-registration before arming (replacing a registration would close the
+  old lifecycle's raw source descriptor after the new one arms, releasing the
+  new blocker's locks); a `None` startup checksum is computed through the
+  retained source descriptor so the armed shadow encoder never falls back to
+  a raw open; the folded-extent check catches commits between the last shadow
+  copy and the dance (invisible to `data_version`); snapshot `VACUUM INTO`
+  keeps its 30s busy timeout on the borrowed connection; the re-anchor branch
+  resets the snapshot trigger and records the metric. The live-S3 end-to-end
+  (`e2e_shadow_checkpoint_reanchors_window_commit_live_s3`) proves a racing
+  writer trips the detection, the re-anchor publishes a new-generation
+  snapshot, and a full restore carries every committed row.
+- **Independent+cache mode closed too (audit finding):** that mode arms the
+  same blocker via its cache `ShadowWal`, and its periodic snapshot then
+  reopened the main DB raw (`get_page_size`) — the same measured
+  invalidation. The snapshot timer now borrows the cache shadow's retained
+  handles; the startup checksum and startup re-anchor run before arming and
+  are unaffected. Double-registration guard is TOCTOU-safe (re-checked under
+  the write lock at insert).
+- **Design review hardening:** at most one lifecycle can arm per database
+  file, process-wide: `BlockerLifecycle::open` acquires an RAII reservation
+  on the database's dev+inode before opening any descriptor, released on
+  drop — a failed or cancelled arming frees it automatically, and duplicate
+  arming (same path, alias, or hardlink, in any scope) is rejected with the
+  original lifecycle untouched. The Replicator rejects double-registration
+  before anything arms. New whole-watch end-to-end
+  (`e2e_cli_shadow_watch_survives_ephemeral_writer_live_s3`): the real
+  `watch_with_shadow` loop drives snapshot+checkpoint timers against an
+  ephemeral one-connection-per-commit writer plus app-side
+  `wal_checkpoint(TRUNCATE)` attempts — the watch stays alive (DF1), every
+  app TRUNCATE is refused, the WAL is never unlinked, snapshots stay
+  bounded, and a restore after graceful shutdown is row-exact (DF2). New API
+  surface narrowed (`SharedLifecycle` alias; three `pub(crate)` helpers; the
+  armer is private). Coverage additions: double-registration
+  rejection/re-add, borrowed-snapshot content decode + repeat-snapshot
+  busy-timeout behavior, folded-extent detection at 512-byte and 64KiB page
+  sizes.
+- **Blocking-review remediations (lifecycle hardening):** a busy/incomplete
+  PASSIVE checkpoint (ordinary application-reader contention) is now a typed
+  deferred outcome — re-pin, retain, loud alarm with the live WAL size,
+  retry on the next tick — instead of an error that killed the watch and
+  dropped the blocker. The owned TRUNCATE dance still fails loudly on an
+  incomplete fold (its snapshot cannot be taken). The WAL-growth alarm
+  (previously a plumbed-but-unread config knob) fires every tick over
+  threshold with the exact size (revert-proof: disabling its send fails the
+  test). Startup checksum failure is fail-closed in both watch modes instead
+  of reaching the armed encoder's raw-open fallback. The graceful shutdown
+  drains the shadow until quiescent instead of one possibly-stale round.
+  Snapshot anchoring lives in one helper used by all three eager paths; the
+  re-anchor's direct upload target is structural; the owned snapshot encode
+  runs in `spawn_blocking`; PASSIVE window-commit detection has a
+  deterministic dance-hook test alongside the race-stress test; shutdown in
+  tests is an injected oneshot rather than a process-global signal.
+- **Second blocking-review remediations (proofs and operator contract):** the
+  WAL-growth alarm now fires from the real wal-sync tick (call-site
+  revert-proof: deleting the tick call makes the live webhook assertion time
+  out), is throttled to one firing per 60s per database instead of every
+  tick, and reports exact bytes with approximate pages; the config and CLI
+  text no longer claim a nonexistent "emergency blocking TRUNCATE". The DF
+  whole-watch e2e's snapshot counter was vacuous — an absolute `rsplit`
+  depth check matched nothing once the object prefix was non-empty, so every
+  rate assertion silently saw zero objects; fixed, and the scenario is now
+  proven two ways: a deterministic zero-re-anchor run
+  (`e2e_cli_shadow_watch_armed_no_windows_no_loss_live_s3` — no periodic
+  ticks and no checkpoint dances inside the measured window, so exactly zero
+  new snapshot objects may appear, every external `wal_checkpoint(TRUNCATE)`
+  is refused, and the restore is row-exact) and per-phase bounds in the
+  dance-driving run (periodic cadence plus at most one window-commit
+  re-anchor per completed dance, never a commit-correlated storm).
+  Owned-mode `None`-checksum pre-image hashes while armed now go through the
+  retained source descriptor (`ltx::compute_checksum_from_fd`, three delta
+  call sites); a child-process regression proves the old raw-open fallback
+  zombied the blocker (`busy=1` on the TRUNCATE probe, WAL unlinked on the
+  close). Independent+cache mode's periodic snapshot tick is pinned at the
+  call site by a live e2e driving the real `run_db_task` loop (neutering the
+  borrowed handles to `None` lets the external close unlink the WAL).
+  Operator documentation (README) now states the retained-connections
+  contract, the WAL-growth tradeoff and alarm semantics, local vs cloud
+  durability, and remote-outage behavior.
+
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
   owns each planned candidate instead of retaining borrowed plan entries across
   the async stream, fixing the non-general `Send` future seen by embedders using

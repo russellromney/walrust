@@ -373,28 +373,46 @@ impl Replicator {
         let prefix = self.prefix.clone();
         sync::ensure_no_saved_state(self.storage.as_ref(), &prefix, name).await?;
 
+        // Replacing a registration would drop the old lifecycle's raw source
+        // descriptor AFTER the new one is armed — and POSIX releases all of
+        // the process's locks on the inode when any descriptor for it closes,
+        // killing the new blocker's SHARED lock. Reject the double-add
+        // BEFORE anything arms; the process-wide inode reservation in
+        // BlockerLifecycle::open is the backstop for every other scope
+        // (aliases, two names, other Replicators, ShadowWal).
+        if self.databases.read().await.contains_key(name) {
+            anyhow::bail!(
+                "Replicator: '{}' is already registered; call remove() before re-adding it",
+                name
+            );
+        }
+
         // Build state and take initial snapshot OUTSIDE the map lock
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
         state.rollover_observer = self.config.rollover_observer.clone();
 
-        // Walrust-owned mode pins the live WAL with a long-running read
-        // transaction so an external checkpoint cannot restart it (D2).
-        let blocker =
-            crate::shadow::ShadowWal::open_checkpoint_blocker(db_path).with_context(|| {
-                format!(
-                    "Replicator: cannot open checkpoint blocker for '{}'",
-                    db_path.display()
-                )
-            })?;
-        state.checkpoint_blocker = Some(Arc::new(AsyncMutex::new(blocker)));
-
+        // Raw main-db reads (checksum, change counter) must happen BEFORE the
+        // blocker lifecycle arms: once armed, opening and closing another
+        // descriptor for the main DB would release the process's POSIX locks
+        // on the inode (see the `blocker` module docs).
         if db_path.exists() {
             state.init_checksum()?;
             let base_change_counter = sync::change_counter_from_file(db_path).unwrap_or(0);
             state.current_seq = base_change_counter;
             state.current_txid = base_change_counter;
         }
+
+        // Walrust-owned mode pins the live WAL with the retained blocker
+        // lifecycle (D2): pinned read transaction, monitor connection, and
+        // source descriptor, armed last.
+        let lifecycle = crate::blocker::BlockerLifecycle::open(db_path).with_context(|| {
+            format!(
+                "Replicator: cannot open checkpoint blocker for '{}'",
+                db_path.display()
+            )
+        })?;
+        state.checkpoint_blocker = Some(Arc::new(AsyncMutex::new(lifecycle)));
 
         state.ensure_lineage_id();
         sync::take_snapshot_with_retry(
@@ -413,10 +431,20 @@ impl Replicator {
             compaction_triggers: None,
         }));
 
-        self.databases
-            .write()
-            .await
-            .insert(name.to_string(), db_state);
+        // Belt-and-suspenders re-check under the write lock: the hazardous
+        // drop of a replaced lifecycle happens exactly here. The name
+        // reservation above already serializes arming, so this can only fire
+        // for an entry inserted through a non-reserving path.
+        {
+            let mut databases = self.databases.write().await;
+            if databases.contains_key(name) {
+                anyhow::bail!(
+                    "Replicator: '{}' is already registered; call remove() before re-adding it",
+                    name
+                );
+            }
+            databases.insert(name.to_string(), db_state);
+        }
 
         tracing::info!("Replicator: added '{}' ({})", name, db_path.display());
         Ok(())
@@ -460,6 +488,15 @@ impl Replicator {
         }
 
         let prefix = self.prefix.clone();
+
+        // Same double-registration hazard as add(): reject BEFORE anything
+        // arms; the process-wide inode reservation backstops other scopes.
+        if self.databases.read().await.contains_key(name) {
+            anyhow::bail!(
+                "Replicator: '{}' is already registered; call remove() before re-adding it",
+                name
+            );
+        }
 
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
@@ -522,15 +559,16 @@ impl Replicator {
             );
         }
 
-        // Re-pin the live WAL in walrust-owned mode after reopening (D2).
-        let blocker =
-            crate::shadow::ShadowWal::open_checkpoint_blocker(db_path).with_context(|| {
-                format!(
-                    "Replicator: cannot open checkpoint blocker for '{}'",
-                    db_path.display()
-                )
-            })?;
-        state.checkpoint_blocker = Some(Arc::new(AsyncMutex::new(blocker)));
+        // Re-pin the live WAL in walrust-owned mode after reopening (D2). The
+        // lifecycle retains the blocker, monitor connection, and source
+        // descriptor for the whole watch lifetime.
+        let lifecycle = crate::blocker::BlockerLifecycle::open(db_path).with_context(|| {
+            format!(
+                "Replicator: cannot open checkpoint blocker for '{}'",
+                db_path.display()
+            )
+        })?;
+        state.checkpoint_blocker = Some(Arc::new(AsyncMutex::new(lifecycle)));
 
         let db_state = Arc::new(AsyncMutex::new(DbState {
             state,
@@ -539,10 +577,18 @@ impl Replicator {
             compaction_triggers: None,
         }));
 
-        self.databases
-            .write()
-            .await
-            .insert(name.to_string(), db_state);
+        // Re-check under the write lock (TOCTOU): the hazardous drop of a
+        // replaced lifecycle happens exactly here.
+        {
+            let mut databases = self.databases.write().await;
+            if databases.contains_key(name) {
+                anyhow::bail!(
+                    "Replicator: '{}' is already registered; call remove() before re-adding it",
+                    name
+                );
+            }
+            databases.insert(name.to_string(), db_state);
+        }
 
         tracing::info!(
             "Replicator: added '{}' without snapshot ({})",
