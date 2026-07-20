@@ -53,6 +53,7 @@
 //!   (struct field declaration order).
 
 use std::path::Path;
+use std::sync::Mutex as StdMutex;
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::Connection;
@@ -62,6 +63,58 @@ use crate::shadow::ensure_connection_in_wal_mode;
 /// The shared-handle form of the lifecycle passed between the CLI watch and
 /// the snapshot paths that must borrow it (see the module docs).
 pub type SharedLifecycle = std::sync::Arc<tokio::sync::Mutex<BlockerLifecycle>>;
+
+/// Process-wide registry of database identities (device, inode) with an
+/// armed blocker lifecycle. POSIX locks are process-wide and inode-scoped,
+/// so the only safe arity is ONE armed lifecycle per inode per process: a
+/// second arming's eventual drop would close its raw source descriptor and
+/// release every lock the first holds on the inode (the zombie shape in the
+/// module docs). Static, so `Replicator`, `ShadowWal`, and any embedder in
+/// this process share one guard.
+static ARMED_INODES: std::sync::LazyLock<StdMutex<std::collections::HashSet<(u64, u64)>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(std::collections::HashSet::new()));
+
+/// RAII reservation for one database identity, acquired in
+/// [`BlockerLifecycle::open`] before any descriptor is opened and released
+/// automatically on drop — including when the owning task is cancelled.
+struct InodeReservation {
+    identity: Option<(u64, u64)>,
+}
+
+impl InodeReservation {
+    #[cfg(unix)]
+    fn acquire(db_path: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(db_path)
+            .with_context(|| format!("failed to stat {}", db_path.display()))?;
+        let identity = (metadata.dev(), metadata.ino());
+        let mut armed = ARMED_INODES.lock().unwrap_or_else(|e| e.into_inner());
+        if !armed.insert(identity) {
+            anyhow::bail!(
+                "a checkpoint blocker lifecycle is already armed for {} (same database file); \
+                 arming twice would let either drop release the other's POSIX locks",
+                db_path.display()
+            );
+        }
+        Ok(Self {
+            identity: Some(identity),
+        })
+    }
+
+    #[cfg(not(unix))]
+    fn acquire(_db_path: &Path) -> Result<Self> {
+        Ok(Self { identity: None })
+    }
+}
+
+impl Drop for InodeReservation {
+    fn drop(&mut self) {
+        if let Some(identity) = self.identity {
+            let mut armed = ARMED_INODES.lock().unwrap_or_else(|e| e.into_inner());
+            armed.remove(&identity);
+        }
+    }
+}
 
 /// The retained per-database handles for the checkpoint-blocker lifecycle.
 /// See the module docs for the contract.
@@ -85,6 +138,18 @@ pub struct BlockerLifecycle {
     /// encoding, checksum, change counter). Opened before the blocker arms
     /// and never closed while armed.
     source_fd: std::fs::File,
+    /// Process-wide reservation for this database's inode, declared last so
+    /// it releases only after every handle above has closed (module docs:
+    /// close order). Held only for its Drop side effect.
+    _reservation: InodeReservation,
+}
+
+impl Drop for BlockerLifecycle {
+    fn drop(&mut self) {
+        // Best-effort rollback before the connections close, regardless of
+        // which Arc<Mutex<..>> wrapper disappears first.
+        self.rollback_blocker();
+    }
 }
 
 /// Outcome of a [`BlockerLifecycle::controlled_checkpoint`] dance.
@@ -99,13 +164,28 @@ pub struct ControlledCheckpoint {
     /// extent to catch commits folded **before** the window sample: a commit
     /// that lands between the last shadow copy and the window is folded by
     /// this checkpoint and then erased by the re-pin WAL restart, but it is
-    /// invisible to `data_version` (v0 already includes it).
+    /// invisible to `data_version` (v0 already includes it). Zero when the
+    /// fold was deferred.
     pub checkpointed_frames: u64,
+    /// The fold could not complete because application readers pin the WAL
+    /// (busy or an incomplete fold). Nothing is at risk — unread frames stay
+    /// in the WAL (no reset is possible while readers pin) — so the caller
+    /// defers and retries instead of dying (PASSIVE dance only; a TRUNCATE
+    /// dance still fails loudly, since the snapshot cannot be taken).
+    pub deferred: bool,
 }
 
 impl BlockerLifecycle {
     /// Open the retained handles and arm the blocker LAST (module docs).
+    ///
+    /// Fails if another lifecycle is already armed for this database file
+    /// (same inode) anywhere in the process: two armed lifecycles would let
+    /// either one's drop release the other's POSIX locks.
     pub fn open(db_path: &Path) -> Result<Self> {
+        // Process-wide reservation first; it frees itself if any step below
+        // fails, so a failed open never leaks the identity.
+        let reservation = InodeReservation::acquire(db_path)?;
+
         // Retained raw descriptor first: every later raw read borrows this.
         let source_fd = std::fs::File::open(db_path)
             .with_context(|| format!("failed to open {} read-only", db_path.display()))?;
@@ -126,6 +206,7 @@ impl BlockerLifecycle {
             blocker_conn,
             monitor_conn,
             source_fd,
+            _reservation: reservation,
         })
     }
 
@@ -200,11 +281,15 @@ impl BlockerLifecycle {
     /// Run a controlled checkpoint through the release/re-acquire dance and
     /// report whether an application commit landed in the window.
     ///
-    /// - `truncate == false`: PASSIVE checkpoint (CLI shadow mode), folded
-    ///   frames must cover the whole log or the call fails (same semantics
-    ///   as the old one-shot `ShadowWal::checkpoint`).
-    /// - `truncate == true`: TRUNCATE checkpoint (owned snapshot mode), same
-    ///   completeness check.
+    /// - `truncate == false`: PASSIVE checkpoint (CLI shadow mode). A busy or
+    ///   incomplete fold is ordinary SQLite contention (an application reader
+    ///   is pinning part of the WAL): it returns `deferred: true` — the
+    ///   blocker is re-pinned, the caller alarms and retries, and the watch
+    ///   lives on. Only hard errors propagate.
+    /// - `truncate == true`: TRUNCATE checkpoint (owned snapshot mode). A busy
+    ///   or incomplete fold is a hard error, same semantics as the old
+    ///   one-shot `checkpoint_wal` — the snapshot cannot be taken without the
+    ///   fold.
     ///
     /// Window detection runs only for the PASSIVE dance: `PRAGMA
     /// data_version` is sampled on the idle observer connection around the
@@ -228,20 +313,27 @@ impl BlockerLifecycle {
         };
         self.release_pin()?;
 
-        let checkpoint_result = self.run_checkpoint(truncate);
-        let dirty = match (&checkpoint_result, v0) {
-            (Ok(_), Some(v0)) => Some(self.data_version().map(|v1| v1 != v0)),
+        let fold_result = self.run_checkpoint(truncate);
+        let dirty = match (&fold_result, v0) {
+            (Ok(Some(_)), Some(v0)) => Some(self.data_version().map(|v1| v1 != v0)),
             _ => None,
         };
-        // Always re-pin before returning, even when the checkpoint failed.
+        // Always re-pin before returning, even when the fold deferred or
+        // errored (the old code re-armed on failure too).
         let repin_result = self.repin();
-        match (checkpoint_result, repin_result) {
-            (Ok(checkpointed_frames), Ok(())) => Ok(ControlledCheckpoint {
+        match (fold_result, repin_result) {
+            (Ok(Some(checkpointed_frames)), Ok(())) => Ok(ControlledCheckpoint {
                 commit_in_window: match dirty {
                     Some(d) => d?,
                     None => false,
                 },
                 checkpointed_frames,
+                deferred: false,
+            }),
+            (Ok(None), Ok(())) => Ok(ControlledCheckpoint {
+                commit_in_window: false,
+                checkpointed_frames: 0,
+                deferred: true,
             }),
             (Err(checkpoint_err), Ok(())) => Err(checkpoint_err),
             (Ok(_), Err(repin_err)) => Err(repin_err),
@@ -254,8 +346,10 @@ impl BlockerLifecycle {
     /// The controlled checkpoint runs on the BLOCKER connection: after
     /// ROLLBACK it is in autocommit, and running it anywhere else (notably
     /// the observer) would either mask window commits from `data_version` or
-    /// require a third connection. Returns the folded frame count.
-    fn run_checkpoint(&self, truncate: bool) -> Result<u64> {
+    /// require a third connection. Returns the folded frame count on a
+    /// complete fold; `None` when the fold deferred to application readers
+    /// (PASSIVE dance only — busy/incomplete is a hard error for TRUNCATE).
+    fn run_checkpoint(&self, truncate: bool) -> Result<Option<u64>> {
         let pragma = if truncate {
             "PRAGMA wal_checkpoint(TRUNCATE);"
         } else {
@@ -266,6 +360,9 @@ impl BlockerLifecycle {
                 Ok((row.get(0)?, row.get(1)?, row.get(2)?))
             })?;
         if busy != 0 || checkpointed_frames < log_frames {
+            if !truncate {
+                return Ok(None);
+            }
             return Err(anyhow!(
                 "controlled checkpoint incomplete (busy={}, log_frames={}, checkpointed_frames={})",
                 busy,
@@ -273,7 +370,7 @@ impl BlockerLifecycle {
                 checkpointed_frames
             ));
         }
-        Ok(checkpointed_frames as u64)
+        Ok(Some(checkpointed_frames as u64))
     }
 }
 

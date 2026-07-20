@@ -112,6 +112,11 @@ pub struct ShadowCheckpoint {
     /// The checkpoint folded frames past the shadow's copied WAL cursor (a
     /// commit that landed between the last copy and the dance).
     pub folded_uncopied_frames: bool,
+    /// The fold could not complete because application readers pin the WAL
+    /// (busy or an incomplete fold). Nothing is at risk — unread frames stay
+    /// in the WAL — so the caller defers with a loud alarm and retries on
+    /// the next tick instead of dying.
+    pub deferred: bool,
 }
 
 /// A segment file in the shadow WAL
@@ -552,6 +557,7 @@ impl ShadowWal {
         Ok(ShadowCheckpoint {
             commit_in_window: outcome.commit_in_window,
             folded_uncopied_frames,
+            deferred: outcome.deferred,
         })
     }
 
@@ -650,25 +656,11 @@ impl ShadowWal {
     }
 }
 
-impl Drop for ShadowWal {
-    fn drop(&mut self) {
-        // Close the lifecycle handles: blocker first, then monitor, then the
-        // source descriptor (BlockerLifecycle's field order). Roll back the
-        // pinned read transaction first so the blocker's own close does not
-        // attempt its last-connection checkpoint against a live read mark.
-        // If a borrowed handle is still held elsewhere (a snapshot in flight),
-        // try_unwrap fails and the rollback is skipped: the watch loop
-        // serializes snapshot and checkpoint work per database, so that does
-        // not happen in production, and the connection's own close still
-        // cleans up the transaction when the last Arc drops.
-        if let Some(lifecycle) = self.lifecycle.take() {
-            if let Ok(mutex) = Arc::try_unwrap(lifecycle) {
-                let lifecycle = mutex.into_inner();
-                lifecycle.rollback_blocker();
-            }
-        }
-    }
-}
+// Note: no explicit Drop here. The lifecycle's own Drop does the full close
+// order (best-effort rollback; blocker, then monitor, then source
+// descriptor, then the inode reservation release) whenever the last
+// Arc<Mutex<BlockerLifecycle>> for it drops — whether that's the one in this
+// ShadowWal or one borrowed by a snapshot still in flight.
 
 #[cfg(test)]
 mod tests {

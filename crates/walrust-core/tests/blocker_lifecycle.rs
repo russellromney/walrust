@@ -402,6 +402,12 @@ async fn replicator_rejects_double_add_until_remove() {
         "error must name the double registration, got: {err}"
     );
 
+    // The second add_without_snapshot must be rejected BEFORE anything arms
+    // (the registration guard), and the ORIGINAL lifecycle must still be
+    // fully functional afterwards.
+    let outcome = run_child(&db_path, "commit_and_truncate", "original-lives");
+    assert_external_truncate_blocked(&outcome, &db_path, "original lifecycle after rejected add");
+
     replicator.remove("dbl").await.unwrap();
     // add() again would trip the remote-state guard; the reopen path must work.
     replicator
@@ -411,6 +417,44 @@ async fn replicator_rejects_double_add_until_remove() {
 
     let outcome = run_child(&db_path, "commit_and_truncate", "after-readd");
     assert_external_truncate_blocked(&outcome, &db_path, "re-add after remove");
+}
+
+/// Process-wide inode reservation: two lifecycles may not arm on the same
+/// database file at once — not through the same path, an alias, or a
+/// hardlink — a failed arming leaves the original untouched, and re-arming
+/// after a drop succeeds.
+#[tokio::test]
+async fn second_lifecycle_on_same_database_is_rejected() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = fresh_db(dir.path(), "dup.db");
+
+    let first = BlockerLifecycle::open(&db_path).unwrap();
+    let err = BlockerLifecycle::open(&db_path)
+        .err()
+        .expect("second arming on the same file must be rejected");
+    assert!(
+        err.to_string().contains("already armed"),
+        "error must name the duplicate arming, got: {err}"
+    );
+
+    // A hardlink alias resolves to the same inode and must be caught too.
+    let alias = dir.path().join("dup-alias.db");
+    std::fs::hard_link(&db_path, &alias).unwrap();
+    let err = BlockerLifecycle::open(&alias)
+        .err()
+        .expect("arming through a hardlink alias must be rejected");
+    assert!(
+        err.to_string().contains("already armed"),
+        "error must name the duplicate arming, got: {err}"
+    );
+
+    // The original lifecycle is untouched by the failed armings.
+    let outcome = run_child(&db_path, "commit_and_truncate", "original-lives");
+    assert_external_truncate_blocked(&outcome, &db_path, "original after rejected armings");
+
+    // Re-arming after the drop must succeed (the reservation releases).
+    drop(first);
+    let _second = BlockerLifecycle::open(&db_path).unwrap();
 }
 
 /// Owned mode: `Replicator::add()` arms the blocker and runs the owned
@@ -787,12 +831,12 @@ async fn bisect_which_step_invalidates_blocker() {
     );
 }
 
-/// Busy-failure negative path: an external reader pinning the WAL makes the
-/// controlled checkpoint incomplete, so the dance errors — but the blocker
-/// must be re-pinned before the error returns, and an external TRUNCATE
-/// afterwards must still be blocked.
+/// Deferred busy path: an external reader pinning part of the WAL makes the
+/// fold incomplete — ordinary contention, so the dance returns `deferred`
+/// (NOT an error), the blocker is re-pinned, and a later clean dance
+/// succeeds.
 #[tokio::test]
-async fn checkpoint_busy_failure_still_repins_blocker() {
+async fn checkpoint_busy_defer_still_repins_blocker() {
     let dir = tempfile::tempdir().unwrap();
     let db_path = fresh_db(dir.path(), "busy.db");
 
@@ -800,7 +844,7 @@ async fn checkpoint_busy_failure_still_repins_blocker() {
 
     // An external reader pinning the WAL at its current end; further commits
     // then land past its read mark, so the PASSIVE checkpoint cannot fold the
-    // whole log and the completeness check fails.
+    // whole log and must defer.
     let external = Connection::open(&db_path).unwrap();
     external.execute_batch("BEGIN DEFERRED;").unwrap();
     let _: i64 = external
@@ -808,22 +852,21 @@ async fn checkpoint_busy_failure_still_repins_blocker() {
         .unwrap();
     run_child(&db_path, "commit", "past-the-mark");
 
-    let err = lifecycle
-        .controlled_checkpoint(false)
-        .expect_err("checkpoint must fail while the external reader pins the WAL");
+    let outcome = lifecycle.controlled_checkpoint(false).unwrap();
     assert!(
-        err.to_string().contains("incomplete"),
-        "expected the completeness failure, got: {err}"
+        outcome.deferred,
+        "a reader-pinned WAL must defer the checkpoint, not error it"
     );
 
     drop(external);
 
-    // The dance re-pinned the blocker before returning the error.
-    let outcome = run_child(&db_path, "commit_and_truncate", "after-busy");
-    assert_external_truncate_blocked(&outcome, &db_path, "busy-failure re-pin");
+    // The dance re-pinned the blocker before returning the deferral.
+    let outcome = run_child(&db_path, "commit_and_truncate", "after-defer");
+    assert_external_truncate_blocked(&outcome, &db_path, "deferred checkpoint re-pin");
 
-    // And the next clean dance succeeds.
-    lifecycle.controlled_checkpoint(false).unwrap();
+    // And the next clean dance succeeds and does not defer.
+    let outcome = lifecycle.controlled_checkpoint(false).unwrap();
+    assert!(!outcome.deferred, "a clean dance must complete");
 }
 
 /// Re-pin failure recovery: if the heartbeat upsert times out behind an

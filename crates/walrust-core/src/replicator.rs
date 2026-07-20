@@ -191,16 +191,6 @@ pub struct Replicator {
     /// Each database is stored under `{prefix}{db_name}/`.
     prefix: String,
     databases: Arc<RwLock<HashMap<String, Arc<AsyncMutex<DbState>>>>>,
-    /// Names currently being registered, held across build+insert. Closing
-    /// the hazard window between the optimistic check and the map insert:
-    /// two concurrent same-name adds would both arm a lifecycle on the same
-    /// inode, and the loser's eventual drop closes its raw source
-    /// descriptor — which releases the process's POSIX locks on the inode,
-    /// zombifying the winner's blocker (see the `blocker` module docs).
-    /// Reserving the name means no second lifecycle can arm on it
-    /// concurrently; on failure the single armed lifecycle drops alone
-    /// (safe — no other armed handle exists on that inode).
-    registering: AsyncMutex<std::collections::HashSet<String>>,
     /// Background sync/snapshot task. Held so `Drop` can abort it — without
     /// this, a Replicator that is built and immediately discarded (e.g. an
     /// init retry that fails after `try_new` succeeds) leaves the task
@@ -296,7 +286,6 @@ impl Replicator {
             prefix: prefix.to_string(),
             databases: Arc::new(RwLock::new(HashMap::new())),
             background: Mutex::new(None),
-            registering: AsyncMutex::new(std::collections::HashSet::new()),
         });
 
         tracing::info!(
@@ -387,21 +376,17 @@ impl Replicator {
         // Replacing a registration would drop the old lifecycle's raw source
         // descriptor AFTER the new one is armed — and POSIX releases all of
         // the process's locks on the inode when any descriptor for it closes,
-        // killing the new blocker's SHARED lock. Reserve the name across
-        // build+insert so no second lifecycle can arm on it concurrently.
-        self.reserve_registration(name).await?;
-        let result = self.add_armed(name, db_path, wal_path, prefix).await;
-        self.registering.lock().await.remove(name);
-        result
-    }
+        // killing the new blocker's SHARED lock. Reject the double-add
+        // BEFORE anything arms; the process-wide inode reservation in
+        // BlockerLifecycle::open is the backstop for every other scope
+        // (aliases, two names, other Replicators, ShadowWal).
+        if self.databases.read().await.contains_key(name) {
+            anyhow::bail!(
+                "Replicator: '{}' is already registered; call remove() before re-adding it",
+                name
+            );
+        }
 
-    async fn add_armed(
-        &self,
-        name: &str,
-        db_path: &Path,
-        wal_path: &Path,
-        prefix: String,
-    ) -> Result<()> {
         // Build state and take initial snapshot OUTSIDE the map lock
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
@@ -465,19 +450,6 @@ impl Replicator {
         Ok(())
     }
 
-    /// Reserve a database name across build+insert (see the `registering`
-    /// field for why a concurrent arm on the same inode is fatal).
-    async fn reserve_registration(&self, name: &str) -> Result<()> {
-        let mut registering = self.registering.lock().await;
-        if !registering.insert(name.to_string()) {
-            anyhow::bail!(
-                "Replicator: '{}' is already registered or registering; call remove() before re-adding it",
-                name
-            );
-        }
-        Ok(())
-    }
-
     /// Reopen the same local database without taking a new snapshot.
     ///
     /// This reloads the saved WAL offset and is therefore only for a process
@@ -517,23 +489,15 @@ impl Replicator {
 
         let prefix = self.prefix.clone();
 
-        // Same double-registration hazard as add(): reserve the name so no
-        // second lifecycle can arm on it concurrently.
-        self.reserve_registration(name).await?;
-        let result = self
-            .add_without_snapshot_armed(name, db_path, wal_path, prefix)
-            .await;
-        self.registering.lock().await.remove(name);
-        result
-    }
+        // Same double-registration hazard as add(): reject BEFORE anything
+        // arms; the process-wide inode reservation backstops other scopes.
+        if self.databases.read().await.contains_key(name) {
+            anyhow::bail!(
+                "Replicator: '{}' is already registered; call remove() before re-adding it",
+                name
+            );
+        }
 
-    async fn add_without_snapshot_armed(
-        &self,
-        name: &str,
-        db_path: &Path,
-        wal_path: &Path,
-        prefix: String,
-    ) -> Result<()> {
         let mut state = SyncState::new_with_paths(db_path.to_path_buf(), wal_path.to_path_buf())?;
         state.name = name.to_string();
         state.rollover_observer = self.config.rollover_observer.clone();
@@ -681,17 +645,6 @@ impl Replicator {
     /// Does a final sync before removing — blocks until the sync completes.
     /// The caller should checkpoint/close the database only after this returns `Ok(())`.
     pub async fn remove(&self, name: &str) -> Result<()> {
-        // Take the same reservation as add: the removed entry's lifecycle drop
-        // closes its raw source descriptor, which must not race a new arming
-        // on the same name (the fd close would release the new blocker's
-        // POSIX locks).
-        self.reserve_registration(name).await?;
-        let result = self.remove_reserved(name).await;
-        self.registering.lock().await.remove(name);
-        result
-    }
-
-    async fn remove_reserved(&self, name: &str) -> Result<()> {
         let entry = {
             let databases = self.databases.read().await;
             databases.get(name).cloned()
