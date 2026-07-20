@@ -625,15 +625,7 @@ async fn run_db_task(
             // Periodic full-snapshot timer
             _ = snapshot_timer.tick(), if snapshot_interval_secs > 0 => {
                 tracing::debug!("{}: Taking periodic snapshot", db_name);
-                // Cache mode arms a checkpoint blocker via the cache's
-                // ShadowWal; the snapshot must borrow its retained handles
-                // instead of opening fresh descriptors for the main DB (see
-                // the `blocker` module docs in walrust-core). No-cache mode
-                // holds no blocker and keeps the one-shot path.
-                let snapshot_handles = match cache_state.as_ref() {
-                    Some(cache) => cache.shadow.lock().await.lifecycle(),
-                    None => None,
-                };
+                let snapshot_handles = snapshot_handles_for(cache_state.as_ref()).await;
                 if let Err(e) = take_snapshot_with_retry(
                     &client,
                     &bucket,
@@ -709,4 +701,69 @@ async fn run_db_task(
 
     tracing::debug!("{}: Task exiting", db_name);
     Ok(())
+}
+
+/// Cache mode arms a checkpoint blocker via the cache's `ShadowWal`; its
+/// periodic snapshot must borrow the retained lifecycle handles instead of
+/// opening fresh descriptors for the main DB (see the `blocker` module docs
+/// in walrust-core). No-cache mode holds no blocker and keeps the one-shot
+/// path (`None`).
+async fn snapshot_handles_for(
+    cache_state: Option<&CacheState>,
+) -> Option<walrust_core::blocker::SharedLifecycle> {
+    match cache_state {
+        Some(cache) => cache.shadow.lock().await.lifecycle(),
+        None => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use tokio::sync::mpsc;
+
+    /// The wiring pin: cache mode hands the snapshot the cache shadow's own
+    /// lifecycle handles (so the snapshot borrows instead of reopening), and
+    /// no-cache mode hands None (the one-shot path).
+    #[tokio::test]
+    async fn snapshot_handles_borrows_cache_shadow_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("indep.db");
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t (id INTEGER PRIMARY KEY);
+             INSERT INTO t VALUES (1);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let shadow = Arc::new(tokio::sync::Mutex::new(
+            ShadowWal::new(&db_path).await.unwrap(),
+        ));
+        let expected = shadow.lock().await.lifecycle().unwrap();
+        let (upload_tx, _rx) = mpsc::channel(1);
+        let cache_state = CacheState {
+            cache: Arc::new(LocalCache::new(&db_path).unwrap()),
+            shadow,
+            upload_tx,
+            upload_handle: None,
+            retention_duration: chrono::Duration::hours(1),
+            max_cache_size: 1 << 20,
+        };
+
+        let handles = snapshot_handles_for(Some(&cache_state))
+            .await
+            .expect("cache mode must borrow the cache shadow's lifecycle");
+        assert!(
+            Arc::ptr_eq(&expected, &handles),
+            "the snapshot must borrow the cache shadow's exact lifecycle handles"
+        );
+        assert!(
+            snapshot_handles_for(None).await.is_none(),
+            "no-cache mode must keep the one-shot path"
+        );
+    }
 }

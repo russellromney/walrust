@@ -204,6 +204,17 @@ impl ShadowWal {
         .await?
     }
 
+    /// Open a read connection that prevents SQLite from auto-checkpointing.
+    /// Also used by walrust-owned replication to pin the live WAL (D2).
+    ///
+    /// Test-only access to the arming primitive (the checkpoint-blocker
+    /// contract matrix); production goes through [`BlockerLifecycle::open`],
+    /// which retains the full handle set around it.
+    #[cfg(test)]
+    pub(crate) fn open_checkpoint_blocker(db_path: &Path) -> Result<Connection> {
+        crate::blocker::open_checkpoint_blocker_conn(db_path)
+    }
+
     /// Find the latest generation number in the shadow directory
     async fn find_latest_generation(shadow_dir: &Path) -> Result<Option<u64>> {
         let mut max_gen: Option<u64> = None;

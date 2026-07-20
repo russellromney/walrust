@@ -306,12 +306,21 @@ impl BlockerLifecycle {
     /// reports the window commit detection and the folded frame count (see
     /// [`ControlledCheckpoint`]).
     pub fn controlled_checkpoint(&self, truncate: bool) -> Result<ControlledCheckpoint> {
+        self.controlled_checkpoint_impl(truncate, &|| {})
+    }
+
+    fn controlled_checkpoint_impl(
+        &self,
+        truncate: bool,
+        after_release: &dyn Fn(),
+    ) -> Result<ControlledCheckpoint> {
         let v0 = if truncate {
             None
         } else {
             Some(self.data_version()?)
         };
         self.release_pin()?;
+        after_release();
 
         let fold_result = self.run_checkpoint(truncate);
         let dirty = match (&fold_result, v0) {
@@ -378,7 +387,7 @@ impl BlockerLifecycle {
 /// transaction pinning a real WAL frame so external checkpoints cannot
 /// truncate past the mark (D2). Used by [`BlockerLifecycle::open`], which
 /// retains the full handle set around it — never arm one without them.
-fn open_checkpoint_blocker_conn(db_path: &Path) -> Result<Connection> {
+pub(crate) fn open_checkpoint_blocker_conn(db_path: &Path) -> Result<Connection> {
     let conn = Connection::open(db_path)?;
 
     ensure_connection_in_wal_mode(&conn, db_path)?;
@@ -412,4 +421,62 @@ fn repin_blocker_conn(conn: &Connection) -> Result<()> {
         row.get(0)
     })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fresh_db(dir: &tempfile::TempDir, name: &str) -> std::path::PathBuf {
+        let db_path = dir.path().join(name);
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);
+             INSERT INTO t (v) VALUES ('seed');",
+        )
+        .unwrap();
+        drop(conn);
+        db_path
+    }
+
+    /// Deterministic PASSIVE-window commit detection: the commit is planted
+    /// exactly between pin release and the checkpoint through the dance's
+    /// hook — no racing, no timing.
+    #[test]
+    fn passive_dance_detects_hooked_window_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = fresh_db(&dir, "hook.db");
+        let lifecycle = BlockerLifecycle::open(&db_path).unwrap();
+        let writer = Connection::open(&db_path).unwrap();
+
+        let outcome = lifecycle
+            .controlled_checkpoint_impl(false, &|| {
+                writer
+                    .execute("INSERT INTO t (v) VALUES ('hooked')", [])
+                    .unwrap();
+            })
+            .unwrap();
+        assert!(
+            outcome.commit_in_window,
+            "a commit planted in the release window must be detected"
+        );
+        assert!(!outcome.deferred, "the fold must complete");
+    }
+
+    /// Same hook with no commit: the window must report clean.
+    #[test]
+    fn passive_dance_reports_clean_window_with_hook() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = fresh_db(&dir, "hook-clean.db");
+        let lifecycle = BlockerLifecycle::open(&db_path).unwrap();
+
+        let outcome = lifecycle.controlled_checkpoint_impl(false, &|| {}).unwrap();
+        assert!(
+            !outcome.commit_in_window,
+            "an empty release window must report clean"
+        );
+        assert!(!outcome.deferred, "the fold must complete");
+    }
 }

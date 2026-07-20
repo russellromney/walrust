@@ -2144,13 +2144,17 @@ pub async fn take_snapshot(
     // different physical layout on restore.
     let snapshot = match state.checkpoint_blocker.as_ref() {
         Some(lifecycle) => {
-            let guard = lifecycle.lock().await;
-            ltx::encode_snapshot_with_checksum_fd(
-                guard.source_fd(),
-                page_size,
-                new_seq,
-                prev_checksum,
-            )?
+            let lifecycle = lifecycle.clone();
+            tokio::task::spawn_blocking(move || {
+                let guard = lifecycle.blocking_lock();
+                ltx::encode_snapshot_with_checksum_fd(
+                    guard.source_fd(),
+                    page_size,
+                    new_seq,
+                    prev_checksum,
+                )
+            })
+            .await??
         }
         None => {
             ltx::encode_snapshot_with_checksum(&state.db_path, page_size, new_seq, prev_checksum)?
@@ -2714,13 +2718,17 @@ async fn take_snapshot_with_retry_guarded(
     let prev_checksum = state.db_checksum.unwrap_or(0);
     let snapshot = match state.checkpoint_blocker.as_ref() {
         Some(lifecycle) => {
-            let guard = lifecycle.lock().await;
-            ltx::encode_snapshot_with_checksum_fd(
-                guard.source_fd(),
-                page_size,
-                new_seq,
-                prev_checksum,
-            )?
+            let lifecycle = lifecycle.clone();
+            tokio::task::spawn_blocking(move || {
+                let guard = lifecycle.blocking_lock();
+                ltx::encode_snapshot_with_checksum_fd(
+                    guard.source_fd(),
+                    page_size,
+                    new_seq,
+                    prev_checksum,
+                )
+            })
+            .await??
         }
         None => {
             ltx::encode_snapshot_with_checksum(&state.db_path, page_size, new_seq, prev_checksum)?

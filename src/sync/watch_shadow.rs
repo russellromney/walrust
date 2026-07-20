@@ -113,10 +113,40 @@ async fn copy_final_shadow_frames(db_states: &mut HashMap<PathBuf, ShadowDbState
     Ok(())
 }
 
+/// Build the throwaway `DbState` a snapshot call needs from a shadow state.
+fn snapshot_db_state(state: &ShadowDbState) -> DbState {
+    DbState {
+        name: state.name.clone(),
+        db_path: state.db_path.clone(),
+        wal_path: state.wal_path.clone(),
+        wal_offset: 0,
+        wal_generation: state.shadow.generation(),
+        current_txid: state.current_txid,
+        last_snapshot: state.last_snapshot,
+        db_checksum: state.db_checksum,
+        wal_salt: None,
+        wal_checksum_chain: None,
+    }
+}
+
+/// Anchor the shadow state to a snapshot just taken: adopt its metadata and
+/// reset the shadow/live-WAL cursors so the next sync resumes from the fresh
+/// WAL, then persist the progress record. Used by every eager-snapshot path
+/// (startup, downtime-checkpoint D3, window-commit re-anchor).
+async fn apply_shadow_snapshot_anchor(state: &mut ShadowDbState, db_state: &DbState) -> Result<()> {
+    state.current_txid = db_state.current_txid;
+    state.last_snapshot = db_state.last_snapshot;
+    state.db_checksum = db_state.db_checksum;
+    state.shadow_sync_generation = state.shadow.generation();
+    state.shadow_sync_offset = state.shadow.segment_offset();
+    state.wal_copy_offset = 0;
+    save_shadow_progress(state)
+}
+
 async fn checkpoint_shadow_after_durable_sync(
     state: &mut ShadowDbState,
     cache_state: Option<&(Arc<LocalCache>, mpsc::Sender<UploadMessage>)>,
-    direct_target: Option<DirectShadowSyncTarget>,
+    direct_target: DirectShadowSyncTarget,
     retry_policy: &RetryPolicy,
     webhook_sender: Arc<WebhookSender>,
     drain_timeout: Duration,
@@ -147,21 +177,16 @@ async fn checkpoint_shadow_after_durable_sync(
             Arc::clone(&webhook_sender),
         )
         .await?
-    } else if let Some(target) = direct_target.as_ref() {
+    } else {
         sync_shadow_concurrent_with_retry(
-            Arc::clone(&target.client),
-            target.bucket_name.clone(),
-            target.prefix.clone(),
+            Arc::clone(&direct_target.client),
+            direct_target.bucket_name.clone(),
+            direct_target.prefix.clone(),
             input,
             retry_policy.clone(),
             Arc::clone(&webhook_sender),
         )
         .await?
-    } else {
-        anyhow::bail!(
-            "{}: no cache uploader or direct upload target configured for checkpoint drain",
-            state.name
-        );
     };
     if let Some((cache, _)) = cache_state {
         wait_for_cache_checkpoint_durability(
@@ -226,44 +251,18 @@ async fn checkpoint_shadow_after_durable_sync(
             checkpoint_outcome.commit_in_window,
             checkpoint_outcome.folded_uncopied_frames
         );
-        let target = direct_target.ok_or_else(|| {
-            // Hard requirement, not an option: without an upload target a
-            // window commit can only fail loudly. The production checkpoint
-            // timer always passes Some; None is test-only.
-            anyhow!(
-                "{}: commit-in-window re-anchor requires the direct upload target",
-                state.name
-            )
-        })?;
-        let mut db_state = DbState {
-            name: state.name.clone(),
-            db_path: state.db_path.clone(),
-            wal_path: state.wal_path.clone(),
-            wal_offset: 0,
-            wal_generation: state.shadow.generation(),
-            current_txid: state.current_txid,
-            last_snapshot: state.last_snapshot,
-            db_checksum: state.db_checksum,
-            wal_salt: None,
-            wal_checksum_chain: None,
-        };
+        let mut db_state = snapshot_db_state(state);
         take_snapshot_with_retry(
-            &target.client,
-            &target.bucket_name,
-            &target.prefix,
+            &direct_target.client,
+            &direct_target.bucket_name,
+            &direct_target.prefix,
             &mut db_state,
             retry_policy,
             &webhook_sender,
             state.shadow.lifecycle(),
         )
         .await?;
-        state.current_txid = db_state.current_txid;
-        state.last_snapshot = db_state.last_snapshot;
-        state.db_checksum = db_state.db_checksum;
-        state.shadow_sync_generation = state.shadow.generation();
-        state.shadow_sync_offset = state.shadow.segment_offset();
-        state.wal_copy_offset = 0;
-        save_shadow_progress(state)?;
+        apply_shadow_snapshot_anchor(state, &db_state).await?;
     }
 
     let cleanup_before_gen = state.shadow_sync_generation;
@@ -420,10 +419,10 @@ pub async fn watch_with_shadow(
 }
 
 /// [`watch_with_shadow`] with an injectable shutdown trigger: when `shutdown`
-    /// resolves, the watch runs its graceful final drain and returns. Tests
-    /// use this instead of process-global signals, which are not test-safe
-    /// (they can land on the wrong thread or affect concurrently running
-    /// tests).
+/// resolves, the watch runs its graceful final drain and returns. Tests
+/// use this instead of process-global signals, which are not test-safe
+/// (they can land on the wrong thread or affect concurrently running
+/// tests).
 pub(crate) async fn watch_with_shadow_and_shutdown(
     databases: Vec<ResolvedDbConfig>,
     bucket: &str,
@@ -690,19 +689,7 @@ pub(crate) async fn watch_with_shadow_and_shutdown(
     for (db_path, state) in db_states.iter_mut() {
         let sync_config = sync_configs.get(db_path).unwrap_or(&global_sync);
         if sync_config.on_startup && !eager_snapshot_paths.contains(db_path) {
-            // Convert to DbState temporarily for snapshot
-            let mut db_state = DbState {
-                name: state.name.clone(),
-                db_path: state.db_path.clone(),
-                wal_path: state.wal_path.clone(),
-                wal_offset: 0,
-                wal_generation: state.shadow.generation(),
-                current_txid: state.current_txid,
-                last_snapshot: state.last_snapshot,
-                db_checksum: state.db_checksum,
-                wal_salt: None,
-                wal_checksum_chain: None,
-            };
+            let mut db_state = snapshot_db_state(state);
             if let Err(e) = take_snapshot_with_retry(
                 &client,
                 &bucket_name,
@@ -716,13 +703,7 @@ pub(crate) async fn watch_with_shadow_and_shutdown(
             {
                 tracing::error!("{}: Initial snapshot failed: {}", state.name, e);
             } else {
-                state.current_txid = db_state.current_txid;
-                state.last_snapshot = db_state.last_snapshot;
-                state.db_checksum = db_state.db_checksum;
-                state.shadow_sync_generation = state.shadow.generation();
-                state.shadow_sync_offset = state.shadow.segment_offset();
-                state.wal_copy_offset = 0;
-                save_shadow_progress(state)?;
+                apply_shadow_snapshot_anchor(state, &db_state).await?;
 
                 if let Some(trigger) = trigger_states.get_mut(db_path) {
                     trigger.frames_since_snapshot = 0;
@@ -739,18 +720,7 @@ pub(crate) async fn watch_with_shadow_and_shutdown(
         let state = db_states
             .get_mut(db_path)
             .expect("eager snapshot path must exist in db_states");
-        let mut db_state = DbState {
-            name: state.name.clone(),
-            db_path: state.db_path.clone(),
-            wal_path: state.wal_path.clone(),
-            wal_offset: 0,
-            wal_generation: state.shadow.generation(),
-            current_txid: state.current_txid,
-            last_snapshot: state.last_snapshot,
-            db_checksum: state.db_checksum,
-            wal_salt: None,
-            wal_checksum_chain: None,
-        };
+        let mut db_state = snapshot_db_state(state);
         if let Err(e) = take_snapshot_with_retry(
             &client,
             &bucket_name,
@@ -769,13 +739,7 @@ pub(crate) async fn watch_with_shadow_and_shutdown(
             );
             metrics_state.record_error(&state.name);
         } else {
-            state.current_txid = db_state.current_txid;
-            state.last_snapshot = db_state.last_snapshot;
-            state.db_checksum = db_state.db_checksum;
-            state.shadow_sync_generation = state.shadow.generation();
-            state.shadow_sync_offset = state.shadow.segment_offset();
-            state.wal_copy_offset = 0;
-            save_shadow_progress(state)?;
+            apply_shadow_snapshot_anchor(state, &db_state).await?;
             metrics_state.record_snapshot(&state.name);
 
             if let Some(trigger) = trigger_states.get_mut(db_path) {
@@ -1178,11 +1142,11 @@ pub(crate) async fn watch_with_shadow_and_shutdown(
                         match checkpoint_shadow_after_durable_sync(
                             state,
                             cache_states.get(db_path),
-                            Some(DirectShadowSyncTarget {
+                            DirectShadowSyncTarget {
                                 client: Arc::clone(&client),
                                 bucket_name: bucket_name.clone(),
                                 prefix: prefix.clone(),
-                            }),
+                            },
                             &retry_policy,
                             Arc::clone(&webhook_sender),
                             CHECKPOINT_UPLOAD_DRAIN_TIMEOUT,
@@ -1448,8 +1412,11 @@ mod tests {
         let (_temp, db_path, conn) = create_real_wal_db();
         // Enough rows to exceed one page of WAL.
         for i in 0..50 {
-            conn.execute("INSERT INTO items (value) VALUES (?1)", [format!("row-{i}")])
-                .unwrap();
+            conn.execute(
+                "INSERT INTO items (value) VALUES (?1)",
+                [format!("row-{i}")],
+            )
+            .unwrap();
         }
         let shadow = ShadowWal::new(&db_path).await.unwrap();
         let wal_bytes = std::fs::metadata(db_path.with_extension("db-wal"))
@@ -1898,7 +1865,7 @@ mod tests {
         let reanchored = checkpoint_shadow_after_durable_sync(
             &mut state,
             Some(&cache_state),
-            None,
+            dummy_direct_target().await,
             &RetryPolicy::new(RetryConfig::default()),
             Arc::new(WebhookSender::new(vec![])),
             Duration::from_secs(2),
@@ -1953,7 +1920,7 @@ mod tests {
         let err = checkpoint_shadow_after_durable_sync(
             &mut state,
             Some(&cache_state),
-            None,
+            dummy_direct_target().await,
             &RetryPolicy::new(RetryConfig::default()),
             Arc::new(WebhookSender::new(vec![])),
             Duration::from_millis(100),
@@ -2195,11 +2162,11 @@ mod tests {
             match checkpoint_shadow_after_durable_sync(
                 &mut state,
                 None,
-                Some(DirectShadowSyncTarget {
+                DirectShadowSyncTarget {
                     client: Arc::clone(&client),
                     bucket_name: bucket_name.clone(),
                     prefix: prefix.clone(),
-                }),
+                },
                 &retry_policy,
                 Arc::clone(&webhook_sender),
                 Duration::from_secs(30),
@@ -2262,11 +2229,11 @@ mod tests {
             match checkpoint_shadow_after_durable_sync(
                 &mut state,
                 None,
-                Some(DirectShadowSyncTarget {
+                DirectShadowSyncTarget {
                     client: Arc::clone(&client),
                     bucket_name: bucket_name.clone(),
                     prefix: prefix.clone(),
-                }),
+                },
                 &retry_policy,
                 Arc::clone(&webhook_sender),
                 Duration::from_secs(30),
@@ -2547,9 +2514,11 @@ mod tests {
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         writer.join().unwrap();
         truncater.join().unwrap();
-        let snapshots_before_quiet = count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
+        let snapshots_before_quiet =
+            count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
         tokio::time::sleep(Duration::from_secs(4)).await;
-        let snapshots_after_quiet = count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
+        let snapshots_after_quiet =
+            count_snapshot_objects(&client, &bucket_name, &prefix, &name).await;
         assert!(
             snapshots_after_quiet - snapshots_before_quiet <= 3,
             "quiet phase must produce only periodic snapshots, no re-anchor storm ({} -> {})",
@@ -2652,6 +2621,17 @@ mod tests {
         }
     }
 
+    /// A never-used upload target for cache-mode checkpoint tests: the
+    /// client is constructed but never PUTs (cache mode drains through the
+    /// LocalCache). The re-anchor path requires a target structurally.
+    async fn dummy_direct_target() -> DirectShadowSyncTarget {
+        DirectShadowSyncTarget {
+            client: Arc::new(create_client(None).await.unwrap()),
+            bucket_name: "unused".to_string(),
+            prefix: String::new(),
+        }
+    }
+
     /// One-shot webhook capture: returns the server URL and a handle that
     /// resolves with the first request body it receives.
     async fn capture_one_webhook() -> (String, tokio::task::JoinHandle<String>) {
@@ -2666,9 +2646,7 @@ mod tests {
                 let n = stream.read(&mut chunk).await.unwrap();
                 assert!(n > 0, "webhook connection closed before request body");
                 buffer.extend_from_slice(&chunk[..n]);
-                if let Some(header_end) = buffer
-                    .windows(4)
-                    .position(|window| window == b"\r\n\r\n")
+                if let Some(header_end) = buffer.windows(4).position(|window| window == b"\r\n\r\n")
                 {
                     let headers = String::from_utf8_lossy(&buffer[..header_end]);
                     let content_length: usize = headers
@@ -2722,4 +2700,3 @@ mod tests {
             .count()
     }
 }
-
