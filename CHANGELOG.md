@@ -114,6 +114,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Testing
 
+- Pinned the checkpoint-blocker contract against real SQLite databases across
+  every supported page size and synchronous level: a concurrent
+  `wal_checkpoint(TRUNCATE)` reports busy and preserves the WAL until walrust
+  releases its pinned read transaction.
 - Added public-API integration coverage for flat and lineaged owned histories,
   leveled-compaction restore/resume, mixed DDL/INSERT/UPDATE/DELETE/blob loads,
   PITR refusal with no storage writes, competing-writer refusal with byte-exact
