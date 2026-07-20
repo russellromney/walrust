@@ -75,21 +75,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   handles; the startup checksum and startup re-anchor run before arming and
   are unaffected. Double-registration guard is TOCTOU-safe (re-checked under
   the write lock at insert).
-- **Design review hardening:** registration is now reserved by name across
-  build+insert AND remove, so no two lifecycles can ever arm on the same
-  name concurrently (a concurrent same-name add would have zombified the
-  winner when the loser's handles dropped). New whole-watch end-to-end
+- **Design review hardening:** at most one lifecycle can arm per database
+  file, process-wide: `BlockerLifecycle::open` acquires an RAII reservation
+  on the database's dev+inode before opening any descriptor, released on
+  drop — a failed or cancelled arming frees it automatically, and duplicate
+  arming (same path, alias, or hardlink, in any scope) is rejected with the
+  original lifecycle untouched. The Replicator rejects double-registration
+  before anything arms. New whole-watch end-to-end
   (`e2e_cli_shadow_watch_survives_ephemeral_writer_live_s3`): the real
   `watch_with_shadow` loop drives snapshot+checkpoint timers against an
   ephemeral one-connection-per-commit writer plus app-side
   `wal_checkpoint(TRUNCATE)` attempts — the watch stays alive (DF1), every
   app TRUNCATE is refused, the WAL is never unlinked, snapshots stay
-  bounded, and a restore after graceful SIGTERM is row-exact (DF2). New API
+  bounded, and a restore after graceful shutdown is row-exact (DF2). New API
   surface narrowed (`SharedLifecycle` alias; three `pub(crate)` helpers; the
   armer is private). Coverage additions: double-registration
   rejection/re-add, borrowed-snapshot content decode + repeat-snapshot
   busy-timeout behavior, folded-extent detection at 512-byte and 64KiB page
   sizes.
+- **Blocking-review remediations (lifecycle hardening):** a busy/incomplete
+  PASSIVE checkpoint (ordinary application-reader contention) is now a typed
+  deferred outcome — re-pin, retain, loud alarm with the live WAL size,
+  retry on the next tick — instead of an error that killed the watch and
+  dropped the blocker. The owned TRUNCATE dance still fails loudly on an
+  incomplete fold (its snapshot cannot be taken). The WAL-growth alarm
+  (previously a plumbed-but-unread config knob) fires every tick over
+  threshold with the exact size (revert-proof: disabling its send fails the
+  test). Startup checksum failure is fail-closed in both watch modes instead
+  of reaching the armed encoder's raw-open fallback. The graceful shutdown
+  drains the shadow until quiescent instead of one possibly-stale round.
+  Snapshot anchoring lives in one helper used by all three eager paths; the
+  re-anchor's direct upload target is structural; the owned snapshot encode
+  runs in `spawn_blocking`; PASSIVE window-commit detection has a
+  deterministic dance-hook test alongside the race-stress test; shutdown in
+  tests is an injected oneshot rather than a process-global signal.
 
 - **`sync::restore` is `Send` in spawned tasks:** compaction restore prefetch now
   owns each planned candidate instead of retaining borrowed plan entries across
