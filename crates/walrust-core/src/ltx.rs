@@ -604,12 +604,24 @@ pub fn chain_checksum(prev: u64, pages: &[(u32, Vec<u8>)]) -> u64 {
 /// Returns a raw u64 (SHA256 truncated to 8 bytes). This is a full-DB hash
 /// used for snapshots, NOT the HADBP chain checksum.
 pub fn compute_checksum_from_file(db_path: &Path) -> Result<u64> {
-    use sha2::{Digest, Sha256};
-    use std::io::BufReader;
-
     let file = std::fs::File::open(db_path)
         .map_err(|e| anyhow!("Failed to open database for checksum: {}", e))?;
-    let mut reader = BufReader::with_capacity(1024 * 1024, file);
+    compute_checksum_from_fd(&file)
+}
+
+/// [`compute_checksum_from_file`] through an already-open descriptor.
+///
+/// Checksum computation while the checkpoint blocker is armed MUST borrow the
+/// retained source descriptor this way: opening and closing a fresh
+/// descriptor for the main DB would release the process's POSIX locks on the
+/// inode (see the `blocker` module docs).
+pub fn compute_checksum_from_fd(file: &std::fs::File) -> Result<u64> {
+    use sha2::{Digest, Sha256};
+    use std::io::{BufReader, Seek, SeekFrom};
+
+    let mut file_ref = file;
+    file_ref.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::with_capacity(1024 * 1024, file_ref);
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 65536];
 
@@ -640,6 +652,22 @@ pub fn compute_db_checksum_raw(data: &[u8]) -> u64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn test_checksum_from_fd_matches_checksum_from_file() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("checksum-parity.db");
+        // Larger than one 64KiB read chunk so the streaming loop iterates.
+        let data: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&db_path, &data).unwrap();
+
+        let file = std::fs::File::open(&db_path).unwrap();
+        assert_eq!(
+            compute_checksum_from_fd(&file).unwrap(),
+            compute_checksum_from_file(&db_path).unwrap(),
+            "the fd path must hash the exact same bytes as the file path"
+        );
+    }
 
     #[test]
     fn test_snapshot_roundtrip_single_page() {

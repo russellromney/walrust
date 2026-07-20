@@ -1247,6 +1247,27 @@ async fn ensure_database_in_wal_mode(db_path: &Path, db_name: &str) -> Result<()
     }
 }
 
+/// Pre-image checksum for delta encoding. When the checkpoint blocker is
+/// armed, hash through its retained source descriptor: opening and closing a
+/// fresh descriptor for the main DB while armed would release the process's
+/// POSIX locks on the inode (see the `blocker` module docs).
+async fn pre_image_checksum(state: &SyncState) -> Result<u64> {
+    if let Some(cs) = state.db_checksum {
+        return Ok(cs);
+    }
+    match state.checkpoint_blocker.as_ref() {
+        Some(lifecycle) => {
+            let lifecycle = lifecycle.clone();
+            tokio::task::spawn_blocking(move || {
+                let guard = lifecycle.blocking_lock();
+                ltx::compute_checksum_from_fd(guard.source_fd())
+            })
+            .await?
+        }
+        None => ltx::compute_checksum_from_file(&state.db_path),
+    }
+}
+
 async fn sync_wal_with_sequence(
     storage: &dyn StorageBackend,
     prefix: &str,
@@ -1325,10 +1346,7 @@ async fn sync_wal_with_sequence(
 
     let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
 
-    let pre_checksum = match state.db_checksum {
-        Some(cs) => cs,
-        None => ltx::compute_checksum_from_file(&state.db_path)?,
-    };
+    let pre_checksum = pre_image_checksum(state).await?;
 
     // Derive TXID from SQLite's file change counter for change detection.
     // TXID is internal-only -- the HADBP format uses seq.
@@ -2032,10 +2050,7 @@ pub async fn sync_wal_fenced_delta(
 
     let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
 
-    let pre_checksum = match state.db_checksum {
-        Some(cs) => cs,
-        None => ltx::compute_checksum_from_file(&state.db_path)?,
-    };
+    let pre_checksum = pre_image_checksum(state).await?;
 
     let max_txid = change_counter_from_pages(&pages)
         .filter(|&cc| cc > state.current_txid)
@@ -2826,10 +2841,7 @@ pub async fn sync_wal_with_retry(
 
     let pages: Vec<(u32, Vec<u8>)> = page_map.into_iter().collect();
 
-    let pre_checksum = match state.db_checksum {
-        Some(cs) => cs,
-        None => ltx::compute_checksum_from_file(&state.db_path)?,
-    };
+    let pre_checksum = pre_image_checksum(state).await?;
 
     let max_txid = change_counter_from_pages(&pages)
         .filter(|&cc| cc > state.current_txid)

@@ -366,6 +366,62 @@ async fn cli_startup_snapshot_does_not_invalidate_blocker() {
     assert_external_truncate_blocked(&outcome, &db_path, "cli startup snapshot");
 }
 
+/// Owned HADBP sync with `db_checksum == None` while the blocker is armed: the
+/// pre-image hash must be computed through the retained source descriptor
+/// (`pre_image_checksum` in walrust-core/src/sync.rs), never by reopening the
+/// main DB. An open/close of the main DB while armed drops the process's POSIX
+/// locks on the inode; the TRUNCATE probe below still reports busy (read marks
+/// live on the `-shm` inode), but the child's last-connection close can then
+/// take the EXCLUSIVE main-db lock its close-time checkpoint needs — the DF2
+/// kill shape. Neuter the fd arm of `pre_image_checksum` (back to
+/// `compute_checksum_from_file`) and the close/unlink assertions below fail on
+/// platforms where a bare main-db open/close is load-bearing.
+#[tokio::test]
+async fn owned_sync_armed_none_checksum_preserves_blocker() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = fresh_db(dir.path(), "owned-none-checksum.db");
+
+    let mut state = walrust_core::sync::SyncState::new(db_path.clone()).unwrap();
+    state.checkpoint_blocker = Some(Arc::new(tokio::sync::Mutex::new(
+        BlockerLifecycle::open(&db_path).unwrap(),
+    )));
+    state.db_checksum = None;
+
+    // Frames for the incremental to encode, committed past the blocker's mark.
+    let app = Connection::open(&db_path).unwrap();
+    app.execute("INSERT INTO app_data (value) VALUES ('pre-sync')", [])
+        .unwrap();
+
+    let storage = MemStorage::default();
+    let shipped = walrust_core::sync::sync_wal_with_retry(
+        &storage,
+        "pfx/",
+        &mut state,
+        &hadb_io::RetryPolicy::default_policy(),
+    )
+    .await
+    .unwrap();
+    assert!(shipped >= 1, "the incremental must ship");
+
+    // External TRUNCATE is still refused (the read-mark layer).
+    let outcome = run_child(&db_path, "commit_and_truncate", "post-sync");
+    assert_external_truncate_blocked(&outcome, &db_path, "owned sync, None checksum");
+
+    // The child's close-time checkpoint must not take EXCLUSIVE and unlink the
+    // WAL (the main-db SHARED-lock layer).
+    let before = wal_state(&db_path);
+    run_child(&db_path, "commit", "closer");
+    let after = wal_state(&db_path);
+    assert!(
+        after.exists && after.len > 0,
+        "child close must not unlink the WAL while the blocker is armed ({before:?} -> {after:?})"
+    );
+    assert_eq!(
+        after.ino, before.ino,
+        "the WAL must be the same inode (not unlinked and recreated)"
+    );
+}
+
 /// Double-registration is rejected before arming (a replaced lifecycle's raw
 /// descriptor must never close after the new one arms); `remove()` clears the
 /// way for a re-add, and the re-armed blocker still blocks.
