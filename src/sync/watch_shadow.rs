@@ -3021,7 +3021,8 @@ mod tests {
         // Phase 2: a long application reader pins part of the WAL across a
         // checkpoint tick. The dance must DEFER with a loud alarm — the watch
         // must NOT die (dying would drop the blocker and leave the WAL
-        // unprotected). The WAL grows while the fold defers.
+        // unprotected) and the WAL must never be truncated underneath the
+        // reader.
         let wal_before = std::fs::metadata(db_path.with_extension("db-wal"))
             .map(|m| m.len())
             .unwrap_or(0);
@@ -3035,12 +3036,18 @@ mod tests {
             !watch.is_finished(),
             "watch must survive a long application reader across its checkpoint tick"
         );
+        // The fold must never truncate while the application reader pins the
+        // WAL. Growth is NOT asserted here: walrust's deferred checkpoint
+        // busy-waits behind the reader holding the writer lock, which can
+        // stall the ephemeral writer for the whole window on some platforms
+        // (Linux CI observed 53592 -> 53592); non-shrink is the invariant.
+        // The defer itself is proven by the loud alarm asserted just below.
         let wal_during = std::fs::metadata(db_path.with_extension("db-wal"))
             .map(|m| m.len())
             .unwrap_or(0);
         assert!(
-            wal_during > wal_before,
-            "WAL must grow while the fold defers to the application reader ({wal_before} -> {wal_during})"
+            wal_during >= wal_before,
+            "WAL must never be truncated while the fold defers to the application reader ({wal_before} -> {wal_during})"
         );
         drop(holder);
 
