@@ -60,21 +60,58 @@ changesets, and takes periodic snapshots. See
 cargo install walrust
 ```
 
+walrust reads standard AWS credentials and region from the environment, and
+every command that talks to S3 also honors `AWS_ENDPOINT_URL_S3` when
+`--endpoint` isn't passed:
+
+```bash
+export AWS_ACCESS_KEY_ID=...
+export AWS_SECRET_ACCESS_KEY=...
+export AWS_REGION=auto        # any region string satisfies the SDK for most S3-compatibles
+export AWS_ENDPOINT_URL_S3=https://fly.storage.tigris.dev   # your S3-compatible endpoint
+```
+
+Your database must already be in WAL mode — `walrust watch` refuses a
+rollback-journal database rather than replicate it wrong. A stock `sqlite3`
+database is *not* in WAL mode; apply the recommended settings with:
+
+```bash
+walrust pragma --output pragma.sql && sqlite3 app.db < pragma.sql
+```
+
+(Use the `--output` form: piping `walrust pragma` straight into sqlite3
+currently breaks when a `walrust.toml` is in the working directory, because a
+config log line precedes the SQL on stdout.)
+
 ```bash
 walrust watch app.db -b s3://my-bucket --endpoint https://fly.storage.tigris.dev
 ```
 
-More commands:
+More commands (`app` is the database's name in the bucket — the file stem of
+the watched path, exactly as `walrust list` shows it; always pass the same
+bucket URI, including any prefix, that `watch` used):
 
 ```bash
-walrust restore mydb -o restored.db -b s3://my-bucket                        # restore from S3
-walrust restore mydb -o restored.db -b s3://my-bucket --point-in-time 42     # restore through TXID/sequence 42
+walrust restore app -o restored.db -b s3://my-bucket                        # restore from S3
+walrust restore app -o restored.db -b s3://my-bucket --point-in-time 42     # restore through TXID/sequence 42
 walrust snapshot app.db -b s3://my-bucket                  # immediate snapshot (errors if a watcher owns the DB)
-walrust verify mydb -b s3://my-bucket                      # check backup integrity
+walrust verify app -b s3://my-bucket                       # check backup integrity
 walrust list -b s3://my-bucket                             # list backups
-walrust prune -b s3://my-bucket                            # GFS retention cleanup
+walrust prune app -b s3://my-bucket                        # GFS retention cleanup
 walrust explain                                            # preview resolved config
 ```
+
+**Finding a point-in-time restore target.** `--point-in-time` takes a TXID (a
+per-sync sequence number), not a timestamp. `walrust list` shows each
+database's current TXID and its newest snapshot's TXID — it does not enumerate
+history or map TXIDs to wall-clock time. To roll back a bad change (a
+destructive migration, a bad deploy): restore at TXIDs below the current one
+and inspect each output database until you find the state you want — probing
+is safe because every restore is chain-verified and written to a separate
+output path, and the newest-snapshot TXID from `list` is always a restorable
+floor. Before a risky migration, note the current TXID from `walrust list` so
+you can restore exactly to it. (`drills/fresh-user.sh` exercises this exact
+recovery, end to end, against the published crates.io binary.)
 
 ## Use as a library
 
@@ -164,6 +201,13 @@ behavior breaks:
   provably-clean restart is possible future work (see ROADMAP).
 - **Single writer, enforced.** A lock file (`.walrust-<db>.lock`) makes a
   second watcher on the same host fail fast instead of corrupting the backup.
+- **Known issue (DF2): intermittent writers can silently stall replication.**
+  If your writes come from short-lived sqlite3 sessions (cron jobs, scripts)
+  rather than a long-lived app connection, the default watch mode can stop
+  shipping writes after a WAL restart — with no error and a healthy-looking
+  `list`/`verify`. Confirmed on 0.7.0 by `drills/fresh-user.sh`; tracked as
+  DF2 under "Dogfooding findings" in `ROADMAP.md` (fix in progress). Until
+  fixed, prefer a long-running app connection, and test your restore.
 - **Retention never orphans a restore point.** `prune` keeps every object a
   retained point-in-time restore still needs.
 
