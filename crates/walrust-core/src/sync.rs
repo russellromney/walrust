@@ -1125,6 +1125,28 @@ async fn existing_changeset_is_our_publish(
     }
 }
 
+/// Speculative WAL-reader bookkeeping must not outlive a failed or cancelled
+/// fenced publish. Keep the cursor pinned until its envelope is durable.
+struct WalCursorRollback<'a> {
+    state: &'a mut SyncState,
+    wal_offset: u64,
+    wal_generation: u64,
+    wal_salt: Option<(u32, u32)>,
+    wal_checksum_chain: Option<(u32, u32)>,
+    committed: bool,
+}
+
+impl Drop for WalCursorRollback<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.state.wal_offset = self.wal_offset;
+            self.state.wal_generation = self.wal_generation;
+            self.state.wal_salt = self.wal_salt;
+            self.state.wal_checksum_chain = self.wal_checksum_chain;
+        }
+    }
+}
+
 /// Result of reading the next batch of WAL frames for a sync site.
 struct WalBatch {
     page_map: std::collections::HashMap<u32, Vec<u8>>,
@@ -1201,24 +1223,32 @@ async fn read_next_wal_batch(state: &mut SyncState, header: &wal::WalHeader) -> 
 }
 
 async fn ensure_database_in_wal_mode(db_path: &Path, db_name: &str) -> Result<()> {
-    let db_path = db_path.to_path_buf();
-    let mode = tokio::task::spawn_blocking(move || -> Result<String> {
-        let conn = rusqlite::Connection::open(&db_path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
-        let mode: String = conn.query_row("PRAGMA journal_mode", [], |row| row.get(0))?;
-        Ok(mode)
-    })
-    .await??;
+    use tokio::io::AsyncReadExt;
 
-    if mode.eq_ignore_ascii_case("wal") {
-        Ok(())
-    } else {
-        Err(anyhow!(
-            "{}: SQLite journal_mode is '{}', expected WAL; replication cannot continue",
-            db_name,
-            mode
-        ))
+    // Do not open a SQLite connection just to inspect the mode. In external
+    // VFS integrations, closing a default-VFS connection can unlink the live
+    // WAL while the owning VFS still has its file descriptor open. Later
+    // commits then land in an orphaned file that the sender cannot discover.
+    // The persistent SQLite header records WAL mode in both format bytes.
+    let mut file = tokio::fs::File::open(db_path).await?;
+    let mut header = [0; 100];
+    file.read_exact(&mut header).await?;
+    if &header[..16] != b"SQLite format 3\0" {
+        anyhow::bail!(
+            "{}: invalid SQLite header; cannot verify journal_mode WAL",
+            db_name
+        );
     }
+    let mode = match (header[18], header[19]) {
+        (2, 2) => return Ok(()),
+        (1, 1) => "delete",
+        _ => "unknown",
+    };
+    anyhow::bail!(
+        "{}: SQLite journal_mode is '{}', expected WAL; replication cannot continue",
+        db_name,
+        mode
+    )
 }
 
 async fn sync_wal_with_sequence(
@@ -1968,10 +1998,15 @@ pub async fn sync_wal_fenced_delta(
         }
     };
 
-    let previous_wal_offset = state.wal_offset;
-    let previous_wal_generation = state.wal_generation;
-    let previous_wal_salt = state.wal_salt;
-    let previous_wal_checksum_chain = state.wal_checksum_chain;
+    let mut rollback = WalCursorRollback {
+        wal_offset: state.wal_offset,
+        wal_generation: state.wal_generation,
+        wal_salt: state.wal_salt,
+        wal_checksum_chain: state.wal_checksum_chain,
+        state,
+        committed: false,
+    };
+    let state = &mut *rollback.state;
 
     let WalBatch {
         page_map,
@@ -1983,10 +2018,6 @@ pub async fn sync_wal_fenced_delta(
     } = read_next_wal_batch(state, &header).await?;
 
     if rollover_detected {
-        state.wal_offset = previous_wal_offset;
-        state.wal_generation = previous_wal_generation;
-        state.wal_salt = previous_wal_salt;
-        state.wal_checksum_chain = previous_wal_checksum_chain;
         let message = format!(
             "{}: WAL rollover detected in fenced external mode; refusing to publish deltas until the external base is re-anchored",
             state.name
@@ -2068,6 +2099,7 @@ pub async fn sync_wal_fenced_delta(
     state.db_checksum = Some(post_checksum);
     // Intentionally no save_state: the replay cursor lives in the externally
     // owned base manifest, not a remote state.json sidecar.
+    rollback.committed = true;
 
     Ok(Some(DeltaPublishResult {
         seq: new_seq,
@@ -3894,12 +3926,9 @@ mod tests {
         assert_eq!(count, 10);
     }
 
-    /// The journal-mode probe must ride out transient lock contention instead
-    /// of failing fast with SQLITE_BUSY. An external writer holding an
-    /// exclusive rollback-mode lock makes a bare (no busy_timeout) probe fail
-    /// immediately with "database is locked"; the probe used by the sync path
-    /// sets a 5s busy_timeout, so it waits the lock out and reports the real
-    /// journal mode.
+    /// The journal-mode probe must report the persistent mode rather than
+    /// fail with SQLITE_BUSY under an exclusive writer. Reading the header
+    /// directly needs neither a SQLite connection nor a busy timeout.
     #[tokio::test]
     async fn test_wal_mode_probe_survives_transient_exclusive_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -3926,14 +3955,14 @@ mod tests {
         );
         drop(bare);
 
-        // Release the lock well within the probe's 5s busy_timeout.
+        // The header probe may complete while this SQLite lock is still held.
         let releaser = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(500));
             locker.execute_batch("COMMIT;").unwrap();
         });
 
-        // The fixed probe waits out the lock and reports the real journal mode
-        // (delete), rather than surfacing "database is locked".
+        // The read-only probe reports the real persistent mode (delete),
+        // rather than surfacing "database is locked".
         let err = ensure_database_in_wal_mode(&db_path, "busy-probe")
             .await
             .expect_err("delete-mode database must be rejected");
@@ -4934,12 +4963,14 @@ mod tests {
     #[derive(Clone)]
     struct MutStorage {
         objects: Arc<Mutex<StdHashMap<String, Vec<u8>>>>,
+        fail_publication: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl MutStorage {
         fn new() -> Self {
             Self {
                 objects: Arc::new(Mutex::new(StdHashMap::new())),
+                fail_publication: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             }
         }
     }
@@ -4977,6 +5008,12 @@ mod tests {
             Ok(self.objects.lock().unwrap().contains_key(key))
         }
         async fn put_if_absent(&self, key: &str, data: &[u8]) -> Result<CasResult> {
+            if self
+                .fail_publication
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                anyhow::bail!("injected fenced publication failure");
+            }
             let mut objs = self.objects.lock().unwrap();
             if objs.contains_key(key) {
                 return Ok(CasResult {
@@ -5819,6 +5856,97 @@ mod tests {
             }
         }
         prev_env
+    }
+
+    #[tokio::test]
+    async fn empty_external_wal_probe_preserves_the_live_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, db_path, _) = setup_fenced_source(dir.path());
+        drop(conn);
+        let mut state = SyncState::new(db_path).unwrap();
+        // An external VFS owns this open handle. Opening and closing the base
+        // through SQLite's default VFS must not unlink its empty live WAL.
+        let _live_wal = std::fs::File::create(&state.wal_path).unwrap();
+        let params = FencedDeltaSyncParams {
+            epoch: 7,
+            writer_id: "writer".to_owned(),
+            prev_envelope_checksum: [0x11; 32],
+        };
+        assert!(
+            sync_wal_fenced_delta(&MutStorage::new(), "fenced/", &mut state, &params)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            state.wal_path.exists(),
+            "an empty sync must not unlink the externally owned WAL"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_fenced_publish_retries_pending_wal_frames() {
+        let dir = tempfile::tempdir().unwrap();
+        let (conn, db_path, base_copy) = setup_fenced_source(dir.path());
+        let storage = MutStorage::new();
+        let mut state = SyncState::new(db_path).unwrap();
+        state.name = "fenced".to_owned();
+        state.init_checksum().unwrap();
+        let base_seq = state.current_seq;
+        let anchor = [0x11; 32];
+        let head = publish_fenced_deltas(
+            &storage, "fenced/", &mut state, &conn, 7, "writer", anchor, 1,
+        )
+        .await;
+        conn.execute("INSERT INTO items VALUES (11, 'pending')", [])
+            .unwrap();
+        let params = FencedDeltaSyncParams {
+            epoch: 7,
+            writer_id: "writer".to_owned(),
+            prev_envelope_checksum: head,
+        };
+        storage
+            .fail_publication
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        for _ in 0..2 {
+            let err = sync_wal_fenced_delta(&storage, "fenced/", &mut state, &params)
+                .await
+                .expect_err("unpublished frames must still be retried");
+            assert!(
+                err.to_string()
+                    .contains("injected fenced publication failure"),
+                "{err:#}"
+            );
+        }
+        storage
+            .fail_publication
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let published = sync_wal_fenced_delta(&storage, "fenced/", &mut state, &params)
+            .await
+            .unwrap()
+            .expect("retry must publish, not acknowledge zero frames");
+        assert!(published.frame_count > 0);
+        let follower = dir.path().join("follower.db");
+        let cursor = FencedFollowerCursor {
+            base_seq,
+            epoch: 7,
+            writer_id: "writer".to_owned(),
+            base_envelope_checksum: anchor,
+        };
+        reconstruct_fenced_follower(
+            &storage, "fenced/", "fenced", &cursor, &base_copy, &follower,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_items(&follower),
+            vec![
+                (1, "base-1".to_owned()),
+                (2, "base-2".to_owned()),
+                (10, "d0".to_owned()),
+                (11, "pending".to_owned()),
+            ]
+        );
     }
 
     /// Production-path proof: a follower reconstructs the EXACT database from
